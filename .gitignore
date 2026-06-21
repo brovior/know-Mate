@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# 가상환경
+.venv/
+venv/
+env/
+
+# pytest / 테스트 캐시
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Jupyter 체크포인트
+.ipynb_checkpoints/
+
+# 런타임 상태 (APPDATA에 저장되지만 혹시 로컬에 생기면 제외)
+index_state.json
+threads.json
+*.tmp
+
+# LanceDB 인덱스 (APPDATA에 저장되지만 프로젝트 내 생성 방지)
+*.lance/
+*.ldb
+
+# 보안 키 파일
+*.key
+km.key
+
+# 임시 테스트 아티팩트
+test_docs/
+write_test4.py
+debug.log
+
+# IDE
+.idea/
+.vscode/
+*.suo
+*.user
+
+# Windows
+Thumbs.db
+desktop.ini

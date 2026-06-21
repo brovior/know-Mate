@@ -1,0 +1,38 @@
+# 추출 모드
+extractor: fake          # fake | plain | auto
+
+# 임베딩 (사내 API 호출 — base_url은 LLM과 동일, Host 헤더로 분기)
+embedding:
+  base_url: "http://10.x.x.x"
+  host_header: "embed.internal"
+  model: "bge-m3"
+  batch_size: 32
+
+# 청킹
+chunking:
+  chunk_size: 400
+  overlap: 80
+
+# 검색
+search:
+  top_k_max: 10
+  score_threshold: 0.4
+  rerank_enabled: false
+
+# 수집기
+collector:
+  watch_folders:
+    - "C:/Users/이재관/Documents"
+    - "Z:/부서공유/설비관리"
+  idle_seconds: 60
+
+# orphan 정리
+cleanup:
+  dry_run: true
+  max_delete_ratio: 0.30
+
+# LLM
+llm:
+  base_url: "http://10.x.x.x"
+  host_header: "llm.internal"
+  model: "qwen3-27b"

@@ -1,0 +1,96 @@
+"""벡터 검색 및 권한 필터 Retriever (CLAUDE.md 6-10)."""
+import getpass
+import logging
+from typing import Any
+
+from knowmate.rag.embedding import EmbeddingClient
+from knowmate.rag.indexer import Indexer
+
+logger = logging.getLogger(__name__)
+
+
+class Retriever:
+    def __init__(
+        self,
+        indexer: Indexer,
+        embed_client: EmbeddingClient,
+        top_k: int = 10,
+        score_threshold: float = 0.4,
+        crypto=None,
+    ) -> None:
+        """Retriever를 초기화한다.
+
+        crypto: CryptoManager 또는 FakeCryptoManager 인스턴스.
+                None이면 FakeCryptoManager를 사용한다.
+        """
+        self._table = indexer.table
+        self._embed = embed_client
+        self._top_k = top_k
+        self._score_threshold = score_threshold
+        self._current_user = getpass.getuser()
+
+        if crypto is None:
+            from knowmate.secure.crypto import FakeCryptoManager
+            self._crypto = FakeCryptoManager()
+        else:
+            self._crypto = crypto
+
+    def search(
+        self, query: str, scopes: list[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """쿼리를 벡터 검색해 권한 필터·복호화·샌드위치 배열 후 청크 dict 리스트를 반환한다."""
+        vec = self._embed.embed([query])[0]
+
+        raw = (
+            self._table.search(vec)
+            .where("is_deleted = false")
+            .limit(self._top_k * 2)
+            .to_arrow()
+            .to_pandas()
+        )
+
+        if raw.empty:
+            return []
+
+        # 유사도 점수 계산
+        if "_distance" in raw.columns:
+            raw = raw.copy()
+            raw["score"] = 1.0 - raw["_distance"] / 2.0
+            raw = raw[raw["score"] >= self._score_threshold]
+        else:
+            raw = raw.copy()
+            raw["score"] = 1.0
+
+        if raw.empty:
+            return []
+
+        # 권한 필터
+        if scopes is not None:
+            raw = raw[raw["scope"].isin(scopes)]
+            local_mask = raw["scope"] == "local"
+            other_mask = ~local_mask
+            local_filtered = raw[local_mask & (raw["owner"] == self._current_user)]
+            raw = raw[other_mask]._append(local_filtered)
+
+        if raw.empty:
+            return []
+
+        raw = raw.sort_values("score", ascending=False).head(self._top_k)
+        rows = raw.to_dict(orient="records")
+
+        # text 컬럼 복호화 (선택된 청크에 한해 메모리에서만)
+        for row in rows:
+            try:
+                row["text"] = self._crypto.decrypt(row["text"])
+            except Exception as exc:
+                logger.warning("청크 복호화 실패 (chunk_id=%s): %s", row.get("chunk_id"), exc)
+                row["text"] = ""
+
+        logger.info("검색 결과: query_len=%d hits=%d", len(query), len(rows))
+        return self._sandwich(rows)
+
+    def _sandwich(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Lost in the Middle 대응 샌드위치 배열: [0,2,4,...] + reversed([1,3,...])."""
+        evens = rows[::2]
+        odds = list(reversed(rows[1::2]))
+        return evens + odds

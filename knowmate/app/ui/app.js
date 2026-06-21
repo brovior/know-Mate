@@ -1,0 +1,336 @@
+/* ===== KnowMate 프런트엔드 ===== */
+'use strict';
+
+let bridge = null;
+let currentMode = "knowledge";
+let waiting = false;
+
+/* -- QWebChannel 초기화 -- */
+new QWebChannel(qt.webChannelTransport, function(channel) {
+  bridge = channel.objects.bridge;
+  bridge.responseReady.connect(onResponse);
+  bridge.indexProgress.connect(onIndexProgress);
+  bridge.indexFinished.connect(onIndexFinished);
+  bridge.indexAlert.connect(onIndexAlert);
+  onBridgeReady();
+});
+
+function onBridgeReady() {
+  renderEmptyState();
+  initTitlebarDrag();
+}
+
+/* -- 커스텀 타이틀바 -- */
+function initTitlebarDrag() {
+  const bar = document.getElementById("titlebar");
+  bar.addEventListener("mousedown", function(e) {
+    if (e.button !== 0 || e.target.closest(".wc-btn")) return;
+    if (bridge) bridge.startWindowDrag();
+  });
+  bar.addEventListener("dblclick", function(e) {
+    if (e.target.closest(".wc-btn")) return;
+    windowMaximize();
+  });
+}
+
+let _maximized = false;
+
+function windowMinimize() { if (bridge) bridge.minimizeWindow(); }
+
+function windowMaximize() {
+  if (!bridge) return;
+  bridge.maximizeWindow();
+  _maximized = !_maximized;
+  const icon = document.getElementById("wcMaxIcon");
+  if (icon) {
+    icon.textContent = _maximized ? "⧉" : "□";
+  }
+  document.getElementById("wcMax").title = _maximized ? "복원" : "최대화";
+}
+
+function windowClose()    { if (bridge) bridge.closeWindow(); }
+
+/* -- 모드 전환 -- */
+function switchMode(mode) {
+  currentMode = mode;
+  document.getElementById("segKnow").classList.toggle("active", mode === "knowledge");
+  document.getElementById("segMes").classList.toggle("active",  mode === "mes");
+  document.getElementById("panelKnow").style.display = mode === "knowledge" ? "" : "none";
+  document.getElementById("panelMes").style.display  = mode === "mes"       ? "" : "none";
+}
+
+/* -- 입력 전송 -- */
+function handleKey(e) {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMsg(); }
+}
+
+function sendMsg() {
+  if (waiting || !bridge) return;
+  const inp = document.getElementById("inputPill");
+  const text = inp.value.trim();
+  if (!text) return;
+
+  appendUserMsg(text);
+  inp.value = "";
+  setWaiting(true);
+
+  const scopes = [];
+  if (document.getElementById("chkLocal")?.checked)  scopes.push("local");
+  if (document.getElementById("chkShared")?.checked) scopes.push("shared");
+
+  bridge.sendQuery(JSON.stringify({ query: text, mode: currentMode, scopes }));
+}
+
+function setWaiting(on) {
+  waiting = on;
+  const inp = document.getElementById("inputPill");
+  inp.disabled = on;
+  if (on) showLoading(true);
+}
+
+/* -- Python 응답 수신 -- */
+function onResponse(json) {
+  showLoading(false);
+  setWaiting(false);
+
+  let data;
+  try { data = JSON.parse(json); } catch { return; }
+
+  removeLoading();
+  appendAiBlocks(data.blocks || []);
+  document.getElementById("inputPill").focus();
+}
+
+/* -- 인덱싱 시그널 핸들러 -- */
+function onIndexProgress(json) {
+  let data;
+  try { data = JSON.parse(json); } catch { return; }
+  updateIndexProgressUI(data.current, data.total, data.filename);
+}
+
+function onIndexFinished(message) {
+  hideIndexProgress();
+  showToast(message.length > 50 ? message.substring(0, 50) + "..." : message);
+}
+
+function onIndexAlert(message) {
+  showToast(message);
+}
+
+/* -- 인덱싱 진행률 UI -- */
+function updateIndexProgressUI(current, total, filename) {
+  let bar = document.getElementById("_indexProgressBar");
+  if (!bar) {
+    const sidebar = document.querySelector(".sidebar-bottom") || document.body;
+    const wrap = document.createElement("div");
+    wrap.id = "_indexProgressWrap";
+    wrap.style.cssText = "padding:8px 12px;font-size:12px;color:#aaa;";
+    wrap.innerHTML =
+      "<div style=\"margin-bottom:4px;\">인덱싱 중...</div>" +
+      "<div id=\"_indexProgressBar\" style=\"background:#333;border-radius:4px;height:6px;\">" +
+        "<div id=\"_indexProgressFill\" style=\"background:#4e8ef7;height:6px;border-radius:4px;width:0%;\"></div>" +
+      "</div>" +
+      "<div id=\"_indexProgressText\" style=\"margin-top:4px;font-size:11px;\"></div>";
+    sidebar.appendChild(wrap);
+    bar = document.getElementById("_indexProgressBar");
+  }
+  const pct = total > 0 ? Math.round((current / total) * 100) : 0;
+  const fill = document.getElementById("_indexProgressFill");
+  if (fill) fill.style.width = pct + "%";
+  const txt = document.getElementById("_indexProgressText");
+  if (txt) txt.textContent = current + "/" + total + "건  " + (filename || "");
+}
+
+function hideIndexProgress() {
+  const wrap = document.getElementById("_indexProgressWrap");
+  if (wrap) wrap.remove();
+}
+
+/* -- DOM 헬퍼 -- */
+function renderEmptyState() {
+  const scroll = document.getElementById("chatScroll");
+  scroll.innerHTML = `
+    <div class="empty-state">
+      <i class="ti ti-message-search"></i>
+      <p>질문을 입력하면 관련 문서를 검색해 드립니다.</p>
+    </div>`;
+}
+
+function appendUserMsg(text) {
+  const scroll = document.getElementById("chatScroll");
+  const empty = scroll.querySelector(".empty-state");
+  if (empty) empty.remove();
+
+  const div = document.createElement("div");
+  div.className = "msg-user";
+  div.innerHTML = `<div class="bubble-user">${escHtml(text)}</div>`;
+  scroll.appendChild(div);
+  scrollBottom();
+}
+
+function showLoading(show) {
+  let el = document.getElementById("_loadingMsg");
+  if (show && !el) {
+    const scroll = document.getElementById("chatScroll");
+    el = document.createElement("div");
+    el.id = "_loadingMsg";
+    el.className = "msg-ai";
+    el.innerHTML = `<div class="avatar">K</div>
+      <div class="bubble-ai"><div class="loading">
+        <div class="dot"></div><div class="dot"></div><div class="dot"></div>
+      </div></div>`;
+    scroll.appendChild(el);
+    scrollBottom();
+  } else if (!show && el) {
+    el.remove();
+  }
+}
+
+function removeLoading() { showLoading(false); }
+
+function appendAiBlocks(blocks) {
+  const scroll = document.getElementById("chatScroll");
+  const wrap = document.createElement("div");
+  wrap.className = "msg-ai";
+  wrap.innerHTML = `<div class="avatar">K</div>`;
+  const inner = document.createElement("div");
+
+  blocks.forEach(block => {
+    inner.appendChild(renderBlock(block));
+  });
+
+  wrap.appendChild(inner);
+  scroll.appendChild(wrap);
+  scrollBottom();
+}
+
+function renderBlock(block) {
+  switch (block.type) {
+    case "text":    return renderText(block);
+    case "sources": return renderSources(block);
+    case "table":   return renderTable(block);
+    default:        return renderUnsupported(block);
+  }
+}
+
+function renderText(block) {
+  const div = document.createElement("div");
+  div.className = "bubble-ai";
+  div.textContent = block.content;
+  return div;
+}
+
+function renderSources(block) {
+  const frag = document.createDocumentFragment();
+  const title = document.createElement("div");
+  title.className = "sources-title";
+  title.textContent = block.title || "관련 문서";
+  frag.appendChild(title);
+
+  (block.items || []).forEach(item => {
+    const card = document.createElement("div");
+    card.className = "source-card";
+    const badgeClass = item.badge === "메일" ? "badge-mail" : "badge-doc";
+    const scorePct = Math.round((item.score || 0) * 100);
+    card.innerHTML = `
+      <span class="source-badge ${badgeClass}">${escHtml(item.badge)}</span>
+      <div class="source-info">
+        <div class="source-title">${escHtml(item.title)}</div>
+        <div class="source-sub">${escHtml(item.subtitle)}</div>
+      </div>
+      <span class="source-score">일치율 ${scorePct}%</span>`;
+    card.onclick = () => {
+      if (bridge) {
+        bridge.openFile(item.path).then(result => {
+          if (result === "not_found") showToast("원본을 찾을 수 없음");
+        }).catch(() => showToast("파일 열기 실패"));
+      }
+    };
+    frag.appendChild(card);
+  });
+
+  const wrapper = document.createElement("div");
+  wrapper.appendChild(frag);
+  return wrapper;
+}
+
+function renderTable(block) {
+  const wrap = document.createElement("div");
+  wrap.className = "block-table-wrap";
+  const titleEl = document.createElement("div");
+  titleEl.className = "block-title";
+  titleEl.textContent = block.title || "";
+  wrap.appendChild(titleEl);
+
+  const table = document.createElement("table");
+  table.className = "block-table";
+  const thead = `<thead><tr>${(block.columns||[]).map(c=>`<th>${escHtml(String(c))}</th>`).join("")}</tr></thead>`;
+  const tbody = `<tbody>${(block.rows||[]).map(row=>`<tr>${row.map(c=>`<td>${escHtml(String(c))}</td>`).join("")}</tr>`).join("")}</tbody>`;
+  table.innerHTML = thead + tbody;
+  wrap.appendChild(table);
+  return wrap;
+}
+
+function renderUnsupported(block) {
+  const div = document.createElement("div");
+  div.className = "unsupported-block";
+  div.innerHTML = `<i class="ti ti-alert-circle" style="font-size:14px;vertical-align:-2px;"></i> 지원하지 않는 응답 형식 (type: "${escHtml(block.type || "?")}")`;
+  return div;
+}
+
+/* -- 온보딩 오버레이 -- */
+function openOnboarding() {
+  document.getElementById("overlay").classList.add("show");
+  document.getElementById("obTitle").textContent = "폴더 관리";
+  document.getElementById("obSub").textContent = "인덱싱할 폴더를 추가하거나 제거하세요";
+}
+function closeOnboarding() {
+  document.getElementById("overlay").classList.remove("show");
+}
+function addFolder() { showToast("폴더 선택 기능은 Python 브리지 연동 후 활성화됩니다."); }
+
+/* -- 인덱싱 버튼 -- */
+function startFullIndex() {
+  closeOnboarding();
+  if (bridge) {
+    bridge.startReindex();
+  } else {
+    showToast("브리지가 준비되지 않았습니다.");
+  }
+}
+
+/* -- 증분 재인덱싱 -- */
+function startReindex() {
+  if (bridge) {
+    bridge.startReindex();
+  } else {
+    showToast("브리지가 준비되지 않았습니다.");
+  }
+}
+
+function cancelReindex() {
+  if (bridge) bridge.cancelReindex();
+}
+
+function newThread()    { renderEmptyState(); }
+
+/* -- 유틸 -- */
+function scrollBottom() {
+  const s = document.getElementById("chatScroll");
+  s.scrollTop = s.scrollHeight;
+}
+
+function escHtml(str) {
+  return String(str)
+    .replace(/&/g,"&amp;").replace(/</g,"&lt;")
+    .replace(/>/g,"&gt;").replace(/"/g,"&quot;");
+}
+
+let toastTimer = null;
+function showToast(msg) {
+  const t = document.getElementById("toast");
+  t.textContent = msg;
+  t.classList.add("show");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove("show"), 2500);
+}
