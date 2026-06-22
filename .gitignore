@@ -45,3 +45,10 @@ debug.log
 # Windows
 Thumbs.db
 desktop.ini
+
+# Claude Code 로컬 설정
+.claude/
+
+# 디버깅용 스크린샷
+image.png
+knowmate/image.png

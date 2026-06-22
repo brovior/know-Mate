@@ -58,6 +58,20 @@ class CollectorWorker(QThread):
         """증분 스캔 사이클 1회를 실행한다."""
         self._cancelled = False
         start = time.time()
+
+        # QThread에서 COM 사용 시 초기화 필수.
+        # MTA로 초기화해야 메시지 펌프 없이 Office STA 서버를 호출할 수 있다.
+        # (STA로 초기화하면 펌프 부재로 Documents.Open 등이 무한 대기)
+        _com_initialized = False
+        try:
+            import pythoncom  # type: ignore
+            pythoncom.CoInitializeEx(pythoncom.COINIT_MULTITHREADED)
+            _com_initialized = True
+        except ImportError:
+            pass
+        except Exception as exc:
+            logger.warning("COM 초기화 경고: %s", exc)
+
         try:
             self._run_cycle()
         except Exception as exc:
@@ -66,11 +80,74 @@ class CollectorWorker(QThread):
         finally:
             elapsed = time.time() - start
             logger.info("수집기 사이클 완료: %.1f초", elapsed)
+            if _com_initialized:
+                # COM 앱 Quit은 반드시 생성 스레드(여기)에서 수행해야 한다(STA)
+                try:
+                    from knowmate.secure.com_reader import quit_com_apps
+                    quit_com_apps()
+                except Exception:
+                    pass
+                import pythoncom  # type: ignore
+                pythoncom.CoUninitialize()
 
     def cancel(self):
         """취소 플래그를 설정한다. 현재 처리 중인 파일 완료 후 중단된다."""
         self._cancelled = True
         logger.info("수집기 취소 요청됨")
+
+    def _purge_removed_folders(self, watch_folders: list[str], state: dict) -> None:
+        """watch_folders에 속하지 않는 청크를 LanceDB에서 직접 삭제한다.
+
+        state.json 대신 LanceDB의 file_path 컬럼을 기준으로 삭제해
+        state와 DB 불일치 상황도 처리한다.
+        사용자가 명시적으로 폴더를 제거한 경우이므로 dry_run과 무관하게 즉시 삭제한다.
+        """
+        normalized = [f.replace("\\", "/").rstrip("/") for f in watch_folders]
+
+        def belongs_to_any(path_str: str) -> bool:
+            p = path_str.replace("\\", "/")
+            return any(p.startswith(w + "/") or p == w for w in normalized)
+
+        # state에서 제거된 폴더 항목 정리
+        stale_state_paths = [p for p in list(state.keys()) if not belongs_to_any(p)]
+        for p in stale_state_paths:
+            state.pop(p, None)
+
+        # LanceDB에서 현재 file_path 목록 조회 후 직접 삭제
+        try:
+            df = self._indexer.table.to_arrow().to_pandas()
+        except Exception as exc:
+            logger.warning("[purge] DB 조회 실패: %s", exc)
+            return
+
+        if df.empty:
+            return
+
+        # watch_folders에 속하지 않는 file_path 추출
+        stale_mask = ~df["file_path"].apply(belongs_to_any)
+        stale_paths_db = df.loc[stale_mask, "file_path"].unique().tolist()
+
+        if not stale_paths_db:
+            return
+
+        logger.info("[purge] 제거된 폴더 DB 청크 정리: %d개 경로", len(stale_paths_db))
+
+        # 경로별로 삭제 (SQL 길이 제한 방지)
+        any_deleted = False
+        for path_str in stale_paths_db:
+            try:
+                safe = path_str.replace("'", "''")
+                self._indexer.table.delete(f"file_path = '{safe}'")
+                any_deleted = True
+                logger.info("[purge] 삭제 완료: %s", path_str)
+            except Exception as exc:
+                logger.error("[purge] 삭제 실패: %s - %s", path_str, exc)
+
+        if any_deleted:
+            try:
+                self._indexer.optimize()
+            except Exception as exc:
+                logger.warning("[purge] optimize 실패: %s", exc)
 
     def _run_cycle(self):
         """스캔 -> 분류 -> 인덱싱 -> orphan 정리 -> 저장 순으로 사이클을 실행한다."""
@@ -106,6 +183,9 @@ class CollectorWorker(QThread):
         total = len(heap)
         done = 0
         failed = []
+
+        # 시작 시 한 번 알림 (total=0 이면 즉시 완료 흐름으로 넘어감)
+        self.progress.emit(0, total, "스캔 완료" if total == 0 else "")
 
         while heap:
             if self._cancelled:
@@ -146,6 +226,9 @@ class CollectorWorker(QThread):
                 logger.error("파일 처리 실패 (건너뜀): %s - %s", task.path, exc)
                 failed.append(task.path)
 
+        # watch_folders에서 제거된 폴더의 청크를 즉시 정리한다
+        self._purge_removed_folders(watch_folders, state)
+
         cleanup = CleanupManager(
             indexer=self._indexer,
             max_delete_ratio=max_delete_ratio,
@@ -169,18 +252,27 @@ class CollectorWorker(QThread):
 
 
 class IdleScheduler(QObject):
-    """마지막 입력 이벤트로부터 idle_seconds 경과 시 워커를 실행한다."""
+    """유휴 시간 경과 시 인덱싱을 트리거한다.
 
-    def __init__(self, worker_factory, idle_seconds=60, parent=None):
-        """스케줄러를 초기화한다."""
+    단일 워커를 공유하기 위해 워커를 직접 생성하지 않고,
+    trigger/is_busy 콜백으로 외부 워커를 제어한다.
+    이미 인덱싱(수동/유휴 무관)이 진행 중이면 건너뛴다.
+    """
+
+    def __init__(self, trigger, is_busy, idle_seconds=60, parent=None):
+        """스케줄러를 초기화한다.
+
+        trigger: () -> None, 인덱싱을 시작하는 콜백
+        is_busy: () -> bool, 인덱싱이 진행 중이면 True를 반환하는 콜백
+        """
         super().__init__(parent)
-        self._worker_factory = worker_factory
+        self._trigger = trigger
+        self._is_busy = is_busy
         self._idle_seconds = idle_seconds
         self._timer = QTimer(self)
         self._timer.setInterval(idle_seconds * 1000)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._on_idle)
-        self._worker = None
 
     def start(self):
         """스케줄러를 시작한다."""
@@ -190,8 +282,6 @@ class IdleScheduler(QObject):
     def stop(self):
         """스케줄러를 중지한다."""
         self._timer.stop()
-        if self._worker and self._worker.isRunning():
-            self._worker.cancel()
         logger.info("IdleScheduler 중지")
 
     def reset_idle(self):
@@ -200,11 +290,13 @@ class IdleScheduler(QObject):
             self._timer.start()
 
     def _on_idle(self):
-        """유휴 시간 경과 시 워커를 실행한다."""
-        if self._worker and self._worker.isRunning():
-            logger.debug("IdleScheduler: 이전 워커 실행 중, 건너뜀")
+        """유휴 시간 경과 시 인덱싱을 트리거한다. 진행 중이면 건너뛰고 재예약한다."""
+        if self._is_busy():
+            logger.debug("IdleScheduler: 인덱싱 진행 중, 건너뜀")
+            self._timer.start()  # 다음 사이클에 재시도
             return
         logger.info("IdleScheduler: 유휴 감지 -> 수집기 실행")
-        self._worker = self._worker_factory()
-        self._worker.finished.connect(lambda _: self._timer.start())
-        self._worker.start()
+        try:
+            self._trigger()
+        finally:
+            self._timer.start()  # 다음 유휴 사이클 예약

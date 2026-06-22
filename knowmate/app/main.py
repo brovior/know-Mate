@@ -1,9 +1,15 @@
 """KnowMate 진입점 — PyQt6 윈도우 + QWebEngineView."""
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from pathlib import Path
+
+# PyTorch/sentence-transformers가 import되기 전에 설정해야 효과 있음
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 from PyQt6.QtCore import QFile, QIODevice, QUrl, Qt
 from PyQt6.QtWebEngineCore import QWebEngineScript
@@ -19,6 +25,7 @@ from knowmate.app.bridge import Bridge
 from knowmate.agents.registry import AgentRegistry
 
 UI_DIR = Path(__file__).parent / "ui"
+logger = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
@@ -31,7 +38,6 @@ class MainWindow(QMainWindow):
         self._view = QWebEngineView(self)
         self.setCentralWidget(self._view)
 
-        # 프레임리스 창 우하단 리사이즈 그립
         self._grip = QSizeGrip(self)
         self._grip.setFixedSize(16, 16)
         self._grip.raise_()
@@ -42,13 +48,91 @@ class MainWindow(QMainWindow):
         self._channel.registerObject("bridge", self._bridge)
         self._view.page().setWebChannel(self._channel)
 
-        _inject_qwebchannel_js(self._view)
+        self._init_collector()
 
+        _inject_qwebchannel_js(self._view)
         self._view.load(QUrl.fromLocalFile(str(UI_DIR / "index.html")))
+
+    def _init_collector(self) -> None:
+        """수집기 파이프라인을 초기화하고 IdleScheduler를 시작한다."""
+        try:
+            from knowmate.config import get_config
+            from knowmate.rag.embedding import get_embedding_client
+            from knowmate.rag.indexer import Indexer
+            from knowmate.secure import get_extractor
+            from knowmate.secure.crypto import get_crypto_manager
+            from knowmate.collector.scheduler import CollectorWorker, IdleScheduler
+
+            cfg = get_config()
+            db_path = Path(os.environ.get("APPDATA", ".")) / "KnowMate" / "index"
+            db_path.mkdir(parents=True, exist_ok=True)
+
+            chunking = cfg.get("chunking", {})
+            self._cfg      = cfg
+            self._indexer  = Indexer(
+                db_path=db_path,
+                embed_client=get_embedding_client(cfg),
+                chunk_size=chunking.get("chunk_size", 400),
+                overlap=chunking.get("overlap", 80),
+                batch_size=cfg.get("embedding", {}).get("batch_size", 32),
+                crypto=get_crypto_manager(cfg),
+            )
+            self._extractor = get_extractor(cfg.get("extractor", "fake"))
+
+            # 단일 워커를 생성해 bridge에 연결한다 (수동·유휴 인덱싱 공유)
+            self._make_worker()
+
+            # 유휴시간 자동 인덱싱 스케줄러 (6-7)
+            # 동일한 단일 워커를 재사용해 동시 실행을 방지한다.
+            idle_sec = cfg.get("collector", {}).get("idle_seconds", 60)
+            self._idle_scheduler = IdleScheduler(
+                trigger=self._trigger_idle_index,
+                is_busy=lambda: self._bridge._worker is not None
+                and self._bridge._worker.isRunning(),
+                idle_seconds=idle_sec,
+                parent=self,
+            )
+            self._idle_scheduler.start()
+
+        except Exception as exc:
+            logger.warning("수집기 초기화 실패: %s", exc)
+
+    def _make_worker(self):
+        """단일 CollectorWorker를 생성하고 bridge에 연결한다."""
+        from knowmate.collector.scheduler import CollectorWorker
+        worker = CollectorWorker(
+            config=self._cfg,
+            indexer=self._indexer,
+            extractor=self._extractor,
+            parent=self,
+        )
+        self._bridge.set_worker(worker)
+        return worker
+
+    def _trigger_idle_index(self) -> None:
+        """유휴 인덱싱을 트리거한다. 공유 워커가 멈춰 있을 때만 시작한다."""
+        worker = self._bridge._worker
+        if worker is not None and not worker.isRunning():
+            worker.start()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._grip.move(self.width() - 16, self.height() - 16)
+
+    def closeEvent(self, event) -> None:
+        """앱 종료 시 스케줄러·워커를 정리해 스레드 누수를 방지한다."""
+        try:
+            scheduler = getattr(self, "_idle_scheduler", None)
+            if scheduler is not None:
+                scheduler.stop()
+            worker = getattr(self._bridge, "_worker", None)
+            if worker is not None and worker.isRunning():
+                worker.cancel()
+                # 현재 처리 중인 파일 완료 후 종료될 때까지 대기 (최대 10초)
+                worker.wait(10000)
+        except Exception as exc:
+            logger.warning("종료 정리 중 예외: %s", exc)
+        super().closeEvent(event)
 
 
 def _inject_qwebchannel_js(view: QWebEngineView) -> None:

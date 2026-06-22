@@ -15,3 +15,12 @@ def get_config() -> dict[str, Any]:
         with _CONFIG_PATH.open(encoding="utf-8") as f:
             _cache = yaml.safe_load(f) or {}
     return _cache
+
+
+def update_watch_folders(folders: list[str]) -> None:
+    """watch_folders를 갱신하고 config.yaml에 저장한다."""
+    cfg = get_config()
+    cfg.setdefault("collector", {})["watch_folders"] = folders
+    with _CONFIG_PATH.open("w", encoding="utf-8") as f:
+        yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+

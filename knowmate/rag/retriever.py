@@ -17,17 +17,21 @@ class Retriever:
         top_k: int = 10,
         score_threshold: float = 0.4,
         crypto=None,
+        rerank_enabled: bool = False,
     ) -> None:
         """Retriever를 초기화한다.
 
         crypto: CryptoManager 또는 FakeCryptoManager 인스턴스.
                 None이면 FakeCryptoManager를 사용한다.
+        rerank_enabled: True이면 벡터 검색 후 cross-encoder rerank를 수행한다.
+                        사내 rerank API가 준비된 시점에 config로 활성화한다.
         """
         self._table = indexer.table
         self._embed = embed_client
         self._top_k = top_k
         self._score_threshold = score_threshold
         self._current_user = getpass.getuser()
+        self._rerank_enabled = rerank_enabled
 
         if crypto is None:
             from knowmate.secure.crypto import FakeCryptoManager
@@ -86,8 +90,15 @@ class Retriever:
                 logger.warning("청크 복호화 실패 (chunk_id=%s): %s", row.get("chunk_id"), exc)
                 row["text"] = ""
 
+        if self._rerank_enabled:
+            rows = self._rerank(rows, query)
+
         logger.info("검색 결과: query_len=%d hits=%d", len(query), len(rows))
         return self._sandwich(rows)
+
+    def _rerank(self, rows: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
+        """cross-encoder rerank placeholder. 사내 rerank API 연동 시 구현한다."""
+        return rows
 
     def _sandwich(self, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Lost in the Middle 대응 샌드위치 배열: [0,2,4,...] + reversed([1,3,...])."""
