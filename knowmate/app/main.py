@@ -1,6 +1,7 @@
 """KnowMate 진입점 — PyQt6 윈도우 + QWebEngineView."""
 from __future__ import annotations
 
+import logging
 import os
 import sys
 from pathlib import Path
@@ -17,8 +18,53 @@ if str(ROOT) not in sys.path:
 
 from knowmate.app.bridge import Bridge
 from knowmate.agents.registry import AgentRegistry
+from knowmate.config import get_config
 
 UI_DIR = Path(__file__).parent / "ui"
+
+logger = logging.getLogger(__name__)
+
+
+def _build_collector_worker(cfg: dict, parent=None):
+    """config를 읽어 CollectorWorker를 조립해 반환한다."""
+    import os
+    from knowmate.rag.embedding import EmbeddingClient
+    from knowmate.rag.indexer import Indexer
+    from knowmate.collector.scheduler import CollectorWorker
+
+    embed_cfg = cfg.get("embedding", {})
+    fake_mode = cfg.get("extractor", "fake") == "fake"
+
+    embed_client = EmbeddingClient(
+        base_url=embed_cfg.get("base_url", "http://localhost"),
+        host_header=embed_cfg.get("host_header", ""),
+        fake=fake_mode,
+    )
+
+    chunk_cfg = cfg.get("chunking", {})
+    appdata = os.environ.get("APPDATA", str(Path.home()))
+    db_path = Path(appdata) / "KnowMate" / "index"
+
+    indexer = Indexer(
+        db_path=db_path,
+        embed_client=embed_client,
+        chunk_size=int(chunk_cfg.get("chunk_size", 400)),
+        overlap=int(chunk_cfg.get("overlap", 80)),
+        batch_size=int(embed_cfg.get("batch_size", 32)),
+    )
+
+    extractor_mode = cfg.get("extractor", "fake")
+    if extractor_mode == "fake":
+        from knowmate.secure.fake_reader import FakeReader
+        extractor = FakeReader()
+    elif extractor_mode == "plain":
+        from knowmate.secure.plain_reader import PlainReader
+        extractor = PlainReader()
+    else:  # auto
+        from knowmate.secure.plain_reader import PlainReader
+        extractor = PlainReader()
+
+    return CollectorWorker(cfg, indexer, extractor, parent=parent)
 
 
 class MainWindow(QMainWindow):
@@ -43,6 +89,15 @@ class MainWindow(QMainWindow):
         self._view.page().setWebChannel(self._channel)
 
         _inject_qwebchannel_js(self._view)
+
+        # CollectorWorker 조립 및 브리지 연결
+        try:
+            cfg = get_config()
+            worker = _build_collector_worker(cfg, parent=self)
+            self._bridge.set_worker(worker)
+            logger.info("CollectorWorker 초기화 완료")
+        except Exception as exc:
+            logger.error("CollectorWorker 초기화 실패: %s", exc)
 
         self._view.load(QUrl.fromLocalFile(str(UI_DIR / "index.html")))
 
