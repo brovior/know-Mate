@@ -1,38 +1,29 @@
-# 추출 모드
-extractor: fake          # fake | plain | auto
-
-# 임베딩 (사내 API 호출 — base_url은 LLM과 동일, Host 헤더로 분기)
+extractor: auto
 embedding:
-  base_url: "http://10.x.x.x"
-  host_header: "embed.internal"
-  model: "bge-m3"
+  mode: local
+  local_model: BAAI/bge-m3
+  base_url: http://10.x.x.x
+  host_header: embed.internal
+  model: bge-m3
   batch_size: 32
-
-# 청킹
 chunking:
   chunk_size: 400
   overlap: 80
-
-# 검색
 search:
   top_k_max: 10
   score_threshold: 0.4
   rerank_enabled: false
-
-# 수집기
 collector:
   watch_folders:
-    - "C:/Users/이재관/Documents"
-    - "Z:/부서공유/설비관리"
+  - C:/Users/SDSPRO/Documents/공공행정
   idle_seconds: 60
-
-# orphan 정리
 cleanup:
   dry_run: true
-  max_delete_ratio: 0.30
-
-# LLM
+  max_delete_ratio: 0.3
 llm:
-  base_url: "http://10.x.x.x"
-  host_header: "llm.internal"
-  model: "qwen3-27b"
+  mode: openrouter
+  model: anthropic/claude-haiku-4-5
+  api_key: ""              # 비워두면 OPENROUTER_API_KEY / ANTHROPIC_API_KEY 환경변수 사용
+  base_url: http://10.x.x.x
+  host_header: llm.internal
+  max_context_tokens: 4096

@@ -4,6 +4,7 @@
 let bridge = null;
 let currentMode = "knowledge";
 let waiting = false;
+let currentThread = null;   // 현재 대화 스레드 {id, title, mode, created_at, messages}
 
 /* -- QWebChannel 초기화 -- */
 new QWebChannel(qt.webChannelTransport, function(channel) {
@@ -12,12 +13,19 @@ new QWebChannel(qt.webChannelTransport, function(channel) {
   bridge.indexProgress.connect(onIndexProgress);
   bridge.indexFinished.connect(onIndexFinished);
   bridge.indexAlert.connect(onIndexAlert);
+  bridge.statusUpdated.connect(onStatusUpdated);
   onBridgeReady();
 });
 
 function onBridgeReady() {
   renderEmptyState();
   initTitlebarDrag();
+  bridge.getIndexStatus().then(json => {
+    let data;
+    try { data = JSON.parse(json); } catch { return; }
+    onStatusUpdated(data);
+  });
+  loadRecentQuestions();
 }
 
 /* -- 커스텀 타이틀바 -- */
@@ -57,6 +65,7 @@ function switchMode(mode) {
   document.getElementById("segMes").classList.toggle("active",  mode === "mes");
   document.getElementById("panelKnow").style.display = mode === "knowledge" ? "" : "none";
   document.getElementById("panelMes").style.display  = mode === "mes"       ? "" : "none";
+  loadRecentQuestions();
 }
 
 /* -- 입력 전송 -- */
@@ -70,6 +79,18 @@ function sendMsg() {
   const text = inp.value.trim();
   if (!text) return;
 
+  // 첫 메시지면 스레드 초기화
+  if (!currentThread) {
+    currentThread = {
+      id: _genId(),
+      title: text.substring(0, 30),
+      mode: currentMode,
+      created_at: new Date().toISOString(),
+      messages: [],
+    };
+  }
+  currentThread.messages.push({ role: "user", content: text });
+
   appendUserMsg(text);
   inp.value = "";
   setWaiting(true);
@@ -79,6 +100,10 @@ function sendMsg() {
   if (document.getElementById("chkShared")?.checked) scopes.push("shared");
 
   bridge.sendQuery(JSON.stringify({ query: text, mode: currentMode, scopes }));
+}
+
+function _genId() {
+  return Date.now().toString(36) + Math.random().toString(36).substring(2, 7);
 }
 
 function setWaiting(on) {
@@ -99,6 +124,13 @@ function onResponse(json) {
   removeLoading();
   appendAiBlocks(data.blocks || []);
   document.getElementById("inputPill").focus();
+
+  // 스레드에 AI 응답 저장
+  if (currentThread && bridge) {
+    currentThread.messages.push({ role: "ai", blocks: data.blocks || [] });
+    bridge.saveThread(currentThread.mode, JSON.stringify(currentThread));
+    loadRecentQuestions();
+  }
 }
 
 /* -- 인덱싱 시그널 핸들러 -- */
@@ -110,40 +142,56 @@ function onIndexProgress(json) {
 
 function onIndexFinished(message) {
   hideIndexProgress();
-  showToast(message.length > 50 ? message.substring(0, 50) + "..." : message);
+  showToast(message.length > 60 ? message.substring(0, 60) + "…" : message);
+}
+
+function onStatusUpdated(dataOrJson) {
+  let data = (typeof dataOrJson === "string") ? JSON.parse(dataOrJson) : dataOrJson;
+
+  const idxTime   = document.getElementById("idxTime");
+  const idxDetail = document.getElementById("idxDetail");
+  const badgeLocal  = document.getElementById("badgeLocal");
+  const badgeShared = document.getElementById("badgeShared");
+
+  if (idxTime)   idxTime.textContent   = data.last_indexed || "-";
+  if (idxDetail) idxDetail.textContent = `문서 ${data.doc_count ?? 0}건`;
+  if (badgeLocal)  badgeLocal.textContent  = data.local_count  ?? "-";
+  if (badgeShared) badgeShared.textContent = data.shared_count ?? "-";
 }
 
 function onIndexAlert(message) {
   showToast(message);
 }
 
-/* -- 인덱싱 진행률 UI -- */
+/* -- 인덱싱 진행률 UI (사이드바 기존 요소 활용) -- */
 function updateIndexProgressUI(current, total, filename) {
-  let bar = document.getElementById("_indexProgressBar");
-  if (!bar) {
-    const sidebar = document.querySelector(".sidebar-bottom") || document.body;
-    const wrap = document.createElement("div");
-    wrap.id = "_indexProgressWrap";
-    wrap.style.cssText = "padding:8px 12px;font-size:12px;color:#aaa;";
-    wrap.innerHTML =
-      "<div style=\"margin-bottom:4px;\">인덱싱 중...</div>" +
-      "<div id=\"_indexProgressBar\" style=\"background:#333;border-radius:4px;height:6px;\">" +
-        "<div id=\"_indexProgressFill\" style=\"background:#4e8ef7;height:6px;border-radius:4px;width:0%;\"></div>" +
-      "</div>" +
-      "<div id=\"_indexProgressText\" style=\"margin-top:4px;font-size:11px;\"></div>";
-    sidebar.appendChild(wrap);
-    bar = document.getElementById("_indexProgressBar");
-  }
+  const progWrap = document.getElementById("progWrap");
+  const progBar  = document.getElementById("progBar");
+  const progText = document.getElementById("progText");
+  const progFile = document.getElementById("progFile");
+  const idxIcon  = document.getElementById("idxIcon");
+
+  if (progWrap) progWrap.style.display = "block";
+  if (progText) progText.style.display = "block";
+  if (progFile) progFile.style.display = "block";
+  if (idxIcon)  idxIcon.textContent = "⟳ 인덱싱 중...";
+
   const pct = total > 0 ? Math.round((current / total) * 100) : 0;
-  const fill = document.getElementById("_indexProgressFill");
-  if (fill) fill.style.width = pct + "%";
-  const txt = document.getElementById("_indexProgressText");
-  if (txt) txt.textContent = current + "/" + total + "건  " + (filename || "");
+  if (progBar)  progBar.style.width = pct + "%";
+  if (progText) progText.textContent = `${current}/${total}건`;
+  if (progFile) progFile.textContent = filename || "";
 }
 
 function hideIndexProgress() {
-  const wrap = document.getElementById("_indexProgressWrap");
-  if (wrap) wrap.remove();
+  const progWrap = document.getElementById("progWrap");
+  const progText = document.getElementById("progText");
+  const progFile = document.getElementById("progFile");
+  const idxIcon  = document.getElementById("idxIcon");
+
+  if (progWrap) progWrap.style.display = "none";
+  if (progText) { progText.style.display = "none"; progText.textContent = ""; }
+  if (progFile) { progFile.style.display = "none"; progFile.textContent = ""; }
+  if (idxIcon)  idxIcon.textContent = "✅ 마지막 인덱싱";
 }
 
 /* -- DOM 헬퍼 -- */
@@ -283,11 +331,40 @@ function openOnboarding() {
   document.getElementById("overlay").classList.add("show");
   document.getElementById("obTitle").textContent = "폴더 관리";
   document.getElementById("obSub").textContent = "인덱싱할 폴더를 추가하거나 제거하세요";
+  if (bridge) {
+    bridge.getFolders().then(json => renderFolderList(JSON.parse(json)));
+  }
 }
+
 function closeOnboarding() {
   document.getElementById("overlay").classList.remove("show");
 }
-function addFolder() { showToast("폴더 선택 기능은 Python 브리지 연동 후 활성화됩니다."); }
+
+function renderFolderList(folders) {
+  const list = document.getElementById("folderList");
+  list.innerHTML = "";
+  (folders || []).forEach(path => {
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #2a2a2a;font-size:13px;";
+    row.innerHTML =
+      `<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escHtml(path)}</span>` +
+      `<button onclick="removeFolder(this,'${escHtml(path)}')" style="background:none;border:none;color:#888;cursor:pointer;font-size:16px;padding:0 4px;">✕</button>`;
+    list.appendChild(row);
+  });
+}
+
+function removeFolder(btn, path) {
+  if (!bridge) return;
+  bridge.removeWatchFolder(path).then(json => renderFolderList(JSON.parse(json)));
+}
+
+function addFolder() {
+  if (!bridge) return;
+  bridge.selectFolder().then(path => {
+    if (!path) return;
+    bridge.addWatchFolder(path).then(json => renderFolderList(JSON.parse(json)));
+  });
+}
 
 /* -- 인덱싱 버튼 -- */
 function startFullIndex() {
@@ -301,18 +378,72 @@ function startFullIndex() {
 
 /* -- 증분 재인덱싱 -- */
 function startReindex() {
-  if (bridge) {
-    bridge.startReindex();
-  } else {
-    showToast("브리지가 준비되지 않았습니다.");
-  }
+  if (!bridge) { showToast("브리지가 준비되지 않았습니다."); return; }
+  // 클릭 즉시 로딩 상태 표시 (progress 시그널 오기 전에도 보이도록)
+  showIndexRunning();
+  bridge.startReindex();
+}
+
+function showIndexRunning() {
+  const progWrap = document.getElementById("progWrap");
+  const progText = document.getElementById("progText");
+  const progFile = document.getElementById("progFile");
+  const progBar  = document.getElementById("progBar");
+  const idxIcon  = document.getElementById("idxIcon");
+  if (progWrap) progWrap.style.display = "block";
+  if (progText) { progText.style.display = "block"; progText.textContent = "스캔 중..."; }
+  if (progFile) { progFile.style.display = "block"; progFile.textContent = ""; }
+  if (progBar)  progBar.style.width = "0%";
+  if (idxIcon)  idxIcon.textContent = "⟳ 인덱싱 중...";
 }
 
 function cancelReindex() {
   if (bridge) bridge.cancelReindex();
 }
 
-function newThread()    { renderEmptyState(); }
+function newThread() {
+  currentThread = null;
+  renderEmptyState();
+  document.getElementById("inputPill").focus();
+  loadRecentQuestions();
+}
+
+/* -- 최근 질문 -- */
+function loadRecentQuestions() {
+  if (!bridge) return;
+  bridge.getThreads(currentMode).then(json => {
+    let threads;
+    try { threads = JSON.parse(json); } catch { return; }
+    renderRecentList(threads);
+  });
+}
+
+function renderRecentList(threads) {
+  const list = document.getElementById("recentList");
+  list.innerHTML = '<div class="panel-title" style="margin-top:4px;">최근 질문</div>';
+  (threads || []).slice(0, 15).forEach(t => {
+    const div = document.createElement("div");
+    div.className = "recent-item" + (currentThread && currentThread.id === t.id ? " active" : "");
+    div.title = t.title;
+    div.textContent = t.title;
+    div.onclick = () => restoreThread(t);
+    list.appendChild(div);
+  });
+}
+
+function restoreThread(thread) {
+  currentThread = thread;
+  const scroll = document.getElementById("chatScroll");
+  scroll.innerHTML = "";
+  (thread.messages || []).forEach(msg => {
+    if (msg.role === "user") {
+      appendUserMsg(msg.content);
+    } else if (msg.role === "ai") {
+      appendAiBlocks(msg.blocks || []);
+    }
+  });
+  loadRecentQuestions();  // active 상태 반영
+}
 
 /* -- 유틸 -- */
 function scrollBottom() {

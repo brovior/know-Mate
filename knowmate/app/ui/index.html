@@ -73,7 +73,7 @@
             <span class="index-label" id="idxIcon">✅ 마지막 인덱싱</span>
             <span class="index-time"  id="idxTime">-</span>
           </div>
-          <div class="prog-wrap" id="progWrap">
+          <div class="prog-wrap" id="progWrap" style="display:none;">
             <div class="prog-bar" id="progBar" style="width:0%"></div>
           </div>
           <div class="prog-text" id="progText"></div>
@@ -97,7 +97,7 @@
     <!-- 채팅 영역 -->
     <div class="chat-area">
       <div class="tab-bar" id="tabBar">
-        <div class="tab active" id="tabNew">새 대화 +</div>
+        <div class="tab active" id="tabNew" onclick="newThread()">새 대화 +</div>
       </div>
 
       <div class="chat-scroll" id="chatScroll"></div>

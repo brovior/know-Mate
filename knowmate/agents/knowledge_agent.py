@@ -9,16 +9,16 @@ from knowmate.agents.base import Block, TextBlock, SourcesBlock, SourceItem
 logger = logging.getLogger(__name__)
 
 
-def _mock_blocks(query: str) -> list[Block]:
+def _mock_blocks(query: str, error: str = "") -> list[Block]:
     """RAG 파이프라인 미초기화 시 반환할 안내 블록."""
-    text: TextBlock = {
-        "type": "text",
-        "content": (
-            f'"{query}"에 대한 검색을 시도했으나 RAG 파이프라인이 초기화되지 않았습니다.\n\n'
-            "인덱싱 후 재시도해 주세요. 사이드바의 [인덱싱 시작] 버튼을 눌러 문서를 인덱싱하면 "
-            "실제 문서를 기반으로 답변을 받을 수 있습니다."
-        ),
-    }
+    body = (
+        f'"{query}"에 대한 검색을 시도했으나 RAG 파이프라인이 초기화되지 않았습니다.\n\n'
+        "인덱싱 후 재시도해 주세요. 사이드바의 [인덱싱 시작] 버튼을 눌러 문서를 인덱싱하면 "
+        "실제 문서를 기반으로 답변을 받을 수 있습니다."
+    )
+    if error:
+        body += f"\n\n[디버그] 오류 내용:\n{error}"
+    text: TextBlock = {"type": "text", "content": body}
     return [text]
 
 
@@ -70,6 +70,7 @@ def _build_pipeline() -> dict[str, Any]:
         top_k=search.get("top_k_max", 10),
         score_threshold=search.get("score_threshold", 0.4),
         crypto=crypto,
+        rerank_enabled=search.get("rerank_enabled", False),
     )
     llm = get_llm_client(cfg)
     extractor = get_extractor(cfg.get("extractor", "fake"))
@@ -98,8 +99,10 @@ class KnowledgeAgent:
         try:
             pipeline = self._get_pipeline()
         except Exception as exc:
-            logger.warning("RAG 파이프라인 초기화 실패: %s", exc)
-            return _mock_blocks(query)
+            import traceback
+            detail = traceback.format_exc()
+            logger.warning("RAG 파이프라인 초기화 실패: %s\n%s", exc, detail)
+            return _mock_blocks(query, error=detail)
 
         scopes = context.get("scopes", ["local", "shared"])
 

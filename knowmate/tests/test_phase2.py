@@ -192,6 +192,51 @@ class TestIndexerFake:
         df = indexer.table.to_arrow().to_pandas()
         deleted = df[df["chunk_id"].isin(ids)]
         assert all(deleted["is_deleted"])
+        assert all(deleted["miss_count"] == 1)
+
+    def test_delete_chunks_second_miss_physically_deletes(self, tmp_path: Path):
+        """delete_chunks() 2회 호출 시(miss_count>=1) 청크가 물리 삭제된다."""
+        from knowmate.rag.indexer import Indexer
+
+        embed = _fake_embed_client()
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        text = FakeReader().extract("sample.docx")
+        ids = indexer.index_file(path="C:/sample/test.docx", text=text, mtime=1000.0, scope="local")
+
+        indexer.delete_chunks(ids)   # 1차: soft delete
+        df = indexer.table.to_arrow().to_pandas()
+        assert all(df[df["chunk_id"].isin(ids)]["miss_count"] == 1)
+
+        indexer.delete_chunks(ids)   # 2차: 물리 삭제
+        df2 = indexer.table.to_arrow().to_pandas()
+        assert len(df2[df2["chunk_id"].isin(ids)]) == 0
+
+    def test_reopen_existing_table(self, tmp_path: Path):
+        """같은 db_path로 두 번 Indexer를 생성해도 오류가 없어야 한다 (앱 재시작 시나리오)."""
+        from knowmate.rag.indexer import Indexer
+
+        embed = _fake_embed_client()
+        db_path = tmp_path / "db"
+        Indexer(db_path=db_path, embed_client=embed)   # 최초 생성
+        indexer2 = Indexer(db_path=db_path, embed_client=embed)  # 재오픈
+        assert indexer2 is not None
+
+    def test_reopen_preserves_data(self, tmp_path: Path):
+        """재오픈한 Indexer에서 이전 인덱싱 데이터가 유지됨을 확인한다."""
+        from knowmate.rag.indexer import Indexer
+
+        embed = _fake_embed_client()
+        db_path = tmp_path / "db"
+        reader = FakeReader()
+        text = reader.extract("sample.docx")
+
+        indexer1 = Indexer(db_path=db_path, embed_client=embed)
+        ids = indexer1.index_file(path="C:/sample/test.docx", text=text, mtime=1000.0, scope="local")
+        assert len(ids) >= 1
+
+        indexer2 = Indexer(db_path=db_path, embed_client=embed)
+        df = indexer2.table.to_arrow().to_pandas()
+        assert len(df) == len(ids)
 
 
 # ──────────────────────────────────────────────
@@ -328,7 +373,7 @@ def _make_fake_pipeline(db_dir: str) -> dict:
         base_url="http://localhost",
         host_header="llm.internal",
         model="fake",
-        fake=True,
+        mode="fake",
     )
     return {
         "indexer": indexer,
@@ -349,7 +394,7 @@ class TestLLMFake:
             base_url="http://localhost",
             host_header="llm.internal",
             model="fake",
-            fake=True,
+            mode="fake",
         )
         result = client.answer("질문", ["청크 내용입니다."])
         assert isinstance(result, str)
@@ -361,7 +406,7 @@ class TestLLMFake:
             base_url="http://localhost",
             host_header="llm.internal",
             model="fake",
-            fake=True,
+            mode="fake",
         )
         result = client.answer("질문", [])
         assert "찾지 못했습니다" in result
@@ -372,7 +417,7 @@ class TestLLMFake:
             base_url="http://localhost",
             host_header="llm.internal",
             model="fake",
-            fake=True,
+            mode="fake",
         )
         chunk = "A" * 300
         result = client.answer("질문", [chunk])

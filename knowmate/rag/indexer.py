@@ -65,9 +65,9 @@ class Indexer:
             self._crypto = crypto
 
         self._db = lancedb.connect(str(db_path))
-        if TABLE_NAME in self._db.list_tables():
+        try:
             self._table = self._db.open_table(TABLE_NAME)
-        else:
+        except Exception:
             self._table = self._db.create_table(TABLE_NAME, schema=SCHEMA)
 
     @property
@@ -134,7 +134,11 @@ class Indexer:
         return chunk_ids
 
     def delete_chunks(self, chunk_ids: list[str]) -> None:
-        """chunk_id 목록을 soft delete하고, miss_count>=2인 항목은 물리 삭제한다."""
+        """chunk_id 목록을 2단계 soft delete한다.
+
+        1차 miss(miss_count=0): is_deleted=true, miss_count=1 마킹.
+        2차 miss(miss_count>=1): 물리 삭제.
+        """
         if not chunk_ids:
             return
 
@@ -153,26 +157,22 @@ class Indexer:
         if df.empty:
             return
 
-        # miss_count >= 2 → 물리 삭제
-        hard_delete_ids = df.loc[df["miss_count"] >= 2, "chunk_id"].tolist()
+        # miss_count == 0 → 1차 miss: soft delete 마킹
+        first_miss_ids = df.loc[df["miss_count"] == 0, "chunk_id"].tolist()
+        if first_miss_ids:
+            fm_list = ", ".join(f"'{cid}'" for cid in first_miss_ids)
+            self._table.update(
+                where=f"chunk_id IN ({fm_list})",
+                values={"is_deleted": True, "deleted_at": now, "miss_count": 1},
+            )
+            logger.info("soft delete 마킹(1차): %d건", len(first_miss_ids))
+
+        # miss_count >= 1 → 2차 miss: 물리 삭제
+        hard_delete_ids = df.loc[df["miss_count"] >= 1, "chunk_id"].tolist()
         if hard_delete_ids:
             hd_list = ", ".join(f"'{cid}'" for cid in hard_delete_ids)
             self._table.delete(f"chunk_id IN ({hd_list})")
-            logger.info("물리 삭제: %d건", len(hard_delete_ids))
-
-        # miss_count < 2 → soft delete (miss_count 증가)
-        soft_ids = df.loc[df["miss_count"] < 2, "chunk_id"].tolist()
-        if soft_ids:
-            soft_list = ", ".join(f"'{cid}'" for cid in soft_ids)
-            self._table.update(
-                where=f"chunk_id IN ({soft_list}) AND is_deleted = false",
-                values={
-                    "is_deleted": True,
-                    "deleted_at": now,
-                    "miss_count": 1,
-                },
-            )
-            logger.info("soft delete 마킹: %d건", len(soft_ids))
+            logger.info("물리 삭제(2차): %d건", len(hard_delete_ids))
 
     def optimize(self) -> None:
         """LanceDB optimize()로 삭제 데이터를 정리한다 (compact_files() 사용 금지)."""

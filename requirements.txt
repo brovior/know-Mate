@@ -1,0 +1,31 @@
+# ── UI ──────────────────────────────────────────────────────────────────────
+PyQt6>=6.6.0
+PyQt6-WebEngine>=6.6.0          # QWebEngineView, QWebEngineScript
+                                  # QWebChannel은 PyQt6에 포함
+
+# ── 벡터 DB ──────────────────────────────────────────────────────────────────
+lancedb>=0.6.0
+pyarrow>=14.0.0                  # LanceDB 스키마·Arrow 변환
+
+# ── 문서 파싱 (plain_reader) ─────────────────────────────────────────────────
+python-docx>=1.1.0               # .docx
+openpyxl>=3.1.0                  # .xlsx
+python-pptx>=0.6.23              # .pptx
+PyMuPDF>=1.24.0                  # .pdf (import fitz)
+
+# ── 보안 (crypto) ────────────────────────────────────────────────────────────
+cryptography>=42.0.0             # AES-256-GCM
+pywin32>=306                     # win32com (COM 파서) + win32crypt (DPAPI)
+                                  # Windows 전용 — fake 모드에서는 불필요
+
+# ── 설정 ─────────────────────────────────────────────────────────────────────
+PyYAML>=6.0.1                    # config.yaml 로드
+
+# ── 개발 / 테스트 ─────────────────────────────────────────────────────────────
+pytest>=8.0.0
+
+# ── 선택: 사외 테스트용 (사내에서는 임베딩·LLM 모두 사내 API라 불필요) ──────────
+# embedding.mode=local 일 때만 필요 (로컬 bge-m3 임베딩, CPU에서 느림)
+# sentence-transformers>=3.0.0
+# llm.mode=claude 일 때만 필요 (Anthropic 직접 호출; openrouter 모드는 불필요)
+# anthropic>=0.40.0

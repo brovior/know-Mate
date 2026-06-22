@@ -2,10 +2,14 @@
 
 win32com 없는 환경에서 import 시 ComUnavailableError를 발생시킨다.
 fake 모드에서는 이 모듈을 import하지 않아야 한다.
+
+COM STA 주의: COM 객체는 생성한 스레드에서만 사용 가능하다.
+_ThreadLocalComApps를 통해 스레드별로 독립적인 COM 앱 인스턴스를 관리한다.
 """
+import threading
 from pathlib import Path
 
-# COM을 사용할 수 없는 환경임을 나타내는 예외
+
 class ComUnavailableError(RuntimeError):
     """win32com.client를 사용할 수 없는 환경에서 발생한다."""
 
@@ -22,61 +26,115 @@ def _require_win32com():
         ) from exc
 
 
-class WordComReader:
-    """doc 파일을 COM(Word) 싱글톤으로 파싱하는 리더.
+def _ensure_com_initialized() -> bool:
+    """현재 스레드에 COM을 MTA로 초기화한다.
 
-    매번 Quit() 하지 않고 인스턴스를 재사용해 기동 비용을 절감한다.
+    워커 스레드(메시지 펌프 없음)에서 Office STA 서버를 호출하려면
+    MTA가 필요하다. STA로 초기화하면 펌프 부재로 Open()이 무한 대기한다.
     """
+    try:
+        import pythoncom  # type: ignore
+        # COINIT_MULTITHREADED — 메시지 펌프 불필요, COM이 RPC로 마샬링
+        pythoncom.CoInitializeEx(pythoncom.COINIT_MULTITHREADED)
+        return True
+    except Exception:
+        # 이미 다른 모드로 초기화됨(RPC_E_CHANGED_MODE) 등 → 그대로 진행
+        return False
 
-    _instance = None  # Word.Application COM 싱글톤
 
-    def get_app(self):
-        """Word COM 애플리케이션 싱글톤을 반환한다. 없으면 생성한다."""
-        if self._instance is None:
-            win32com = _require_win32com()
-            self._instance = win32com.Dispatch("Word.Application")
-        return self._instance
+# 스레드별 COM 앱 인스턴스를 저장한다 (STA 요구사항 준수)
+_tls = threading.local()
+
+
+# COM 상수 (모달 다이얼로그 억제용)
+_WD_ALERTS_NONE = 0          # wdAlertsNone
+_MSO_SEC_FORCE_DISABLE = 3   # msoAutomationSecurityForceDisable (매크로 강제 비활성)
+_XL_ALERTS_OFF = False
+
+
+def _get_word_app():
+    """현재 스레드의 Word.Application COM 인스턴스를 반환한다."""
+    if not getattr(_tls, "word", None):
+        _ensure_com_initialized()
+        win32com = _require_win32com()
+        app = win32com.Dispatch("Word.Application")
+        # 모달 다이얼로그/매크로 경고/변환 확인창 억제
+        try:
+            app.Visible = False
+            app.DisplayAlerts = _WD_ALERTS_NONE
+            app.AutomationSecurity = _MSO_SEC_FORCE_DISABLE
+            app.Options.ConfirmConversions = False
+        except Exception:
+            pass
+        _tls.word = app
+    return _tls.word
+
+
+def _get_excel_app():
+    """현재 스레드의 Excel.Application COM 인스턴스를 반환한다."""
+    if not getattr(_tls, "excel", None):
+        _ensure_com_initialized()
+        win32com = _require_win32com()
+        app = win32com.Dispatch("Excel.Application")
+        try:
+            app.Visible = False
+            app.DisplayAlerts = _XL_ALERTS_OFF
+            app.AutomationSecurity = _MSO_SEC_FORCE_DISABLE
+            app.AskToUpdateLinks = False
+        except Exception:
+            pass
+        _tls.excel = app
+    return _tls.excel
+
+
+def _get_ppt_app():
+    """현재 스레드의 PowerPoint.Application COM 인스턴스를 반환한다."""
+    if not getattr(_tls, "ppt", None):
+        _ensure_com_initialized()
+        win32com = _require_win32com()
+        app = win32com.Dispatch("PowerPoint.Application")
+        try:
+            app.DisplayAlerts = 1  # ppAlertsNone 계열 (버전별 차이 → try)
+            app.AutomationSecurity = _MSO_SEC_FORCE_DISABLE
+        except Exception:
+            pass
+        _tls.ppt = app
+    return _tls.ppt
+
+
+class WordComReader:
+    """doc 파일을 COM(Word)으로 파싱하는 리더. 스레드별 싱글톤을 사용한다."""
 
     def parse(self, path: str) -> str:
-        """doc 파일을 열어 본문 텍스트를 반환한다.
-
-        예외 발생 시 인스턴스를 초기화해 다음 호출에 재생성하도록 한다.
-        """
-        word = self.get_app()
+        """doc 파일을 열어 본문 텍스트를 반환한다."""
         try:
-            doc = word.Documents.Open(str(Path(path).resolve()))
+            word = _get_word_app()
+            # ConfirmConversions=False: 변환 확인창 억제
+            # ReadOnly=True, AddToRecentFiles=False, Visible=False
+            doc = word.Documents.Open(
+                str(Path(path).resolve()),
+                False,   # ConfirmConversions
+                True,    # ReadOnly
+                False,   # AddToRecentFiles
+                "",      # PasswordDocument
+                "",      # PasswordTemplate
+                False,   # Revert
+            )
             text = doc.Content.Text
             doc.Close(False)
             return text
         except Exception:
-            WordComReader._instance = None
+            _tls.word = None  # 예외 시 이 스레드의 인스턴스 리셋
             raise
 
 
 class ExcelComReader:
-    """xls 파일을 COM(Excel) 싱글톤으로 파싱하는 리더.
-
-    매번 Quit() 하지 않고 인스턴스를 재사용한다.
-    """
-
-    _instance = None  # Excel.Application COM 싱글톤
-
-    def get_app(self):
-        """Excel COM 애플리케이션 싱글톤을 반환한다. 없으면 생성한다."""
-        if self._instance is None:
-            win32com = _require_win32com()
-            self._instance = win32com.Dispatch("Excel.Application")
-            self._instance.Visible = False
-            self._instance.DisplayAlerts = False
-        return self._instance
+    """xls 파일을 COM(Excel)으로 파싱하는 리더. 스레드별 싱글톤을 사용한다."""
 
     def parse(self, path: str) -> str:
-        """xls 파일을 열어 시트 전체를 탭 구분 텍스트로 반환한다.
-
-        예외 발생 시 인스턴스를 초기화해 다음 호출에 재생성하도록 한다.
-        """
-        excel = self.get_app()
+        """xls 파일을 열어 시트 전체를 탭 구분 텍스트로 반환한다."""
         try:
+            excel = _get_excel_app()
             wb = excel.Workbooks.Open(str(Path(path).resolve()))
             lines: list[str] = []
             for sheet in wb.Sheets:
@@ -89,32 +147,17 @@ class ExcelComReader:
             wb.Close(False)
             return "\n".join(lines)
         except Exception:
-            ExcelComReader._instance = None
+            _tls.excel = None
             raise
 
 
 class PowerPointComReader:
-    """ppt 파일을 COM(PowerPoint) 싱글톤으로 파싱하는 리더.
-
-    매번 Quit() 하지 않고 인스턴스를 재사용한다.
-    """
-
-    _instance = None  # PowerPoint.Application COM 싱글톤
-
-    def get_app(self):
-        """PowerPoint COM 애플리케이션 싱글톤을 반환한다. 없으면 생성한다."""
-        if self._instance is None:
-            win32com = _require_win32com()
-            self._instance = win32com.Dispatch("PowerPoint.Application")
-        return self._instance
+    """ppt 파일을 COM(PowerPoint)으로 파싱하는 리더. 스레드별 싱글톤을 사용한다."""
 
     def parse(self, path: str) -> str:
-        """ppt 파일을 열어 슬라이드 텍스트를 반환한다.
-
-        예외 발생 시 인스턴스를 초기화해 다음 호출에 재생성하도록 한다.
-        """
-        ppt = self.get_app()
+        """ppt 파일을 열어 슬라이드 텍스트를 반환한다."""
         try:
+            ppt = _get_ppt_app()
             prs = ppt.Presentations.Open(str(Path(path).resolve()), ReadOnly=True, WithWindow=False)
             slides: list[str] = []
             for slide in prs.Slides:
@@ -129,14 +172,31 @@ class PowerPointComReader:
             prs.Close()
             return "\n\n".join(slides)
         except Exception:
-            PowerPointComReader._instance = None
+            _tls.ppt = None
             raise
 
 
-# COM 리더 싱글톤 인스턴스 (모듈 레벨 공유)
 _word_reader = WordComReader()
 _excel_reader = ExcelComReader()
 _ppt_reader = PowerPointComReader()
+
+
+def quit_com_apps() -> None:
+    """현재 스레드의 COM 앱들을 Quit하고 thread-local을 비운다.
+
+    COM 객체는 생성한 스레드에서만 Quit할 수 있으므로(STA),
+    반드시 COM 앱을 생성한 워커 스레드 내부에서 호출해야 한다.
+    누수된 WINWORD/EXCEL/POWERPNT 프로세스를 정리한다.
+    """
+    for attr in ("word", "excel", "ppt"):
+        app = getattr(_tls, attr, None)
+        if app is None:
+            continue
+        try:
+            app.Quit()
+        except Exception:
+            pass
+        setattr(_tls, attr, None)
 
 
 class ComReader:
