@@ -1,0 +1,26 @@
+# KnowMate 의존성
+# 사내 PyPI 미러 기준: pip install -r requirements.txt --index-url <미러URL> --trusted-host <미러호스트>
+
+# UI
+PyQt6==6.11
+PyQt6-WebEngine==6.11
+
+# 벡터DB
+lancedb>=0.20
+pyarrow>=15.0
+
+# 문서 파서 (plain_reader)
+python-docx>=1.1
+openpyxl>=3.1
+python-pptx>=1.0
+PyMuPDF>=1.24          # fitz
+
+# 보안 (Phase 4)
+cryptography>=42.0
+
+# Windows COM (Phase 4, 사내 PC 전용)
+# pywin32>=306          # com_reader.py 사용 시 주석 해제
+
+# 테스트
+pytest>=8.0
+pytest-qt>=4.4
