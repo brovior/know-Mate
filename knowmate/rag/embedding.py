@@ -1,12 +1,23 @@
 """임베딩 모델 상수 및 API 클라이언트 (CLAUDE.md 5-1)."""
 import json
 import math
+import os
 import random
 import urllib.request
 from typing import Any
 
+# 인증 키가 없을 때 보내는 더미 값. vLLM 등 OpenAI 호환 서버는 키 미설정 시
+# 임의 값을 받아주므로 항상 Authorization 헤더를 채워 보낸다.
+_DUMMY_API_KEY = "EMPTY"
+
+# 모델 → 벡터 차원 매핑 (단일 출처). 모델 추가 시 여기만 갱신한다.
+# 모델과 차원은 한 몸이라 따로 두면 desync 되므로 VECTOR_DIM은 여기서 파생한다.
+MODEL_DIMS = {
+    "bge-m3": 1024,
+}
+
 EMBEDDING_MODEL = "bge-m3"
-VECTOR_DIM = 1024  # bge-m3 고정 차원. 모델 변경 시 전체 재인덱싱 필수
+VECTOR_DIM = MODEL_DIMS[EMBEDDING_MODEL]  # 모델에서 자동 파생. 변경 시 전체 재인덱싱 필수
 
 _local_model = None  # sentence-transformers 모델 싱글톤
 
@@ -39,18 +50,21 @@ class EmbeddingClient:
         fake: bool = False,
         local: bool = False,
         local_model_name: str = "BAAI/bge-m3",
+        api_key: str = "",
     ) -> None:
         """임베딩 클라이언트를 초기화한다.
 
         fake=True: 랜덤 벡터 반환 (API 불필요)
         local=True: sentence-transformers 로컬 모델 사용
         둘 다 False: 사내 임베딩 API 호출
+        api_key: 사내 API 인증 키. 비우면 더미 값을 전송한다.
         """
         self._base_url = base_url.rstrip("/")
         self._host_header = host_header
         self._fake = fake
         self._local = local
         self._local_model_name = local_model_name
+        self._api_key = api_key or _DUMMY_API_KEY
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         """텍스트 리스트를 임베딩 벡터 리스트로 변환한다."""
@@ -87,6 +101,7 @@ class EmbeddingClient:
             headers={
                 "Content-Type": "application/json",
                 "Host": self._host_header,
+                "Authorization": f"Bearer {self._api_key}",
             },
             method="POST",
         )
@@ -101,10 +116,14 @@ def get_embedding_client(cfg: dict[str, Any]) -> EmbeddingClient:
     embed_cfg = cfg.get("embedding", {})
     mode = embed_cfg.get("mode", "fake" if extractor == "fake" else "api")
 
+    # API 키: config 우선, 없으면 환경변수
+    api_key = embed_cfg.get("api_key", "") or os.environ.get("EMBED_API_KEY", "")
+
     return EmbeddingClient(
         base_url=embed_cfg.get("base_url", "http://localhost"),
         host_header=embed_cfg.get("host_header", "embed.internal"),
         fake=(mode == "fake"),
         local=(mode == "local"),
         local_model_name=embed_cfg.get("local_model", "BAAI/bge-m3"),
+        api_key=api_key,
     )

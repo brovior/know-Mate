@@ -4,7 +4,8 @@ embedding:
   local_model: BAAI/bge-m3
   base_url: http://10.x.x.x
   host_header: embed.internal
-  model: bge-m3
+  api_key: ""              # 비워두면 EMBED_API_KEY 환경변수 → 더미값(EMPTY) 순으로 사용
+  # 모델·차원은 rag/embedding.py 의 상수(MODEL_DIMS)로 고정. 변경 시 전체 재인덱싱 필요.
   batch_size: 32
 chunking:
   chunk_size: 400
