@@ -6,9 +6,9 @@ import random
 import urllib.request
 from typing import Any
 
-# 인증 키가 없을 때 보내는 더미 값. vLLM 등 OpenAI 호환 서버는 키 미설정 시
-# 임의 값을 받아주므로 항상 Authorization 헤더를 채워 보낸다.
-_DUMMY_API_KEY = "EMPTY"
+# 인증 키가 없을 때 보내는 더미 값. 사내 임베딩 서버는 Authorization 헤더가
+# 비어 있으면 호출을 거부하므로, 키 미설정 시 이 더미값을 채워 보낸다.
+_DUMMY_API_KEY = "dummy"
 
 # 모델 → 벡터 차원 매핑 (단일 출처). 모델 추가 시 여기만 갱신한다.
 # 모델과 차원은 한 몸이라 따로 두면 desync 되므로 VECTOR_DIM은 여기서 파생한다.

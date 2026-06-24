@@ -33,6 +33,23 @@ def _to_source_item(chunk: dict[str, Any]) -> SourceItem:
     return SourceItem(badge=badge, title=title, subtitle=subtitle, score=score, path=file_path)
 
 
+def _dedupe_sources(chunks: list[dict[str, Any]]) -> list[SourceItem]:
+    """청크 리스트를 파일 경로 단위로 중복 제거해 SourceItem 리스트를 반환한다.
+
+    같은 문서의 여러 청크는 가장 높은 score를 가진 청크 하나로 합쳐 표시한다.
+    출력은 score 내림차순 정렬.
+    """
+    best_by_path: dict[str, dict[str, Any]] = {}
+    for chunk in chunks:
+        path = chunk.get("file_path", "")
+        prev = best_by_path.get(path)
+        if prev is None or float(chunk.get("score", 0.0)) > float(prev.get("score", 0.0)):
+            best_by_path[path] = chunk
+    items = [_to_source_item(c) for c in best_by_path.values()]
+    items.sort(key=lambda it: it["score"], reverse=True)
+    return items
+
+
 def _build_pipeline() -> dict[str, Any]:
     """RAG 파이프라인 컴포넌트를 생성해 dict로 반환한다."""
     from knowmate.config import get_config
@@ -117,7 +134,7 @@ class KnowledgeAgent:
         blocks: list[Block] = [TextBlock(type="text", content=answer_text)]
 
         if chunks:
-            items = [_to_source_item(c) for c in chunks]
+            items = _dedupe_sources(chunks)  # 파일 단위 중복 제거 (문서당 1줄)
             sources: SourcesBlock = {
                 "type": "sources",
                 "title": f"관련 문서 {len(items)}건 · 근거 자료",

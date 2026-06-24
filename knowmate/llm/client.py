@@ -15,9 +15,9 @@ _SYSTEM_PROMPT = (
 
 _CONTEXT_SEPARATOR = "\n---\n"
 
-# 인증 키가 없을 때 보내는 더미 값. vLLM 등 OpenAI 호환 서버는 키 미설정 시
-# 임의 값을 받아주므로 항상 Authorization 헤더를 채워 보낸다.
-_DUMMY_API_KEY = "EMPTY"
+# 인증 키가 없을 때 보내는 더미 값. 사내 LLM 서버는 Authorization 헤더가
+# 비어 있으면 호출을 거부하므로, 키 미설정 시 이 더미값을 채워 보낸다.
+_DUMMY_API_KEY = "dummy"
 
 
 def _estimate_tokens(text: str) -> int:
