@@ -249,12 +249,16 @@ class ComReader:
     """확장자를 보고 Word/Excel/PowerPoint COM 리더로 라우팅하는 TextExtractor 구현체."""
 
     def extract(self, path: str) -> str:
-        """확장자에 따라 적합한 COM 리더로 파일을 파싱해 텍스트를 반환한다."""
+        """확장자에 따라 적합한 COM 리더로 파일을 파싱해 텍스트를 반환한다.
+
+        OLE2 오라벨 파일(.docx/.xlsx/.pptx인데 실제 구형 바이너리)도 같은 앱으로
+        라우팅한다. COM 앱은 확장자와 무관하게 실제 포맷을 열기 때문이다.
+        """
         ext = Path(path).suffix.lower()
-        if ext == ".doc":
+        if ext in (".doc", ".docx"):
             return _word_reader.parse(path)
-        if ext == ".xls":
+        if ext in (".xls", ".xlsx"):
             return _excel_reader.parse(path)
-        if ext == ".ppt":
+        if ext in (".ppt", ".pptx"):
             return _ppt_reader.parse(path)
         raise ValueError(f"ComReader가 지원하지 않는 확장자: {ext!r} ({path})")

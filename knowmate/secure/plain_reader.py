@@ -50,20 +50,56 @@ class PlainReader:
         return format_table(rows)
 
     def _read_xlsx(self, path: str) -> str:
-        """openpyxl로 xlsx 파일을 읽어 셀값을 탭 구분 텍스트로 반환한다."""
+        """openpyxl로 xlsx 파일을 읽어 셀값을 탭 구분 텍스트로 반환한다.
+
+        손상된 사용자 정의 속성(docProps/custom.xml)으로 load_workbook이 실패하면
+        해당 파트를 제거한 사본으로 재시도해 시트 데이터를 복구한다.
+        """
         import openpyxl  # type: ignore
 
-        wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        try:
+            wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        except Exception as exc:
+            # custom.xml 손상 등 메타데이터 문제 → 정리한 사본으로 재시도(복구)
+            import logging
+            logging.getLogger(__name__).warning(
+                "xlsx 로드 실패, custom.xml 제거 후 재시도: %s (%s)", path, exc
+            )
+            wb = self._load_xlsx_sanitized(path)
+
         lines: list[str] = []
-        for ws in wb.worksheets:
-            for row in ws.iter_rows(values_only=True):
-                row_text = "\t".join(
-                    str(cell) if cell is not None else "" for cell in row
-                )
-                if row_text.strip():
-                    lines.append(row_text)
-        wb.close()
+        try:
+            for ws in wb.worksheets:
+                for row in ws.iter_rows(values_only=True):
+                    row_text = "\t".join(
+                        str(cell) if cell is not None else "" for cell in row
+                    )
+                    if row_text.strip():
+                        lines.append(row_text)
+        finally:
+            wb.close()
         return "\n".join(lines)
+
+    @staticmethod
+    def _load_xlsx_sanitized(path: str):
+        """docProps/custom.xml을 제거한 메모리 사본으로 워크북을 로드한다.
+
+        openpyxl은 custom.xml 파트가 없으면 사용자 정의 속성을 건너뛰므로,
+        손상된 해당 파트만 빼면 시트 데이터는 정상적으로 읽힌다.
+        """
+        import io
+        import zipfile
+        import openpyxl  # type: ignore
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(path, "r") as zin:
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    if item.filename == "docProps/custom.xml":
+                        continue  # 손상된 사용자 정의 속성 파트 제거
+                    zout.writestr(item, zin.read(item.filename))
+        buf.seek(0)
+        return openpyxl.load_workbook(buf, read_only=True, data_only=True)
 
     def _read_pptx(self, path: str) -> str:
         """python-pptx로 pptx를 읽어 슬라이드별 텍스트를 반환한다.
