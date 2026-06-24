@@ -405,3 +405,76 @@ class TestXlsxRecovery:
             assert names  # 시트가 정상 로드됨
         finally:
             loaded.close()
+
+
+# ── .ppt COM 도형 추출 (win32com 없이 mock 도형으로 검증) ──────────
+
+class _FakeTextRange:
+    def __init__(self, text):
+        self.Text = text
+
+
+class _FakeTextFrame:
+    def __init__(self, text):
+        self.TextRange = _FakeTextRange(text)
+
+
+class _FakeShape:
+    """PowerPoint COM Shape의 텍스트 관련 속성만 흉내낸다."""
+    def __init__(self, *, type=1, has_table=False, has_text_frame=False,
+                 text="", group_items=None, table=None):
+        self.Type = type
+        self.HasTable = has_table
+        self.HasTextFrame = has_text_frame
+        self._text = text
+        self.GroupItems = group_items or []
+        self.Table = table
+
+    @property
+    def TextFrame(self):
+        return _FakeTextFrame(self._text)
+
+
+class _FakeCount:
+    def __init__(self, n):
+        self.Count = n
+
+
+class _FakeTable:
+    """grid(행×열 문자열)로 PowerPoint Table COM을 흉내낸다 (1-indexed)."""
+    def __init__(self, grid):
+        self._grid = grid
+        self.Rows = _FakeCount(len(grid))
+        self.Columns = _FakeCount(len(grid[0]) if grid else 0)
+
+    def Cell(self, r, c):
+        cell_shape = _FakeShape(has_text_frame=True, text=self._grid[r - 1][c - 1])
+        return type("_C", (), {"Shape": cell_shape})()
+
+
+class TestPptShapeTexts:
+    """com_reader._ppt_shape_texts 의 그룹 재귀·표·텍스트프레임 분기 검증."""
+
+    def test_text_frame_shape(self):
+        from knowmate.secure.com_reader import _ppt_shape_texts
+        shp = _FakeShape(has_text_frame=True, text="제목 텍스트")
+        assert _ppt_shape_texts(shp) == ["제목 텍스트"]
+
+    def test_table_shape(self):
+        from knowmate.secure.com_reader import _ppt_shape_texts
+        tbl = _FakeTable([["직급", "이름"], ["팀장", "김철수"]])
+        shp = _FakeShape(type=19, has_table=True, table=tbl)
+        assert _ppt_shape_texts(shp) == ["직급 | 이름\n팀장 | 김철수"]
+
+    def test_group_recurses_children(self):
+        from knowmate.secure.com_reader import _ppt_shape_texts
+        child_box = _FakeShape(has_text_frame=True, text="대표이사")
+        child_tbl = _FakeShape(
+            type=19, has_table=True, table=_FakeTable([["부서", "인원"], ["생산", "10"]])
+        )
+        group = _FakeShape(type=6, group_items=[child_box, child_tbl])
+        assert _ppt_shape_texts(group) == ["대표이사", "부서 | 인원\n생산 | 10"]
+
+    def test_empty_shape_returns_empty(self):
+        from knowmate.secure.com_reader import _ppt_shape_texts
+        assert _ppt_shape_texts(_FakeShape()) == []

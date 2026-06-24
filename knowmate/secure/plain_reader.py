@@ -1,6 +1,8 @@
 """확장자 기반 실제 파일 파싱 TextExtractor."""
 from pathlib import Path
 
+from knowmate.secure.text_util import format_table
+
 
 class PlainReader:
     def extract(self, path: str) -> str:
@@ -44,13 +46,8 @@ class PlainReader:
 
     @staticmethod
     def _format_table(rows: list[list[str]]) -> str:
-        """표 행렬을 행마다 ' | '로 묶은 텍스트로 변환한다 (빈 표는 빈 문자열)."""
-        lines: list[str] = []
-        for row in rows:
-            cells = [(c or "").strip().replace("\n", " ") for c in row]
-            if any(cells):
-                lines.append(" | ".join(cells))
-        return "\n".join(lines)
+        """표 행렬을 ' | ' 텍스트로 변환한다 (공용 format_table에 위임)."""
+        return format_table(rows)
 
     def _read_xlsx(self, path: str) -> str:
         """openpyxl로 xlsx 파일을 읽어 셀값을 탭 구분 텍스트로 반환한다.

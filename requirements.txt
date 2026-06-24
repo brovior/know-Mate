@@ -6,6 +6,8 @@ PyQt6-WebEngine>=6.6.0          # QWebEngineView, QWebEngineScript
 # ── 벡터 DB ──────────────────────────────────────────────────────────────────
 lancedb>=0.6.0
 pyarrow>=14.0.0                  # LanceDB 스키마·Arrow 변환
+pandas>=2.0.0                    # retriever pd.concat + to_arrow().to_pandas()
+                                  # (2.0+ 에서 _append() 제거 → concat 사용)
 
 # ── 문서 파싱 (plain_reader) ─────────────────────────────────────────────────
 python-docx>=1.1.0               # .docx
