@@ -290,3 +290,118 @@ class TestPlainReaderTables:
         assert "조직도" in text
         assert "직급 | 이름" in text
         assert "팀장 | 김철수" in text
+
+
+# ── 시그니처 판별 ────────────────────────────────────────────────
+
+class TestSignature:
+    def test_is_ole2_true(self, tmp_path: Path):
+        from knowmate.secure.signature import is_ole2
+        p = tmp_path / "x.xlsx"
+        p.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1rest")
+        assert is_ole2(str(p)) is True
+
+    def test_is_ole2_false_for_zip(self, tmp_path: Path):
+        from knowmate.secure.signature import is_ole2, is_zip
+        p = tmp_path / "x.xlsx"
+        p.write_bytes(b"PK\x03\x04rest")
+        assert is_ole2(str(p)) is False
+        assert is_zip(str(p)) is True
+
+    def test_is_ole2_missing_file(self):
+        from knowmate.secure.signature import is_ole2
+        assert is_ole2("C:/nope/missing.xlsx") is False
+
+
+# ── AutoReader OLE2 폴백 라우팅 ──────────────────────────────────
+
+class TestAutoReaderOle2Fallback:
+    def test_ole2_labeled_xlsx_routes_to_com(self, tmp_path, monkeypatch):
+        """확장자는 .xlsx인데 실제 OLE2면 ComReader로 폴백한다."""
+        import knowmate.secure.com_reader as com_mod
+        from knowmate.secure import AutoReader
+
+        captured = {}
+
+        class _FakeCom:
+            def extract(self, path):
+                captured["path"] = path
+                return "COM_RESULT"
+
+        monkeypatch.setattr(com_mod, "ComReader", _FakeCom)
+
+        p = tmp_path / "mislabeled.xlsx"
+        p.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 16)  # OLE2 magic
+        assert AutoReader().extract(str(p)) == "COM_RESULT"
+        assert captured["path"] == str(p)
+
+    def test_real_xlsx_uses_plain(self, tmp_path, monkeypatch):
+        """정상 OOXML(.xlsx)은 PlainReader 경로로 간다(COM 호출 안 함)."""
+        import openpyxl
+        import knowmate.secure.com_reader as com_mod
+        from knowmate.secure import AutoReader
+
+        class _BoomCom:
+            def extract(self, path):
+                raise AssertionError("정상 xlsx인데 COM으로 갔다")
+
+        monkeypatch.setattr(com_mod, "ComReader", _BoomCom)
+
+        wb = openpyxl.Workbook()
+        wb.active["A1"] = "정상셀"
+        p = tmp_path / "ok.xlsx"
+        wb.save(str(p))
+        assert "정상셀" in AutoReader().extract(str(p))
+
+
+# ── xlsx 손상(custom.xml) 복구 ──────────────────────────────────
+
+class TestXlsxRecovery:
+    def test_read_xlsx_recovers_when_load_fails_once(self, tmp_path, monkeypatch):
+        """첫 load_workbook이 실패해도 sanitized 사본으로 복구해 셀 데이터를 읽는다."""
+        import openpyxl
+        from knowmate.secure.plain_reader import PlainReader
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws["A1"] = "헤더"; ws["B1"] = "값"
+        p = tmp_path / "data.xlsx"
+        wb.save(str(p))
+
+        real_load = openpyxl.load_workbook
+        state = {"n": 0}
+
+        def flaky_load(*args, **kwargs):
+            state["n"] += 1
+            if state["n"] == 1:
+                # custom.xml 손상 에러를 흉내냄
+                raise TypeError("StringProperty.name should be str but value is NoneType")
+            return real_load(*args, **kwargs)
+
+        monkeypatch.setattr(openpyxl, "load_workbook", flaky_load)
+
+        text = PlainReader()._read_xlsx(str(p))
+        assert "헤더" in text and "값" in text
+        assert state["n"] >= 2  # 직접 로드 실패 → sanitized 재시도
+
+    def test_load_xlsx_sanitized_strips_custom_xml(self, tmp_path):
+        """_load_xlsx_sanitized가 docProps/custom.xml을 제거하고 워크북을 로드한다."""
+        import zipfile
+        import openpyxl
+        from knowmate.secure.plain_reader import PlainReader
+
+        wb = openpyxl.Workbook()
+        wb.active["A1"] = "셀값"
+        p = tmp_path / "withcustom.xlsx"
+        wb.save(str(p))
+
+        # 손상된 custom.xml 주입
+        with zipfile.ZipFile(str(p), "a") as z:
+            z.writestr("docProps/custom.xml", "<bad/>")
+
+        loaded = PlainReader._load_xlsx_sanitized(str(p))
+        try:
+            names = loaded.sheetnames
+            assert names  # 시트가 정상 로드됨
+        finally:
+            loaded.close()
