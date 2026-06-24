@@ -425,10 +425,33 @@ function renderRecentList(threads) {
     const div = document.createElement("div");
     div.className = "recent-item" + (currentThread && currentThread.id === t.id ? " active" : "");
     div.title = t.title;
-    div.textContent = t.title;
     div.onclick = () => restoreThread(t);
+
+    const label = document.createElement("span");
+    label.className = "recent-label";
+    label.textContent = t.title;
+
+    const del = document.createElement("button");
+    del.className = "recent-del";
+    del.title = "삭제";
+    del.innerHTML = '<i class="ti ti-x"></i>';
+    del.onclick = (e) => { e.stopPropagation(); deleteQuestion(t); };
+
+    div.appendChild(label);
+    div.appendChild(del);
     list.appendChild(div);
   });
+}
+
+function deleteQuestion(thread) {
+  if (!bridge) return;
+  bridge.deleteThread(currentMode, thread.id);
+  // 현재 열려 있는 스레드를 삭제하면 화면을 비우고 목록 갱신
+  if (currentThread && currentThread.id === thread.id) {
+    newThread();              // 내부에서 loadRecentQuestions 호출
+  } else {
+    loadRecentQuestions();
+  }
 }
 
 function restoreThread(thread) {

@@ -244,3 +244,49 @@ class TestAutoReader:
         from knowmate.secure import get_extractor
         with pytest.raises(ValueError):
             get_extractor("unknown_mode")
+
+
+class TestPlainReaderTables:
+    """표·도형 추출 검증 (docx 표 / pptx 표 + 그룹 재귀)."""
+
+    def test_docx_extracts_table_in_order(self, tmp_path: Path):
+        """docx 문단과 표가 문서 순서대로, 표는 ' | '로 추출된다."""
+        import docx
+        from knowmate.secure.plain_reader import PlainReader
+
+        d = docx.Document()
+        d.add_paragraph("머리말")
+        t = d.add_table(rows=2, cols=2)
+        t.cell(0, 0).text = "이름"; t.cell(0, 1).text = "부서"
+        t.cell(1, 0).text = "홍길동"; t.cell(1, 1).text = "생산1팀"
+        d.add_paragraph("꼬리말")
+        p = tmp_path / "a.docx"
+        d.save(str(p))
+
+        text = PlainReader().extract(str(p))
+        assert "머리말" in text
+        assert "이름 | 부서" in text
+        assert "홍길동 | 생산1팀" in text
+        # 순서 보존: 머리말 → 표 → 꼬리말
+        assert text.index("머리말") < text.index("홍길동") < text.index("꼬리말")
+
+    def test_pptx_extracts_table_and_textbox(self, tmp_path: Path):
+        """pptx 텍스트박스와 표 셀이 모두 추출된다."""
+        from pptx import Presentation
+        from pptx.util import Inches
+        from knowmate.secure.plain_reader import PlainReader
+
+        prs = Presentation()
+        slide = prs.slides.add_slide(prs.slide_layouts[6])
+        tb = slide.shapes.add_textbox(Inches(0), Inches(0), Inches(3), Inches(1))
+        tb.text_frame.text = "조직도"
+        table = slide.shapes.add_table(2, 2, Inches(0), Inches(2), Inches(4), Inches(1)).table
+        table.cell(0, 0).text = "직급"; table.cell(0, 1).text = "이름"
+        table.cell(1, 0).text = "팀장"; table.cell(1, 1).text = "김철수"
+        p = tmp_path / "b.pptx"
+        prs.save(str(p))
+
+        text = PlainReader().extract(str(p))
+        assert "조직도" in text
+        assert "직급 | 이름" in text
+        assert "팀장 | 김철수" in text
