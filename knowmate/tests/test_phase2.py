@@ -422,3 +422,77 @@ class TestLLMFake:
         chunk = "A" * 300
         result = client.answer("질문", [chunk])
         assert "A" * 200 in result
+
+
+class _FakeResp:
+    """urlopen 컨텍스트매니저를 흉내내는 응답 객체."""
+    def __init__(self, body: bytes):
+        self._body = body
+    def read(self) -> bytes:
+        return self._body
+    def __enter__(self):
+        return self
+    def __exit__(self, *a):
+        return False
+
+
+class TestProxyBypass:
+    """사내 API 호출이 시스템 프록시를 우회(빈 ProxyHandler)하며 헤더·엔드포인트를 보존하는지 검증."""
+
+    def _patch_opener(self, monkeypatch, captured, body: dict):
+        import json
+        import urllib.request
+
+        class FakeOpener:
+            def open(self, req, timeout=None):
+                captured["url"] = req.full_url
+                captured["headers"] = {k.lower(): v for k, v in req.header_items()}
+                captured["timeout"] = timeout
+                return _FakeResp(json.dumps(body).encode("utf-8"))
+
+        def fake_build_opener(handler):
+            captured["handler_type"] = type(handler).__name__
+            captured["proxies"] = handler.proxies
+            return FakeOpener()
+
+        monkeypatch.setattr(urllib.request, "build_opener", fake_build_opener)
+
+    def test_embedding_api_bypasses_proxy(self, monkeypatch):
+        """임베딩 _call_api가 빈 ProxyHandler opener로 호출하고 Authorization을 보존한다."""
+        captured: dict = {}
+        self._patch_opener(
+            monkeypatch, captured, {"data": [{"embedding": [0.0] * VECTOR_DIM}]}
+        )
+        client = EmbeddingClient(
+            base_url="http://intra", host_header="embed.internal", api_key="dummy"
+        )
+        out = client.embed(["hi"])
+
+        assert len(out) == 1 and len(out[0]) == VECTOR_DIM
+        assert captured["handler_type"] == "ProxyHandler"
+        assert captured["proxies"] == {}                     # 빈 프록시 = 우회
+        assert captured["url"] == "http://intra/v1/embeddings"
+        assert captured["headers"]["authorization"] == "Bearer dummy"
+        assert captured["headers"]["host"] == "embed.internal"
+
+    def test_llm_api_bypasses_proxy(self, monkeypatch):
+        """LLM _call_api가 빈 ProxyHandler opener로 호출하고 Authorization을 보존한다."""
+        captured: dict = {}
+        self._patch_opener(
+            monkeypatch, captured, {"choices": [{"message": {"content": "답변"}}]}
+        )
+        client = LLMClient(
+            base_url="http://intra",
+            host_header="llm.internal",
+            model="qwen3-27b",
+            mode="api",
+            api_key="dummy",
+        )
+        result = client.answer("질문", ["근거 청크"])
+
+        assert result == "답변"
+        assert captured["handler_type"] == "ProxyHandler"
+        assert captured["proxies"] == {}
+        assert captured["url"] == "http://intra/v1/chat/completions"
+        assert captured["headers"]["authorization"] == "Bearer dummy"
+        assert captured["headers"]["host"] == "llm.internal"

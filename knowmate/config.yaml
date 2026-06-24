@@ -22,9 +22,9 @@ cleanup:
   dry_run: true
   max_delete_ratio: 0.3
 llm:
-  mode: openrouter
-  model: anthropic/claude-haiku-4-5
-  api_key: ""              # 비워두면 OPENROUTER_API_KEY / ANTHROPIC_API_KEY 환경변수 사용
-  base_url: http://10.x.x.x
+  mode: api                # 사내 LLM 서버 직접 호출 (fake|claude|openrouter|api)
+  model: qwen3-27b
+  api_key: ""              # 비우면 더미값(dummy). 사내 서버가 키 요구 시 채움
+  base_url: http://10.x.x.x   # ← 사내 PC에서 실제 LLM 서버 IP로 교체
   host_header: llm.internal
   max_context_tokens: 4096

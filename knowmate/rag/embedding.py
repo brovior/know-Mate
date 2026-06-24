@@ -105,7 +105,9 @@ class EmbeddingClient:
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        # 사내 시스템 프록시가 요청을 가로채 403을 내므로 프록시를 우회한다
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=30) as resp:
             body = json.loads(resp.read().decode("utf-8"))
         return [item["embedding"] for item in body["data"]]
 

@@ -124,7 +124,9 @@ class LLMClient:
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        # 사내 시스템 프록시 우회 (프록시 인터셉트로 인한 403 방지)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=60) as resp:
             body = json.loads(resp.read().decode("utf-8"))
         return body["choices"][0]["message"]["content"]
 
@@ -151,7 +153,9 @@ class LLMClient:
             },
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=60) as resp:
+        # 사내 시스템 프록시 우회 (프록시 인터셉트로 인한 403 방지)
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(req, timeout=60) as resp:
             body = json.loads(resp.read().decode("utf-8"))
         return body["choices"][0]["message"]["content"]
 
