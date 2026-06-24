@@ -1,10 +1,29 @@
-"""Phase 1 테스트 — 에이전트 골격 및 브리지 로직 검증."""
+"""Phase 1 테스트 — 에이전트 골격 및 브리지 로직 검증.
+
+골격 테스트이므로 실제 config·인덱스·네트워크(임베딩/LLM API)에 의존하지 않도록
+fake 모드로 강제 격리한다. (autouse 픽스처가 이 모듈 전체에 적용된다.)
+"""
 import json
 import pytest
 from knowmate.agents.base import TextBlock, SourcesBlock, SourceItem
 from knowmate.agents.knowledge_agent import KnowledgeAgent
 from knowmate.agents.mes_agent import MesAgent
 from knowmate.agents.registry import AgentRegistry
+
+
+@pytest.fixture(autouse=True)
+def _force_fake_config(monkeypatch):
+    """config를 fake 모드로 덮어써 외부 API/실제 인덱스 의존을 제거한다."""
+    import knowmate.config as config_mod
+
+    fake_cfg = {
+        "extractor": "fake",
+        "embedding": {"mode": "fake"},
+        "chunking": {"chunk_size": 400, "overlap": 80},
+        "search": {"top_k_max": 10, "score_threshold": 0.4, "rerank_enabled": False},
+        "llm": {"mode": "fake", "model": "test", "base_url": "http://x", "host_header": "x"},
+    }
+    monkeypatch.setattr(config_mod, "get_config", lambda: fake_cfg)
 
 
 # ── KnowledgeAgent ──────────────────────────────────────────────

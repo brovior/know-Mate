@@ -168,8 +168,9 @@ class Bridge(QObject):
             if self._worker and hasattr(self._worker, "_indexer"):
                 df = self._worker._indexer.table.to_arrow().to_pandas()
                 active = df[~df["is_deleted"]]
-                local_count  = int((active["scope"] == "local").sum())
-                shared_count = int((active["scope"] == "shared").sum())
+                # 문서 수 = 고유 file_path 개수 (청크 행 수가 아님)
+                local_count  = int(active.loc[active["scope"] == "local", "file_path"].nunique())
+                shared_count = int(active.loc[active["scope"] == "shared", "file_path"].nunique())
                 self._doc_count = local_count + shared_count
                 # DB에서 가장 최근 인덱싱 시각 조회 (UTC → 로컬 시간 변환)
                 if not active.empty and "indexed_at" in active.columns:
@@ -218,8 +219,9 @@ class Bridge(QObject):
             if self._worker and hasattr(self._worker, "_indexer"):
                 df = self._worker._indexer.table.to_arrow().to_pandas()
                 active = df[~df["is_deleted"]]
-                local_count  = int((active["scope"] == "local").sum())
-                shared_count = int((active["scope"] == "shared").sum())
+                # 문서 수 = 고유 file_path 개수 (청크 행 수가 아님)
+                local_count  = int(active.loc[active["scope"] == "local", "file_path"].nunique())
+                shared_count = int(active.loc[active["scope"] == "shared", "file_path"].nunique())
                 self._doc_count = local_count + shared_count
         except Exception:
             pass

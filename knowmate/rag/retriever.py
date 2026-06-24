@@ -3,6 +3,8 @@ import getpass
 import logging
 from typing import Any
 
+import pandas as pd
+
 from knowmate.rag.embedding import EmbeddingClient
 from knowmate.rag.indexer import Indexer
 
@@ -74,7 +76,7 @@ class Retriever:
             local_mask = raw["scope"] == "local"
             other_mask = ~local_mask
             local_filtered = raw[local_mask & (raw["owner"] == self._current_user)]
-            raw = raw[other_mask]._append(local_filtered)
+            raw = pd.concat([raw[other_mask], local_filtered])
 
         if raw.empty:
             return []
