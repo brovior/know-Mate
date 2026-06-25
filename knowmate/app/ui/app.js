@@ -271,8 +271,62 @@ function renderBlock(block) {
 function renderText(block) {
   const div = document.createElement("div");
   div.className = "bubble-ai";
-  div.textContent = block.content;
+  div.innerHTML = renderMarkdown(block.content);
   return div;
+}
+
+/* ── 경량 마크다운 렌더러 ── */
+
+function renderMarkdown(text) {
+  const lines = text.split('\n');
+  let html = '';
+  let i = 0;
+  while (i < lines.length) {
+    if (_isMdTableRow(lines[i]) && i + 1 < lines.length && _isMdSeparator(lines[i + 1])) {
+      const tableLines = [];
+      while (i < lines.length && _isMdTableRow(lines[i])) {
+        tableLines.push(lines[i]);
+        i++;
+      }
+      html += _renderMdTable(tableLines);
+    } else {
+      const line = lines[i].trim();
+      html += line ? '<p>' + _renderInline(line) + '</p>' : '<br>';
+      i++;
+    }
+  }
+  return html;
+}
+
+function _isMdTableRow(line) {
+  return /^\|.+\|$/.test(line.trim());
+}
+
+function _isMdSeparator(line) {
+  return /^\|[\s|:-]+\|$/.test(line.trim());
+}
+
+function _renderMdTable(lines) {
+  const rows = lines
+    .filter(l => !_isMdSeparator(l))
+    .map(l => l.trim().replace(/^\||\|$/g, '').split('|').map(c => c.trim()));
+
+  if (rows.length === 0) return '';
+  const [head, ...body] = rows;
+
+  const th = head.map(c => `<th>${_renderInline(c)}</th>`).join('');
+  const tr = body.map(r =>
+    '<tr>' + r.map(c => `<td>${_renderInline(c)}</td>`).join('') + '</tr>'
+  ).join('');
+
+  return `<table class="md-table"><thead><tr>${th}</tr></thead><tbody>${tr}</tbody></table>`;
+}
+
+function _renderInline(text) {
+  return escHtml(text)
+    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+    .replace(/~~(.+?)~~/g, '<s>$1</s>')
+    .replace(/`(.+?)`/g, '<code>$1</code>');
 }
 
 function renderSources(block) {

@@ -195,6 +195,18 @@ html, body { height: 100%; font-family: 'Malgun Gothic', sans-serif; font-size: 
 .btn-ob-cancel { padding: 9px 18px; background: none; border: 1px solid var(--border-dark); border-radius: 8px; font-size: 13px; color: var(--text-sub); font-family: inherit; cursor: pointer; }
 .btn-ob-cancel:hover { background: var(--bg-side); }
 
+/* ===== LLM 응답 마크다운 렌더링 ===== */
+.bubble-ai p  { margin: 0 0 6px; line-height: 1.6; }
+.bubble-ai p:last-child { margin-bottom: 0; }
+.bubble-ai strong { font-weight: 600; color: var(--text-main); }
+.bubble-ai s  { color: var(--text-hint); }
+.bubble-ai code { background: #1a1a2e; border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; font-size: 12px; font-family: 'Consolas', monospace; }
+.md-table { width: 100%; border-collapse: collapse; margin: 8px 0; font-size: 13px; }
+.md-table th { background: #1e2235; color: var(--text-main); font-weight: 600; text-align: left; padding: 7px 10px; border: 1px solid var(--border-dark); white-space: nowrap; }
+.md-table td { padding: 6px 10px; border: 1px solid var(--border); color: var(--text-sub); vertical-align: top; }
+.md-table tr:nth-child(even) td { background: #141622; }
+.md-table tr:hover td { background: #1a1f30; }
+
 /* ===== 토스트 ===== */
 .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: #1F2937; color: #fff; padding: 10px 20px; border-radius: 8px; font-size: 13px; z-index: 200; opacity: 0; transition: opacity 0.2s; pointer-events: none; }
 .toast.show { opacity: 1; }
