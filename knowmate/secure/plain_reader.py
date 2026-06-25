@@ -82,22 +82,33 @@ class PlainReader:
 
     @staticmethod
     def _load_xlsx_sanitized(path: str):
-        """docProps/custom.xml을 제거한 메모리 사본으로 워크북을 로드한다.
+        """docProps/custom.xml과 [ContentTypes].xml 내 참조를 제거한 사본으로 워크북을 로드한다.
 
-        openpyxl은 custom.xml 파트가 없으면 사용자 정의 속성을 건너뛰므로,
-        손상된 해당 파트만 빼면 시트 데이터는 정상적으로 읽힌다.
+        custom.xml 파트만 빼면 [ContentTypes].xml에 참조가 남아 openpyxl이 다시 실패하므로
+        해당 Override 엔트리도 함께 제거한다.
         """
         import io
+        import re
         import zipfile
         import openpyxl  # type: ignore
+
+        CUSTOM_XML = "docProps/custom.xml"
 
         buf = io.BytesIO()
         with zipfile.ZipFile(path, "r") as zin:
             with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zout:
                 for item in zin.infolist():
-                    if item.filename == "docProps/custom.xml":
-                        continue  # 손상된 사용자 정의 속성 파트 제거
-                    zout.writestr(item, zin.read(item.filename))
+                    if item.filename == CUSTOM_XML:
+                        continue
+                    data = zin.read(item.filename)
+                    if item.filename == "[Content_Types].xml":
+                        # custom.xml Override 엔트리 제거
+                        data = re.sub(
+                            rb'<Override[^/]*/docProps/custom\.xml[^/]*/?>',
+                            b"",
+                            data,
+                        )
+                    zout.writestr(item, data)
         buf.seek(0)
         return openpyxl.load_workbook(buf, read_only=True, data_only=True)
 
