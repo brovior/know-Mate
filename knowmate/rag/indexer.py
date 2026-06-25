@@ -94,9 +94,12 @@ class Indexer:
         total = len(chunks)
         chunk_ids: list[str] = []
 
+        logger.debug("청크 수: %d, 배치 크기: %d", total, self._batch_size)
         for batch_start in range(0, total, self._batch_size):
             batch = chunks[batch_start : batch_start + self._batch_size]
+            logger.debug("배치 임베딩 시작: %d~%d / %d", batch_start, batch_start + len(batch) - 1, total)
             vectors = self._embed.embed(batch)
+            logger.debug("배치 임베딩 완료: %d~%d", batch_start, batch_start + len(batch) - 1)
 
             rows: list[dict[str, Any]] = []
             for i, (chunk_text_val, vector) in enumerate(zip(batch, vectors)):
