@@ -99,6 +99,13 @@ function sendMsg() {
   if (document.getElementById("chkLocal")?.checked)  scopes.push("local");
   if (document.getElementById("chkShared")?.checked) scopes.push("shared");
 
+  if (scopes.length === 0) {
+    setWaiting(false);
+    removeLoading();
+    appendAiBlocks([{ type: "text", content: "검색 범위를 하나 이상 선택해주세요. (내 PC 문서 또는 공유 폴더)" }]);
+    return;
+  }
+
   bridge.sendQuery(JSON.stringify({ query: text, mode: currentMode, scopes }));
 }
 
