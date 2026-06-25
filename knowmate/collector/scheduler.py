@@ -95,12 +95,12 @@ class CollectorWorker(QThread):
         self._cancelled = True
         logger.info("수집기 취소 요청됨")
 
-    def _purge_removed_folders(self, watch_folders: list[str], state: dict) -> None:
+    def _purge_removed_folders(self, watch_folders: list[str], state: dict, dry_run: bool = True) -> None:
         """watch_folders에 속하지 않는 청크를 LanceDB에서 직접 삭제한다.
 
         state.json 대신 LanceDB의 file_path 컬럼을 기준으로 삭제해
         state와 DB 불일치 상황도 처리한다.
-        사용자가 명시적으로 폴더를 제거한 경우이므로 dry_run과 무관하게 즉시 삭제한다.
+        dry_run=True이면 삭제 대상 목록만 로그 출력하고 실제 삭제는 수행하지 않는다.
         """
         normalized = [f.replace("\\", "/").rstrip("/") for f in watch_folders]
 
@@ -128,6 +128,14 @@ class CollectorWorker(QThread):
         stale_paths_db = df.loc[stale_mask, "file_path"].unique().tolist()
 
         if not stale_paths_db:
+            return
+
+        if dry_run:
+            logger.info(
+                "[purge][dry-run] 제거된 폴더 DB 청크 정리 대상 %d개 경로 (실제 삭제 생략): %s",
+                len(stale_paths_db),
+                stale_paths_db,
+            )
             return
 
         logger.info("[purge] 제거된 폴더 DB 청크 정리: %d개 경로", len(stale_paths_db))
@@ -236,8 +244,8 @@ class CollectorWorker(QThread):
                 logger.error("파일 처리 실패 (건너뜀): %s - %s", task.path, exc)
                 failed.append(task.path)
 
-        # watch_folders에서 제거된 폴더의 청크를 즉시 정리한다
-        self._purge_removed_folders(watch_folders, state)
+        # watch_folders에서 제거된 폴더의 청크를 정리한다 (dry_run 준수)
+        self._purge_removed_folders(watch_folders, state, dry_run=dry_run)
 
         cleanup = CleanupManager(
             indexer=self._indexer,

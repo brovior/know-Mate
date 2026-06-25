@@ -6,6 +6,10 @@ let currentMode = "knowledge";
 let waiting = false;
 let currentThread = null;   // 현재 대화 스레드 {id, title, mode, created_at, messages}
 
+// QWebEngineView 환경에서 .checked 동적 읽기가 불안정한 경우를 방어하기 위해 JS 변수로 별도 추적
+let scopeLocal  = true;
+let scopeShared = true;
+
 /* -- QWebChannel 초기화 -- */
 new QWebChannel(qt.webChannelTransport, function(channel) {
   bridge = channel.objects.bridge;
@@ -20,6 +24,7 @@ new QWebChannel(qt.webChannelTransport, function(channel) {
 function onBridgeReady() {
   renderEmptyState();
   initTitlebarDrag();
+  initScopeCheckboxes();
   bridge.getIndexStatus().then(json => {
     let data;
     try { data = JSON.parse(json); } catch { return; }
@@ -42,6 +47,25 @@ function initTitlebarDrag() {
 }
 
 let _maximized = false;
+
+function initScopeCheckboxes() {
+  const elLocal  = document.getElementById("chkLocal");
+  const elShared = document.getElementById("chkShared");
+  if (elLocal) {
+    scopeLocal = elLocal.checked;
+    elLocal.addEventListener("change", function() {
+      scopeLocal = this.checked;
+      this.closest(".check-item")?.classList.toggle("selected", this.checked);
+    });
+  }
+  if (elShared) {
+    scopeShared = elShared.checked;
+    elShared.addEventListener("change", function() {
+      scopeShared = this.checked;
+      this.closest(".check-item")?.classList.toggle("selected", this.checked);
+    });
+  }
+}
 
 function windowMinimize() { if (bridge) bridge.minimizeWindow(); }
 
@@ -96,14 +120,16 @@ function sendMsg() {
   setWaiting(true);
 
   const scopes = [];
-  if (document.getElementById("chkLocal")?.checked)  scopes.push("local");
-  if (document.getElementById("chkShared")?.checked) scopes.push("shared");
+  if (currentMode === "knowledge") {
+    if (scopeLocal)  scopes.push("local");
+    if (scopeShared) scopes.push("shared");
 
-  if (scopes.length === 0) {
-    setWaiting(false);
-    removeLoading();
-    appendAiBlocks([{ type: "text", content: "검색 범위를 하나 이상 선택해주세요. (내 PC 문서 또는 공유 폴더)" }]);
-    return;
+    if (scopes.length === 0) {
+      setWaiting(false);
+      removeLoading();
+      appendAiBlocks([{ type: "text", content: "검색 범위를 하나 이상 선택해주세요. (내 PC 문서 또는 공유 폴더)" }]);
+      return;
+    }
   }
 
   bridge.sendQuery(JSON.stringify({ query: text, mode: currentMode, scopes }));
