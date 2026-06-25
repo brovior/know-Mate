@@ -153,8 +153,10 @@ def _inject_qwebchannel_js(view: QWebEngineView) -> None:
 
 
 def main() -> None:
+    from knowmate.config import get_config
+    _log_level = getattr(logging, get_config().get("log_level", "INFO").upper(), logging.INFO)
     logging.basicConfig(
-        level=logging.DEBUG,
+        level=_log_level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         datefmt="%H:%M:%S",
     )
