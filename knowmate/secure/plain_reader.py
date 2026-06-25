@@ -70,12 +70,17 @@ class PlainReader:
         lines: list[str] = []
         try:
             for ws in wb.worksheets:
+                sheet_lines: list[str] = []
                 for row in ws.iter_rows(values_only=True):
                     row_text = "\t".join(
                         str(cell) if cell is not None else "" for cell in row
                     )
                     if row_text.strip():
-                        lines.append(row_text)
+                        sheet_lines.append(row_text)
+                if sheet_lines:
+                    # chunker가 시트 경계를 인식할 수 있도록 헤더 삽입
+                    lines.append(f"=== 시트: {ws.title} ===")
+                    lines.extend(sheet_lines)
         finally:
             wb.close()
         return "\n".join(lines)

@@ -161,9 +161,14 @@ class CollectorWorker(QThread):
         max_delete_ratio = float(cleanup_cfg.get("max_delete_ratio", 0.30))
         chunk_size = int(chunk_cfg.get("chunk_size", 400))
         overlap = int(chunk_cfg.get("overlap", 80))
+        max_file_size_mb = float(chunk_cfg.get("max_file_size_mb", 30.0))
+        max_chunks_per_file = int(chunk_cfg.get("max_chunks_per_file", 500))
+        xlsx_max_rows_per_sheet = int(chunk_cfg.get("xlsx_max_rows_per_sheet", 2000))
 
         self._indexer._chunk_size = chunk_size
         self._indexer._overlap = overlap
+        self._indexer._max_chunks_per_file = max_chunks_per_file
+        self._indexer._xlsx_max_rows_per_sheet = xlsx_max_rows_per_sheet
 
         state = load_state(self._state_file)
         heap = []
@@ -173,7 +178,7 @@ class CollectorWorker(QThread):
             if not folder.exists():
                 logger.warning("watch_folder 없음: %s", folder_str)
                 continue
-            current = scan_folder(folder)
+            current = scan_folder(folder, max_file_size_mb=max_file_size_mb)
             new_paths, mod_paths, _ = classify_changes(state, current)
             for p in new_paths:
                 heapq.heappush(heap, IndexTask(PRIORITY_NEW, p, "new"))

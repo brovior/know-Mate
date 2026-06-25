@@ -27,11 +27,13 @@ def get_scope(path: str) -> str:
     return "local"
 
 
-def scan_folder(folder: Path) -> dict[str, dict]:
+def scan_folder(folder: Path, max_file_size_mb: float = 30.0) -> dict[str, dict]:
     """지원 확장자 파일의 mtime 과 size 를 수집해 반환한다.
 
     반환 dict 키는 str(절대경로), 값은 {"mtime": float, "size": int}.
+    max_file_size_mb 초과 파일은 WARNING 로그 후 제외한다.
     """
+    max_bytes = int(max_file_size_mb * 1024 * 1024)
     result: dict[str, dict] = {}
     try:
         for dirpath, _dirs, files in os.walk(folder):
@@ -41,6 +43,12 @@ def scan_folder(folder: Path) -> dict[str, dict]:
                     continue
                 try:
                     stat = fpath.stat()
+                    if stat.st_size > max_bytes:
+                        logger.warning(
+                            "파일 크기 초과로 인덱싱 제외 (%.1fMB > %.1fMB): %s",
+                            stat.st_size / 1024 / 1024, max_file_size_mb, fpath,
+                        )
+                        continue
                     result[str(fpath)] = {
                         "mtime": stat.st_mtime,
                         "size": stat.st_size,
