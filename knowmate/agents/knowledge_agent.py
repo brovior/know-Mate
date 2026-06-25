@@ -121,7 +121,9 @@ class KnowledgeAgent:
             logger.warning("RAG 파이프라인 초기화 실패: %s\n%s", exc, detail)
             return _mock_blocks(query, error=detail)
 
-        scopes = context.get("scopes", ["local", "shared"])
+        scopes = context.get("scopes") or []
+        if not scopes:
+            return [{"type": "text", "content": "검색 범위를 하나 이상 선택해주세요. (내 PC 문서 또는 공유 폴더)"}]
 
         try:
             chunks = pipeline["retriever"].search(query, scopes=scopes)
