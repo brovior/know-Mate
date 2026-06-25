@@ -38,8 +38,9 @@ class Bridge(QObject):
             self._emit_error("invalid JSON payload")
             return
 
-        query = data.get("query", "").strip()
-        mode  = data.get("mode", "knowledge")
+        query  = data.get("query", "").strip()
+        mode   = data.get("mode", "knowledge")
+        scopes = data.get("scopes", [])
 
         if not query:
             self._emit_error("empty query")
@@ -50,7 +51,7 @@ class Bridge(QObject):
         else:
             try:
                 agent = self._registry.get(mode)
-                blocks = agent.handle(query, {"mode": mode})
+                blocks = agent.handle(query, {"mode": mode, "scopes": scopes})
             except Exception as exc:
                 self._emit_error(str(exc))
                 return
