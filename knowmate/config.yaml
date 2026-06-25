@@ -12,6 +12,9 @@ embedding:
 chunking:
   chunk_size: 400
   overlap: 80
+  max_file_size_mb: 30        # 1단: 이 크기 초과 파일은 파싱 전에 제외
+  xlsx_max_rows_per_sheet: 2000  # 2단: xlsx 시트당 행 수 초과 시 메타 청크 1개로 대체
+  max_chunks_per_file: 500    # 3단: 모든 형식 공통 최대 청크 수 (최후 안전망)
 search:
   top_k_max: 10
   score_threshold: 0.4

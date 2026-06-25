@@ -57,6 +57,8 @@ class Indexer:
         self._chunk_size = chunk_size
         self._overlap = overlap
         self._batch_size = batch_size
+        self._max_chunks_per_file = 500
+        self._xlsx_max_rows_per_sheet = 2000
 
         if crypto is None:
             from knowmate.secure.crypto import FakeCryptoManager
@@ -85,7 +87,11 @@ class Indexer:
     ) -> list[str]:
         """파일 텍스트를 청킹·임베딩·암호화해 LanceDB에 저장하고 chunk_id 리스트를 반환한다."""
         file_type = Path(path).suffix.lower().lstrip(".")
-        chunks = chunk_text(text, file_type, self._chunk_size, self._overlap)
+        chunks = chunk_text(
+            text, file_type, self._chunk_size, self._overlap,
+            max_chunks_per_file=self._max_chunks_per_file,
+            xlsx_max_rows_per_sheet=self._xlsx_max_rows_per_sheet,
+        )
         if not chunks:
             return []
 
