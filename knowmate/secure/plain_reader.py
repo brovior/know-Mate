@@ -104,7 +104,7 @@ class PlainReader:
                     if item.filename == "[Content_Types].xml":
                         # custom.xml Override 엔트리 제거
                         data = re.sub(
-                            rb'<Override[^/]*/docProps/custom\.xml[^/]*/?>',
+                            rb'<Override\b[^>]*/docProps/custom\.xml[^>]*/?>',
                             b"",
                             data,
                         )
