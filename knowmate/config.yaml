@@ -17,7 +17,7 @@ chunking:
   max_chunks_per_file: 500    # 3단: 모든 형식 공통 최대 청크 수 (최후 안전망)
 search:
   top_k_max: 10
-  score_threshold: 0.4
+  score_threshold: 0.3
   rerank_enabled: false
 collector:
   watch_folders:

@@ -62,6 +62,11 @@ class Retriever:
         if "_distance" in raw.columns:
             raw = raw.copy()
             raw["score"] = 1.0 - raw["_distance"] / 2.0
+            logger.debug(
+                "검색 후보 점수 분포: top5=%s threshold=%.2f",
+                raw.nlargest(5, "score")[["file_path", "score"]].to_dict(orient="records"),
+                self._score_threshold,
+            )
             raw = raw[raw["score"] >= self._score_threshold]
         else:
             raw = raw.copy()
