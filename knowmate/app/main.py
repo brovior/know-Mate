@@ -153,6 +153,11 @@ def _inject_qwebchannel_js(view: QWebEngineView) -> None:
 
 
 def main() -> None:
+    logging.basicConfig(
+        level=logging.DEBUG,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    )
     os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
     app = QApplication(sys.argv)
     app.setApplicationName("KnowMate")

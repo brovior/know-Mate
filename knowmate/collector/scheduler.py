@@ -200,21 +200,26 @@ class CollectorWorker(QThread):
             self.progress.emit(done, total, filename)
 
             try:
+                logger.debug("[단계1] 텍스트 추출 시작: %s", task.path)
                 text = self._extractor.extract(task.path)
+                logger.debug("[단계2] 텍스트 추출 완료: %s (%d자)", task.path, len(text))
                 stat = Path(task.path).stat()
                 scope = get_scope(task.path)
 
                 if task.action == "modified":
                     old_ids = state.get(task.path, {}).get("chunk_ids", [])
                     if old_ids:
+                        logger.debug("[단계3] 기존 청크 삭제: %d개", len(old_ids))
                         self._indexer.delete_chunks(old_ids)
 
+                logger.debug("[단계4] 임베딩·저장 시작: %s", task.path)
                 chunk_ids = self._indexer.index_file(
                     path=task.path,
                     text=text,
                     mtime=stat.st_mtime,
                     scope=scope,
                 )
+                logger.debug("[단계5] 임베딩·저장 완료: %s -> %d청크", task.path, len(chunk_ids))
                 state[task.path] = {
                     "mtime": stat.st_mtime,
                     "size": stat.st_size,
