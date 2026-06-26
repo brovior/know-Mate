@@ -1,0 +1,28 @@
+MIME-Version: 1.0
+From: =?UTF-8?B?SG9uZyBHaWxEb25n?= <hong@company.com>
+To: receiver@company.com
+Subject: =?UTF-8?B?7YWM7Iqk7Yq4IOuplOydvA==?=
+Message-ID: <test-001@company.com>
+X-Desktop-Msg-UniqueID: 2026062600000001
+X-CMS-RootMailID: ROOT-001
+Date: Thu, 25 Jun 2026 10:00:00 +0900
+Content-Type: multipart/related; boundary="BOUNDARY_TEST"
+
+--BOUNDARY_TEST
+Content-Type: text/html; charset="UTF-8"
+Content-Disposition: inline
+
+<html><body>
+<h1>A설비 알람 처리</h1>
+<p>2025년 알람 폭주 사례 처리 절차를 안내합니다.</p>
+<p>1단계: 설비 재시작. 2단계: 로그 확인. 3단계: 담당자 보고.</p>
+</body></html>
+
+--BOUNDARY_TEST
+Content-Type: image/gif
+Content-Transfer-Encoding: base64
+Content-ID: <img001@test>
+
+R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7
+
+--BOUNDARY_TEST--

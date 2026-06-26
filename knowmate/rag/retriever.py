@@ -20,6 +20,7 @@ class Retriever:
         score_threshold: float = 0.4,
         crypto=None,
         rerank_enabled: bool = False,
+        email_indexer=None,
     ) -> None:
         """Retriever를 초기화한다.
 
@@ -27,6 +28,7 @@ class Retriever:
                 None이면 FakeCryptoManager를 사용한다.
         rerank_enabled: True이면 벡터 검색 후 cross-encoder rerank를 수행한다.
                         사내 rerank API가 준비된 시점에 config로 활성화한다.
+        email_indexer: EmailIndexer 인스턴스. None이면 메일 검색 비활성.
         """
         self._table = indexer.table
         self._embed = embed_client
@@ -34,6 +36,7 @@ class Retriever:
         self._score_threshold = score_threshold
         self._current_user = getpass.getuser()
         self._rerank_enabled = rerank_enabled
+        self._email_indexer = email_indexer
 
         if crypto is None:
             from knowmate.secure.crypto import FakeCryptoManager
@@ -47,8 +50,42 @@ class Retriever:
         """쿼리를 벡터 검색해 권한 필터·복호화·샌드위치 배열 후 청크 dict 리스트를 반환한다."""
         vec = self._embed.embed([query])[0]
 
+        # chunks 테이블 검색
+        chunks_rows = self._search_table(self._table, vec, scopes, use_owner_filter=True)
+
+        # emails 테이블 병합 (local scope 포함 시 또는 scopes=None)
+        if self._email_indexer and (scopes is None or "local" in scopes):
+            try:
+                email_rows = self._search_table(
+                    self._email_indexer.table, vec, scopes=None, use_owner_filter=False
+                )
+                for row in email_rows:
+                    # emails 테이블에는 file_path가 없으므로 source_file로 채움
+                    if "file_path" not in row or not row.get("file_path"):
+                        row["file_path"] = row.get("source_file", "")
+                chunks_rows = self._merge(chunks_rows, email_rows)
+            except Exception as exc:
+                logger.warning("[emails] 메일 검색 실패, 문서 결과만 반환: %s", exc)
+
+        if not chunks_rows:
+            return []
+
+        if self._rerank_enabled:
+            chunks_rows = self._rerank(chunks_rows, query)
+
+        logger.info("검색 결과: query_len=%d hits=%d", len(query), len(chunks_rows))
+        return self._sandwich(chunks_rows)
+
+    def _search_table(
+        self,
+        table,
+        vec: list[float],
+        scopes: list[str] | None,
+        use_owner_filter: bool,
+    ) -> list[dict[str, Any]]:
+        """단일 테이블에서 벡터 검색 후 점수 필터·권한 필터·복호화를 수행한다."""
         raw = (
-            self._table.search(vec)
+            table.search(vec)
             .where("is_deleted = false")
             .limit(self._top_k * 2)
             .to_arrow()
@@ -62,11 +99,12 @@ class Retriever:
         if "_distance" in raw.columns:
             raw = raw.copy()
             raw["score"] = 1.0 - raw["_distance"] / 2.0
-            logger.debug(
-                "검색 후보 점수 분포: top5=%s threshold=%.2f",
-                raw.nlargest(5, "score")[["file_path", "score"]].to_dict(orient="records"),
-                self._score_threshold,
-            )
+            if "file_path" in raw.columns:
+                logger.debug(
+                    "검색 후보 점수 분포: top5=%s threshold=%.2f",
+                    raw.nlargest(5, "score")[["file_path", "score"]].to_dict(orient="records"),
+                    self._score_threshold,
+                )
             raw = raw[raw["score"] >= self._score_threshold]
         else:
             raw = raw.copy()
@@ -75,13 +113,14 @@ class Retriever:
         if raw.empty:
             return []
 
-        # 권한 필터
-        if scopes is not None:
+        # 권한 필터 (chunks 테이블 전용 — emails는 항상 local이고 owner 컬럼 없음)
+        if use_owner_filter and scopes is not None and "scope" in raw.columns:
             raw = raw[raw["scope"].isin(scopes)]
-            local_mask = raw["scope"] == "local"
-            other_mask = ~local_mask
-            local_filtered = raw[local_mask & (raw["owner"] == self._current_user)]
-            raw = pd.concat([raw[other_mask], local_filtered])
+            if "owner" in raw.columns:
+                local_mask = raw["scope"] == "local"
+                other_mask = ~local_mask
+                local_filtered = raw[local_mask & (raw["owner"] == self._current_user)]
+                raw = pd.concat([raw[other_mask], local_filtered])
 
         if raw.empty:
             return []
@@ -89,7 +128,7 @@ class Retriever:
         raw = raw.sort_values("score", ascending=False).head(self._top_k)
         rows = raw.to_dict(orient="records")
 
-        # text 컬럼 복호화 (선택된 청크에 한해 메모리에서만)
+        # text 컬럼 복호화
         for row in rows:
             try:
                 row["text"] = self._crypto.decrypt(row["text"])
@@ -97,11 +136,22 @@ class Retriever:
                 logger.warning("청크 복호화 실패 (chunk_id=%s): %s", row.get("chunk_id"), exc)
                 row["text"] = ""
 
-        if self._rerank_enabled:
-            rows = self._rerank(rows, query)
+        return rows
 
-        logger.info("검색 결과: query_len=%d hits=%d", len(query), len(rows))
-        return self._sandwich(rows)
+    def _merge(
+        self, chunks: list[dict[str, Any]], emails: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """chunks와 emails를 score 내림차순으로 병합하고 top_k로 자른다."""
+        merged = chunks + emails
+        seen: set[str] = set()
+        deduped: list[dict[str, Any]] = []
+        for row in sorted(merged, key=lambda r: float(r.get("score", 0.0)), reverse=True):
+            cid = row.get("chunk_id", "")
+            if cid and cid in seen:
+                continue
+            seen.add(cid)
+            deduped.append(row)
+        return deduped[: self._top_k]
 
     def _rerank(self, rows: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:
         """cross-encoder rerank placeholder. 사내 rerank API 연동 시 구현한다."""

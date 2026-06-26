@@ -1,11 +1,11 @@
 # CLAUDE.md — KnowMate
-> Phase 1~4 완료 | 2026-06-25
+> Phase 1~4 완료, Phase 5 진행 중 (Knox 메일 인덱싱 구현) | 2026-06-26
 
 ## 프로젝트 개요
 
-**개인 PC용 사내 지식 AI 비서 데스크톱 앱.** PyQt6 + QWebEngineView 셸 위에서 여러 에이전트가 구동되는 멀티 에이전트 구조. Phase 1~4 완료(RAG 지식검색), Phase 5(공용 DB·메일·배포) 예정.
+**개인 PC용 사내 지식 AI 비서 데스크톱 앱.** PyQt6 + QWebEngineView 셸 위에서 여러 에이전트가 구동되는 멀티 에이전트 구조. Phase 1~4 완료(RAG 지식검색), Phase 5 진행 중(Knox 메일 인덱싱 구현 완료, 공용 DB·PyInstaller 배포 예정).
 
-핵심 시나리오: "작년 A설비 알람 폭주 때 처리 절차 찾아줘" → 로컬 문서 의미 검색 → 요약 답변 + 출처 제시.
+핵심 시나리오: "작년 A설비 알람 폭주 때 처리 절차 찾아줘" → 로컬 문서·메일 의미 검색 → 요약 답변 + 출처 제시.
 
 ---
 
@@ -19,10 +19,12 @@ PyQt6 + QWebEngineView
   │    ├─ knowledge_agent  ← RAG 지식검색 (완료)
   │    └─ mes_agent        ← stub ("준비 중")
   ├─ RAG 파이프라인
-  │    ├─ Indexer  → chunker → embedding → LanceDB (%APPDATA%/KnowMate/index)
-  │    └─ Retriever → 벡터검색 → 권한필터 → 샌드위치배열 → LLM
+  │    ├─ Indexer       → chunker → embedding → LanceDB chunks 테이블
+  │    ├─ EmailIndexer  → chunker → embedding → LanceDB emails 테이블 (Knox 메일)
+  │    └─ Retriever → 벡터검색(chunks+emails 병합) → 권한필터 → 샌드위치배열 → LLM
   └─ CollectorWorker (QThread)
-       └─ Scanner → TextExtractor → Indexer, CleanupManager
+       ├─ Scanner      → TextExtractor → Indexer, CleanupManager
+       └─ MailScanner  → MysingleReader → EmailIndexer (orphan 정리 없음)
 ```
 
 ---
@@ -33,17 +35,17 @@ PyQt6 + QWebEngineView
 knowmate/
  ├─ app/          main.py · bridge.py · threads.py · ui/
  ├─ agents/       base.py · registry.py · knowledge_agent.py · mes_agent.py
- ├─ rag/          indexer.py · retriever.py · embedding.py · chunker.py
- ├─ collector/    scanner.py · cleanup.py · state.py · scheduler.py
+ ├─ rag/          indexer.py · email_indexer.py · retriever.py · embedding.py · chunker.py
+ ├─ collector/    scanner.py · mail_scanner.py · cleanup.py · state.py · scheduler.py
  ├─ secure/       base.py · plain_reader.py · com_reader.py · fake_reader.py
- │                crypto.py · signature.py · text_util.py
+ │                mysingle_reader.py · crypto.py · signature.py · text_util.py
  ├─ llm/          client.py
  ├─ config.py     # config.yaml 싱글톤 로더
  ├─ config.yaml   # 런타임 설정 전체 (설정 추가 시 여기에만)
- └─ tests/        test_phase1~4.py
+ └─ tests/        test_phase1~4.py · test_mysingle.py · fixtures/sample.mysingle
 ```
 
-참고 문서: `app/ui/UI_SPEC.md` (화면 사양) · `app/ui/mockup.html` (룩앤필) · `docs/DESIGN.md` (설계 결정 상세)
+참고 문서: `app/ui/UI_SPEC.md` (화면 사양) · `app/ui/mockup.html` (룩앤필) · `docs/DESIGN.md` (설계 결정 상세) · `docs/EMAIL_DESIGN.md` (메일 인덱싱 설계)
 
 ---
 
@@ -79,9 +81,11 @@ knowmate/
 | 2 | RAG 파이프라인 (chunker/embedding/indexer/retriever) | ✅ 완료 |
 | 3 | 수집기 (증분스캔 + orphan정리 + 스케줄러) | ✅ 완료 |
 | 4 | 보안 모듈 (COM 싱글톤 + AES-GCM + DPAPI) | ✅ 완료 |
-| 5 | 공용 벡터DB · 메일 커넥터 · PyInstaller 배포 | 🔲 예정 |
+| 5a | Knox `.mysingle` 메일 인덱싱 | ✅ 완료 |
+| 5b | 공용 벡터DB 읽기 연동 | 🔲 예정 |
+| 5c | PyInstaller 배포 | 🔲 예정 |
 
-> 메일(.msg) 처리는 Phase 5까지 보류. "메일" 배지는 mock 표시만.
+> Outlook PST 인덱싱은 COM 보안 정책 선결 검증 후 5b 이후에 착수. 상세는 `docs/EMAIL_DESIGN.md` §8 참조.
 
 ---
 

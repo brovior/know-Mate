@@ -26,26 +26,47 @@ def _to_source_item(chunk: dict[str, Any]) -> SourceItem:
     """청크 dict를 SourceItem TypedDict로 변환한다."""
     file_path = chunk.get("file_path", "")
     file_type = chunk.get("file_type", "")
-    badge = "메일" if file_type in {"msg", "eml"} else "문서"
-    title = Path(file_path).name if file_path else "(알 수 없음)"
-    subtitle = str(Path(file_path).parent) if file_path else ""
+    source_type = chunk.get("source_type", "")
     score = float(chunk.get("score", 0.0))
-    return SourceItem(badge=badge, title=title, subtitle=subtitle, score=score, path=file_path)
+
+    # emails 테이블 청크: source_type="knox" 또는 file_type="msg"/"eml"
+    is_mail = source_type in {"knox", "outlook"} or file_type in {"msg", "eml"}
+
+    if is_mail:
+        badge = "메일"
+        title = chunk.get("subject") or "(제목 없음)"
+        sender = chunk.get("sender", "")
+        mail_date = chunk.get("mail_date", "")
+        subtitle = f"{sender} · {mail_date}".strip(" ·")
+        # 출처 카드 클릭용 경로: source_file (원본 .mysingle)
+        path = chunk.get("source_file") or file_path
+    else:
+        badge = "문서"
+        title = Path(file_path).name if file_path else "(알 수 없음)"
+        subtitle = str(Path(file_path).parent) if file_path else ""
+        path = file_path
+
+    return SourceItem(badge=badge, title=title, subtitle=subtitle, score=score, path=path)
 
 
 def _dedupe_sources(chunks: list[dict[str, Any]]) -> list[SourceItem]:
-    """청크 리스트를 파일 경로 단위로 중복 제거해 SourceItem 리스트를 반환한다.
+    """청크 리스트를 파일/메일 단위로 중복 제거해 SourceItem 리스트를 반환한다.
 
-    같은 문서의 여러 청크는 가장 높은 score를 가진 청크 하나로 합쳐 표시한다.
+    같은 문서·메일의 여러 청크는 가장 높은 score를 가진 청크 하나로 표시한다.
     출력은 score 내림차순 정렬.
     """
-    best_by_path: dict[str, dict[str, Any]] = {}
+    best_by_key: dict[str, dict[str, Any]] = {}
     for chunk in chunks:
-        path = chunk.get("file_path", "")
-        prev = best_by_path.get(path)
+        # 메일은 source_file, 문서는 file_path 기준으로 dedup
+        source_type = chunk.get("source_type", "")
+        if source_type in {"knox", "outlook"}:
+            key = chunk.get("source_file") or chunk.get("file_path", "")
+        else:
+            key = chunk.get("file_path", "")
+        prev = best_by_key.get(key)
         if prev is None or float(chunk.get("score", 0.0)) > float(prev.get("score", 0.0)):
-            best_by_path[path] = chunk
-    items = [_to_source_item(c) for c in best_by_path.values()]
+            best_by_key[key] = chunk
+    items = [_to_source_item(c) for c in best_by_key.values()]
     items.sort(key=lambda it: it["score"], reverse=True)
     return items
 
@@ -81,6 +102,18 @@ def _build_pipeline() -> dict[str, Any]:
         batch_size=cfg.get("embedding", {}).get("batch_size", 32),
         crypto=crypto,
     )
+
+    # 메일 인덱서 (mail.enabled 무관하게 항상 초기화 — 기존 emails 테이블 검색 지원)
+    from knowmate.rag.email_indexer import EmailIndexer
+    email_indexer = EmailIndexer(
+        db_path=db_path,
+        embed_client=embed_client,
+        chunk_size=chunking.get("chunk_size", 400),
+        overlap=chunking.get("overlap", 80),
+        batch_size=cfg.get("embedding", {}).get("batch_size", 32),
+        crypto=crypto,
+    )
+
     retriever = Retriever(
         indexer=indexer,
         embed_client=embed_client,
@@ -88,12 +121,14 @@ def _build_pipeline() -> dict[str, Any]:
         score_threshold=search.get("score_threshold", 0.4),
         crypto=crypto,
         rerank_enabled=search.get("rerank_enabled", False),
+        email_indexer=email_indexer,
     )
     llm = get_llm_client(cfg)
     extractor = get_extractor(cfg.get("extractor", "fake"))
 
     return {
         "indexer": indexer,
+        "email_indexer": email_indexer,
         "retriever": retriever,
         "llm": llm,
         "extractor": extractor,
