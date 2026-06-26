@@ -142,12 +142,16 @@ class ExcelComReader:
             wb = excel.Workbooks.Open(str(Path(path).resolve()))
             lines: list[str] = []
             for sheet in wb.Sheets:
+                sheet_lines: list[str] = []
                 used = sheet.UsedRange
                 for row in used.Rows:
                     cells = [str(cell.Value) if cell.Value is not None else "" for cell in row.Cells]
                     row_text = "\t".join(cells)
                     if row_text.strip():
-                        lines.append(row_text)
+                        sheet_lines.append(row_text)
+                if sheet_lines:
+                    lines.append(f"=== 시트: {sheet.Name} ===")
+                    lines.extend(sheet_lines)
             wb.Close(False)
             return "\n".join(lines)
         except Exception:
