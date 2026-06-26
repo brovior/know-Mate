@@ -17,6 +17,7 @@ from knowmate.collector.state import load_state, save_state
 
 if TYPE_CHECKING:
     from knowmate.rag.indexer import Indexer
+    from knowmate.rag.email_indexer import EmailIndexer
     from knowmate.secure.base import TextExtractor
 
 logger = logging.getLogger(__name__)
@@ -43,12 +44,13 @@ class CollectorWorker(QThread):
     error = pyqtSignal(str)
     indexing_needed = pyqtSignal(str)
 
-    def __init__(self, config, indexer, extractor, state_file=None, parent=None):
+    def __init__(self, config, indexer, extractor, state_file=None, email_indexer=None, parent=None):
         """수집기 워커를 초기화한다."""
         super().__init__(parent)
         self._config = config
         self._indexer = indexer
         self._extractor = extractor
+        self._email_indexer = email_indexer
         self._cancelled = False
         appdata = os.environ.get("APPDATA", str(Path.home()))
         default_state_file = Path(appdata) / "KnowMate" / "index_state.json"
@@ -259,11 +261,25 @@ class CollectorWorker(QThread):
 
         save_state(self._state_file, state)
 
+        # 메일 스캔 (.mysingle) — mail.enabled: true 일 때만
+        mail_indexed = 0
+        if self._email_indexer and self._config.get("mail", {}).get("enabled", False):
+            from knowmate.collector.mail_scanner import run_mail_scan
+            try:
+                mail_indexed, _ = run_mail_scan(
+                    watch_folders, self._email_indexer, self._config,
+                    on_progress=lambda cur, tot, fn: self.progress.emit(cur, tot, fn),
+                )
+            except Exception as exc:
+                logger.error("[mail_scanner] 메일 스캔 실패: %s", exc)
+
         summary = (
             f"인덱싱 완료 - 처리 {done}건 / 실패 {len(failed)}건 / "
             f"orphan 마킹 {report.newly_marked}건 / "
             f"물리삭제 {report.physically_deleted}건"
         )
+        if mail_indexed:
+            summary += f" / 메일 {mail_indexed}건"
         if failed:
             logger.warning("실패 파일 목록: %s", failed)
         self.finished.emit(summary)
