@@ -41,6 +41,8 @@ def scan_folder(folder: Path, max_file_size_mb: float = 30.0) -> dict[str, dict]
                 fpath = Path(dirpath) / fname
                 if fpath.suffix.lower() not in SUPPORTED_EXT:
                     continue
+                if fname.startswith("~$"):
+                    continue
                 try:
                     stat = fpath.stat()
                     if stat.st_size > max_bytes:
