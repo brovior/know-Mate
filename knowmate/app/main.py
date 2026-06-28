@@ -1,4 +1,4 @@
-"""KnowMate 진입점 — PyQt6 윈도우 + QWebEngineView."""
+"""Aegis Desk 진입점 — PyQt6 윈도우 + QWebEngineView."""
 from __future__ import annotations
 
 import logging
@@ -12,6 +12,7 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 from PyQt6.QtCore import QFile, QIODevice, QUrl, Qt
+from PyQt6.QtGui import QIcon
 from PyQt6.QtWebEngineCore import QWebEngineScript
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebChannel import QWebChannel
@@ -25,13 +26,16 @@ from knowmate.app.bridge import Bridge
 from knowmate.agents.registry import AgentRegistry
 
 UI_DIR = Path(__file__).parent / "ui"
+APP_ICON = UI_DIR / "assets" / "aegisdesk.ico"
 logger = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("KnowMate")
+        self.setWindowTitle("Aegis Desk")
+        if APP_ICON.exists():
+            self.setWindowIcon(QIcon(str(APP_ICON)))
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
         self.resize(1100, 700)
 
@@ -56,7 +60,7 @@ class MainWindow(QMainWindow):
     def _init_collector(self) -> None:
         """수집기 파이프라인을 초기화하고 IdleScheduler를 시작한다."""
         try:
-            from knowmate.config import get_config
+            from knowmate.config import get_config, get_data_dir
             from knowmate.rag.embedding import get_embedding_client
             from knowmate.rag.indexer import Indexer
             from knowmate.secure import get_extractor
@@ -64,7 +68,7 @@ class MainWindow(QMainWindow):
             from knowmate.collector.scheduler import CollectorWorker, IdleScheduler
 
             cfg = get_config()
-            db_path = Path(os.environ.get("APPDATA", ".")) / "KnowMate" / "index"
+            db_path = get_data_dir() / "index"
             db_path.mkdir(parents=True, exist_ok=True)
 
             chunking = cfg.get("chunking", {})
@@ -152,6 +156,17 @@ def _inject_qwebchannel_js(view: QWebEngineView) -> None:
     view.page().scripts().insert(script)
 
 
+def _set_windows_app_id(app_id: str) -> None:
+    """Windows 작업표시줄이 python.exe 대신 앱 고유 아이콘을 쓰도록 AppUserModelID를 설정한다."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+    except Exception as exc:  # noqa: BLE001 — 아이콘 그룹핑 실패는 치명적이지 않음
+        logger.debug("AppUserModelID 설정 실패: %s", exc)
+
+
 def main() -> None:
     from knowmate.config import get_config
     _log_level = getattr(logging, get_config().get("log_level", "INFO").upper(), logging.INFO)
@@ -161,8 +176,11 @@ def main() -> None:
         datefmt="%H:%M:%S",
     )
     os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
+    _set_windows_app_id("AegisDesk.App")
     app = QApplication(sys.argv)
-    app.setApplicationName("KnowMate")
+    app.setApplicationName("Aegis Desk")
+    if APP_ICON.exists():
+        app.setWindowIcon(QIcon(str(APP_ICON)))
     win = MainWindow()
     win.show()
     sys.exit(app.exec())

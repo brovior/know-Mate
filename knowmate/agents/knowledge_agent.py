@@ -73,7 +73,7 @@ def _dedupe_sources(chunks: list[dict[str, Any]]) -> list[SourceItem]:
 
 def _build_pipeline() -> dict[str, Any]:
     """RAG 파이프라인 컴포넌트를 생성해 dict로 반환한다."""
-    from knowmate.config import get_config
+    from knowmate.config import get_config, get_data_dir
     from knowmate.rag.embedding import get_embedding_client
     from knowmate.rag.indexer import Indexer
     from knowmate.rag.retriever import Retriever
@@ -85,9 +85,7 @@ def _build_pipeline() -> dict[str, Any]:
     chunking = cfg.get("chunking", {})
     search = cfg.get("search", {})
 
-    db_path = os.path.join(
-        os.environ.get("APPDATA", "."), "KnowMate", "index"
-    )
+    db_path = str(get_data_dir() / "index")
     os.makedirs(db_path, exist_ok=True)
 
     # crypto는 Indexer와 Retriever가 공유한다

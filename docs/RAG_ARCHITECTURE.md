@@ -1,4 +1,4 @@
-# KnowMate RAG 전체 구조 검토
+# Aegis Desk RAG 전체 구조 검토
 
 ## 현재 구조
 

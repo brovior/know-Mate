@@ -40,7 +40,7 @@ COM 애플리케이션을 파일 1개마다 `Dispatch → Quit`하면:
 
 ### 왜 키를 파일에 평문 저장하면 안 되는가
 
-벡터DB(`%APPDATA%/KnowMate/index`)는 개인 PC의 파일 시스템에 저장된다.
+벡터DB(`%APPDATA%/AegisDesk/index`)는 개인 PC의 파일 시스템에 저장된다.
 AES 키를 같은 위치에 평문으로 두면 DB 파일과 키를 함께 복사해 복호화할 수 있어
 암호화 의미가 없어진다.
 
@@ -105,7 +105,7 @@ Phase 4 구현 후 회사 PC에서 아래 항목을 순서대로 확인한다.
 
 4. **km.key 파일 확인**
    ```
-   %APPDATA%\KnowMate\km.key
+   %APPDATA%\AegisDesk\km.key
    ```
    위 경로에 파일이 생성됐는지 확인한다.
    (파일 내용은 DPAPI 암호문이므로 사람이 읽을 수 없다)
@@ -114,7 +114,7 @@ Phase 4 구현 후 회사 PC에서 아래 항목을 순서대로 확인한다.
    Python 대화형 셸에서:
    ```python
    import lancedb, os
-   db = lancedb.connect(os.path.join(os.environ["APPDATA"], "KnowMate", "index"))
+   db = lancedb.connect(os.path.join(os.environ["APPDATA"], "AegisDesk", "index"))
    tbl = db.open_table("chunks")
    df = tbl.to_arrow().to_pandas()
    print(df["text"].iloc[0][:80])  # base64 암호문이어야 함 (평문 아님)

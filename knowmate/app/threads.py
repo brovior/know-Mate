@@ -1,10 +1,10 @@
 """대화 스레드 저장 관리 (CLAUDE.md 6-12)."""
 import json
-import os
-from pathlib import Path
 from typing import Any
 
-THREADS_FILE = Path(os.environ.get("APPDATA", ".")) / "KnowMate" / "threads.json"
+from knowmate.config import get_data_dir
+
+THREADS_FILE = get_data_dir() / "threads.json"
 _EMPTY: dict[str, list] = {"knowledge": [], "mes": []}
 
 
