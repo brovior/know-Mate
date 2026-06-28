@@ -52,8 +52,8 @@ class CollectorWorker(QThread):
         self._extractor = extractor
         self._email_indexer = email_indexer
         self._cancelled = False
-        appdata = os.environ.get("APPDATA", str(Path.home()))
-        default_state_file = Path(appdata) / "KnowMate" / "index_state.json"
+        from knowmate.config import get_data_dir
+        default_state_file = get_data_dir() / "index_state.json"
         self._state_file = state_file or default_state_file
 
     def run(self):

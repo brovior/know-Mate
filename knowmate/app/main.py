@@ -1,4 +1,4 @@
-"""KnowMate 진입점 — PyQt6 윈도우 + QWebEngineView."""
+"""Aegis Desk 진입점 — PyQt6 윈도우 + QWebEngineView."""
 from __future__ import annotations
 
 import logging
@@ -60,7 +60,7 @@ class MainWindow(QMainWindow):
     def _init_collector(self) -> None:
         """수집기 파이프라인을 초기화하고 IdleScheduler를 시작한다."""
         try:
-            from knowmate.config import get_config
+            from knowmate.config import get_config, get_data_dir
             from knowmate.rag.embedding import get_embedding_client
             from knowmate.rag.indexer import Indexer
             from knowmate.secure import get_extractor
@@ -68,7 +68,7 @@ class MainWindow(QMainWindow):
             from knowmate.collector.scheduler import CollectorWorker, IdleScheduler
 
             cfg = get_config()
-            db_path = Path(os.environ.get("APPDATA", ".")) / "KnowMate" / "index"
+            db_path = get_data_dir() / "index"
             db_path.mkdir(parents=True, exist_ok=True)
 
             chunking = cfg.get("chunking", {})

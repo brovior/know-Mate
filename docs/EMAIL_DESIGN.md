@@ -1,4 +1,4 @@
-# EMAIL_DESIGN.md — KnowMate 메일 인덱싱 설계
+# EMAIL_DESIGN.md — Aegis Desk 메일 인덱싱 설계
 > 상태: **Phase 5a 구현 완료** (2026-06-26)
 > Knox `.mysingle` 구현 완료 · Outlook PST 보류
 

@@ -363,7 +363,7 @@ def _make_fake_pipeline(db_dir: str) -> dict:
     from knowmate.secure.fake_reader import FakeReader
 
     embed = _fake_embed_client()
-    db_path = Path(db_dir) / "KnowMate" / "index"
+    db_path = Path(db_dir) / "AegisDesk" / "index"
     db_path.mkdir(parents=True, exist_ok=True)
     indexer = Indexer(db_path=str(db_path), embed_client=embed)
     retriever = Retriever(

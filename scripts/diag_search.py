@@ -35,7 +35,7 @@ def main() -> None:
     print(f"질의 벡터 차원: {len(vec)}")
 
     # 2) LanceDB 원시 검색
-    db_path = os.path.join(os.environ.get("APPDATA", "."), "KnowMate", "index")
+    db_path = os.path.join(os.environ.get("APPDATA", "."), "AegisDesk", "index")
     db = lancedb.connect(db_path)
     try:
         table = db.open_table(TABLE_NAME)

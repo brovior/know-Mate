@@ -112,5 +112,6 @@ def get_crypto_manager(cfg: dict) -> Union[CryptoManager, FakeCryptoManager]:
     if cfg.get("extractor", "fake") == "fake":
         return FakeCryptoManager()
 
-    key_file = Path(os.environ.get("APPDATA", ".")) / "KnowMate" / "km.key"
+    from knowmate.config import get_data_dir
+    key_file = get_data_dir() / "km.key"
     return CryptoManager(key_file)

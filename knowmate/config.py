@@ -1,4 +1,5 @@
-"""config.yaml 싱글톤 로더."""
+"""config.yaml 싱글톤 로더 + 앱 데이터 폴더 관리."""
+import os
 from pathlib import Path
 from typing import Any
 
@@ -6,6 +7,32 @@ import yaml
 
 _CONFIG_PATH = Path(__file__).parent / "config.yaml"
 _cache: dict[str, Any] | None = None
+
+# 앱 데이터 루트 (%APPDATA%/AegisDesk). 구버전 KnowMate 폴더는 1회 자동 이전.
+_APP_DIR_NAME = "AegisDesk"
+_LEGACY_DIR_NAME = "KnowMate"
+_data_dir_migrated = False
+
+
+def get_data_dir() -> Path:
+    """앱 데이터 루트(%APPDATA%/AegisDesk)를 반환한다.
+
+    구버전 KnowMate 폴더가 있으면 통째로 AegisDesk로 1회 이전한다
+    (km.key·index·threads.json 보존). 폴더가 없으면 생성한다.
+    """
+    global _data_dir_migrated
+    base = Path(os.environ.get("APPDATA", "."))
+    data_dir = base / _APP_DIR_NAME
+    if not _data_dir_migrated:
+        legacy = base / _LEGACY_DIR_NAME
+        if legacy.exists() and not data_dir.exists():
+            try:
+                legacy.rename(data_dir)
+            except OSError:
+                pass  # 이전 실패 시 신규 폴더로 진행 (기존 인덱스는 재인덱싱 필요)
+        _data_dir_migrated = True
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir
 
 
 def get_config() -> dict[str, Any]:

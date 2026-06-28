@@ -1,5 +1,6 @@
-# CLAUDE.md — KnowMate
-> Phase 1~4 완료, Phase 5 진행 중 (Knox 메일 인덱싱 구현) | 2026-06-26
+# CLAUDE.md — Aegis Desk
+> Phase 1~4 완료, Phase 5 진행 중 (Knox 메일 인덱싱 구현) | 2026-06-28
+> 제품명: **Aegis Desk (이지스 데스크)** — 구 KnowMate. 데이터 폴더 `%APPDATA%/AegisDesk` (구 KnowMate 폴더는 최초 실행 시 자동 이전).
 
 ## 프로젝트 개요
 

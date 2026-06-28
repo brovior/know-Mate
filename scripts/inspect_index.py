@@ -25,7 +25,7 @@ def main() -> None:
     parser.add_argument("--text", type=int, default=0, help="복호화해서 미리볼 청크 수")
     args = parser.parse_args()
 
-    db_path = os.path.join(os.environ.get("APPDATA", "."), "KnowMate", "index")
+    db_path = os.path.join(os.environ.get("APPDATA", "."), "AegisDesk", "index")
     print(f"DB 경로 : {db_path}")
     print(f"테이블  : {TABLE_NAME}\n")
 
