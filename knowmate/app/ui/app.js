@@ -195,11 +195,13 @@ function onStatusUpdated(dataOrJson) {
   const idxDetail = document.getElementById("idxDetail");
   const badgeLocal  = document.getElementById("badgeLocal");
   const badgeShared = document.getElementById("badgeShared");
+  const badgeMail   = document.getElementById("badgeMail");
 
   if (idxTime)   idxTime.textContent   = data.last_indexed || "-";
   if (idxDetail) idxDetail.textContent = `문서 ${data.doc_count ?? 0}건`;
   if (badgeLocal)  badgeLocal.textContent  = data.local_count  ?? "-";
   if (badgeShared) badgeShared.textContent = data.shared_count ?? "-";
+  if (badgeMail)   badgeMail.textContent   = data.mail_count   ?? "-";
 }
 
 function onIndexAlert(message) {

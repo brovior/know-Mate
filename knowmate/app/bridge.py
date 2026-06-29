@@ -165,6 +165,7 @@ class Bridge(QObject):
         shared_count = 0
         last_indexed = self._last_indexed
 
+        mail_count = 0
         try:
             if self._worker and hasattr(self._worker, "_indexer"):
                 df = self._worker._indexer.table.to_arrow().to_pandas()
@@ -183,12 +184,20 @@ class Bridge(QObject):
         except Exception:
             pass
 
+        try:
+            if self._worker and hasattr(self._worker, "_email_indexer") and self._worker._email_indexer:
+                edf = self._worker._email_indexer.table.to_arrow().to_pandas()
+                mail_count = int(edf[~edf["is_deleted"]]["mail_uid"].nunique())
+        except Exception:
+            pass
+
         status = {
             "status":        "running" if running else "idle",
             "last_indexed":  last_indexed,
             "doc_count":     self._doc_count,
             "local_count":   local_count,
             "shared_count":  shared_count,
+            "mail_count":    mail_count,
         }
         return json.dumps(status, ensure_ascii=False)
 
@@ -216,6 +225,7 @@ class Bridge(QObject):
 
         local_count = 0
         shared_count = 0
+        mail_count = 0
         try:
             if self._worker and hasattr(self._worker, "_indexer"):
                 df = self._worker._indexer.table.to_arrow().to_pandas()
@@ -227,11 +237,19 @@ class Bridge(QObject):
         except Exception:
             pass
 
+        try:
+            if self._worker and hasattr(self._worker, "_email_indexer") and self._worker._email_indexer:
+                edf = self._worker._email_indexer.table.to_arrow().to_pandas()
+                mail_count = int(edf[~edf["is_deleted"]]["mail_uid"].nunique())
+        except Exception:
+            pass
+
         status = {
             "last_indexed":  self._last_indexed,
             "doc_count":     self._doc_count,
             "local_count":   local_count,
             "shared_count":  shared_count,
+            "mail_count":    mail_count,
         }
         self.statusUpdated.emit(json.dumps(status, ensure_ascii=False))
 

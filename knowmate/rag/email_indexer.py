@@ -1,7 +1,6 @@
 """emails 테이블 스키마 및 EmailIndexer (Knox .mysingle 전용)."""
 from __future__ import annotations
 
-import getpass
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -14,6 +13,9 @@ from knowmate.rag.chunker import chunk_text
 from knowmate.rag.embedding import EmbeddingClient, VECTOR_DIM
 
 logger = logging.getLogger(__name__)
+
+# 인덱싱 포맷 버전 — 변경 시 기존 메일 자동 재인덱싱
+EMAIL_INDEX_VERSION = "2"
 
 EMAIL_SCHEMA = pa.schema([
     # ── 청크 공통 ──
@@ -47,6 +49,17 @@ EMAIL_SCHEMA = pa.schema([
 ])
 
 EMAIL_TABLE_NAME = "emails"
+
+
+def _inject_version(source_meta: str) -> str:
+    """source_meta JSON 문자열에 _index_version 필드를 삽입한다."""
+    import json
+    try:
+        meta = json.loads(source_meta or "{}")
+    except Exception:
+        meta = {}
+    meta["_index_version"] = EMAIL_INDEX_VERSION
+    return json.dumps(meta, ensure_ascii=False)
 
 
 def get_or_create_emails_table(db):
@@ -84,7 +97,8 @@ class EmailIndexer:
         self.table = get_or_create_emails_table(db)
 
     def is_indexed(self, mail_uid: str, mtime: float) -> bool:
-        """동일 mail_uid + mtime이 이미 인덱싱돼 있으면 True를 반환한다."""
+        """동일 mail_uid + mtime + 인덱스 버전이 모두 일치하면 True를 반환한다."""
+        import json
         try:
             df = (
                 self.table.search()
@@ -95,8 +109,17 @@ class EmailIndexer:
             )
             if df.empty:
                 return False
-            stored_mtime = float(df.iloc[0]["mtime"])
-            return abs(stored_mtime - mtime) < 1.0
+            row = df.iloc[0]
+            if abs(float(row["mtime"]) - mtime) >= 1.0:
+                return False
+            # source_meta에 저장된 인덱스 버전 확인
+            try:
+                meta = json.loads(row.get("source_meta", "{}") or "{}")
+                if meta.get("_index_version") != EMAIL_INDEX_VERSION:
+                    return False
+            except Exception:
+                return False
+            return True
         except Exception as exc:
             logger.warning("[email_indexer] is_indexed 조회 실패 (uid=%s): %s", mail_uid[:20], exc)
             return False
@@ -111,7 +134,14 @@ class EmailIndexer:
         파싱된 메일 dict를 청킹·임베딩·암호화해 emails 테이블에 저장한다.
         chunk_id 리스트를 반환한다.
         """
-        body_text: str = parsed["body_text"]
+        # 메타데이터 헤더를 본문 앞에 붙여 발신인·날짜·수신인 기반 검색 지원
+        meta_header = (
+            f"제목: {parsed.get('subject', '')}\n"
+            f"발신: {parsed.get('sender', '')}\n"
+            f"수신: {parsed.get('recipients', '')}\n"
+            f"날짜: {parsed.get('mail_date', '')}\n\n"
+        )
+        body_text: str = meta_header + parsed["body_text"]
         chunks = chunk_text(body_text, "txt", self._chunk_size, self._overlap)
         if not chunks:
             return []
@@ -122,7 +152,6 @@ class EmailIndexer:
         indexed_at = datetime.now(timezone.utc).isoformat()
         total = len(chunks)
         chunk_ids: list[str] = []
-        owner = getpass.getuser()
 
         for batch_start in range(0, total, self._batch_size):
             batch = chunks[batch_start: batch_start + self._batch_size]
@@ -157,7 +186,7 @@ class EmailIndexer:
                     "chunk_origin":    "body",
                     "attach_filename": "",
                     "attach_sha256":   "",
-                    "source_meta":     parsed["source_meta"],
+                    "source_meta":     _inject_version(parsed["source_meta"]),
                 })
 
             self.table.add(rows)
@@ -179,5 +208,6 @@ class EmailIndexer:
             logger.warning("[email_indexer] 청크 삭제 실패 (uid=%s): %s", mail_uid[:30], exc)
 
     def optimize(self) -> None:
+
         """emails 테이블을 최적화한다."""
         self.table.optimize()

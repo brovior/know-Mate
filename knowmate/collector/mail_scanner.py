@@ -58,10 +58,26 @@ def run_mail_scan(
     candidates = scan_mail_folders(watch_folders, max_per_scan)
     indexed_count = 0
     skipped_count = 0
+    migrate_count = 0       # 버전 불일치로 재인덱싱된 건수
+    migrate_logged = False  # 마이그레이션 시작 안내 1회만 출력
 
     for i, item in enumerate(candidates):
         path = item["path"]
         mtime = item["mtime"]
+
+        # source_file 기준 사전 상태 분류 (파싱 비용 절약)
+        state = _source_index_state(email_indexer, path, mtime)
+        if state == "indexed":
+            skipped_count += 1
+            continue
+
+        is_migration = state == "stale_version"
+        if is_migration and not migrate_logged:
+            logger.info(
+                "[mail_scanner] 인덱싱 포맷 변경 감지 — 기존 메일 재인덱싱을 시작합니다 (전체=%d건)",
+                len(candidates),
+            )
+            migrate_logged = True
 
         try:
             parsed = parse_mysingle(path)
@@ -75,8 +91,15 @@ def run_mail_scan(
             continue
 
         try:
-            email_indexer.index_mail(parsed, mtime)
+            chunk_ids = email_indexer.index_mail(parsed, mtime)
             indexed_count += 1
+            if is_migration:
+                migrate_count += 1
+            tag = "MIGRATE" if is_migration else "NEW"
+            logger.info(
+                "[mail_scanner] [%s] %s -> %d청크 (subject=%s)",
+                tag, Path(path).name, len(chunk_ids), parsed.get("subject", "")[:40],
+            )
         except Exception as exc:
             logger.warning("[mail_scanner] 인덱싱 실패: %s (%s)", path, exc)
             skipped_count += 1
@@ -84,8 +107,46 @@ def run_mail_scan(
         if on_progress and (indexed_count % batch_every == 0):
             on_progress(i + 1, len(candidates), Path(path).name)
 
+    if migrate_count:
+        logger.info("[mail_scanner] 포맷 마이그레이션 완료: 재인덱싱=%d건", migrate_count)
     logger.info(
-        "[mail_scanner] 스캔 완료: 전체=%d 인덱싱=%d 스킵=%d",
-        len(candidates), indexed_count, skipped_count,
+        "[mail_scanner] 스캔 완료: 전체=%d 인덱싱=%d (마이그레이션=%d) 스킵=%d",
+        len(candidates), indexed_count, migrate_count, skipped_count,
     )
     return indexed_count, skipped_count
+
+
+def _source_index_state(email_indexer: "EmailIndexer", source_file: str, mtime: float) -> str:
+    """
+    source_file 의 인덱싱 상태를 분류한다.
+
+    반환:
+      "indexed"       — mtime·버전 모두 일치, 재인덱싱 불필요 (스킵)
+      "stale_version" — mtime 일치하나 인덱스 버전 불일치 (포맷 마이그레이션)
+      "new_or_changed"— 미인덱싱 또는 파일 변경 (mtime 불일치)
+    """
+    import json
+    from knowmate.rag.email_indexer import EMAIL_INDEX_VERSION
+    try:
+        escaped = source_file.replace("'", "''")
+        df = (
+            email_indexer.table.search()
+            .where(f"source_file = '{escaped}' AND is_deleted = false")
+            .limit(1)
+            .to_arrow()
+            .to_pandas()
+        )
+        if df.empty:
+            return "new_or_changed"
+        row = df.iloc[0]
+        if abs(float(row["mtime"]) - mtime) >= 1.0:
+            return "new_or_changed"
+        try:
+            meta = json.loads(row.get("source_meta", "{}") or "{}")
+            if meta.get("_index_version") != EMAIL_INDEX_VERSION:
+                return "stale_version"
+        except Exception:
+            return "stale_version"
+        return "indexed"
+    except Exception:
+        return "new_or_changed"

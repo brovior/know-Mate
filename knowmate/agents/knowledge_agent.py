@@ -164,7 +164,19 @@ class KnowledgeAgent:
             logger.warning("검색 실패: %s", exc)
             chunks = []
 
-        answer_text = pipeline["llm"].answer(query, [c.get("text", "") for c in chunks])
+        def _chunk_context(c: dict) -> str:
+            text = c.get("text", "")
+            if c.get("source_type") in {"knox", "outlook"}:
+                header = (
+                    f"[메일] 제목: {c.get('subject', '')} | "
+                    f"발신: {c.get('sender', '')} | "
+                    f"수신: {c.get('recipients', '')} | "
+                    f"날짜: {c.get('mail_date', '')}\n"
+                )
+                return header + text
+            return text
+
+        answer_text = pipeline["llm"].answer(query, [_chunk_context(c) for c in chunks])
 
         blocks: list[Block] = [TextBlock(type="text", content=answer_text)]
 
