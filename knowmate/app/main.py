@@ -72,14 +72,27 @@ class MainWindow(QMainWindow):
             db_path.mkdir(parents=True, exist_ok=True)
 
             chunking = cfg.get("chunking", {})
+            batch_size = cfg.get("embedding", {}).get("batch_size", 32)
+            embed_client = get_embedding_client(cfg)
+            crypto = get_crypto_manager(cfg)
             self._cfg      = cfg
             self._indexer  = Indexer(
                 db_path=db_path,
-                embed_client=get_embedding_client(cfg),
+                embed_client=embed_client,
                 chunk_size=chunking.get("chunk_size", 400),
                 overlap=chunking.get("overlap", 80),
-                batch_size=cfg.get("embedding", {}).get("batch_size", 32),
-                crypto=get_crypto_manager(cfg),
+                batch_size=batch_size,
+                crypto=crypto,
+            )
+            # 메일(.mysingle) 인덱서 — mail.enabled: true 일 때 워커가 사용
+            from knowmate.rag.email_indexer import EmailIndexer
+            self._email_indexer = EmailIndexer(
+                db_path=db_path,
+                embed_client=embed_client,
+                chunk_size=chunking.get("chunk_size", 400),
+                overlap=chunking.get("overlap", 80),
+                batch_size=batch_size,
+                crypto=crypto,
             )
             self._extractor = get_extractor(cfg.get("extractor", "fake"))
 
@@ -108,6 +121,7 @@ class MainWindow(QMainWindow):
             config=self._cfg,
             indexer=self._indexer,
             extractor=self._extractor,
+            email_indexer=getattr(self, "_email_indexer", None),
             parent=self,
         )
         self._bridge.set_worker(worker)
