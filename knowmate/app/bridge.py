@@ -2,49 +2,9 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
-import sys
 from pathlib import Path
 from PyQt6.QtCore import QObject, pyqtSlot, pyqtSignal
-
-logger = logging.getLogger(__name__)
-
-# IFileOpenDialog 옵션 플래그 (shobjidl.h)
-_FOS_PICKFOLDERS = 0x00000020       # 폴더 선택 모드
-_FOS_FORCEFILESYSTEM = 0x00000040   # 파일시스템 경로만 허용
-_FOS_PATHMUSTEXIST = 0x00000800     # 존재하는 경로만
-_FOS_NOTESTFILECREATE = 0x00010000  # 쓰기 테스트 생략 → 읽기전용/네트워크 드라이브 지원
-
-
-def _native_pick_folder_win(hwnd: int = 0) -> str:
-    """Windows IFileOpenDialog로 폴더를 선택해 경로를 반환한다 (취소 시 빈 문자열).
-
-    FOS_NOTESTFILECREATE로 쓰기 테스트를 건너뛰어, 읽기전용·네트워크 매핑
-    드라이브(예: M:\\)에서 발생하는 'ERROR_WRITE_PROTECT'(쓰기 방지된 미디어) 오류를
-    피한다. 외형은 표준 모던 폴더 picker와 동일하다.
-    """
-    import pythoncom
-    from win32com.shell import shell, shellcon
-
-    dialog = pythoncom.CoCreateInstance(
-        shell.CLSID_FileOpenDialog,
-        None,
-        pythoncom.CLSCTX_INPROC_SERVER,
-        shell.IID_IFileOpenDialog,
-    )
-    opts = dialog.GetOptions()
-    dialog.SetOptions(
-        opts | _FOS_PICKFOLDERS | _FOS_FORCEFILESYSTEM
-        | _FOS_PATHMUSTEXIST | _FOS_NOTESTFILECREATE
-    )
-    dialog.SetTitle("폴더 선택")
-    try:
-        dialog.Show(hwnd)
-    except pythoncom.com_error:
-        return ""  # 사용자 취소(ERROR_CANCELLED)
-    item = dialog.GetResult()
-    return item.GetDisplayName(shellcon.SIGDN_FILESYSPATH) or ""
 
 
 class Bridge(QObject):
@@ -133,19 +93,7 @@ class Bridge(QObject):
 
     @pyqtSlot(result=str)
     def selectFolder(self) -> str:
-        """네이티브 폴더 선택 다이얼로그를 열고 선택된 경로를 반환한다. 취소 시 빈 문자열.
-
-        Windows에서는 IFileOpenDialog(FOS_NOTESTFILECREATE)를 직접 사용해
-        읽기전용·네트워크 매핑 드라이브에서도 정상 동작하게 한다. win32가 아니거나
-        실패하면 Qt 기본 다이얼로그로 폴백한다.
-        """
-        if sys.platform == "win32":
-            try:
-                hwnd = int(self._win.winId()) if self._win else 0
-                return _native_pick_folder_win(hwnd)
-            except Exception as exc:  # noqa: BLE001 — 폴백이 있으므로 치명적이지 않음
-                logger.warning("네이티브 폴더 선택 실패, Qt 다이얼로그로 폴백: %s", exc)
-
+        """네이티브 폴더 선택 다이얼로그를 열고 선택된 경로를 반환한다. 취소 시 빈 문자열."""
         from PyQt6.QtWidgets import QFileDialog
         path = QFileDialog.getExistingDirectory(self._win, "폴더 선택")
         return path or ""
