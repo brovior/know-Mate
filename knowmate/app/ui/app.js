@@ -463,22 +463,6 @@ function addFolder() {
   });
 }
 
-function addFolderByPath() {
-  if (!bridge) return;
-  const input = document.getElementById("folderPathInput");
-  const path = (input.value || "").trim();
-  if (!path) return;
-  bridge.addFolderByPath(path).then(json => {
-    const res = JSON.parse(json);
-    if (res.ok) {
-      input.value = "";
-      renderFolderList(res.folders);
-    } else {
-      showToast(res.error || "경로를 추가할 수 없습니다.");
-    }
-  });
-}
-
 /* -- 인덱싱 버튼 -- */
 function startFullIndex() {
   closeOnboarding();
