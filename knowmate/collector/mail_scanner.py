@@ -101,17 +101,29 @@ def run_mail_scan(
 
 
 def _is_source_indexed(email_indexer: "EmailIndexer", source_file: str, mtime: float) -> bool:
-    """source_file + mtime 기준 사전 중복 검사. mail_uid 없이도 체크 가능."""
+    """source_file + mtime + 인덱스 버전 기준 사전 중복 검사."""
+    import json
+    from knowmate.rag.email_indexer import EMAIL_INDEX_VERSION
     try:
+        escaped = source_file.replace("'", "''")
         df = (
             email_indexer.table.search()
-            .where(f"source_file = '{source_file.replace(chr(39), chr(39)*2)}' AND is_deleted = false")
+            .where(f"source_file = '{escaped}' AND is_deleted = false")
             .limit(1)
             .to_arrow()
             .to_pandas()
         )
         if df.empty:
             return False
-        return abs(float(df.iloc[0]["mtime"]) - mtime) < 1.0
+        row = df.iloc[0]
+        if abs(float(row["mtime"]) - mtime) >= 1.0:
+            return False
+        try:
+            meta = json.loads(row.get("source_meta", "{}") or "{}")
+            if meta.get("_index_version") != EMAIL_INDEX_VERSION:
+                return False
+        except Exception:
+            return False
+        return True
     except Exception:
         return False

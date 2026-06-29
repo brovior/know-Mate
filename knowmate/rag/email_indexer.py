@@ -14,6 +14,9 @@ from knowmate.rag.embedding import EmbeddingClient, VECTOR_DIM
 
 logger = logging.getLogger(__name__)
 
+# 인덱싱 포맷 버전 — 변경 시 기존 메일 자동 재인덱싱
+EMAIL_INDEX_VERSION = "2"
+
 EMAIL_SCHEMA = pa.schema([
     # ── 청크 공통 ──
     pa.field("chunk_id",        pa.string()),
@@ -46,6 +49,17 @@ EMAIL_SCHEMA = pa.schema([
 ])
 
 EMAIL_TABLE_NAME = "emails"
+
+
+def _inject_version(source_meta: str) -> str:
+    """source_meta JSON 문자열에 _index_version 필드를 삽입한다."""
+    import json
+    try:
+        meta = json.loads(source_meta or "{}")
+    except Exception:
+        meta = {}
+    meta["_index_version"] = EMAIL_INDEX_VERSION
+    return json.dumps(meta, ensure_ascii=False)
 
 
 def get_or_create_emails_table(db):
@@ -83,7 +97,8 @@ class EmailIndexer:
         self.table = get_or_create_emails_table(db)
 
     def is_indexed(self, mail_uid: str, mtime: float) -> bool:
-        """동일 mail_uid + mtime이 이미 인덱싱돼 있으면 True를 반환한다."""
+        """동일 mail_uid + mtime + 인덱스 버전이 모두 일치하면 True를 반환한다."""
+        import json
         try:
             df = (
                 self.table.search()
@@ -94,8 +109,17 @@ class EmailIndexer:
             )
             if df.empty:
                 return False
-            stored_mtime = float(df.iloc[0]["mtime"])
-            return abs(stored_mtime - mtime) < 1.0
+            row = df.iloc[0]
+            if abs(float(row["mtime"]) - mtime) >= 1.0:
+                return False
+            # source_meta에 저장된 인덱스 버전 확인
+            try:
+                meta = json.loads(row.get("source_meta", "{}") or "{}")
+                if meta.get("_index_version") != EMAIL_INDEX_VERSION:
+                    return False
+            except Exception:
+                return False
+            return True
         except Exception as exc:
             logger.warning("[email_indexer] is_indexed 조회 실패 (uid=%s): %s", mail_uid[:20], exc)
             return False
@@ -162,7 +186,7 @@ class EmailIndexer:
                     "chunk_origin":    "body",
                     "attach_filename": "",
                     "attach_sha256":   "",
-                    "source_meta":     parsed["source_meta"],
+                    "source_meta":     _inject_version(parsed["source_meta"]),
                 })
 
             self.table.add(rows)
@@ -184,5 +208,6 @@ class EmailIndexer:
             logger.warning("[email_indexer] 청크 삭제 실패 (uid=%s): %s", mail_uid[:30], exc)
 
     def optimize(self) -> None:
+
         """emails 테이블을 최적화한다."""
         self.table.optimize()
