@@ -1,7 +1,6 @@
 """emails 테이블 스키마 및 EmailIndexer (Knox .mysingle 전용)."""
 from __future__ import annotations
 
-import getpass
 import logging
 import uuid
 from datetime import datetime, timezone
@@ -122,7 +121,6 @@ class EmailIndexer:
         indexed_at = datetime.now(timezone.utc).isoformat()
         total = len(chunks)
         chunk_ids: list[str] = []
-        owner = getpass.getuser()
 
         for batch_start in range(0, total, self._batch_size):
             batch = chunks[batch_start: batch_start + self._batch_size]

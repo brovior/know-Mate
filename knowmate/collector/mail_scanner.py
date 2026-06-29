@@ -63,6 +63,11 @@ def run_mail_scan(
         path = item["path"]
         mtime = item["mtime"]
 
+        # source_file 기준 mtime 사전 체크 (파싱 비용 절약)
+        if _is_source_indexed(email_indexer, path, mtime):
+            skipped_count += 1
+            continue
+
         try:
             parsed = parse_mysingle(path)
         except Exception as exc:
@@ -75,8 +80,12 @@ def run_mail_scan(
             continue
 
         try:
-            email_indexer.index_mail(parsed, mtime)
+            chunk_ids = email_indexer.index_mail(parsed, mtime)
             indexed_count += 1
+            logger.info(
+                "[mail_scanner] [NEW] %s -> %d청크 (subject=%s)",
+                Path(path).name, len(chunk_ids), parsed.get("subject", "")[:40],
+            )
         except Exception as exc:
             logger.warning("[mail_scanner] 인덱싱 실패: %s (%s)", path, exc)
             skipped_count += 1
@@ -89,3 +98,20 @@ def run_mail_scan(
         len(candidates), indexed_count, skipped_count,
     )
     return indexed_count, skipped_count
+
+
+def _is_source_indexed(email_indexer: "EmailIndexer", source_file: str, mtime: float) -> bool:
+    """source_file + mtime 기준 사전 중복 검사. mail_uid 없이도 체크 가능."""
+    try:
+        df = (
+            email_indexer.table.search()
+            .where(f"source_file = '{source_file.replace(chr(39), chr(39)*2)}' AND is_deleted = false")
+            .limit(1)
+            .to_arrow()
+            .to_pandas()
+        )
+        if df.empty:
+            return False
+        return abs(float(df.iloc[0]["mtime"]) - mtime) < 1.0
+    except Exception:
+        return False
