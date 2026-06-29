@@ -110,7 +110,14 @@ class EmailIndexer:
         파싱된 메일 dict를 청킹·임베딩·암호화해 emails 테이블에 저장한다.
         chunk_id 리스트를 반환한다.
         """
-        body_text: str = parsed["body_text"]
+        # 메타데이터 헤더를 본문 앞에 붙여 발신인·날짜·수신인 기반 검색 지원
+        meta_header = (
+            f"제목: {parsed.get('subject', '')}\n"
+            f"발신: {parsed.get('sender', '')}\n"
+            f"수신: {parsed.get('recipients', '')}\n"
+            f"날짜: {parsed.get('mail_date', '')}\n\n"
+        )
+        body_text: str = meta_header + parsed["body_text"]
         chunks = chunk_text(body_text, "txt", self._chunk_size, self._overlap)
         if not chunks:
             return []
