@@ -169,6 +169,37 @@ class Bridge(QObject):
         return json.dumps(folders, ensure_ascii=False)
 
     @pyqtSlot(str, result=str)
+    def addFolderByPath(self, raw_path: str) -> str:
+        """사용자가 직접 입력한 경로를 검증 후 watch_folders에 추가한다.
+
+        네트워크·DMS 드라이브(M:\\ 등)는 폴더 선택 다이얼로그가 셸 탐색에 실패하므로,
+        경로를 직접 입력받아 우회한다. 인덱싱은 os.walk로 정상 동작한다.
+
+        반환 JSON: {"ok": bool, "folders": [...], "error": str}
+        경로가 비었거나 존재하지 않거나 폴더가 아니면 ok=false + error 메시지.
+        """
+        from knowmate.config import get_config
+        current = get_config().get("collector", {}).get("watch_folders", [])
+
+        def _fail(msg: str) -> str:
+            return json.dumps({"ok": False, "folders": current, "error": msg}, ensure_ascii=False)
+
+        raw = (raw_path or "").strip().strip('"').strip("'")
+        if not raw:
+            return _fail("경로를 입력하세요.")
+        try:
+            p = Path(raw)
+            if not p.exists():
+                return _fail(f"경로를 찾을 수 없습니다: {raw}")
+            if not p.is_dir():
+                return _fail(f"폴더가 아닙니다: {raw}")
+        except OSError as exc:
+            return _fail(f"경로 접근 실패: {exc}")
+
+        folders = json.loads(self.addWatchFolder(raw))
+        return json.dumps({"ok": True, "folders": folders, "error": ""}, ensure_ascii=False)
+
+    @pyqtSlot(str, result=str)
     def removeWatchFolder(self, path: str) -> str:
         """폴더를 watch_folders에서 제거하고 갱신된 목록을 JSON으로 반환한다."""
         from knowmate.config import get_config, update_watch_folders
