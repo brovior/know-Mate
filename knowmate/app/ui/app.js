@@ -219,8 +219,17 @@ function updateIndexProgressUI(current, total, filename) {
   if (progWrap) progWrap.style.display = "block";
   if (progText) progText.style.display = "block";
   if (progFile) progFile.style.display = "block";
-  if (idxIcon)  idxIcon.textContent = "⟳ 인덱싱 중...";
 
+  // total < 0 : 스캔 단계 (총 건수 미정, 발견 건수만 표시)
+  if (total < 0) {
+    if (idxIcon)  idxIcon.textContent = "⟳ 스캔 중...";
+    if (progBar)  progBar.style.width = "0%";
+    if (progText) progText.textContent = `폴더 스캔 중... ${current}건 발견`;
+    if (progFile) progFile.textContent = "";
+    return;
+  }
+
+  if (idxIcon)  idxIcon.textContent = "⟳ 인덱싱 중...";
   const pct = total > 0 ? Math.round((current / total) * 100) : 0;
   if (progBar)  progBar.style.width = pct + "%";
   if (progText) progText.textContent = `${current}/${total}건`;
