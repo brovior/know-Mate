@@ -43,31 +43,44 @@ def iter_scan_folder(
     cancel_check: True를 반환하면 즉시 순회를 중단한다(취소 지원).
     """
     max_bytes = int(max_file_size_mb * 1024 * 1024)
-    try:
-        for dirpath, _dirs, files in os.walk(folder):
-            if cancel_check and cancel_check():
-                return
-            for fname in files:
-                if cancel_check and cancel_check():
-                    return
-                fpath = Path(dirpath) / fname
-                if fpath.suffix.lower() not in SUPPORTED_EXT:
-                    continue
-                if fname.startswith("~$"):
-                    continue
-                try:
-                    stat = fpath.stat()
-                    if stat.st_size > max_bytes:
-                        logger.warning(
-                            "파일 크기 초과로 인덱싱 제외 (%.1fMB > %.1fMB): %s",
-                            stat.st_size / 1024 / 1024, max_file_size_mb, fpath,
-                        )
+    # os.scandir 스택 순회: 디렉터리 열거 시 크기·수정시각을 함께 받아오고
+    # DirEntry.stat()이 그 캐시를 재사용해 Windows/SMB에서 파일별 stat 왕복이 0이 된다.
+    stack: list[str] = [str(folder)]
+    while stack:
+        if cancel_check and cancel_check():
+            return
+        current_dir = stack.pop()
+        try:
+            with os.scandir(current_dir) as it:
+                for entry in it:
+                    if cancel_check and cancel_check():
+                        return
+                    try:
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                    except OSError as exc:
+                        logger.warning("항목 접근 실패: %s (%s)", entry.path, exc)
                         continue
-                    yield str(fpath), {"mtime": stat.st_mtime, "size": stat.st_size}
-                except OSError as exc:
-                    logger.warning("파일 stat 실패: %s (%s)", fpath, exc)
-    except OSError as exc:
-        logger.error("폴더 스캔 실패: %s (%s)", folder, exc)
+                    if is_dir:
+                        stack.append(entry.path)
+                        continue
+                    name = entry.name
+                    if name.startswith("~$"):
+                        continue
+                    if os.path.splitext(name)[1].lower() not in SUPPORTED_EXT:
+                        continue
+                    try:
+                        st = entry.stat()  # Windows: scandir 캐시 재사용(무 syscall)
+                        if st.st_size > max_bytes:
+                            logger.warning(
+                                "파일 크기 초과로 인덱싱 제외 (%.1fMB > %.1fMB): %s",
+                                st.st_size / 1024 / 1024, max_file_size_mb, entry.path,
+                            )
+                            continue
+                        yield entry.path, {"mtime": st.st_mtime, "size": st.st_size}
+                    except OSError as exc:
+                        logger.warning("파일 stat 실패: %s (%s)", entry.path, exc)
+        except OSError as exc:
+            logger.error("폴더 스캔 실패: %s (%s)", current_dir, exc)
 
 
 def scan_folder(
