@@ -1,7 +1,10 @@
 """확장자 기반 실제 파일 파싱 TextExtractor."""
+import logging
 from pathlib import Path
 
 from knowmate.secure.text_util import format_table
+
+logger = logging.getLogger(__name__)
 
 
 class PlainReader:
@@ -129,7 +132,12 @@ class PlainReader:
         for slide in prs.slides:
             texts: list[str] = []
             for shape in slide.shapes:
-                texts.extend(self._iter_shape_texts(shape))
+                # 도형 1개 실패가 슬라이드·파일 전체를 멈추지 않도록 건별 방어
+                # (SmartArt·OLE·미디어 등 python-pptx가 인식 못 하는 도형 대응)
+                try:
+                    texts.extend(self._iter_shape_texts(shape))
+                except Exception as exc:
+                    logger.debug("pptx 도형 건너뜀 (%s): %s", type(exc).__name__, exc)
             texts = [t for t in texts if t.strip()]
             if texts:
                 slides.append("\n".join(texts))
@@ -139,7 +147,14 @@ class PlainReader:
         """도형 하나에서 텍스트를 추출한다. 그룹은 재귀, 표는 셀을 펼친다."""
         from pptx.enum.shapes import MSO_SHAPE_TYPE  # type: ignore
 
-        if shape.shape_type == MSO_SHAPE_TYPE.GROUP:
+        # shape_type 접근은 인식 못 하는 도형에서 예외를 던지므로 방어한다.
+        # 실패 시 그룹이 아닌 것으로 간주하고 아래 텍스트/표 추출로 진행한다.
+        try:
+            is_group = shape.shape_type == MSO_SHAPE_TYPE.GROUP
+        except Exception:
+            is_group = False
+
+        if is_group:
             out: list[str] = []
             for child in shape.shapes:
                 out.extend(self._iter_shape_texts(child))
