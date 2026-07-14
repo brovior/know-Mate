@@ -15,6 +15,22 @@ _SYSTEM_PROMPT = (
 
 _CONTEXT_SEPARATOR = "\n---\n"
 
+_KO_WEEKDAYS = ["월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"]
+
+
+def _today_context() -> str:
+    """LLM이 상대 날짜(어제/저번주/N주차/최근)를 해석할 기준점 문자열을 만든다."""
+    from datetime import datetime
+
+    now = datetime.now()
+    weekday = _KO_WEEKDAYS[now.weekday()]
+    iso_week = now.isocalendar().week
+    return (
+        f"오늘은 {now.strftime('%Y-%m-%d')} ({weekday}), ISO {iso_week}주차입니다. "
+        "사용자가 '어제', '저번주', 'N주차', '최근' 등 상대 날짜 표현을 쓰면 "
+        "이 날짜를 기준으로 해석하세요."
+    )
+
 # 인증 키가 없을 때 보내는 더미 값. 사내 LLM 서버는 Authorization 헤더가
 # 비어 있으면 호출을 거부하므로, 키 미설정 시 이 더미값을 채워 보낸다.
 _DUMMY_API_KEY = "dummy"
@@ -79,15 +95,18 @@ class LLMClient:
                 f"참고 문서 미리보기:\n{preview}"
             )
 
+        # 상대 날짜 해석을 위해 현재 날짜 문맥을 시스템 프롬프트에 결합
+        system_prompt = f"{_SYSTEM_PROMPT}\n\n{_today_context()}"
+
         if self._mode == "claude":
-            return self._call_claude(query, trimmed)
+            return self._call_claude(query, trimmed, system_prompt)
 
         if self._mode == "openrouter":
-            return self._call_openrouter(query, trimmed)
+            return self._call_openrouter(query, trimmed, system_prompt)
 
-        return self._call_api(query, trimmed)
+        return self._call_api(query, trimmed, system_prompt)
 
-    def _call_claude(self, query: str, context_chunks: list[str]) -> str:
+    def _call_claude(self, query: str, context_chunks: list[str], system_prompt: str) -> str:
         """Anthropic Claude API를 호출해 답변을 반환한다."""
         import anthropic
         context_text = _CONTEXT_SEPARATOR.join(context_chunks)
@@ -97,12 +116,12 @@ class LLMClient:
         message = client.messages.create(
             model=self._model,
             max_tokens=1024,
-            system=_SYSTEM_PROMPT,
+            system=system_prompt,
             messages=[{"role": "user", "content": user_message}],
         )
         return message.content[0].text
 
-    def _call_openrouter(self, query: str, context_chunks: list[str]) -> str:
+    def _call_openrouter(self, query: str, context_chunks: list[str], system_prompt: str) -> str:
         """OpenRouter API(OpenAI 호환)를 호출해 답변을 반환한다."""
         context_text = _CONTEXT_SEPARATOR.join(context_chunks)
         user_message = f"참고 문서:\n{context_text}\n\n질문: {query}"
@@ -110,7 +129,7 @@ class LLMClient:
         payload: dict[str, Any] = {
             "model": self._model,
             "messages": [
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
             ],
         }
@@ -130,7 +149,7 @@ class LLMClient:
             body = json.loads(resp.read().decode("utf-8"))
         return body["choices"][0]["message"]["content"]
 
-    def _call_api(self, query: str, context_chunks: list[str]) -> str:
+    def _call_api(self, query: str, context_chunks: list[str], system_prompt: str) -> str:
         """사내 LLM API /v1/chat/completions를 호출해 답변을 반환한다."""
         context_text = _CONTEXT_SEPARATOR.join(context_chunks)
         user_message = f"참고 문서:\n{context_text}\n\n질문: {query}"
@@ -138,7 +157,7 @@ class LLMClient:
         payload: dict[str, Any] = {
             "model": self._model,
             "messages": [
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_message},
             ],
         }
