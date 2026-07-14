@@ -220,6 +220,15 @@ function updateIndexProgressUI(current, total, filename) {
   if (progText) progText.style.display = "block";
   if (progFile) progFile.style.display = "block";
 
+  // total === -2 : 스트리밍 인덱싱 중 (총계 미정, 처리 건수 카운터)
+  if (total === -2) {
+    if (idxIcon)  idxIcon.textContent = "⟳ 인덱싱 중...";
+    if (progBar)  progBar.style.width = "0%";
+    if (progText) progText.textContent = `인덱싱 중... ${current}건 처리`;
+    if (progFile) progFile.textContent = filename || "";
+    return;
+  }
+
   // total < 0 : 스캔 단계 (총 건수 미정, 발견 건수만 표시)
   if (total < 0) {
     if (idxIcon)  idxIcon.textContent = "⟳ 스캔 중...";

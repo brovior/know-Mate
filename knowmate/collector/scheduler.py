@@ -1,7 +1,6 @@
 """QThread 기반 수집기 워커 + 유휴시간 스케줄러 (CLAUDE.md 5장 원칙8)."""
 from __future__ import annotations
 
-import heapq
 import logging
 import os
 import time
@@ -12,7 +11,7 @@ from typing import Callable, TYPE_CHECKING
 from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal
 
 from knowmate.collector.cleanup import CleanupManager
-from knowmate.collector.scanner import classify_changes, get_scope, scan_folder
+from knowmate.collector.scanner import get_scope, iter_scan_folder
 from knowmate.collector.state import load_state, save_state
 
 if TYPE_CHECKING:
@@ -181,50 +180,77 @@ class CollectorWorker(QThread):
         self._indexer._xlsx_max_rows_per_sheet = xlsx_max_rows_per_sheet
 
         state = load_state(self._state_file)
-        heap = []
 
-        # 스캔 하트비트: total=-1 을 스캔 단계 신호로 사용 (네트워크 드라이브 지연 대비)
-        scan_found_base = 0
+        # ── 스캔·인덱싱 파이프라인 (하이브리드) ──────────────────────────
+        # 생산자 스레드: 폴더를 walk 하며 신규/변경 파일을 큐에 넣는다(os.walk+stat만).
+        # 소비자(현재 스레드): 큐에서 꺼내 즉시 인덱싱(추출·임베딩·LanceDB 쓰기는 여기서만).
+        # 열거 완료 전엔 total 미정(-2)으로, 완료 후엔 확정 total 로 진행률을 emit 한다.
+        import queue as _queue
+        import threading as _threading
 
-        def _scan_progress(found: int) -> None:
-            # 폴더별 콜백은 해당 폴더 누적 발견 건수를 넘김 → 이전 폴더 합계와 합산
-            self.progress.emit(scan_found_base + found, -1, "스캔 중...")
+        task_queue: "_queue.Queue" = _queue.Queue()
+        _SENTINEL = None
+        producer_state = {"total": None, "seen": set()}
 
-        for folder_str in watch_folders:
-            folder = Path(folder_str)
-            if not folder.exists():
-                logger.warning("watch_folder 없음: %s", folder_str)
-                continue
-            current = scan_folder(
-                folder,
-                max_file_size_mb=max_file_size_mb,
-                on_progress=_scan_progress,
-            )
-            scan_found_base += len(current)
-            new_paths, mod_paths, _ = classify_changes(state, current)
-            for p in new_paths:
-                heapq.heappush(heap, IndexTask(PRIORITY_NEW, p, "new"))
-            for p in mod_paths:
-                heapq.heappush(heap, IndexTask(PRIORITY_MODIFIED, p, "modified"))
+        logger.info("[collector] 작업 시작 — 폴더 스캔·인덱싱 파이프라인")
+        self.progress.emit(0, -2, "인덱싱 시작...")
 
-        total = len(heap)
+        def _producer() -> None:
+            found = 0
+            try:
+                for folder_str in watch_folders:
+                    folder = Path(folder_str)
+                    if not folder.exists():
+                        logger.warning("watch_folder 없음: %s", folder_str)
+                        continue
+                    for path, meta in iter_scan_folder(
+                        folder,
+                        max_file_size_mb=max_file_size_mb,
+                        cancel_check=lambda: self._cancelled,
+                    ):
+                        if self._cancelled:
+                            break
+                        producer_state["seen"].add(path)
+                        prev = state.get(path)
+                        if prev is None:
+                            action = "new"
+                        elif meta["mtime"] != prev.get("mtime") or meta["size"] != prev.get("size"):
+                            action = "modified"
+                        else:
+                            continue  # 변경 없음 → 인덱싱 대상 아님
+                        priority = PRIORITY_NEW if action == "new" else PRIORITY_MODIFIED
+                        task_queue.put(IndexTask(priority, path, action))
+                        found += 1
+                    if self._cancelled:
+                        break
+            except Exception as exc:
+                logger.exception("[collector] 스캔 생산자 예외: %s", exc)
+            finally:
+                producer_state["total"] = found  # 확정 총계
+                task_queue.put(_SENTINEL)         # 소비자 종료 신호(무한대기 방지)
+
+        producer = _threading.Thread(target=_producer, name="scan-producer", daemon=True)
+        producer.start()
+
         done = 0
         failed = []
 
-        # 시작 시 한 번 알림 (total=0 이면 즉시 완료 흐름으로 넘어감)
-        self.progress.emit(0, total, "스캔 완료" if total == 0 else "")
-
-        while heap:
+        while True:
+            task = task_queue.get()
+            if task is _SENTINEL:
+                break
             if self._cancelled:
                 logger.info("수집기 취소됨")
-                self.finished.emit(f"인덱싱 취소됨 ({done}/{total}건 처리 완료)")
+                self.finished.emit(f"인덱싱 취소됨 ({done}건 처리 완료)")
+                producer.join(timeout=5)
                 save_state(self._state_file, state)
                 return
 
-            task = heapq.heappop(heap)
             filename = Path(task.path).name
             done += 1
-            self.progress.emit(done, total, filename)
+            # 생산자 완료 시 확정 total(>0), 진행 중이면 -2(총계 미정)
+            total_known = producer_state["total"]
+            self.progress.emit(done, total_known if total_known is not None else -2, filename)
 
             try:
                 logger.debug("[단계1] 텍스트 추출 시작: %s", task.path)
@@ -257,6 +283,9 @@ class CollectorWorker(QThread):
             except Exception as exc:
                 logger.error("파일 처리 실패 (건너뜀): %s - %s", task.path, exc)
                 failed.append(task.path)
+
+        # 생산자 스레드 정리 (정상 종료 시 이미 끝나 있음)
+        producer.join(timeout=5)
 
         # watch_folders에서 제거된 폴더의 청크를 정리한다 (dry_run 준수)
         self._purge_removed_folders(watch_folders, state, dry_run=dry_run)
