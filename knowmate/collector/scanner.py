@@ -2,7 +2,7 @@
 import logging
 import os
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -31,26 +31,25 @@ def get_scope(path: str) -> str:
     return "local"
 
 
-def scan_folder(
+def iter_scan_folder(
     folder: Path,
     max_file_size_mb: float = 30.0,
-    on_progress: Callable[[int], None] | None = None,
-) -> dict[str, dict]:
-    """지원 확장자 파일의 mtime 과 size 를 수집해 반환한다.
+    cancel_check: Callable[[], bool] | None = None,
+) -> Iterator[tuple[str, dict]]:
+    """지원 확장자 파일을 walk 하며 (절대경로, {"mtime","size"})를 하나씩 yield 한다.
 
-    반환 dict 키는 str(절대경로), 값은 {"mtime": float, "size": int}.
+    스트리밍 인덱싱용 — 트리 전체 열거를 기다리지 않고 발견 즉시 소비할 수 있다.
     max_file_size_mb 초과 파일은 WARNING 로그 후 제외한다.
-    on_progress: 열거 진행 중 주기적으로 (누적 발견 건수)로 호출된다(네트워크 드라이브 지연 대비 하트비트).
+    cancel_check: True를 반환하면 즉시 순회를 중단한다(취소 지원).
     """
     max_bytes = int(max_file_size_mb * 1024 * 1024)
-    result: dict[str, dict] = {}
-    walked = 0
     try:
         for dirpath, _dirs, files in os.walk(folder):
+            if cancel_check and cancel_check():
+                return
             for fname in files:
-                walked += 1
-                if on_progress and walked % _SCAN_HEARTBEAT_EVERY == 0:
-                    on_progress(len(result))
+                if cancel_check and cancel_check():
+                    return
                 fpath = Path(dirpath) / fname
                 if fpath.suffix.lower() not in SUPPORTED_EXT:
                     continue
@@ -64,14 +63,30 @@ def scan_folder(
                             stat.st_size / 1024 / 1024, max_file_size_mb, fpath,
                         )
                         continue
-                    result[str(fpath)] = {
-                        "mtime": stat.st_mtime,
-                        "size": stat.st_size,
-                    }
+                    yield str(fpath), {"mtime": stat.st_mtime, "size": stat.st_size}
                 except OSError as exc:
                     logger.warning("파일 stat 실패: %s (%s)", fpath, exc)
     except OSError as exc:
         logger.error("폴더 스캔 실패: %s (%s)", folder, exc)
+
+
+def scan_folder(
+    folder: Path,
+    max_file_size_mb: float = 30.0,
+    on_progress: Callable[[int], None] | None = None,
+) -> dict[str, dict]:
+    """지원 확장자 파일의 mtime 과 size 를 수집해 dict로 반환한다(iter_scan_folder 래퍼).
+
+    반환 dict 키는 str(절대경로), 값은 {"mtime": float, "size": int}.
+    on_progress: 열거 진행 중 주기적으로 (누적 발견 건수)로 호출된다(네트워크 드라이브 지연 대비 하트비트).
+    """
+    result: dict[str, dict] = {}
+    found = 0
+    for path, meta in iter_scan_folder(folder, max_file_size_mb=max_file_size_mb):
+        result[path] = meta
+        found += 1
+        if on_progress and found % _SCAN_HEARTBEAT_EVERY == 0:
+            on_progress(found)
     if on_progress:
         on_progress(len(result))   # 폴더 종료 시 최종 발견 건수 반영
     return result
