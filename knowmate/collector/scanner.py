@@ -2,8 +2,12 @@
 import logging
 import os
 from pathlib import Path
+from typing import Callable
 
 logger = logging.getLogger(__name__)
+
+# 스캔 하트비트: 열거한 파일이 이 개수만큼 늘 때마다 on_progress 호출
+_SCAN_HEARTBEAT_EVERY = 100
 
 SUPPORTED_EXT = {".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".pdf", ".txt"}
 
@@ -27,17 +31,26 @@ def get_scope(path: str) -> str:
     return "local"
 
 
-def scan_folder(folder: Path, max_file_size_mb: float = 30.0) -> dict[str, dict]:
+def scan_folder(
+    folder: Path,
+    max_file_size_mb: float = 30.0,
+    on_progress: Callable[[int], None] | None = None,
+) -> dict[str, dict]:
     """지원 확장자 파일의 mtime 과 size 를 수집해 반환한다.
 
     반환 dict 키는 str(절대경로), 값은 {"mtime": float, "size": int}.
     max_file_size_mb 초과 파일은 WARNING 로그 후 제외한다.
+    on_progress: 열거 진행 중 주기적으로 (누적 발견 건수)로 호출된다(네트워크 드라이브 지연 대비 하트비트).
     """
     max_bytes = int(max_file_size_mb * 1024 * 1024)
     result: dict[str, dict] = {}
+    walked = 0
     try:
         for dirpath, _dirs, files in os.walk(folder):
             for fname in files:
+                walked += 1
+                if on_progress and walked % _SCAN_HEARTBEAT_EVERY == 0:
+                    on_progress(len(result))
                 fpath = Path(dirpath) / fname
                 if fpath.suffix.lower() not in SUPPORTED_EXT:
                     continue
@@ -59,6 +72,8 @@ def scan_folder(folder: Path, max_file_size_mb: float = 30.0) -> dict[str, dict]
                     logger.warning("파일 stat 실패: %s (%s)", fpath, exc)
     except OSError as exc:
         logger.error("폴더 스캔 실패: %s (%s)", folder, exc)
+    if on_progress:
+        on_progress(len(result))   # 폴더 종료 시 최종 발견 건수 반영
     return result
 
 

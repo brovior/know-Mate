@@ -183,12 +183,24 @@ class CollectorWorker(QThread):
         state = load_state(self._state_file)
         heap = []
 
+        # 스캔 하트비트: total=-1 을 스캔 단계 신호로 사용 (네트워크 드라이브 지연 대비)
+        scan_found_base = 0
+
+        def _scan_progress(found: int) -> None:
+            # 폴더별 콜백은 해당 폴더 누적 발견 건수를 넘김 → 이전 폴더 합계와 합산
+            self.progress.emit(scan_found_base + found, -1, "스캔 중...")
+
         for folder_str in watch_folders:
             folder = Path(folder_str)
             if not folder.exists():
                 logger.warning("watch_folder 없음: %s", folder_str)
                 continue
-            current = scan_folder(folder, max_file_size_mb=max_file_size_mb)
+            current = scan_folder(
+                folder,
+                max_file_size_mb=max_file_size_mb,
+                on_progress=_scan_progress,
+            )
+            scan_found_base += len(current)
             new_paths, mod_paths, _ = classify_changes(state, current)
             for p in new_paths:
                 heapq.heappush(heap, IndexTask(PRIORITY_NEW, p, "new"))
