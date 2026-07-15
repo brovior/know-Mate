@@ -34,6 +34,9 @@ llm:
   host_header: llm.internal
   max_context_tokens: 4096
 mail:
-  enabled: true            # watch_folders 내 .mysingle 자동 인덱싱 (false로 끄기)
+  enabled: true            # watch_folders 내 메일 파일 자동 인덱싱 (false로 끄기)
+  extensions:              # 인덱싱할 메일 확장자 (.mysingle=Knox, .eml=표준 이메일)
+  - .mysingle
+  - .eml
   max_mails_per_scan: 500  # 스캔당 처리 상한 (최신 mtime 순)
   batch_commit_every: 50   # state 중간 저장 주기

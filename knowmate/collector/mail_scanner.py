@@ -11,24 +11,31 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def scan_mail_folders(watch_folders: list[str], max_per_scan: int) -> list[dict]:
+_DEFAULT_MAIL_EXTS = [".mysingle", ".eml"]
+
+
+def scan_mail_folders(
+    watch_folders: list[str], max_per_scan: int, extensions: list[str] | None = None
+) -> list[dict]:
     """
-    watch_folders 에서 .mysingle 파일을 수집해 최신 mtime 순으로 반환한다.
+    watch_folders 에서 메일 파일(.mysingle/.eml)을 수집해 최신 mtime 순으로 반환한다.
 
     반환: [{"path": str, "mtime": float}, ...]
     """
+    exts = extensions or _DEFAULT_MAIL_EXTS
     found: list[dict] = []
     for folder_str in watch_folders:
         folder = Path(folder_str)
         if not folder.is_dir():
             logger.warning("[mail_scanner] 폴더 접근 불가, 건너뜀: %s", folder_str)
             continue
-        for p in folder.rglob("*.mysingle"):
-            try:
-                mtime = p.stat().st_mtime
-                found.append({"path": str(p), "mtime": mtime})
-            except OSError as exc:
-                logger.warning("[mail_scanner] stat 실패: %s (%s)", p, exc)
+        for ext in exts:
+            for p in folder.rglob(f"*{ext}"):
+                try:
+                    mtime = p.stat().st_mtime
+                    found.append({"path": str(p), "mtime": mtime})
+                except OSError as exc:
+                    logger.warning("[mail_scanner] stat 실패: %s (%s)", p, exc)
 
     found.sort(key=lambda x: x["mtime"], reverse=True)
     return found[:max_per_scan]
@@ -49,13 +56,14 @@ def run_mail_scan(
 
     반환: (인덱싱 건수, 건너뜀 건수)
     """
-    from knowmate.secure.mysingle_reader import parse_mysingle
+    from knowmate.secure.mysingle_reader import parse_mail_file
 
     mail_cfg = cfg.get("mail", {})
     max_per_scan = mail_cfg.get("max_mails_per_scan", 500)
     batch_every = mail_cfg.get("batch_commit_every", 50)
+    extensions = mail_cfg.get("extensions", _DEFAULT_MAIL_EXTS)
 
-    candidates = scan_mail_folders(watch_folders, max_per_scan)
+    candidates = scan_mail_folders(watch_folders, max_per_scan, extensions)
     indexed_count = 0
     skipped_count = 0
     migrate_count = 0       # 버전 불일치로 재인덱싱된 건수
@@ -80,7 +88,7 @@ def run_mail_scan(
             migrate_logged = True
 
         try:
-            parsed = parse_mysingle(path)
+            parsed = parse_mail_file(path)
         except Exception as exc:
             logger.warning("[mail_scanner] 파싱 실패, 건너뜀: %s (%s)", path, exc)
             skipped_count += 1
