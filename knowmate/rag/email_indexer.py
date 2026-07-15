@@ -175,7 +175,7 @@ class EmailIndexer:
                     "miss_count":      0,
                     "mtime":           mtime,
                     "mail_uid":        parsed["mail_uid"],
-                    "source_type":     "knox",
+                    "source_type":     parsed.get("source_type", "knox"),
                     "message_id":      parsed["message_id"],
                     "subject":         parsed["subject"],
                     "sender":          parsed["sender"],

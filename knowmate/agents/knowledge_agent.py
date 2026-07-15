@@ -8,6 +8,9 @@ from knowmate.agents.base import Block, TextBlock, SourcesBlock, SourceItem
 
 logger = logging.getLogger(__name__)
 
+# 메일로 취급하는 source_type (emails 테이블 청크 판별용)
+MAIL_SOURCE_TYPES = {"knox", "outlook", "eml"}
+
 
 def _mock_blocks(query: str, error: str = "") -> list[Block]:
     """RAG 파이프라인 미초기화 시 반환할 안내 블록."""
@@ -29,8 +32,8 @@ def _to_source_item(chunk: dict[str, Any]) -> SourceItem:
     source_type = chunk.get("source_type", "")
     score = float(chunk.get("score", 0.0))
 
-    # emails 테이블 청크: source_type="knox" 또는 file_type="msg"/"eml"
-    is_mail = source_type in {"knox", "outlook"} or file_type in {"msg", "eml"}
+    # emails 테이블 청크: source_type이 메일 계열 또는 file_type="msg"/"eml"
+    is_mail = source_type in MAIL_SOURCE_TYPES or file_type in {"msg", "eml"}
 
     if is_mail:
         badge = "메일"
@@ -59,7 +62,7 @@ def _dedupe_sources(chunks: list[dict[str, Any]]) -> list[SourceItem]:
     for chunk in chunks:
         # 메일은 source_file, 문서는 file_path 기준으로 dedup
         source_type = chunk.get("source_type", "")
-        if source_type in {"knox", "outlook"}:
+        if source_type in MAIL_SOURCE_TYPES:
             key = chunk.get("source_file") or chunk.get("file_path", "")
         else:
             key = chunk.get("file_path", "")
@@ -166,7 +169,7 @@ class KnowledgeAgent:
 
         def _chunk_context(c: dict) -> str:
             text = c.get("text", "")
-            if c.get("source_type") in {"knox", "outlook"}:
+            if c.get("source_type") in MAIL_SOURCE_TYPES:
                 header = (
                     f"[메일] 제목: {c.get('subject', '')} | "
                     f"발신: {c.get('sender', '')} | "

@@ -213,3 +213,49 @@ class TestMailScanner:
         """mail.enabled=false이면 스캔 분기에 진입하지 않는다."""
         cfg = {"mail": {"enabled": False}}
         assert not cfg.get("mail", {}).get("enabled", False)
+
+
+# ---------------------------------------------------------------------------
+# .eml (표준 이메일) 지원 테스트
+# ---------------------------------------------------------------------------
+
+_EML_SAMPLE = (
+    "MIME-Version: 1.0\r\n"
+    "From: alice@company.com\r\n"
+    "To: bob@company.com\r\n"
+    "Subject: 3월 점검 결과\r\n"
+    "Date: Mon, 16 Jun 2025 14:23:00 +0900\r\n"
+    "Message-ID: <eml-test-001@company.com>\r\n"
+    "Content-Type: text/html; charset=UTF-8\r\n\r\n"
+    "<html><body>설비 점검 완료했습니다.</body></html>\r\n"
+)
+
+
+class TestEmlSupport:
+    def test_parse_eml_source_type(self, tmp_path):
+        """.eml은 source_type='eml', mail_uid는 eml: 접두를 가진다."""
+        from knowmate.secure.mysingle_reader import parse_mail_file
+        p = tmp_path / "mail.eml"
+        p.write_text(_EML_SAMPLE, encoding="utf-8")
+        r = parse_mail_file(str(p))
+        assert r["source_type"] == "eml"
+        assert r["mail_uid"] == "eml:<eml-test-001@company.com>"
+        assert r["subject"] == "3월 점검 결과"
+        assert "설비 점검" in r["body_text"]
+
+    def test_mysingle_still_knox(self):
+        """.mysingle은 여전히 source_type='knox', knox: 접두 (회귀 방지)."""
+        from knowmate.secure.mysingle_reader import parse_mail_file
+        r = parse_mail_file(str(FIXTURES / "sample.mysingle"))
+        assert r["source_type"] == "knox"
+        assert r["mail_uid"].startswith("knox:")
+
+    def test_scan_finds_both_extensions(self, tmp_path):
+        """scan_mail_folders가 .mysingle과 .eml을 모두 탐지한다."""
+        (tmp_path / "a.mysingle").write_bytes(b"test")
+        (tmp_path / "b.eml").write_bytes(b"test")
+        (tmp_path / "c.txt").write_bytes(b"not mail")
+        from knowmate.collector.mail_scanner import scan_mail_folders
+        results = scan_mail_folders([str(tmp_path)], max_per_scan=100)
+        names = sorted(Path(r["path"]).name for r in results)
+        assert names == ["a.mysingle", "b.eml"]
