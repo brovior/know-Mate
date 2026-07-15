@@ -12,11 +12,11 @@ os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 from PyQt6.QtCore import QFile, QIODevice, QUrl, Qt
-from PyQt6.QtGui import QIcon
+from PyQt6.QtGui import QIcon, QAction
 from PyQt6.QtWebEngineCore import QWebEngineScript
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWebChannel import QWebChannel
-from PyQt6.QtWidgets import QApplication, QMainWindow, QSizeGrip
+from PyQt6.QtWidgets import QApplication, QMainWindow, QSizeGrip, QSystemTrayIcon, QMenu
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -39,6 +39,9 @@ class MainWindow(QMainWindow):
         self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Window)
         self.resize(1100, 700)
 
+        self._tray: QSystemTrayIcon | None = None
+        self._really_quit = False
+
         self._view = QWebEngineView(self)
         self.setCentralWidget(self._view)
 
@@ -53,9 +56,61 @@ class MainWindow(QMainWindow):
         self._view.page().setWebChannel(self._channel)
 
         self._init_collector()
+        self._init_tray()
 
         _inject_qwebchannel_js(self._view)
         self._view.load(QUrl.fromLocalFile(str(UI_DIR / "index.html")))
+
+    def _init_tray(self) -> None:
+        """시스템 트레이 아이콘과 메뉴를 초기화한다. 창을 닫아도 백그라운드 상주한다."""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            logger.debug("시스템 트레이 사용 불가 — 트레이 상주 비활성")
+            return
+
+        icon = QIcon(str(APP_ICON)) if APP_ICON.exists() else self.windowIcon()
+        self._tray = QSystemTrayIcon(icon, self)
+        self._tray.setToolTip("Aegis Desk")
+
+        menu = QMenu()
+        act_open = QAction("열기", self)
+        act_open.triggered.connect(self._show_from_tray)
+        act_reindex = QAction("지금 재인덱싱", self)
+        act_reindex.triggered.connect(self._tray_reindex)
+        act_quit = QAction("종료", self)
+        act_quit.triggered.connect(self._quit_app)
+        menu.addAction(act_open)
+        menu.addAction(act_reindex)
+        menu.addSeparator()
+        menu.addAction(act_quit)
+
+        self._tray.setContextMenu(menu)
+        self._tray.activated.connect(self._on_tray_activated)
+        self._tray.show()
+
+    def _on_tray_activated(self, reason) -> None:
+        """트레이 아이콘 클릭(더블클릭 포함) 시 창을 복원한다."""
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self._show_from_tray()
+
+    def _show_from_tray(self) -> None:
+        """트레이에서 창을 복원하고 앞으로 가져온다."""
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _tray_reindex(self) -> None:
+        """트레이 메뉴에서 재인덱싱을 트리거한다(진행 중이면 무시)."""
+        worker = getattr(self._bridge, "_worker", None)
+        if worker is not None and not worker.isRunning():
+            worker.start()
+
+    def _quit_app(self) -> None:
+        """트레이 '종료' — 실제 앱 종료 플래그를 세우고 닫는다."""
+        self._really_quit = True
+        self.close()
 
     def _init_collector(self) -> None:
         """수집기 파이프라인을 초기화하고 IdleScheduler를 시작한다."""
@@ -138,7 +193,22 @@ class MainWindow(QMainWindow):
         self._grip.move(self.width() - 16, self.height() - 16)
 
     def closeEvent(self, event) -> None:
-        """앱 종료 시 스케줄러·워커를 정리해 스레드 누수를 방지한다."""
+        """X/닫기 시 트레이가 있으면 종료 대신 트레이로 숨긴다. 실제 종료는 _quit_app 경유."""
+        if self._tray is not None and not self._really_quit:
+            event.ignore()
+            self.hide()
+            self._tray.showMessage(
+                "Aegis Desk",
+                "백그라운드에서 계속 실행 중입니다. 트레이 아이콘에서 종료할 수 있습니다.",
+                QSystemTrayIcon.MessageIcon.Information,
+                3000,
+            )
+            return
+        self._shutdown()
+        super().closeEvent(event)
+
+    def _shutdown(self) -> None:
+        """스케줄러·워커·트레이를 정리해 스레드 누수를 방지한다."""
         try:
             scheduler = getattr(self, "_idle_scheduler", None)
             if scheduler is not None:
@@ -148,9 +218,10 @@ class MainWindow(QMainWindow):
                 worker.cancel()
                 # 현재 처리 중인 파일 완료 후 종료될 때까지 대기 (최대 10초)
                 worker.wait(10000)
+            if self._tray is not None:
+                self._tray.hide()
         except Exception as exc:
             logger.warning("종료 정리 중 예외: %s", exc)
-        super().closeEvent(event)
 
 
 def _inject_qwebchannel_js(view: QWebEngineView) -> None:
