@@ -21,6 +21,7 @@ search:
   rerank_enabled: false
 collector:
   watch_folders: []        # 배포 기본값은 비움. 앱의 [폴더 관리]에서 사용자별로 지정
+  idle_enabled: true       # 유휴 시간 경과 시 자동 인덱싱 여부
   idle_seconds: 60
 cleanup:
   dry_run: true
@@ -39,3 +40,5 @@ mail:
   - .eml
   max_mails_per_scan: 500  # 스캔당 처리 상한 (최신 mtime 순)
   batch_commit_every: 50   # state 중간 저장 주기
+ui:
+  close_action: tray       # 닫기(X) 버튼 동작: tray(트레이로 숨김) | quit(앱 종료)

@@ -104,6 +104,7 @@ html, body { height: 100%; font-family: 'Malgun Gothic', sans-serif; font-size: 
 .btn-reindex:hover { background: var(--primary-light); }
 .btn-folder  { padding: 6px 10px; font-size: 12px; border: 1px solid var(--border-dark); color: var(--text-sub); background: transparent; border-radius: 6px; cursor: pointer; font-family: inherit; display: flex; align-items: center; gap: 4px; transition: background 0.15s; }
 .btn-folder:hover { background: var(--border); }
+.btn-settings-gear { padding: 6px 8px; flex-shrink: 0; }
 .btn-new-chat { width: 100%; padding: 8px; background: var(--primary); color: #fff; border: none; border-radius: 8px; font-size: 13px; font-family: inherit; cursor: pointer; transition: opacity 0.15s; }
 .btn-new-chat:hover { opacity: 0.9; }
 
@@ -211,3 +212,65 @@ html, body { height: 100%; font-family: 'Malgun Gothic', sans-serif; font-size: 
 /* ===== 토스트 ===== */
 .toast { position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%); background: #1F2937; color: #fff; padding: 10px 20px; border-radius: 8px; font-size: 13px; z-index: 200; opacity: 0; transition: opacity 0.2s; pointer-events: none; }
 .toast.show { opacity: 1; }
+
+/* ===== 설정 패널 ===== */
+.settings-card {
+  background: var(--bg); border-radius: 14px; border: 1px solid var(--border);
+  width: 480px; max-height: 640px; box-shadow: 0 8px 32px rgba(0,0,0,0.15);
+  display: flex; flex-direction: column;
+}
+.settings-header { padding: 22px 28px 14px; border-bottom: 1px solid var(--border); }
+.settings-title { font-size: 17px; font-weight: 700; color: var(--text-main); }
+.settings-sub    { font-size: 12px; color: var(--text-sub); margin-top: 4px; }
+.settings-body { padding: 8px 28px 4px; overflow-y: auto; flex: 1; }
+.settings-sec { margin: 18px 0; }
+.settings-sec-title { font-size: 12px; font-weight: 700; color: var(--text-sub); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 10px; }
+.settings-field { margin-bottom: 12px; }
+.settings-field-label { font-size: 13px; color: var(--text-main); margin-bottom: 5px; display: flex; justify-content: space-between; }
+.settings-field-label .val { color: var(--primary); font-weight: 600; }
+.settings-field-hint { font-size: 11px; color: var(--text-hint); margin-top: 4px; line-height: 1.4; }
+.settings-field input[type=text] {
+  width: 100%; padding: 7px 10px; border: 1px solid var(--border-dark); border-radius: 7px;
+  font-size: 13px; font-family: inherit; color: var(--text-main);
+}
+.settings-field input[type=range] { width: 100%; accent-color: var(--primary); }
+.settings-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; }
+.settings-row-label { font-size: 13px; color: var(--text-main); }
+.settings-row-hint  { font-size: 11px; color: var(--text-hint); margin-top: 2px; }
+
+/* 토글 스위치 */
+.switch { position: relative; width: 38px; height: 21px; flex-shrink: 0; display: inline-block; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.switch .slider { position: absolute; inset: 0; background: var(--border-dark); border-radius: 21px; cursor: pointer; transition: 0.15s; }
+.switch .slider::before { content: ""; position: absolute; width: 17px; height: 17px; left: 2px; top: 2px; background: white; border-radius: 50%; transition: 0.15s; }
+.switch input:checked + .slider { background: var(--primary); }
+.switch input:checked + .slider::before { transform: translateX(17px); }
+
+/* 세그먼트형 라디오(닫기 동작, 로그 레벨) */
+.settings-seg { display: flex; border: 1px solid var(--border-dark); border-radius: 8px; overflow: hidden; }
+.settings-seg-btn { flex: 1; padding: 6px 0; font-size: 12px; text-align: center; cursor: pointer; background: transparent; color: var(--text-sub); border: none; font-family: inherit; transition: background 0.1s; }
+.settings-seg-btn.active { background: var(--primary); color: #fff; font-weight: 500; }
+
+.test-btn {
+  display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--primary);
+  background: var(--primary-light); border: none; border-radius: 6px; padding: 6px 12px;
+  cursor: pointer; margin-top: 6px; font-family: inherit;
+}
+.test-result { font-size: 12px; margin-top: 6px; display: flex; align-items: center; gap: 5px; }
+.test-ok  { color: var(--teal-text); }
+.test-fail { color: #C42B1C; }
+
+.advanced-link {
+  display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-sub);
+  padding: 10px 0; cursor: pointer; border-top: 1px solid var(--border); margin-top: 8px;
+  background: none; border-left: none; border-right: none; border-bottom: none; width: 100%; font-family: inherit;
+}
+.advanced-link:hover { color: var(--primary); }
+
+.settings-footer {
+  padding: 14px 28px; border-top: 1px solid var(--border);
+  display: flex; gap: 8px; justify-content: flex-end;
+}
+.btn-settings-save   { padding: 9px 20px; background: var(--primary); color: #fff; border: none; border-radius: 8px; font-size: 13px; cursor: pointer; font-family: inherit; }
+.btn-settings-cancel { padding: 9px 16px; background: none; border: 1px solid var(--border-dark); border-radius: 8px; font-size: 13px; color: var(--text-sub); cursor: pointer; font-family: inherit; }
+.settings-save-notice { font-size: 11px; color: var(--text-hint); margin-right: auto; align-self: center; }

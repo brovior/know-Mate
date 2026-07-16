@@ -165,17 +165,20 @@ class MainWindow(QMainWindow):
             # 단일 워커를 생성해 bridge에 연결한다 (수동·유휴 인덱싱 공유)
             self._make_worker()
 
-            # 유휴시간 자동 인덱싱 스케줄러 (6-7)
+            # 유휴시간 자동 인덱싱 스케줄러 (6-7). 설정에서 끌 수 있다(collector.idle_enabled).
             # 동일한 단일 워커를 재사용해 동시 실행을 방지한다.
-            idle_sec = cfg.get("collector", {}).get("idle_seconds", 60)
-            self._idle_scheduler = IdleScheduler(
-                trigger=self._trigger_idle_index,
-                is_busy=lambda: self._bridge._worker is not None
-                and self._bridge._worker.isRunning(),
-                idle_seconds=idle_sec,
-                parent=self,
-            )
-            self._idle_scheduler.start()
+            if cfg.get("collector", {}).get("idle_enabled", True):
+                idle_sec = cfg.get("collector", {}).get("idle_seconds", 60)
+                self._idle_scheduler = IdleScheduler(
+                    trigger=self._trigger_idle_index,
+                    is_busy=lambda: self._bridge._worker is not None
+                    and self._bridge._worker.isRunning(),
+                    idle_seconds=idle_sec,
+                    parent=self,
+                )
+                self._idle_scheduler.start()
+            else:
+                logger.info("유휴 자동 인덱싱 비활성화됨 (collector.idle_enabled=false)")
 
         except Exception as exc:
             logger.warning("수집기 초기화 실패: %s", exc)
@@ -204,8 +207,13 @@ class MainWindow(QMainWindow):
         self._grip.move(self.width() - 16, self.height() - 16)
 
     def closeEvent(self, event) -> None:
-        """X/닫기 시 트레이가 있으면 종료 대신 트레이로 숨긴다. 실제 종료는 _quit_app 경유."""
-        if self._tray is not None and not self._really_quit:
+        """X/닫기 시 트레이가 있고 설정이 tray면 종료 대신 트레이로 숨긴다.
+
+        ui.close_action 설정(tray|quit)으로 사용자가 동작을 바꿀 수 있다.
+        실제 종료는 _quit_app 경유(트레이 메뉴의 [종료]) 또는 close_action=quit.
+        """
+        close_action = getattr(self, "_cfg", {}).get("ui", {}).get("close_action", "tray")
+        if self._tray is not None and close_action == "tray" and not self._really_quit:
             event.ignore()
             self.hide()
             self._tray.showMessage(

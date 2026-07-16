@@ -89,6 +89,9 @@
           <button class="btn-folder" onclick="openOnboarding()">
             <i class="ti ti-folder" style="font-size:14px;"></i> 폴더 관리
           </button>
+          <button class="btn-folder btn-settings-gear" onclick="openSettings()" title="설정">
+            <i class="ti ti-settings" style="font-size:14px;"></i>
+          </button>
         </div>
 
         <button class="btn-new-chat" onclick="newThread()">+ 새 대화</button>
@@ -140,6 +143,120 @@
         <i class="ti ti-refresh" style="font-size:14px;"></i> 인덱싱 시작
       </button>
       <button class="btn-ob-cancel" onclick="closeOnboarding()">취소</button>
+    </div>
+  </div>
+</div>
+
+<!-- 설정 오버레이 -->
+<div class="overlay" id="settingsOverlay">
+  <div class="settings-card">
+    <div class="settings-header">
+      <div class="settings-title">⚙ 설정</div>
+      <div class="settings-sub">변경 후 [저장]을 누르면 다음 재시작부터 적용됩니다.</div>
+    </div>
+
+    <div class="settings-body">
+
+      <!-- 연결 -->
+      <div class="settings-sec">
+        <div class="settings-sec-title">연결</div>
+        <div class="settings-field">
+          <div class="settings-field-label">LLM 서버 주소</div>
+          <input type="text" id="setLlmUrl">
+        </div>
+        <div class="settings-field">
+          <div class="settings-field-label">LLM 모델명</div>
+          <input type="text" id="setLlmModel">
+        </div>
+        <div class="settings-field">
+          <div class="settings-field-label">임베딩 서버 주소</div>
+          <input type="text" id="setEmbedUrl">
+        </div>
+        <div class="settings-field">
+          <div class="settings-field-label">임베딩 모델 <span class="val" id="setEmbedModel">-</span></div>
+          <div class="settings-field-hint">고정값(읽기 전용) — 이미 인덱싱된 문서와 벡터 차원이 맞아야 하므로 변경할 수 없습니다.</div>
+        </div>
+        <button class="test-btn" onclick="testConnection()">🔌 연결 테스트</button>
+        <div id="testResults"></div>
+      </div>
+
+      <!-- 검색 -->
+      <div class="settings-sec">
+        <div class="settings-sec-title">검색</div>
+        <div class="settings-field">
+          <div class="settings-field-label">검색 엄격도 <span class="val" id="valScoreThreshold">0.30</span></div>
+          <input type="range" id="setScoreThreshold" min="0" max="0.7" step="0.05" value="0.3"
+            oninput="document.getElementById('valScoreThreshold').textContent = parseFloat(this.value).toFixed(2)">
+          <div class="settings-field-hint">높이면 확실히 관련된 문서만 답변에 사용합니다(결과 수 감소). 낮추면 더 폭넓게 참고합니다.</div>
+        </div>
+        <div class="settings-field">
+          <div class="settings-field-label">답변 참고 문서 수 <span class="val" id="valTopK">10건</span></div>
+          <input type="range" id="setTopK" min="3" max="20" step="1" value="10"
+            oninput="document.getElementById('valTopK').textContent = this.value + '건'">
+        </div>
+      </div>
+
+      <!-- 인덱싱 -->
+      <div class="settings-sec">
+        <div class="settings-sec-title">인덱싱</div>
+        <div class="settings-row">
+          <div>
+            <div class="settings-row-label">유휴 시 자동 인덱싱</div>
+            <div class="settings-row-hint">자리를 비우면 자동으로 새 문서를 인덱싱합니다</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="setIdleEnabled"><span class="slider"></span></label>
+        </div>
+        <div class="settings-field">
+          <div class="settings-field-label">자동 인덱싱 대기 시간 <span class="val" id="valIdleSeconds">60초</span></div>
+          <input type="range" id="setIdleSeconds" min="30" max="1800" step="30" value="60"
+            oninput="document.getElementById('valIdleSeconds').textContent = this.value + '초'">
+        </div>
+        <div class="settings-row">
+          <div>
+            <div class="settings-row-label">메일 인덱싱 사용</div>
+            <div class="settings-row-hint">.mysingle / .eml 파일 자동 인덱싱</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="setMailEnabled"><span class="slider"></span></label>
+        </div>
+        <div class="settings-field">
+          <div class="settings-field-label">최대 파일 크기 <span class="val" id="valMaxFileSize">30MB</span></div>
+          <input type="range" id="setMaxFileSize" min="5" max="100" step="5" value="30"
+            oninput="document.getElementById('valMaxFileSize').textContent = this.value + 'MB'">
+          <div class="settings-field-hint">이 크기를 초과하는 파일은 인덱싱에서 제외됩니다.</div>
+        </div>
+      </div>
+
+      <!-- 동작 -->
+      <div class="settings-sec">
+        <div class="settings-sec-title">동작</div>
+        <div class="settings-row">
+          <div>
+            <div class="settings-row-label">닫기(X) 버튼</div>
+            <div class="settings-row-hint">저장 즉시 적용됩니다(재시작 불필요)</div>
+          </div>
+          <div class="settings-seg" id="segCloseAction">
+            <button type="button" class="settings-seg-btn" data-value="tray" onclick="selectSeg('segCloseAction', 'tray')">트레이로 숨김</button>
+            <button type="button" class="settings-seg-btn" data-value="quit" onclick="selectSeg('segCloseAction', 'quit')">앱 종료</button>
+          </div>
+        </div>
+        <div class="settings-field" style="margin-top:10px;">
+          <div class="settings-field-label">로그 레벨</div>
+          <div class="settings-seg" id="segLogLevel" style="width:100%;">
+            <button type="button" class="settings-seg-btn" data-value="DEBUG" onclick="selectSeg('segLogLevel', 'DEBUG')">DEBUG</button>
+            <button type="button" class="settings-seg-btn" data-value="INFO" onclick="selectSeg('segLogLevel', 'INFO')">INFO</button>
+            <button type="button" class="settings-seg-btn" data-value="WARNING" onclick="selectSeg('segLogLevel', 'WARNING')">WARNING</button>
+          </div>
+        </div>
+      </div>
+
+      <button type="button" class="advanced-link" onclick="openConfigFile()">📄 고급: 설정 파일 직접 열기 (config.yaml)</button>
+
+    </div>
+
+    <div class="settings-footer">
+      <span class="settings-save-notice" id="settingsVersionNotice"></span>
+      <button class="btn-settings-cancel" onclick="closeSettings()">취소</button>
+      <button class="btn-settings-save" onclick="saveSettings()">저장</button>
     </div>
   </div>
 </div>

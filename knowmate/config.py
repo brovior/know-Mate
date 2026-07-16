@@ -92,17 +92,19 @@ def update_watch_folders(folders: list[str]) -> None:
     _save_config(cfg)
 
 
-def update_settings(patch: dict[str, dict[str, Any]]) -> None:
-    """설정 UI에서 받은 patch(섹션별 dict)를 config에 병합하고 저장한다.
+def update_settings(patch: dict[str, Any]) -> None:
+    """설정 UI에서 받은 patch를 config에 병합하고 저장한다.
 
-    patch 예: {"llm": {"base_url": "http://10.0.0.5"}, "search": {"score_threshold": 0.25}}
-    섹션 내부 키만 얕게 덮어쓴다(섹션 자체를 통째로 교체하지 않음).
+    patch 값이 dict면 해당 섹션 내부 키만 얕게 덮어쓴다(섹션 통째 교체 방지).
+    patch 값이 스칼라면(log_level 등 최상위 키) 그대로 대입한다.
+    patch 예: {"llm": {"base_url": "http://10.0.0.5"}, "log_level": "DEBUG"}
     """
     cfg = get_config()
-    for section, values in patch.items():
-        if not isinstance(values, dict):
-            continue
-        cfg.setdefault(section, {}).update(values)
+    for key, value in patch.items():
+        if isinstance(value, dict):
+            cfg.setdefault(key, {}).update(value)
+        else:
+            cfg[key] = value
     _save_config(cfg)
 
 
