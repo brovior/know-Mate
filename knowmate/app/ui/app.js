@@ -31,6 +31,10 @@ function onBridgeReady() {
     try { data = JSON.parse(json); } catch { return; }
     onStatusUpdated(data);
   });
+  bridge.getVersion().then(v => {
+    const el = document.getElementById("appVersion");
+    if (el) el.textContent = "v" + v;
+  }).catch(() => {});
   loadRecentQuestions();
 }
 

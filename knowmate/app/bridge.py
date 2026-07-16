@@ -99,6 +99,12 @@ class Bridge(QObject):
         return path or ""
 
     @pyqtSlot(result=str)
+    def getVersion(self) -> str:
+        """앱 버전 문자열을 반환한다."""
+        from knowmate.version import __version__
+        return __version__
+
+    @pyqtSlot(result=str)
     def getFolders(self) -> str:
         """현재 watch_folders 목록을 JSON 배열로 반환한다."""
         from knowmate.config import get_config

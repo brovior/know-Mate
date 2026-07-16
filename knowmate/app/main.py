@@ -22,10 +22,21 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+
+def resource_path(rel: str) -> Path:
+    """소스 실행/PyInstaller 번들(frozen) 모두에서 동작하는 리소스 경로를 반환한다.
+
+    frozen(exe)일 때는 파일들이 sys._MEIPASS(임시 해제 폴더) 아래 있다.
+    rel은 ROOT 기준 상대경로(예: "knowmate/app/ui").
+    """
+    base = Path(getattr(sys, "_MEIPASS", ROOT))
+    return base / rel
+
+
 from knowmate.app.bridge import Bridge
 from knowmate.agents.registry import AgentRegistry
 
-UI_DIR = Path(__file__).parent / "ui"
+UI_DIR = resource_path("knowmate/app/ui")
 APP_ICON = UI_DIR / "assets" / "aegisdesk.ico"
 logger = logging.getLogger(__name__)
 
@@ -252,14 +263,57 @@ def _set_windows_app_id(app_id: str) -> None:
         logger.debug("AppUserModelID 설정 실패: %s", exc)
 
 
-def main() -> None:
-    from knowmate.config import get_config
-    _log_level = getattr(logging, get_config().get("log_level", "INFO").upper(), logging.INFO)
-    logging.basicConfig(
-        level=_log_level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
+def _init_logging(log_level_name: str) -> None:
+    """콘솔 + 파일(순환) 로깅을 초기화한다. 파일: %APPDATA%/AegisDesk/logs/aegisdesk.log."""
+    from logging.handlers import RotatingFileHandler
+    from knowmate.config import get_data_dir
+
+    log_level = getattr(logging, log_level_name.upper(), logging.INFO)
+    fmt = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
     )
+
+    root = logging.getLogger()
+    root.setLevel(log_level)
+
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    root.addHandler(console)
+
+    try:
+        log_dir = get_data_dir() / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            log_dir / "aegisdesk.log", maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
+        )
+        file_handler.setFormatter(fmt)
+        root.addHandler(file_handler)
+    except OSError as exc:
+        logging.getLogger(__name__).warning("파일 로그 초기화 실패: %s", exc)
+
+
+def _install_exception_hook() -> None:
+    """미처리 예외를 로그에 기록한다(콘솔이 없는 --windowed 빌드에서도 원인 추적 가능)."""
+
+    def _hook(exc_type, exc_value, exc_tb) -> None:
+        logging.getLogger("aegisdesk.uncaught").critical(
+            "미처리 예외로 종료됨", exc_info=(exc_type, exc_value, exc_tb)
+        )
+        sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+    sys.excepthook = _hook
+
+
+def main() -> None:
+    from knowmate.version import __version__
+    from knowmate.config import get_config
+
+    cfg = get_config()
+    _init_logging(cfg.get("log_level", "INFO"))
+    _install_exception_hook()
+
+    logger.info("Aegis Desk %s 시작 (platform=%s)", __version__, sys.platform)
+
     os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
     _set_windows_app_id("AegisDesk.App")
     app = QApplication(sys.argv)

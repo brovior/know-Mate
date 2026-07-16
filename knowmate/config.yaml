@@ -2,9 +2,9 @@ log_level: INFO   # DEBUG | INFO | WARNING | ERROR
 
 extractor: auto
 embedding:
-  mode: local
+  mode: api                # 반드시 api. local은 폐쇄망에서 모델 다운로드 불가로 무한 대기 발생 (CLAUDE.md 환경 절 참조)
   local_model: BAAI/bge-m3
-  base_url: http://10.x.x.x
+  base_url: http://10.x.x.x   # ← 빌드 전 실제 사내 임베딩 서버 IP로 교체
   host_header: embed.internal
   api_key: ""              # 비워두면 EMBED_API_KEY 환경변수 → 더미값(dummy) 순으로 사용
   # 모델·차원은 rag/embedding.py 의 상수(MODEL_DIMS)로 고정. 변경 시 전체 재인덱싱 필요.
@@ -20,8 +20,7 @@ search:
   score_threshold: 0.3
   rerank_enabled: false
 collector:
-  watch_folders:
-  - C:/Users/SDSPRO/Documents/공공행정
+  watch_folders: []        # 배포 기본값은 비움. 앱의 [폴더 관리]에서 사용자별로 지정
   idle_seconds: 60
 cleanup:
   dry_run: true
@@ -30,7 +29,7 @@ llm:
   mode: api                # 사내 LLM 서버 직접 호출 (fake|claude|openrouter|api)
   model: qwen3-27b
   api_key: ""              # 비우면 더미값(dummy). 사내 서버가 키 요구 시 채움
-  base_url: http://10.x.x.x   # ← 사내 PC에서 실제 LLM 서버 IP로 교체
+  base_url: http://10.x.x.x   # ← 빌드 전 실제 사내 LLM 서버 IP로 교체
   host_header: llm.internal
   max_context_tokens: 4096
 mail:
