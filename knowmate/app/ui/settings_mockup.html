@@ -114,8 +114,13 @@ input[type=range] { width: 100%; accent-color: var(--primary); }
           <div class="field-label">임베딩 서버 주소</div>
           <input type="text" value="http://10.20.30.41">
         </div>
+        <div class="field">
+          <div class="field-label">임베딩 모델 <span class="val">bge-m3</span></div>
+          <div class="field-hint">고정값(읽기 전용) — 이미 인덱싱된 문서와 벡터 차원이 맞아야 하므로 변경할 수 없습니다. 모델 교체가 필요하면 개발팀에 문의하세요.</div>
+        </div>
         <button class="test-btn">🔌 연결 테스트</button>
-        <div class="test-result test-ok">✅ LLM · 임베딩 서버 정상 연결</div>
+        <div class="test-result test-ok">✅ LLM 서버 연결 정상</div>
+        <div class="test-result test-fail">❌ 임베딩 서버 연결 실패 — Connection refused (10.20.30.41:80)</div>
       </div>
 
       <!-- 검색 -->
