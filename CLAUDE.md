@@ -2,6 +2,13 @@
 > Phase 1~4 완료, Phase 5 진행 중 (Knox 메일 인덱싱 구현) | 2026-06-28
 > 제품명: **Aegis Desk (이지스 데스크)** — 구 KnowMate. 데이터 폴더 `%APPDATA%/AegisDesk` (구 KnowMate 폴더는 최초 실행 시 자동 이전).
 
+## 모델 사용 정책
+
+- **분석·설계·계획 수립**: Opus 이상 모델 허용.
+- **실제 코드 작성·구현**: Sonnet 사용. 구현 착수 시점에 현재 모델이 Opus 계열이면 사용자에게 Sonnet 전환(`/model`)을 먼저 안내할 것.
+- **예외**: 동시성(스레드), 보안(crypto), 대규모 리팩터링 등 고위험 구현은 사용자 판단으로 상위 모델 허용.
+- 참고: `/model opusplan`은 계획=Opus / 실행=Sonnet을 자동 전환한다.
+
 ## 프로젝트 개요
 
 **개인 PC용 사내 지식 AI 비서 데스크톱 앱.** PyQt6 + QWebEngineView 셸 위에서 여러 에이전트가 구동되는 멀티 에이전트 구조. Phase 1~4 완료(RAG 지식검색), Phase 5 진행 중(Knox 메일 인덱싱 구현 완료, 공용 DB·PyInstaller 배포 예정).
