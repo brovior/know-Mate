@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>Aegis Desk — 설정 목업</title>
+<style>
+/* ===== 토큰 (기존 styles.css 재사용) ===== */
+:root {
+  --primary:        #1F4E79;
+  --primary-light:  #E8EEF6;
+  --teal-bg:        #E1F2EC;
+  --teal-text:      #0F6E56;
+  --bg:             #FFFFFF;
+  --bg-side:        #F4F6F9;
+  --border:         #E2E6EB;
+  --border-dark:    #D5DAE1;
+  --text-main:      #1F2937;
+  --text-sub:       #6B7280;
+  --text-hint:      #9CA3AF;
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: 'Malgun Gothic', sans-serif; font-size: 15px; color: var(--text-main); background: #ddd; padding: 40px; }
+
+.overlay { display: flex; align-items: center; justify-content: center; }
+.settings-card {
+  background: var(--bg); border-radius: 14px; border: 1px solid var(--border);
+  width: 480px; max-height: 640px; box-shadow: 0 8px 32px rgba(0,0,0,0.15);
+  display: flex; flex-direction: column;
+}
+.settings-header { padding: 22px 28px 14px; border-bottom: 1px solid var(--border); }
+.settings-title { font-size: 17px; font-weight: 700; }
+.settings-sub    { font-size: 12px; color: var(--text-sub); margin-top: 4px; }
+
+.settings-body { padding: 8px 28px 4px; overflow-y: auto; flex: 1; }
+
+.sec { margin: 18px 0; }
+.sec-title { font-size: 12px; font-weight: 700; color: var(--text-sub); text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 10px; }
+
+.field { margin-bottom: 12px; }
+.field-label { font-size: 13px; color: var(--text-main); margin-bottom: 5px; display: flex; justify-content: space-between; }
+.field-label .val { color: var(--primary); font-weight: 600; }
+.field-hint  { font-size: 11px; color: var(--text-hint); margin-top: 4px; line-height: 1.4; }
+
+input[type=text] {
+  width: 100%; padding: 7px 10px; border: 1px solid var(--border-dark); border-radius: 7px;
+  font-size: 13px; font-family: inherit; color: var(--text-main);
+}
+input[type=range] { width: 100%; accent-color: var(--primary); }
+
+.row { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; }
+.row-label { font-size: 13px; }
+.row-hint  { font-size: 11px; color: var(--text-hint); margin-top: 2px; }
+
+/* 토글 스위치 */
+.switch { position: relative; width: 38px; height: 21px; flex-shrink: 0; }
+.switch input { opacity: 0; width: 0; height: 0; }
+.slider { position: absolute; inset: 0; background: var(--border-dark); border-radius: 21px; cursor: pointer; transition: 0.15s; }
+.slider::before { content: ""; position: absolute; width: 17px; height: 17px; left: 2px; top: 2px; background: white; border-radius: 50%; transition: 0.15s; }
+.switch input:checked + .slider { background: var(--primary); }
+.switch input:checked + .slider::before { transform: translateX(17px); }
+
+/* 세그먼트(라디오형) - 닫기 버튼 동작 */
+.seg2 { display: flex; border: 1px solid var(--border-dark); border-radius: 8px; overflow: hidden; width: 220px; }
+.seg2-btn { flex: 1; padding: 6px 0; font-size: 12px; text-align: center; cursor: pointer; background: transparent; color: var(--text-sub); }
+.seg2-btn.active { background: var(--primary); color: #fff; font-weight: 500; }
+
+.test-btn {
+  display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--primary);
+  background: var(--primary-light); border: none; border-radius: 6px; padding: 6px 12px;
+  cursor: pointer; margin-top: 6px;
+}
+.test-result { font-size: 12px; margin-top: 6px; display: flex; align-items: center; gap: 5px; }
+.test-ok  { color: var(--teal-text); }
+.test-fail { color: #C42B1C; }
+
+.advanced-link {
+  display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-sub);
+  padding: 10px 0; cursor: pointer; border-top: 1px solid var(--border); margin-top: 8px;
+}
+.advanced-link:hover { color: var(--primary); }
+
+.settings-footer {
+  padding: 14px 28px; border-top: 1px solid var(--border);
+  display: flex; gap: 8px; justify-content: flex-end;
+}
+.btn-save   { padding: 9px 20px; background: var(--primary); color: #fff; border: none; border-radius: 8px; font-size: 13px; cursor: pointer; }
+.btn-cancel { padding: 9px 16px; background: none; border: 1px solid var(--border-dark); border-radius: 8px; font-size: 13px; color: var(--text-sub); cursor: pointer; }
+.save-notice { font-size: 11px; color: var(--text-hint); margin-right: auto; align-self: center; }
+</style>
+</head>
+<body>
+
+<div class="overlay">
+  <div class="settings-card">
+    <div class="settings-header">
+      <div class="settings-title">⚙ 설정</div>
+      <div class="settings-sub">변경 후 [저장]을 누르면 다음 재시작부터 적용됩니다.</div>
+    </div>
+
+    <div class="settings-body">
+
+      <!-- 연결 -->
+      <div class="sec">
+        <div class="sec-title">연결</div>
+        <div class="field">
+          <div class="field-label">LLM 서버 주소</div>
+          <input type="text" value="http://10.20.30.40">
+        </div>
+        <div class="field">
+          <div class="field-label">LLM 모델명</div>
+          <input type="text" value="qwen3-27b">
+        </div>
+        <div class="field">
+          <div class="field-label">임베딩 서버 주소</div>
+          <input type="text" value="http://10.20.30.41">
+        </div>
+        <button class="test-btn">🔌 연결 테스트</button>
+        <div class="test-result test-ok">✅ LLM · 임베딩 서버 정상 연결</div>
+      </div>
+
+      <!-- 검색 -->
+      <div class="sec">
+        <div class="sec-title">검색</div>
+        <div class="field">
+          <div class="field-label">검색 엄격도 <span class="val">0.30</span></div>
+          <input type="range" min="0" max="0.7" step="0.05" value="0.3">
+          <div class="field-hint">높이면 확실히 관련된 문서만 답변에 사용합니다(결과 수 감소). 낮추면 더 폭넓게 참고합니다.</div>
+        </div>
+        <div class="field">
+          <div class="field-label">답변 참고 문서 수 <span class="val">10건</span></div>
+          <input type="range" min="3" max="20" step="1" value="10">
+        </div>
+      </div>
+
+      <!-- 인덱싱 -->
+      <div class="sec">
+        <div class="sec-title">인덱싱</div>
+        <div class="row">
+          <div>
+            <div class="row-label">유휴 시 자동 인덱싱</div>
+            <div class="row-hint">자리를 비우면 자동으로 새 문서를 인덱싱합니다</div>
+          </div>
+          <label class="switch"><input type="checkbox" checked><span class="slider"></span></label>
+        </div>
+        <div class="field">
+          <div class="field-label">자동 인덱싱 대기 시간 <span class="val">60초</span></div>
+          <input type="range" min="30" max="1800" step="30" value="60">
+        </div>
+        <div class="row">
+          <div>
+            <div class="row-label">메일 인덱싱 사용</div>
+            <div class="row-hint">.mysingle / .eml 파일 자동 인덱싱</div>
+          </div>
+          <label class="switch"><input type="checkbox" checked><span class="slider"></span></label>
+        </div>
+        <div class="field">
+          <div class="field-label">최대 파일 크기 <span class="val">30MB</span></div>
+          <input type="range" min="5" max="100" step="5" value="30">
+          <div class="field-hint">이 크기를 초과하는 파일은 인덱싱에서 제외됩니다.</div>
+        </div>
+      </div>
+
+      <!-- 동작 -->
+      <div class="sec">
+        <div class="sec-title">동작</div>
+        <div class="row">
+          <div>
+            <div class="row-label">닫기(X) 버튼</div>
+            <div class="row-hint">저장 즉시 적용됩니다(재시작 불필요)</div>
+          </div>
+          <div class="seg2">
+            <div class="seg2-btn active">트레이로 숨김</div>
+            <div class="seg2-btn">앱 종료</div>
+          </div>
+        </div>
+        <div class="field" style="margin-top:10px;">
+          <div class="field-label">로그 레벨</div>
+          <div class="seg2" style="width:100%;">
+            <div class="seg2-btn">DEBUG</div>
+            <div class="seg2-btn active">INFO</div>
+            <div class="seg2-btn">WARNING</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="advanced-link">📄 고급: 설정 파일 직접 열기 (config.yaml)</div>
+
+    </div>
+
+    <div class="settings-footer">
+      <span class="save-notice">v0.9.0-beta1</span>
+      <button class="btn-cancel">취소</button>
+      <button class="btn-save">저장</button>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

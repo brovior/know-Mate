@@ -1,7 +1,6 @@
 """config.yaml 싱글톤 로더 + 앱 데이터 폴더 관리."""
 import logging
 import os
-import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -56,15 +55,21 @@ def _bundled_config_source() -> Path:
 def _get_config_path() -> Path:
     """실제 읽고 쓰는 config.yaml 경로(%APPDATA%/AegisDesk/config.yaml)를 반환한다.
 
-    없으면 번들 기본값(템플릿)을 최초 1회 시드로 복사한다.
+    없으면 번들 기본값(템플릿)을 최초 1회 시드로 복사한다. 단 watch_folders는
+    배포자(마스터)의 개인 경로가 테스터에게 그대로 전달되지 않도록 빈 배열로 초기화한다.
+    이후 이 파일은 사용자 소유이며 모든 항목을 자유롭게 수정할 수 있다(전체 설정 UI 지원).
     포터블(exe) 빌드에서는 번들 내부가 쓰기 불가/휘발성이므로 항상 APPDATA에 둔다.
     """
     target = get_data_dir() / "config.yaml"
     if not target.exists():
         source = _bundled_config_source()
         try:
-            shutil.copy(source, target)
-            logger.info("config.yaml 최초 시드 완료: %s -> %s", source, target)
+            with source.open(encoding="utf-8") as f:
+                seed_cfg = yaml.safe_load(f) or {}
+            seed_cfg.setdefault("collector", {})["watch_folders"] = []
+            with target.open("w", encoding="utf-8") as f:
+                yaml.dump(seed_cfg, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+            logger.info("config.yaml 최초 시드 완료 (watch_folders 초기화): %s -> %s", source, target)
         except OSError as exc:
             logger.error("config.yaml 시드 실패 (%s -> %s): %s", source, target, exc)
             raise
@@ -84,5 +89,24 @@ def update_watch_folders(folders: list[str]) -> None:
     """watch_folders를 갱신하고 config.yaml에 저장한다."""
     cfg = get_config()
     cfg.setdefault("collector", {})["watch_folders"] = folders
+    _save_config(cfg)
+
+
+def update_settings(patch: dict[str, dict[str, Any]]) -> None:
+    """설정 UI에서 받은 patch(섹션별 dict)를 config에 병합하고 저장한다.
+
+    patch 예: {"llm": {"base_url": "http://10.0.0.5"}, "search": {"score_threshold": 0.25}}
+    섹션 내부 키만 얕게 덮어쓴다(섹션 자체를 통째로 교체하지 않음).
+    """
+    cfg = get_config()
+    for section, values in patch.items():
+        if not isinstance(values, dict):
+            continue
+        cfg.setdefault(section, {}).update(values)
+    _save_config(cfg)
+
+
+def _save_config(cfg: dict[str, Any]) -> None:
+    """현재 config dict를 %APPDATA%의 config.yaml에 저장한다."""
     with _get_config_path().open("w", encoding="utf-8") as f:
         yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
