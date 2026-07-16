@@ -1,6 +1,7 @@
 """벡터 검색 및 권한 필터 Retriever (CLAUDE.md 6-10)."""
 import getpass
 import logging
+import re
 from typing import Any
 
 import pandas as pd
@@ -9,6 +10,21 @@ from knowmate.rag.embedding import EmbeddingClient
 from knowmate.rag.indexer import Indexer
 
 logger = logging.getLogger(__name__)
+
+# 키워드 보강에서 제외할 일반 단어 (파일 경로에 흔해 노이즈만 만드는 것들)
+_KW_STOPWORDS = {"문서", "파일", "폴더", "내용", "관련", "요약", "검색", "찾아줘", "알려줘", "보여줘"}
+
+
+def _keyword_where(query: str) -> str | None:
+    """질의에서 파일명/경로 매칭용 키워드를 뽑아 LIKE 조건 문자열을 만든다. 없으면 None."""
+    tokens = re.split(r"[\s,\.\?!·:;'\"()\[\]]+", query)
+    tokens = [t for t in tokens if len(t) >= 2 and t not in _KW_STOPWORDS]
+    if not tokens:
+        return None
+    conds = " OR ".join(
+        "file_path LIKE '%{}%'".format(t.replace("'", "''")) for t in tokens[:5]
+    )
+    return conds
 
 
 class Retriever:
@@ -53,6 +69,23 @@ class Retriever:
         # chunks 테이블 검색
         chunks_rows = self._search_table(self._table, vec, scopes, use_owner_filter=True)
 
+        # 키워드 보강: 질의 단어가 파일명/경로와 일치하는 문서 청크를 강제 포함
+        # (파일명을 직접 언급하는 질의는 벡터 유사도만으로 놓칠 수 있음)
+        kw_where = _keyword_where(query)
+        if kw_where:
+            try:
+                kw_rows = self._search_table(
+                    self._table, vec, scopes,
+                    use_owner_filter=True,
+                    extra_where=kw_where,
+                    apply_threshold=False,   # 파일명 직접 지목 → 점수 문턱 완화
+                )
+                if kw_rows:
+                    logger.debug("키워드 보강 히트: %d건", len(kw_rows))
+                chunks_rows = self._merge(chunks_rows, kw_rows)
+            except Exception as exc:
+                logger.debug("키워드 보강 검색 실패(무시): %s", exc)
+
         # emails 테이블 병합 (local scope 포함 시 또는 scopes=None)
         if self._email_indexer and (scopes is None or "local" in scopes):
             try:
@@ -82,11 +115,20 @@ class Retriever:
         vec: list[float],
         scopes: list[str] | None,
         use_owner_filter: bool,
+        extra_where: str | None = None,
+        apply_threshold: bool = True,
     ) -> list[dict[str, Any]]:
-        """단일 테이블에서 벡터 검색 후 점수 필터·권한 필터·복호화를 수행한다."""
+        """단일 테이블에서 벡터 검색 후 점수 필터·권한 필터·복호화를 수행한다.
+
+        extra_where: 추가 SQL 조건 (예: 파일명 키워드 매칭).
+        apply_threshold: False면 score_threshold 필터를 건너뛴다.
+        """
+        where = "is_deleted = false"
+        if extra_where:
+            where += f" AND ({extra_where})"
         raw = (
             table.search(vec)
-            .where("is_deleted = false")
+            .where(where)
             .limit(self._top_k * 2)
             .to_arrow()
             .to_pandas()
@@ -105,7 +147,8 @@ class Retriever:
                     raw.nlargest(5, "score")[["file_path", "score"]].to_dict(orient="records"),
                     self._score_threshold,
                 )
-            raw = raw[raw["score"] >= self._score_threshold]
+            if apply_threshold:
+                raw = raw[raw["score"] >= self._score_threshold]
         else:
             raw = raw.copy()
             raw["score"] = 1.0

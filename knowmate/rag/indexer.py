@@ -13,6 +13,9 @@ from knowmate.rag.embedding import EmbeddingClient, VECTOR_DIM
 
 logger = logging.getLogger(__name__)
 
+# 문서 인덱싱 포맷 버전 — 변경 시 기존 문서 자동 재인덱싱 (state.index_version 비교)
+DOC_INDEX_VERSION = "2"
+
 SCHEMA = pa.schema(
     [
         pa.field("chunk_id", pa.string()),
@@ -87,8 +90,11 @@ class Indexer:
     ) -> list[str]:
         """파일 텍스트를 청킹·임베딩·암호화해 LanceDB에 저장하고 chunk_id 리스트를 반환한다."""
         file_type = Path(path).suffix.lower().lstrip(".")
+        # 파일명·경로를 본문 앞에 붙여 제목/폴더명 언급 질의도 벡터 검색에 매칭되게 한다
+        p = Path(path)
+        meta_header = f"파일명: {p.name}\n경로: {p.parent}\n\n"
         chunks = chunk_text(
-            text, file_type, self._chunk_size, self._overlap,
+            meta_header + text, file_type, self._chunk_size, self._overlap,
             max_chunks_per_file=self._max_chunks_per_file,
             xlsx_max_rows_per_sheet=self._xlsx_max_rows_per_sheet,
         )

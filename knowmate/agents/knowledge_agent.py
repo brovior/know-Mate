@@ -177,6 +177,10 @@ class KnowledgeAgent:
                     f"날짜: {c.get('mail_date', '')}\n"
                 )
                 return header + text
+            fp = c.get("file_path", "")
+            if fp:
+                p = Path(fp)
+                return f"[문서] 파일명: {p.name} | 폴더: {p.parent.name}\n" + text
             return text
 
         answer_text = pipeline["llm"].answer(query, [_chunk_context(c) for c in chunks])
