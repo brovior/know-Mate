@@ -196,7 +196,9 @@ class CollectorWorker(QThread):
         self.progress.emit(0, -2, "인덱싱 시작...")
 
         def _producer() -> None:
+            from knowmate.rag.indexer import DOC_INDEX_VERSION
             found = 0
+            migrate_logged = False
             try:
                 for folder_str in watch_folders:
                     folder = Path(folder_str)
@@ -215,6 +217,12 @@ class CollectorWorker(QThread):
                         if prev is None:
                             action = "new"
                         elif meta["mtime"] != prev.get("mtime") or meta["size"] != prev.get("size"):
+                            action = "modified"
+                        elif prev.get("index_version") != DOC_INDEX_VERSION:
+                            # 인덱싱 포맷 변경 → 1회 자동 재인덱싱
+                            if not migrate_logged:
+                                logger.info("[collector] 문서 인덱싱 포맷 변경 감지 — 기존 문서 재인덱싱 시작")
+                                migrate_logged = True
                             action = "modified"
                         else:
                             continue  # 변경 없음 → 인덱싱 대상 아님
@@ -273,11 +281,13 @@ class CollectorWorker(QThread):
                     scope=scope,
                 )
                 logger.debug("[단계5] 임베딩·저장 완료: %s -> %d청크", task.path, len(chunk_ids))
+                from knowmate.rag.indexer import DOC_INDEX_VERSION
                 state[task.path] = {
                     "mtime": stat.st_mtime,
                     "size": stat.st_size,
                     "indexed_at": datetime.now(timezone.utc).isoformat(),
                     "chunk_ids": chunk_ids,
+                    "index_version": DOC_INDEX_VERSION,
                 }
                 logger.info("[%s] %s -> %d청크", task.action, task.path, len(chunk_ids))
             except Exception as exc:
