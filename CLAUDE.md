@@ -1,6 +1,7 @@
 # CLAUDE.md — Aegis Desk
-> Phase 1~4 완료, Phase 5 진행 중 (Knox 메일 인덱싱 구현) | 2026-06-28
-> 제품명: **Aegis Desk (이지스 데스크)** — 구 KnowMate. 데이터 폴더 `%APPDATA%/AegisDesk` (구 KnowMate 폴더는 최초 실행 시 자동 이전).
+> Phase 1~4 완료, Phase 5a(메일) 완료, 5c(포터블 빌드) 완료 · 베타 배포 단계 | 2026-07-17
+> 제품명: **Aegis Desk (이지스 데스크)** — 구 KnowMate. 버전 `knowmate/version.py` (현재 0.9.0-beta1).
+> 데이터 폴더 `%APPDATA%/AegisDesk` (구 KnowMate 폴더는 최초 실행 시 자동 이전). config.yaml·index·logs·km.key·index_state.json 모두 여기 위치.
 
 ## 모델 사용 정책
 
@@ -11,7 +12,7 @@
 
 ## 프로젝트 개요
 
-**개인 PC용 사내 지식 AI 비서 데스크톱 앱.** PyQt6 + QWebEngineView 셸 위에서 여러 에이전트가 구동되는 멀티 에이전트 구조. Phase 1~4 완료(RAG 지식검색), Phase 5 진행 중(Knox 메일 인덱싱 구현 완료, 공용 DB·PyInstaller 배포 예정).
+**개인 PC용 사내 지식 AI 비서 데스크톱 앱.** PyQt6 + QWebEngineView 셸 위에서 여러 에이전트가 구동되는 멀티 에이전트 구조. Phase 1~4 완료(RAG 지식검색), 5a 완료(Knox `.mysingle` + 표준 `.eml` 메일 인덱싱), 5c 완료(PyInstaller 포터블 빌드). 현재 소수 대상 **베타 배포 단계**. 5b(공용 벡터DB)는 SMB 위 LanceDB 직접 실행 불가로 "로컬 캐시 복사" 방식 확정, 착수 예정.
 
 핵심 시나리오: "작년 A설비 알람 폭주 때 처리 절차 찾아줘" → 로컬 문서·메일 의미 검색 → 요약 답변 + 출처 제시.
 
@@ -31,15 +32,21 @@ PyQt6 + QWebEngineView
   │    ├─ EmailIndexer  → chunker → embedding → LanceDB emails 테이블 (Knox 메일)
   │    └─ Retriever → 벡터검색(chunks+emails 병합) → 권한필터 → 샌드위치배열 → LLM
   └─ CollectorWorker (QThread)
-       ├─ Scanner      → TextExtractor → Indexer, CleanupManager
-       └─ MailScanner  → MysingleReader → EmailIndexer (orphan 정리 없음)
+       ├─ Scanner(scandir) → 생산자 스레드 → 큐 → 소비자(추출·임베딩·저장)  ← 스캔·인덱싱 파이프라인
+       │                     TextExtractor → Indexer, CleanupManager
+       └─ MailScanner(scandir) → parse_mail_file(.mysingle/.eml) → EmailIndexer (orphan 정리 없음)
 ```
+
+- **UI 셸 상주**: 닫기(X) 시 시스템 트레이로 숨김(설정으로 종료 전환 가능). 유휴 시 자동 인덱싱(설정으로 on/off·주기 조정).
+- **설정 패널**(⚙): 연결(LLM/임베딩 주소)·검색(엄격도·문서수)·인덱싱(유휴·메일·파일크기·정리삭제)·동작(닫기·로그레벨) + 연결 테스트. `bridge.getSettings/saveSettings/testConnection/openConfigFile`.
+- **파일 로깅**: `%APPDATA%/AegisDesk/logs/aegisdesk.log` (Rotating 5MB×3) + 전역 excepthook.
 
 ---
 
 ## 디렉토리 구조
 
 ```
+AegisDesk.spec · build.bat      # PyInstaller 포터블 빌드 (onedir) · 사내 원클릭 빌드
 knowmate/
  ├─ app/          main.py · bridge.py · threads.py · ui/
  ├─ agents/       base.py · registry.py · knowledge_agent.py · mes_agent.py
@@ -48,12 +55,14 @@ knowmate/
  ├─ secure/       base.py · plain_reader.py · com_reader.py · fake_reader.py
  │                mysingle_reader.py · crypto.py · signature.py · text_util.py
  ├─ llm/          client.py
- ├─ config.py     # config.yaml 싱글톤 로더
- ├─ config.yaml   # 런타임 설정 전체 (설정 추가 시 여기에만)
+ ├─ version.py    # __version__ (릴리스마다 갱신)
+ ├─ config.py     # config.yaml 로더 (번들 템플릿 → %APPDATA% 시드, watch_folders만 초기화)
+ ├─ config.yaml   # 배포 기본값 템플릿 (설정 추가 시 여기에만). 실사용본은 %APPDATA%/AegisDesk/config.yaml
  └─ tests/        test_phase1~4.py · test_mysingle.py · fixtures/sample.mysingle
+scripts/          diag_search.py · inspect_index.py · test_shared_db.py(5b 사전검증)
 ```
 
-참고 문서: `app/ui/UI_SPEC.md` (화면 사양) · `app/ui/mockup.html` (룩앤필) · `docs/DESIGN.md` (설계 결정 상세) · `docs/EMAIL_DESIGN.md` (메일 인덱싱 설계)
+참고 문서: `UI_SPEC.md`(루트, 화면 사양) · `app/ui/mockup.html`(룩앤필) · `docs/DESIGN.md`(설계 결정) · `docs/EMAIL_DESIGN.md`(메일 인덱싱) · `docs/BETA_GUIDE.md`(테스터 배포 가이드)
 
 ---
 
@@ -89,19 +98,24 @@ knowmate/
 | 2 | RAG 파이프라인 (chunker/embedding/indexer/retriever) | ✅ 완료 |
 | 3 | 수집기 (증분스캔 + orphan정리 + 스케줄러) | ✅ 완료 |
 | 4 | 보안 모듈 (COM 싱글톤 + AES-GCM + DPAPI) | ✅ 완료 |
-| 5a | Knox `.mysingle` 메일 인덱싱 | ✅ 완료 |
-| 5b | 공용 벡터DB 읽기 연동 | 🔲 예정 |
-| 5c | PyInstaller 배포 | 🔲 예정 |
+| 5a | 메일 인덱싱 (`.mysingle` Knox + `.eml` 표준) | ✅ 완료 |
+| 5c | PyInstaller 포터블 빌드(onedir) + 파일 로깅·버전·설정 패널·트레이 상주 | ✅ 완료 |
+| 베타 | 소수 테스터 배포 (`docs/BETA_GUIDE.md`) | 🔄 진행 |
+| 5b | 공용 벡터DB (로컬 캐시 복사 방식) | 🔲 예정 |
 
-> Outlook PST 인덱싱은 COM 보안 정책 선결 검증 후 5b 이후에 착수. 상세는 `docs/EMAIL_DESIGN.md` §8 참조.
+> **5b 결론**: SMB 위에서 LanceDB 직접 읽기/쓰기 불가(RustPanic, `scripts/test_shared_db.py`로 확인). → 마스터가 로컬 인덱싱 후 공용 폴더로 **복사 배포**, 사용자는 파트 최상위 `_aegisdesk/`를 상위 탐색으로 발견해 **로컬 캐시로 복사 후 읽기**. 검색은 지정 폴더 범위로 접두 필터.
+> **Outlook PST/.msg**: COM/전용 파서 필요, COM 보안 정책 선결 검증 후 착수. 상세는 `docs/EMAIL_DESIGN.md` §8.
+> **차후 과제**: 날짜 기반 검색 필터(메일 mail_date 파싱), 추출·임베딩 병렬화(P3), batch_size 튜닝(P4).
 
 ---
 
 ## 환경
 
 - **OS**: Windows 10/11 · **Python**: 3.11
-- **임베딩 운영 모드**: 반드시 `mode: api`. `local` 모드는 폐쇄망에서 모델 다운로드 불가로 무한 대기 발생.
-- **패키지**: PyQt6, PyQt6-WebEngine, lancedb, pyarrow, pywin32, cryptography, PyMuPDF, python-docx, openpyxl, python-pptx, pytest
+- **임베딩 운영 모드**: 반드시 `mode: api` (config 기본값도 api). `local` 모드는 폐쇄망에서 모델 다운로드 불가로 무한 대기 발생.
+- **패키지**: PyQt6, PyQt6-WebEngine, lancedb, pyarrow, pywin32, cryptography, PyMuPDF, python-docx, openpyxl, python-pptx, pytest. 빌드 시 pyinstaller 추가.
+- **배포**: `build.bat` → `dist/AegisDesk/`(exe + `_internal` 폴더) 를 통째로 zip 배포. exe만 단독 배포 불가.
+- **네트워크 드라이브**: 일반 SMB(K: 등)는 정상. EFSS2 DRM 드라이브(M: 등)는 화이트리스트 프로세스만 접근 가능해 인덱싱 불가. 나스카 DRM 문서는 SSO 로그인 유지 중에만 복호화.
 
 ---
 

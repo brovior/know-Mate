@@ -1,5 +1,8 @@
 # Aegis Desk RAG 전체 구조 검토
 
+> ⚠ **초기 설계 탐색 문서 (2026-06-20 기준, 역사적 기록).** 확정 구조·상세는
+> `CLAUDE.md`·`docs/DESIGN.md`를 정본으로 본다. 이 문서는 설계 초기 검토 흔적으로 보존.
+
 ## 현재 구조
 
 ```
@@ -102,6 +105,6 @@
 | 로컬 퍼시스턴트 | ✅ | ✅ |
 | soft delete | 직접 구현 | 자연스럽게 지원 |
 | 컬럼 암호화 | 직접 구현 | 컬럼 단위 적용 쉬움 |
-| compact/cleanup | 없음 | `compact_files()` 내장 |
+| compact/cleanup | 없음 | `optimize()` 내장 (구 `compact_files()`는 deprecated — CLAUDE.md 원칙10) |
 
 > 검증은 ChromaDB로 했으나 CLAUDE.md orphan 안전장치 요구사항(soft delete, compact) 구현 편의상 LanceDB로 전환
