@@ -654,6 +654,8 @@ function _fillSettingsForm(data) {
   document.getElementById("setMaxFileSize").value = maxSize;
   document.getElementById("valMaxFileSize").textContent = maxSize + "MB";
 
+  document.getElementById("setAutoDelete").checked = data.cleanup?.auto_delete ?? false;
+
   selectSeg("segCloseAction", data.ui?.close_action ?? "tray");
   selectSeg("segLogLevel", data.log_level ?? "INFO");
 
@@ -699,6 +701,9 @@ function saveSettings() {
     },
     chunking: {
       max_file_size_mb: parseInt(document.getElementById("setMaxFileSize").value, 10),
+    },
+    cleanup: {
+      auto_delete: document.getElementById("setAutoDelete").checked,
     },
     ui: {
       close_action: _segValue("segCloseAction") || "tray",

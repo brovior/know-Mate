@@ -137,6 +137,11 @@ class Bridge(QObject):
             "chunking": {
                 "max_file_size_mb": cfg.get("chunking", {}).get("max_file_size_mb", 30),
             },
+            "cleanup": {
+                # dry_run(부정형) 대신 auto_delete(긍정형)로 노출 — 사용자 혼동 방지.
+                # dry_run=true(기본, 안전) -> auto_delete=false
+                "auto_delete": not cfg.get("cleanup", {}).get("dry_run", True),
+            },
             "ui": {
                 "close_action": cfg.get("ui", {}).get("close_action", "tray"),
             },
@@ -151,6 +156,11 @@ class Bridge(QObject):
             patch = json.loads(payload)
         except json.JSONDecodeError:
             return json.dumps({"ok": False, "error": "invalid JSON"})
+
+        # cleanup.auto_delete(UI 긍정형) -> cleanup.dry_run(실제 config 키, 부정형) 변환
+        if "cleanup" in patch and isinstance(patch["cleanup"], dict) and "auto_delete" in patch["cleanup"]:
+            auto_delete = patch["cleanup"].pop("auto_delete")
+            patch["cleanup"]["dry_run"] = not auto_delete
 
         from knowmate.config import update_settings
         try:

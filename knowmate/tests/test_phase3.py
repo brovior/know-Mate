@@ -460,3 +460,122 @@ class TestCollectorWorker:
         # finished 시그널은 1회 발행됨
         assert len(finished_msgs) == 1
         assert "실패 1건" in finished_msgs[0]
+
+
+# ============================================================
+# TestPurgeRemovedFolders — _purge_removed_folders 안전장치 (베타 배포 전 발견된 이슈)
+# ============================================================
+
+class TestPurgeRemovedFolders:
+    """watch_folders가 비정상적으로 비거나 축소될 때 인덱스가 통째로 삭제되지
+    않도록 하는 안전장치를 검증한다. 실제 발단: config 시드 로직이 최초 실행 시
+    watch_folders를 []로 초기화하는데, 이 상태로 유휴 스케줄러가 돌면
+    dry_run=false인 사용자의 전체 인덱스가 삭제될 수 있었다.
+    """
+
+    def test_purge_skips_when_watch_folders_empty(self, tmp_path: Path):
+        """watch_folders가 비어 있으면 아무것도 삭제하지 않는다(전체 삭제 오판 방지)."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        f = folder / "doc.docx"
+        f.write_bytes(b"content")
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        chunk_ids = indexer.index_file(path=str(f), text="본문 내용", mtime=f.stat().st_mtime, scope="local")
+
+        state = {str(f): {"mtime": f.stat().st_mtime, "size": f.stat().st_size, "chunk_ids": chunk_ids}}
+        worker = CollectorWorker(
+            config=_make_config(str(folder)), indexer=indexer,
+            extractor=None, state_file=tmp_path / "state.json",
+        )
+
+        worker._purge_removed_folders([], state, dry_run=False, max_delete_ratio=0.30)
+
+        # state 불변
+        assert str(f) in state
+        # DB에도 그대로 남아있음
+        df = indexer.table.to_arrow().to_pandas()
+        active = df[~df["is_deleted"]]
+        assert str(f) in active["file_path"].values
+
+    def test_purge_dry_run_does_not_touch_state(self, tmp_path: Path):
+        """dry_run=True이면 DB뿐 아니라 state도 전혀 건드리지 않는다(완전한 예행연습)."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+
+        removed_folder = tmp_path / "removed_docs"
+        removed_folder.mkdir()
+        f = removed_folder / "doc.docx"
+        f.write_bytes(b"content")
+
+        kept_folder = tmp_path / "kept_docs"
+        kept_folder.mkdir()
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        chunk_ids = indexer.index_file(path=str(f), text="본문 내용", mtime=f.stat().st_mtime, scope="local")
+
+        state = {str(f): {"mtime": f.stat().st_mtime, "size": f.stat().st_size, "chunk_ids": chunk_ids}}
+        worker = CollectorWorker(
+            config=_make_config(str(kept_folder)), indexer=indexer,
+            extractor=None, state_file=tmp_path / "state.json",
+        )
+
+        # removed_folder는 watch_folders에 없으므로 doc.docx는 stale 대상이지만 dry_run=True
+        worker._purge_removed_folders([str(kept_folder)], state, dry_run=True, max_delete_ratio=0.30)
+
+        # dry_run이므로 state에서 제거되면 안 됨 (기존 버그: dry_run이어도 state.pop 실행됨)
+        assert str(f) in state
+        # DB에서도 삭제되지 않아야 함
+        df = indexer.table.to_arrow().to_pandas()
+        active = df[~df["is_deleted"]]
+        assert str(f) in active["file_path"].values
+
+    def test_purge_blocks_mass_deletion(self, tmp_path: Path):
+        """삭제 대상이 max_delete_ratio를 초과하면 실제 삭제를 차단한다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+
+        stale_folder = tmp_path / "stale_docs"
+        stale_folder.mkdir()
+        kept_folder = tmp_path / "kept_docs"
+        kept_folder.mkdir()
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+
+        state = {}
+        # stale_folder에 4개 인덱싱 (kept_folder엔 아무것도 없음 -> 전부 stale, ratio=100%)
+        for i in range(4):
+            f = stale_folder / f"doc{i}.docx"
+            f.write_bytes(b"content")
+            chunk_ids = indexer.index_file(path=str(f), text="본문", mtime=f.stat().st_mtime, scope="local")
+            state[str(f)] = {"mtime": f.stat().st_mtime, "size": f.stat().st_size, "chunk_ids": chunk_ids}
+
+        worker = CollectorWorker(
+            config=_make_config(str(kept_folder)), indexer=indexer,
+            extractor=None, state_file=tmp_path / "state.json",
+        )
+
+        alerts = []
+        worker.indexing_needed.connect(alerts.append)
+
+        # watch_folders=[kept_folder] (비어있지 않음) 이지만 전부 stale -> ratio 100% > 30% 차단
+        worker._purge_removed_folders([str(kept_folder)], state, dry_run=False, max_delete_ratio=0.30)
+
+        # 차단되었으므로 DB에 그대로 남아있어야 함
+        df = indexer.table.to_arrow().to_pandas()
+        active = df[~df["is_deleted"]]
+        assert len(active) == 4
+        # state도 그대로
+        assert len(state) == 4
+        # UI 알림 발행됨
+        assert len(alerts) == 1
+        assert "대량 삭제" in alerts[0]
