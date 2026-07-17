@@ -1,6 +1,7 @@
 """LanceDB 스키마 및 Indexer 클래스 (CLAUDE.md 6-2, 6-3)."""
 import getpass
 import logging
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -105,20 +106,23 @@ class Indexer:
         indexed_at = datetime.now(timezone.utc).isoformat()
         total = len(chunks)
         chunk_ids: list[str] = []
+        all_rows: list[dict[str, Any]] = []
+        embed_sec = 0.0
 
         logger.debug("청크 수: %d, 배치 크기: %d", total, self._batch_size)
         for batch_start in range(0, total, self._batch_size):
             batch = chunks[batch_start : batch_start + self._batch_size]
             logger.debug("배치 임베딩 시작: %d~%d / %d", batch_start, batch_start + len(batch) - 1, total)
+            t0 = time.perf_counter()
             vectors = self._embed.embed(batch)
+            embed_sec += time.perf_counter() - t0
             logger.debug("배치 임베딩 완료: %d~%d", batch_start, batch_start + len(batch) - 1)
 
-            rows: list[dict[str, Any]] = []
             for i, (chunk_text_val, vector) in enumerate(zip(batch, vectors)):
                 global_idx = batch_start + i
                 cid = str(uuid.uuid4())
                 chunk_ids.append(cid)
-                rows.append(
+                all_rows.append(
                     {
                         "chunk_id": cid,
                         "file_path": path,
@@ -138,13 +142,18 @@ class Indexer:
                     }
                 )
 
-            self._table.add(rows)
-
             if on_progress:
                 on_progress(min(batch_start + len(batch), total), total)
 
+        # 파일당 add() 1회 — 배치마다 add하면 LanceDB fragment가 과도하게 쌓여
+        # 검색·후속 쓰기 성능이 저하된다.
+        t0 = time.perf_counter()
+        self._table.add(all_rows)
+        save_sec = time.perf_counter() - t0
+
         logger.info(
-            "인덱싱 완료: path=%s chunks=%d scope=%s", path, total, scope
+            "인덱싱 완료: path=%s chunks=%d scope=%s embed=%.2fs save=%.2fs",
+            path, total, scope, embed_sec, save_sec,
         )
         return chunk_ids
 
