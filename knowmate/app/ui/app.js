@@ -644,9 +644,11 @@ function _fillSettingsForm(data) {
   document.getElementById("valTopK").textContent = topK + "건";
 
   document.getElementById("setIdleEnabled").checked = data.collector?.idle_enabled ?? true;
+  // config는 초 단위(idle_seconds)로 저장, UI는 분 단위로 표시 (1~30분, 최소 1분)
   const idleSec = data.collector?.idle_seconds ?? 60;
-  document.getElementById("setIdleSeconds").value = idleSec;
-  document.getElementById("valIdleSeconds").textContent = idleSec + "초";
+  const idleMin = Math.min(30, Math.max(1, Math.round(idleSec / 60)));
+  document.getElementById("setIdleMinutes").value = idleMin;
+  document.getElementById("valIdleMinutes").textContent = idleMin + "분";
 
   document.getElementById("setMailEnabled").checked = data.mail?.enabled ?? true;
 
@@ -694,7 +696,8 @@ function saveSettings() {
     },
     collector: {
       idle_enabled: document.getElementById("setIdleEnabled").checked,
-      idle_seconds: parseInt(document.getElementById("setIdleSeconds").value, 10),
+      // 분 단위 슬라이더 → 초 단위 config로 변환
+      idle_seconds: parseInt(document.getElementById("setIdleMinutes").value, 10) * 60,
     },
     mail: {
       enabled: document.getElementById("setMailEnabled").checked,

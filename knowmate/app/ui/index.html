@@ -207,9 +207,10 @@
           <label class="switch"><input type="checkbox" id="setIdleEnabled"><span class="slider"></span></label>
         </div>
         <div class="settings-field">
-          <div class="settings-field-label">자동 인덱싱 대기 시간 <span class="val" id="valIdleSeconds">60초</span></div>
-          <input type="range" id="setIdleSeconds" min="30" max="1800" step="30" value="60"
-            oninput="document.getElementById('valIdleSeconds').textContent = this.value + '초'">
+          <div class="settings-field-label">자동 인덱싱 대기 시간 <span class="val" id="valIdleMinutes">1분</span></div>
+          <input type="range" id="setIdleMinutes" min="1" max="30" step="1" value="1"
+            oninput="document.getElementById('valIdleMinutes').textContent = this.value + '분'">
+          <div class="settings-field-hint">자리를 비운 뒤 이 시간이 지나면 자동 인덱싱을 시작합니다. 네트워크 폴더가 많으면 길게(예: 30분) 두는 것을 권장합니다.</div>
         </div>
         <div class="settings-row">
           <div>
