@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Iterator, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from knowmate.rag.email_indexer import EmailIndexer
@@ -14,6 +15,41 @@ logger = logging.getLogger(__name__)
 _DEFAULT_MAIL_EXTS = [".mysingle", ".eml"]
 
 
+def _iter_mail_files(folder: str, exts: tuple[str, ...]) -> Iterator[tuple[str, float]]:
+    """os.scandir 스택 순회로 메일 파일을 (경로, mtime)으로 yield 한다.
+
+    확장자별 rglob(트리 N회 순회) 대신 트리를 1회만 훑고, DirEntry.stat()으로
+    디렉터리 열거 시 받아온 mtime 캐시를 재사용한다(Windows/SMB에서 파일별 stat
+    왕복이 0). 문서 스캐너(scanner.iter_scan_folder)와 동일한 최적화.
+    """
+    stack: list[str] = [folder]
+    while stack:
+        current_dir = stack.pop()
+        try:
+            with os.scandir(current_dir) as it:
+                for entry in it:
+                    try:
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                    except OSError as exc:
+                        logger.warning("[mail_scanner] 항목 접근 실패: %s (%s)", entry.path, exc)
+                        continue
+                    if is_dir:
+                        stack.append(entry.path)
+                        continue
+                    name = entry.name
+                    if name.startswith("~$"):
+                        continue
+                    if not name.lower().endswith(exts):
+                        continue
+                    try:
+                        st = entry.stat()  # Windows: scandir 캐시 재사용(무 syscall)
+                        yield entry.path, st.st_mtime
+                    except OSError as exc:
+                        logger.warning("[mail_scanner] stat 실패: %s (%s)", entry.path, exc)
+        except OSError as exc:
+            logger.error("[mail_scanner] 폴더 스캔 실패: %s (%s)", current_dir, exc)
+
+
 def scan_mail_folders(
     watch_folders: list[str], max_per_scan: int, extensions: list[str] | None = None
 ) -> list[dict]:
@@ -22,20 +58,15 @@ def scan_mail_folders(
 
     반환: [{"path": str, "mtime": float}, ...]
     """
-    exts = extensions or _DEFAULT_MAIL_EXTS
+    exts = tuple(e.lower() for e in (extensions or _DEFAULT_MAIL_EXTS))
     found: list[dict] = []
     for folder_str in watch_folders:
         folder = Path(folder_str)
         if not folder.is_dir():
             logger.warning("[mail_scanner] 폴더 접근 불가, 건너뜀: %s", folder_str)
             continue
-        for ext in exts:
-            for p in folder.rglob(f"*{ext}"):
-                try:
-                    mtime = p.stat().st_mtime
-                    found.append({"path": str(p), "mtime": mtime})
-                except OSError as exc:
-                    logger.warning("[mail_scanner] stat 실패: %s (%s)", p, exc)
+        for path, mtime in _iter_mail_files(folder_str, exts):
+            found.append({"path": path, "mtime": mtime})
 
     found.sort(key=lambda x: x["mtime"], reverse=True)
     return found[:max_per_scan]
