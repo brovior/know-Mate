@@ -31,6 +31,10 @@ function onBridgeReady() {
     try { data = JSON.parse(json); } catch { return; }
     onStatusUpdated(data);
   });
+  bridge.getVersion().then(v => {
+    const el = document.getElementById("appVersion");
+    if (el) el.textContent = "v" + v;
+  }).catch(() => {});
   loadRecentQuestions();
 }
 
@@ -604,4 +608,148 @@ function showToast(msg) {
   t.classList.add("show");
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => t.classList.remove("show"), 2500);
+}
+
+/* -- 설정 패널 -- */
+let _currentSettings = null;
+
+function openSettings() {
+  if (!bridge) { showToast("브리지가 준비되지 않았습니다."); return; }
+  bridge.getSettings().then(json => {
+    let data;
+    try { data = JSON.parse(json); } catch { showToast("설정을 불러오지 못했습니다."); return; }
+    _currentSettings = data;
+    _fillSettingsForm(data);
+    document.getElementById("settingsOverlay").classList.add("show");
+  }).catch(() => showToast("설정을 불러오지 못했습니다."));
+}
+
+function closeSettings() {
+  document.getElementById("settingsOverlay").classList.remove("show");
+  document.getElementById("testResults").innerHTML = "";
+}
+
+function _fillSettingsForm(data) {
+  document.getElementById("setLlmUrl").value   = data.llm?.base_url ?? "";
+  document.getElementById("setLlmModel").value = data.llm?.model ?? "";
+  document.getElementById("setEmbedUrl").value = data.embedding?.base_url ?? "";
+  document.getElementById("setEmbedModel").textContent = data.embedding?.model ?? "-";
+
+  const threshold = data.search?.score_threshold ?? 0.3;
+  document.getElementById("setScoreThreshold").value = threshold;
+  document.getElementById("valScoreThreshold").textContent = parseFloat(threshold).toFixed(2);
+
+  const topK = data.search?.top_k_max ?? 10;
+  document.getElementById("setTopK").value = topK;
+  document.getElementById("valTopK").textContent = topK + "건";
+
+  document.getElementById("setIdleEnabled").checked = data.collector?.idle_enabled ?? true;
+  const idleSec = data.collector?.idle_seconds ?? 60;
+  document.getElementById("setIdleSeconds").value = idleSec;
+  document.getElementById("valIdleSeconds").textContent = idleSec + "초";
+
+  document.getElementById("setMailEnabled").checked = data.mail?.enabled ?? true;
+
+  const maxSize = data.chunking?.max_file_size_mb ?? 30;
+  document.getElementById("setMaxFileSize").value = maxSize;
+  document.getElementById("valMaxFileSize").textContent = maxSize + "MB";
+
+  selectSeg("segCloseAction", data.ui?.close_action ?? "tray");
+  selectSeg("segLogLevel", data.log_level ?? "INFO");
+
+  bridge.getVersion().then(v => {
+    document.getElementById("settingsVersionNotice").textContent = "v" + v;
+  }).catch(() => {});
+}
+
+function selectSeg(groupId, value) {
+  const group = document.getElementById(groupId);
+  if (!group) return;
+  group.querySelectorAll(".settings-seg-btn").forEach(btn => {
+    btn.classList.toggle("active", btn.dataset.value === value);
+  });
+}
+
+function _segValue(groupId) {
+  const active = document.querySelector(`#${groupId} .settings-seg-btn.active`);
+  return active ? active.dataset.value : null;
+}
+
+function saveSettings() {
+  if (!bridge) { showToast("브리지가 준비되지 않았습니다."); return; }
+
+  const patch = {
+    llm: {
+      base_url: document.getElementById("setLlmUrl").value.trim(),
+      model: document.getElementById("setLlmModel").value.trim(),
+    },
+    embedding: {
+      base_url: document.getElementById("setEmbedUrl").value.trim(),
+    },
+    search: {
+      score_threshold: parseFloat(document.getElementById("setScoreThreshold").value),
+      top_k_max: parseInt(document.getElementById("setTopK").value, 10),
+    },
+    collector: {
+      idle_enabled: document.getElementById("setIdleEnabled").checked,
+      idle_seconds: parseInt(document.getElementById("setIdleSeconds").value, 10),
+    },
+    mail: {
+      enabled: document.getElementById("setMailEnabled").checked,
+    },
+    chunking: {
+      max_file_size_mb: parseInt(document.getElementById("setMaxFileSize").value, 10),
+    },
+    ui: {
+      close_action: _segValue("segCloseAction") || "tray",
+    },
+    log_level: _segValue("segLogLevel") || "INFO",
+  };
+
+  bridge.saveSettings(JSON.stringify(patch)).then(json => {
+    let result;
+    try { result = JSON.parse(json); } catch { showToast("설정 저장 실패"); return; }
+    if (result.ok) {
+      showToast("설정이 저장되었습니다. 일부 항목은 재시작 후 적용됩니다.");
+      closeSettings();
+    } else {
+      showToast("설정 저장 실패: " + (result.error || "알 수 없는 오류"));
+    }
+  }).catch(() => showToast("설정 저장 실패"));
+}
+
+function testConnection() {
+  if (!bridge) { showToast("브리지가 준비되지 않았습니다."); return; }
+  const box = document.getElementById("testResults");
+  box.innerHTML = '<div class="test-result">연결 확인 중...</div>';
+
+  bridge.testConnection().then(json => {
+    let result;
+    try { result = JSON.parse(json); } catch { box.innerHTML = '<div class="test-result test-fail">❌ 테스트 실패</div>'; return; }
+
+    const rows = [];
+    if (result.llm) {
+      rows.push(_renderTestRow("LLM 서버", result.llm));
+    }
+    if (result.embedding) {
+      rows.push(_renderTestRow("임베딩 서버", result.embedding));
+    }
+    box.innerHTML = rows.join("");
+  }).catch(() => {
+    box.innerHTML = '<div class="test-result test-fail">❌ 테스트 실패</div>';
+  });
+}
+
+function _renderTestRow(label, r) {
+  if (r.ok) {
+    return `<div class="test-result test-ok">✅ ${escHtml(label)} 연결 정상</div>`;
+  }
+  return `<div class="test-result test-fail">❌ ${escHtml(label)} 연결 실패 — ${escHtml(r.detail || "")}</div>`;
+}
+
+function openConfigFile() {
+  if (!bridge) { showToast("브리지가 준비되지 않았습니다."); return; }
+  bridge.openConfigFile().then(result => {
+    if (result !== "ok") showToast("설정 파일을 열지 못했습니다.");
+  }).catch(() => showToast("설정 파일을 열지 못했습니다."));
 }

@@ -99,6 +99,106 @@ class Bridge(QObject):
         return path or ""
 
     @pyqtSlot(result=str)
+    def getVersion(self) -> str:
+        """앱 버전 문자열을 반환한다."""
+        from knowmate.version import __version__
+        return __version__
+
+    # ------------------------------------------------------------------
+    # 설정 패널
+    # ------------------------------------------------------------------
+
+    @pyqtSlot(result=str)
+    def getSettings(self) -> str:
+        """설정 UI에 필요한 값만 추려 JSON으로 반환한다."""
+        from knowmate.config import get_config
+        from knowmate.rag.embedding import EMBEDDING_MODEL
+        cfg = get_config()
+        data = {
+            "llm": {
+                "base_url": cfg.get("llm", {}).get("base_url", ""),
+                "model": cfg.get("llm", {}).get("model", ""),
+            },
+            "embedding": {
+                "base_url": cfg.get("embedding", {}).get("base_url", ""),
+                "model": EMBEDDING_MODEL,  # 읽기 전용 (코드 상수 — CLAUDE.md 원칙2)
+            },
+            "search": {
+                "score_threshold": cfg.get("search", {}).get("score_threshold", 0.3),
+                "top_k_max": cfg.get("search", {}).get("top_k_max", 10),
+            },
+            "collector": {
+                "idle_enabled": cfg.get("collector", {}).get("idle_enabled", True),
+                "idle_seconds": cfg.get("collector", {}).get("idle_seconds", 60),
+            },
+            "mail": {
+                "enabled": cfg.get("mail", {}).get("enabled", True),
+            },
+            "chunking": {
+                "max_file_size_mb": cfg.get("chunking", {}).get("max_file_size_mb", 30),
+            },
+            "ui": {
+                "close_action": cfg.get("ui", {}).get("close_action", "tray"),
+            },
+            "log_level": cfg.get("log_level", "INFO"),
+        }
+        return json.dumps(data, ensure_ascii=False)
+
+    @pyqtSlot(str, result=str)
+    def saveSettings(self, payload: str) -> str:
+        """설정 UI에서 받은 patch를 저장한다. 결과를 {"ok": bool, "error": str} JSON으로 반환."""
+        try:
+            patch = json.loads(payload)
+        except json.JSONDecodeError:
+            return json.dumps({"ok": False, "error": "invalid JSON"})
+
+        from knowmate.config import update_settings
+        try:
+            update_settings(patch)
+            return json.dumps({"ok": True})
+        except Exception as exc:
+            import logging
+            logging.getLogger(__name__).warning("설정 저장 실패: %s", exc)
+            return json.dumps({"ok": False, "error": str(exc)})
+
+    @pyqtSlot(result=str)
+    def testConnection(self) -> str:
+        """LLM·임베딩 서버 연결을 각각 테스트해 결과를 JSON으로 반환한다."""
+        from knowmate.config import get_config
+        from knowmate.rag.embedding import get_embedding_client
+        from knowmate.llm.client import get_llm_client
+
+        cfg = get_config()
+        result: dict[str, dict] = {}
+
+        try:
+            llm = get_llm_client(cfg)
+            llm.answer("연결 테스트", ["ping"])
+            result["llm"] = {"ok": True, "detail": "정상 연결"}
+        except Exception as exc:
+            result["llm"] = {"ok": False, "detail": str(exc)}
+
+        try:
+            embed = get_embedding_client(cfg)
+            embed.embed(["연결 테스트"])
+            result["embedding"] = {"ok": True, "detail": "정상 연결"}
+        except Exception as exc:
+            result["embedding"] = {"ok": False, "detail": str(exc)}
+
+        return json.dumps(result, ensure_ascii=False)
+
+    @pyqtSlot(result=str)
+    def openConfigFile(self) -> str:
+        """config.yaml을 OS 기본 편집기로 연다."""
+        from knowmate.config import get_data_dir
+        path = get_data_dir() / "config.yaml"
+        try:
+            os.startfile(path)
+            return "ok"
+        except Exception as exc:
+            return f"error: {exc}"
+
+    @pyqtSlot(result=str)
     def getFolders(self) -> str:
         """현재 watch_folders 목록을 JSON 배열로 반환한다."""
         from knowmate.config import get_config
