@@ -1,6 +1,6 @@
 # EMAIL_DESIGN.md — Aegis Desk 메일 인덱싱 설계
-> 상태: **Phase 5a 구현 완료** (2026-06-26)
-> Knox `.mysingle` 구현 완료 · Outlook PST 보류
+> 상태: **Phase 5a 구현 완료** (Knox `.mysingle` + 표준 `.eml`) | 2026-07-17
+> Outlook PST/.msg 보류
 
 ---
 
@@ -9,15 +9,18 @@
 | 소스 | 상태 | 비고 |
 |---|---|---|
 | **Knox `.mysingle`** | ✅ 구현 완료 | "메일 1통 = 파일 1개" → 기존 파일 스캐너 모델에 얹힘 |
+| **표준 `.eml`** | ✅ 구현 완료 | 동일 RFC822+MIME 포맷 → 같은 파서 재사용(`parse_mail_file`) |
 | **Outlook PST/.msg** | 🔲 보류 | COM 보안 정책 선결 검증 필요. §8 참조 |
 
-**설계 원칙**: mysingle로 메일 파이프라인 뼈대를 세우고, Outlook은 그 위에 얹는다.
-스키마는 **Outlook까지 고려한 풀 스키마**로 한 번에 정의 (LanceDB는 ALTER가 비싸므로).
+**설계 원칙**: mysingle로 메일 파이프라인 뼈대를 세우고, `.eml`(동일 포맷)을 확장자 분기만으로 얹었다.
+Outlook은 그 위에 얹는다. 스키마는 **Outlook까지 고려한 풀 스키마**로 한 번에 정의 (LanceDB는 ALTER가 비싸므로).
 
 ---
 
-## 1. `.mysingle` 파싱 (`secure/mysingle_reader.py`)
+## 1. 메일 파싱 (`secure/mysingle_reader.py` → `parse_mail_file`)
 
+- **대상**: `.mysingle`(Knox) / `.eml`(표준). 둘 다 RFC822+MIME라 하나의 파서(`parse_mail_file`)로 처리, `parse_mysingle`은 하위호환 래퍼.
+- **source_type 판별**: 확장자로 결정 — `.mysingle` → `knox`, 그 외 → `eml`. `mail_uid` 접두도 동일(`knox:` / `eml:`).
 - **포맷**: 표준 RFC822 + MIME multipart. DRM 없음.
 - **파싱**: `email.message_from_binary_file(f, policy=email.policy.compat32)`
   - `policy.default`는 `=?UTF-8?B?...?=` 헤더 처리 이슈 → 헤더는 `email.header.decode_header()`로 별도 디코딩.
@@ -61,12 +64,20 @@
 
 | 순서 | 키 | 역할 |
 |---|---|---|
-| 1 | `mail_uid` = `knox:{X-Desktop-Msg-UniqueID}` | 같은 메일 재인덱싱 방지 |
-| 2 | `mtime` 비교 | 내용 변경 감지 (`is_indexed(mail_uid, mtime)`) |
-| 3 | `message_id` (RFC, 소스 간 공통) | (향후) Knox↔Outlook 소스 간 dedup |
-| 4 | `attach_sha256` | (향후) 동일 첨부 중복 방지 |
+| 1 | `mail_uid` = `knox:{UniqueID}` / `eml:{Message-ID}` | 같은 메일 재인덱싱 방지 |
+| 2 | `mtime` 비교 | 내용 변경 감지 |
+| 3 | **`_index_version`** (`source_meta`에 저장, `EMAIL_INDEX_VERSION`) | 인덱싱 포맷 변경 시 자동 재인덱싱 |
+| 4 | `message_id` (RFC, 소스 간 공통) | (향후) 소스 간 dedup |
+| 5 | `attach_sha256` | (향후) 동일 첨부 중복 방지 |
 
-`mail_uid` 정규화: Knox → `knox:{UniqueID}`, Outlook → `outlook:{EntryID}` (소스 접두사로 통일).
+`is_indexed(mail_uid, mtime)`는 위 1·2·3을 모두 만족해야 "이미 인덱싱됨"으로 스킵한다. 스캔 단계에선
+`mail_scanner._source_index_state`가 `source_file`+`mtime`+버전으로 사전 분류(indexed/stale_version/
+new_or_changed)해 파싱 비용을 절약한다.
+
+`mail_uid` 정규화: Knox → `knox:{UniqueID}`, eml → `eml:{Message-ID}`, Outlook → `outlook:{EntryID}` (소스 접두사로 통일).
+
+**본문 임베딩 시 메타 헤더 삽입**: `index_mail`은 청킹 전 본문 앞에 `제목/발신/수신/날짜` 헤더를 붙여,
+"○○가 보낸 메일", "○월 메일" 같은 발신인·날짜 기반 질의도 벡터 검색에 매칭되게 한다.
 
 ---
 
@@ -183,9 +194,13 @@ Knox 데스크탑 메일함은 **백업저장소**. 웹 Knox에서 메일을 지
 
 ```yaml
 mail:
-  enabled: false           # true로 바꾸면 watch_folders 내 .mysingle 자동 인덱싱
+  enabled: true            # watch_folders 내 메일 파일 자동 인덱싱 (기본 켬)
+  extensions:              # 인덱싱할 메일 확장자
+  - .mysingle
+  - .eml
   max_mails_per_scan: 500  # 스캔당 처리 상한 (최신 mtime 순)
   batch_commit_every: 50   # state 중간 저장 주기
 ```
 
-`watch_folders`를 공유 — `.mysingle` 확장자를 감지해 자동으로 메일 파이프라인으로 라우팅.
+`watch_folders`를 공유 — `extensions`에 지정된 확장자를 감지해 자동으로 메일 파이프라인으로 라우팅.
+스캔은 `mail_scanner._iter_mail_files`가 `os.scandir` 단일 순회로 처리(확장자별 rglob 아님, `DirEntry.stat` 캐시 재사용).
