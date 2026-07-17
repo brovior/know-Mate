@@ -224,6 +224,13 @@
             oninput="document.getElementById('valMaxFileSize').textContent = this.value + 'MB'">
           <div class="settings-field-hint">이 크기를 초과하는 파일은 인덱싱에서 제외됩니다.</div>
         </div>
+        <div class="settings-row">
+          <div>
+            <div class="settings-row-label">제거된 폴더 데이터 자동 삭제</div>
+            <div class="settings-row-hint">⚠ 폴더 관리에서 폴더를 제거하면 해당 인덱스를 실제로 삭제합니다. 끄면 삭제 대상만 로그로 기록하고 실제로 지우지 않습니다(기본값, 권장).</div>
+          </div>
+          <label class="switch"><input type="checkbox" id="setAutoDelete"><span class="slider"></span></label>
+        </div>
       </div>
 
       <!-- 동작 -->

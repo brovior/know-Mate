@@ -96,25 +96,35 @@ class CollectorWorker(QThread):
         self._cancelled = True
         logger.info("수집기 취소 요청됨")
 
-    def _purge_removed_folders(self, watch_folders: list[str], state: dict, dry_run: bool = True) -> None:
+    def _purge_removed_folders(
+        self, watch_folders: list[str], state: dict, dry_run: bool = True,
+        max_delete_ratio: float = 0.30,
+    ) -> None:
         """watch_folders에 속하지 않는 청크를 LanceDB에서 직접 삭제한다.
 
         state.json 대신 LanceDB의 file_path 컬럼을 기준으로 삭제해
         state와 DB 불일치 상황도 처리한다.
-        dry_run=True이면 삭제 대상 목록만 로그 출력하고 실제 삭제는 수행하지 않는다.
+
+        안전장치:
+        - watch_folders가 비어 있으면(온보딩 전·config 초기화 직후 등) 아무것도
+          "제거된 폴더"로 간주하지 않고 즉시 건너뛴다. 빈 목록을 "전부 삭제"로
+          해석하지 않는다.
+        - dry_run=True이면 state·DB 어느 쪽도 변경하지 않는다(완전한 예행연습).
+          기존에는 dry_run이어도 state 항목이 먼저 지워지는 버그가 있었다.
+        - 삭제 대상이 전체 인덱스의 max_delete_ratio를 초과하면 CleanupManager와
+          동일한 대량 삭제 차단을 적용한다(이 함수엔 원래 이 안전장치가 없었다).
         """
+        if not watch_folders:
+            logger.info("[purge] watch_folders 비어 있음 — 정리 건너뜀 (전체 삭제 오판 방지)")
+            return
+
         normalized = [f.replace("\\", "/").rstrip("/") for f in watch_folders]
 
         def belongs_to_any(path_str: str) -> bool:
             p = path_str.replace("\\", "/")
             return any(p.startswith(w + "/") or p == w for w in normalized)
 
-        # state에서 제거된 폴더 항목 정리
-        stale_state_paths = [p for p in list(state.keys()) if not belongs_to_any(p)]
-        for p in stale_state_paths:
-            state.pop(p, None)
-
-        # LanceDB에서 현재 file_path 목록 조회 후 직접 삭제
+        # LanceDB에서 현재 file_path 목록 조회
         try:
             df = self._indexer.table.to_arrow().to_pandas()
         except Exception as exc:
@@ -124,20 +134,40 @@ class CollectorWorker(QThread):
         if df.empty:
             return
 
-        # watch_folders에 속하지 않는 file_path 추출
+        total_indexed = df["file_path"].nunique()
         stale_mask = ~df["file_path"].apply(belongs_to_any)
         stale_paths_db = df.loc[stale_mask, "file_path"].unique().tolist()
 
         if not stale_paths_db:
             return
 
+        # 대량 삭제 차단 (CleanupManager.run()의 안전장치와 대칭)
+        ratio = len(stale_paths_db) / total_indexed if total_indexed else 1.0
+        if ratio > max_delete_ratio:
+            logger.error(
+                "[purge] 대량 삭제 차단 (%.0f%% > %.0f%%): %d/%d개 경로. "
+                "watch_folders 설정을 확인하세요: %s",
+                ratio * 100, max_delete_ratio * 100,
+                len(stale_paths_db), total_indexed, watch_folders,
+            )
+            self.indexing_needed.emit(
+                f"대량 삭제가 감지되어 정리를 건너뛰었습니다 "
+                f"({len(stale_paths_db)}/{total_indexed}개 경로). watch_folders 설정을 확인하세요."
+            )
+            return
+
         if dry_run:
             logger.info(
-                "[purge][dry-run] 제거된 폴더 DB 청크 정리 대상 %d개 경로 (실제 삭제 생략): %s",
+                "[purge][dry-run] 제거된 폴더 DB 청크 정리 대상 %d개 경로 (실제 삭제 생략, state도 미변경): %s",
                 len(stale_paths_db),
                 stale_paths_db,
             )
             return
+
+        # 실제 삭제 시에만 state에서도 제거 (dry_run 시엔 state를 건드리지 않는다)
+        stale_state_paths = [p for p in list(state.keys()) if not belongs_to_any(p)]
+        for p in stale_state_paths:
+            state.pop(p, None)
 
         logger.info("[purge] 제거된 폴더 DB 청크 정리: %d개 경로", len(stale_paths_db))
 
@@ -297,8 +327,10 @@ class CollectorWorker(QThread):
         # 생산자 스레드 정리 (정상 종료 시 이미 끝나 있음)
         producer.join(timeout=5)
 
-        # watch_folders에서 제거된 폴더의 청크를 정리한다 (dry_run 준수)
-        self._purge_removed_folders(watch_folders, state, dry_run=dry_run)
+        # watch_folders에서 제거된 폴더의 청크를 정리한다 (dry_run·대량삭제차단 준수)
+        self._purge_removed_folders(
+            watch_folders, state, dry_run=dry_run, max_delete_ratio=max_delete_ratio,
+        )
 
         cleanup = CleanupManager(
             indexer=self._indexer,
