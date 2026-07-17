@@ -1,10 +1,14 @@
 """임베딩 모델 상수 및 API 클라이언트 (CLAUDE.md 5-1)."""
+import http.client
 import json
+import logging
 import math
 import os
 import random
-import urllib.request
 from typing import Any
+from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
 
 # 인증 키가 없을 때 보내는 더미 값. 사내 임베딩 서버는 Authorization 헤더가
 # 비어 있으면 호출을 거부하므로, 키 미설정 시 이 더미값을 채워 보낸다.
@@ -66,6 +70,15 @@ class EmbeddingClient:
         self._local_model_name = local_model_name
         self._api_key = api_key or _DUMMY_API_KEY
 
+        # HTTP keep-alive 연결 재사용용 (배치마다 재연결하면 인덱싱 속도가 크게 느려짐).
+        # http.client는 시스템 프록시를 조회하지 않으므로 별도 프록시 우회 처리가 불필요하다.
+        parsed = urlparse(self._base_url)
+        self._conn_scheme = parsed.scheme or "http"
+        self._conn_host = parsed.hostname
+        self._conn_port = parsed.port
+        self._conn_path_prefix = parsed.path.rstrip("/")
+        self._conn: http.client.HTTPConnection | None = None
+
     def embed(self, texts: list[str]) -> list[list[float]]:
         """텍스트 리스트를 임베딩 벡터 리스트로 변환한다."""
         if not texts:
@@ -90,26 +103,51 @@ class EmbeddingClient:
         vecs = model.encode(texts, normalize_embeddings=True)
         return vecs.tolist()
 
+    def _get_connection(self) -> http.client.HTTPConnection:
+        """keep-alive 연결을 재사용한다. 끊겼으면 재생성한다."""
+        if self._conn is None:
+            conn_cls = (
+                http.client.HTTPSConnection
+                if self._conn_scheme == "https"
+                else http.client.HTTPConnection
+            )
+            self._conn = conn_cls(self._conn_host, self._conn_port, timeout=30)
+        return self._conn
+
     def _call_api(self, texts: list[str]) -> list[list[float]]:
-        """사내 임베딩 API를 호출해 벡터 리스트를 반환한다."""
-        url = f"{self._base_url}/v1/embeddings"
+        """사내 임베딩 API를 호출해 벡터 리스트를 반환한다.
+
+        인스턴스 수명 동안 HTTP 연결을 재사용한다(배치마다 재연결하면 인덱싱이
+        크게 느려짐). 연결이 끊겨 있으면 1회 재연결 후 재시도한다.
+        """
+        path = f"{self._conn_path_prefix}/v1/embeddings"
         payload: dict[str, Any] = {"model": EMBEDDING_MODEL, "input": texts}
         data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(
-            url,
-            data=data,
-            headers={
-                "Content-Type": "application/json",
-                "Host": self._host_header,
-                "Authorization": f"Bearer {self._api_key}",
-            },
-            method="POST",
-        )
-        # 사내 시스템 프록시가 요청을 가로채 403을 내므로 프록시를 우회한다
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
-        with opener.open(req, timeout=30) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-        return [item["embedding"] for item in body["data"]]
+        headers = {
+            "Content-Type": "application/json",
+            "Host": self._host_header,
+            "Authorization": f"Bearer {self._api_key}",
+        }
+
+        last_exc: Exception | None = None
+        for attempt in range(2):
+            try:
+                conn = self._get_connection()
+                conn.request("POST", path, body=data, headers=headers)
+                resp = conn.getresponse()
+                body_bytes = resp.read()
+                if resp.status >= 400:
+                    raise RuntimeError(
+                        f"임베딩 API 오류 {resp.status}: {body_bytes[:200]!r}"
+                    )
+                body = json.loads(body_bytes.decode("utf-8"))
+                return [item["embedding"] for item in body["data"]]
+            except (http.client.HTTPException, OSError) as exc:
+                # 연결이 끊겼을 가능성 — 폐기 후 재연결 시도
+                logger.debug("임베딩 API 연결 재시도 (attempt=%d): %s", attempt, exc)
+                self._conn = None
+                last_exc = exc
+        raise RuntimeError(f"임베딩 API 호출 실패: {last_exc}") from last_exc
 
 
 def get_embedding_client(cfg: dict[str, Any]) -> EmbeddingClient:

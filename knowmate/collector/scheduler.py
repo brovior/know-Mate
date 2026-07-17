@@ -292,8 +292,10 @@ class CollectorWorker(QThread):
 
             try:
                 logger.debug("[단계1] 텍스트 추출 시작: %s", task.path)
+                _extract_t0 = time.perf_counter()
                 text = self._extractor.extract(task.path)
-                logger.debug("[단계2] 텍스트 추출 완료: %s (%d자)", task.path, len(text))
+                extract_sec = time.perf_counter() - _extract_t0
+                logger.debug("[단계2] 텍스트 추출 완료: %s (%d자, %.2fs)", task.path, len(text), extract_sec)
                 stat = Path(task.path).stat()
                 scope = get_scope(task.path)
 
@@ -319,7 +321,10 @@ class CollectorWorker(QThread):
                     "chunk_ids": chunk_ids,
                     "index_version": DOC_INDEX_VERSION,
                 }
-                logger.info("[%s] %s -> %d청크", task.action, task.path, len(chunk_ids))
+                logger.info(
+                    "[%s] %s -> %d청크 (extract=%.2fs)",
+                    task.action, task.path, len(chunk_ids), extract_sec,
+                )
             except Exception as exc:
                 logger.error("파일 처리 실패 (건너뜀): %s - %s", task.path, exc)
                 failed.append(task.path)

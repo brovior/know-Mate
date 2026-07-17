@@ -457,23 +457,56 @@ class TestProxyBypass:
 
         monkeypatch.setattr(urllib.request, "build_opener", fake_build_opener)
 
-    def test_embedding_api_bypasses_proxy(self, monkeypatch):
-        """임베딩 _call_api가 빈 ProxyHandler opener로 호출하고 Authorization을 보존한다."""
-        captured: dict = {}
-        self._patch_opener(
-            monkeypatch, captured, {"data": [{"embedding": [0.0] * VECTOR_DIM}]}
-        )
+    def test_embedding_api_uses_direct_connection_no_proxy(self, monkeypatch):
+        """임베딩 _call_api가 http.client로 직접 연결하며(프록시 환경변수 미조회)
+        keep-alive 연결을 재사용하고 헤더·경로를 보존한다.
+        """
+        import http.client
+        import json
+
+        response_body = {"data": [{"embedding": [0.0] * VECTOR_DIM}]}
+        holder: dict = {}
+
+        class FakeResp:
+            status = 200
+            def __init__(self, body: bytes):
+                self._body = body
+            def read(self) -> bytes:
+                return self._body
+
+        class FakeConn:
+            def __init__(self, host, port, timeout=None):
+                self.host = host
+                self.port = port
+                self.request_count = 0
+                self.last_request: dict | None = None
+                holder["conn"] = self
+
+            def request(self, method, path, body=None, headers=None):
+                self.request_count += 1
+                self.last_request = {"method": method, "path": path, "body": body, "headers": headers}
+
+            def getresponse(self):
+                return FakeResp(json.dumps(response_body).encode("utf-8"))
+
+        monkeypatch.setattr(http.client, "HTTPConnection", FakeConn)
+
         client = EmbeddingClient(
             base_url="http://intra", host_header="embed.internal", api_key="dummy"
         )
         out = client.embed(["hi"])
+        client.embed(["world"])  # 두 번째 호출 — 연결 재사용 확인용
 
         assert len(out) == 1 and len(out[0]) == VECTOR_DIM
-        assert captured["handler_type"] == "ProxyHandler"
-        assert captured["proxies"] == {}                     # 빈 프록시 = 우회
-        assert captured["url"] == "http://intra/v1/embeddings"
-        assert captured["headers"]["authorization"] == "Bearer dummy"
-        assert captured["headers"]["host"] == "embed.internal"
+        conn = holder["conn"]
+        assert conn.host == "intra"                          # base_url에서 직접 연결 (프록시 미경유)
+        assert conn.request_count == 2                        # 같은 연결 객체로 2회 요청 = 재사용됨
+        req = conn.last_request
+        assert req["method"] == "POST"
+        assert req["path"] == "/v1/embeddings"
+        headers = {k.lower(): v for k, v in req["headers"].items()}
+        assert headers["authorization"] == "Bearer dummy"
+        assert headers["host"] == "embed.internal"
 
     def test_llm_api_bypasses_proxy(self, monkeypatch):
         """LLM _call_api가 빈 ProxyHandler opener로 호출하고 Authorization을 보존한다."""
