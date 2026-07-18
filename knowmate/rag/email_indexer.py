@@ -15,7 +15,7 @@ from knowmate.rag.embedding import EmbeddingClient, VECTOR_DIM
 logger = logging.getLogger(__name__)
 
 # 인덱싱 포맷 버전 — 변경 시 기존 메일 자동 재인덱싱
-EMAIL_INDEX_VERSION = "2"
+EMAIL_INDEX_VERSION = "3"  # v3: mail_date_ts(epoch) 필드 추가 — 날짜 범위 검색용
 
 EMAIL_SCHEMA = pa.schema([
     # ── 청크 공통 ──
@@ -37,7 +37,8 @@ EMAIL_SCHEMA = pa.schema([
     pa.field("subject",         pa.string()),
     pa.field("sender",          pa.string()),
     pa.field("recipients",      pa.string()),
-    pa.field("mail_date",       pa.string()),
+    pa.field("mail_date",       pa.string()),      # RFC 원문 문자열 (표시용)
+    pa.field("mail_date_ts",    pa.float64()),      # epoch (날짜 범위 검색용). 파싱 실패 시 0.0
     pa.field("thread_ref",      pa.string()),
     pa.field("source_file",     pa.string()),     # .mysingle 경로
     # ── 청크 출처 구분 ──
@@ -49,6 +50,20 @@ EMAIL_SCHEMA = pa.schema([
 ])
 
 EMAIL_TABLE_NAME = "emails"
+
+
+def _parse_mail_date_ts(mail_date: str) -> float:
+    """RFC822 Date 헤더 문자열을 epoch(float)로 변환한다. 파싱 실패 시 0.0."""
+    if not mail_date:
+        return 0.0
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(mail_date)
+        if dt is None:
+            return 0.0
+        return dt.timestamp()
+    except Exception:
+        return 0.0
 
 
 def _inject_version(source_meta: str) -> str:
@@ -146,6 +161,8 @@ class EmailIndexer:
         if not chunks:
             return []
 
+        mail_date_ts = _parse_mail_date_ts(parsed.get("mail_date", ""))
+
         # 기존 청크 삭제 (변경된 메일 재인덱싱)
         self.delete_mail_chunks(parsed["mail_uid"])
 
@@ -181,6 +198,7 @@ class EmailIndexer:
                     "sender":          parsed["sender"],
                     "recipients":      parsed["recipients"],
                     "mail_date":       parsed["mail_date"],
+                    "mail_date_ts":    mail_date_ts,
                     "thread_ref":      parsed["thread_ref"],
                     "source_file":     parsed["source_file"],
                     "chunk_origin":    "body",

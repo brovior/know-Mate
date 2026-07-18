@@ -105,7 +105,9 @@ scripts/          diag_search.py · inspect_index.py · test_shared_db.py(5b 사
 
 > **5b 결론**: SMB 위에서 LanceDB 직접 읽기/쓰기 불가(RustPanic, `scripts/test_shared_db.py`로 확인). → 마스터가 로컬 인덱싱 후 공용 폴더로 **복사 배포**, 사용자는 파트 최상위 `_aegisdesk/`를 상위 탐색으로 발견해 **로컬 캐시로 복사 후 읽기**. 검색은 지정 폴더 범위로 접두 필터.
 > **Outlook PST/.msg**: COM/전용 파서 필요, COM 보안 정책 선결 검증 후 착수. 상세는 `docs/EMAIL_DESIGN.md` §8.
-> **차후 과제**: 날짜 기반 검색 필터(메일 mail_date 파싱), 추출·임베딩 병렬화(P3), batch_size 튜닝(P4).
+> **날짜 기반 검색 필터**: ✅ 완료. `rag/date_filter.py`(규칙기반 한국어 파서)로 질의의 "지난주/3월/25주차" 등을
+> 기간으로 변환해 chunks(`mtime`)·emails(`mail_date_ts`) 검색에 적용. 상세는 `docs/DESIGN.md` §검색 파라미터.
+> **차후 과제**: 추출·임베딩 병렬화(P3), batch_size 튜닝(P4), 기간 나열형 전용 정렬 모드(v2).
 
 ---
 

@@ -83,6 +83,9 @@ new_or_changed)해 파싱 비용을 절약한다.
 
 ## 5. `emails` 테이블 스키마 (`rag/email_indexer.py`)
 
+> `EMAIL_INDEX_VERSION` 이력: v2(메타헤더 임베딩) → **v3**(`mail_date_ts` 추가, 날짜 범위 검색용).
+> 버전 범프 시 `_index_version`(source_meta) 불일치로 기존 메일이 자동 1회 재인덱싱된다.
+
 ```python
 EMAIL_SCHEMA = pa.schema([
     # ── 청크 공통 ──
@@ -104,7 +107,8 @@ EMAIL_SCHEMA = pa.schema([
     pa.field("subject",         pa.string()),
     pa.field("sender",          pa.string()),
     pa.field("recipients",      pa.string()),
-    pa.field("mail_date",       pa.string()),
+    pa.field("mail_date",       pa.string()),     # RFC 원문 문자열 (표시용)
+    pa.field("mail_date_ts",    pa.float64()),     # epoch (날짜 범위 검색용, v3부터)
     pa.field("thread_ref",      pa.string()),
     pa.field("source_file",     pa.string()),     # .mysingle 경로 (출처 카드 열기)
     # ── 청크 출처 구분 ──

@@ -6,6 +6,7 @@ from typing import Any
 
 import pandas as pd
 
+from knowmate.rag.date_filter import parse_date_range_ko
 from knowmate.rag.embedding import EmbeddingClient
 from knowmate.rag.indexer import Indexer
 
@@ -66,8 +67,25 @@ class Retriever:
         """쿼리를 벡터 검색해 권한 필터·복호화·샌드위치 배열 후 청크 dict 리스트를 반환한다."""
         vec = self._embed.embed([query])[0]
 
-        # chunks 테이블 검색
-        chunks_rows = self._search_table(self._table, vec, scopes, use_owner_filter=True)
+        # 질의에서 날짜 범위 파싱 ("지난주", "3월", "25주차" 등) — 매칭 없으면 None
+        date_range = parse_date_range_ko(query)
+        chunks_date_where: str | None = None
+        email_date_where: str | None = None
+        date_limit_override: int | None = None
+        if date_range:
+            start, end = date_range
+            chunks_date_where = f"mtime >= {start} AND mtime <= {end}"
+            email_date_where = f"mail_date_ts >= {start} AND mail_date_ts <= {end}"
+            date_limit_override = self._top_k * 5
+            logger.debug("날짜 필터 적용: %.0f ~ %.0f", start, end)
+
+        # chunks 테이블 검색 (날짜 필터 적용 시 점수 문턱 완화 — 해당 기간을 폭넓게 회수)
+        chunks_rows = self._search_table(
+            self._table, vec, scopes, use_owner_filter=True,
+            extra_where=chunks_date_where,
+            apply_threshold=(date_range is None),
+            limit_override=date_limit_override,
+        )
 
         # 키워드 보강: 질의 단어가 파일명/경로와 일치하는 문서 청크를 강제 포함
         # (파일명을 직접 언급하는 질의는 벡터 유사도만으로 놓칠 수 있음)
@@ -90,7 +108,10 @@ class Retriever:
         if self._email_indexer and (scopes is None or "local" in scopes):
             try:
                 email_rows = self._search_table(
-                    self._email_indexer.table, vec, scopes=None, use_owner_filter=False
+                    self._email_indexer.table, vec, scopes=None, use_owner_filter=False,
+                    extra_where=email_date_where,
+                    apply_threshold=(date_range is None),
+                    limit_override=date_limit_override,
                 )
                 for row in email_rows:
                     # emails 테이블에는 file_path가 없으므로 source_file로 채움
@@ -117,11 +138,14 @@ class Retriever:
         use_owner_filter: bool,
         extra_where: str | None = None,
         apply_threshold: bool = True,
+        limit_override: int | None = None,
     ) -> list[dict[str, Any]]:
         """단일 테이블에서 벡터 검색 후 점수 필터·권한 필터·복호화를 수행한다.
 
-        extra_where: 추가 SQL 조건 (예: 파일명 키워드 매칭).
+        extra_where: 추가 SQL 조건 (예: 파일명 키워드 매칭, 날짜 범위).
         apply_threshold: False면 score_threshold 필터를 건너뛴다.
+        limit_override: 지정 시 기본 후보 수(top_k*2) 대신 이 값을 사용한다
+                         (날짜 필터 적용 시 해당 기간을 폭넓게 회수하기 위해 상향).
         """
         where = "is_deleted = false"
         if extra_where:
@@ -129,7 +153,7 @@ class Retriever:
         raw = (
             table.search(vec)
             .where(where)
-            .limit(self._top_k * 2)
+            .limit(limit_override or self._top_k * 2)
             .to_arrow()
             .to_pandas()
         )
