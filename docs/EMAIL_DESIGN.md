@@ -131,14 +131,24 @@ EMAIL_SCHEMA = pa.schema([
 
 ---
 
-## 6. get-or-create 패턴
+## 6. get-or-create + 스키마 마이그레이션 패턴
 
 ```python
 def get_or_create_emails_table(db):
     if "emails" in db.table_names():
-        return db.open_table("emails")
+        table = db.open_table("emails")
+        return _migrate_emails_schema(db, table)  # 누락 컬럼 자동 보강
     return db.create_table("emails", schema=EMAIL_SCHEMA)
 ```
+
+**스키마 마이그레이션 (v3 회귀 방지)**: `_index_version` 범프는 기존 메일의 *재인덱싱*은
+트리거하지만, LanceDB 테이블의 *컬럼*을 자동으로 늘려주지는 않는다. 그래서 v3에서
+`mail_date_ts`를 추가했을 때, v2 시절 생성된 테이블은 컬럼이 없어 `table.add()`와 날짜필터
+WHERE가 `field 'mail_date_ts' does not exist in table schema`로 실패했다. `_migrate_emails_schema`가
+open 시 `EMAIL_SCHEMA` 대비 누락된 스칼라 컬럼을 `table.add_columns({col: SQL기본값})`으로
+채워(기존 행 보존) 재생성 없이 해소한다. `add_columns` 미지원·실패 또는 list/vector 등
+기본값 생성 불가 컬럼이 있으면 테이블을 재생성해 폴백한다(메일은 백업저장소 =
+`.mysingle`/`.eml`에서 다음 스캔에 재인덱싱되므로 데이터 유실 없음).
 
 ---
 
