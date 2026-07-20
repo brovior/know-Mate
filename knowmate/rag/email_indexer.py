@@ -77,10 +77,81 @@ def _inject_version(source_meta: str) -> str:
     return json.dumps(meta, ensure_ascii=False)
 
 
+# pyarrow 스칼라 타입 → 누락 컬럼 마이그레이션용 SQL 기본값(DataFusion)
+_MIGRATION_DEFAULT_SQL = {
+    pa.float64(): "CAST(0.0 AS DOUBLE)",
+    pa.int32():   "CAST(0 AS INT)",
+    pa.string():  "CAST('' AS STRING)",
+    pa.bool_():   "CAST(FALSE AS BOOLEAN)",
+}
+
+
+def _migrate_emails_schema(db, table):
+    """기존 emails 테이블에 EMAIL_SCHEMA 대비 누락된 스칼라 컬럼을 채운다.
+
+    v3에서 mail_date_ts(float64)가 추가됐으나, 그 이전에 생성된 테이블은 이 컬럼이
+    없어 index_mail의 table.add()·날짜필터 WHERE가 'field ... does not exist in table
+    schema'로 실패한다. LanceDB add_columns로 누락 컬럼을 기본값과 함께 추가해
+    재생성 없이 마이그레이션한다(기존 행 보존). add_columns 미지원·실패 시에는
+    테이블을 재생성해 폴백한다(메일은 백업저장소 = .mysingle/.eml에서 재인덱싱됨).
+
+    반환: 마이그레이션(또는 재생성)된 테이블 객체.
+    """
+    try:
+        existing = set(table.schema.names)
+    except Exception as exc:
+        logger.warning("[email_indexer] 스키마 조회 실패, 마이그레이션 생략: %s", exc)
+        return table
+
+    to_add: dict[str, str] = {}
+    unsupported: list[str] = []
+    for field in EMAIL_SCHEMA:
+        if field.name in existing:
+            continue
+        default_sql = _MIGRATION_DEFAULT_SQL.get(field.type)
+        if default_sql is None:  # list/vector 등 — add_columns 기본값 생성 불가
+            unsupported.append(field.name)
+        else:
+            to_add[field.name] = default_sql
+
+    if not to_add and not unsupported:
+        return table  # 최신 스키마 — 변경 없음
+
+    if to_add:
+        try:
+            table.add_columns(to_add)
+            logger.info("[email_indexer] emails 스키마 마이그레이션 — 컬럼 추가: %s", list(to_add))
+        except Exception as exc:
+            logger.error(
+                "[email_indexer] add_columns 실패(%s) — 테이블 재생성으로 폴백. "
+                "기존 메일은 다음 스캔에서 재인덱싱됩니다: %s", list(to_add), exc,
+            )
+            unsupported = []  # 재생성이 모든 누락을 해소
+            try:
+                db.drop_table(EMAIL_TABLE_NAME)
+            except Exception:
+                pass
+            return db.create_table(EMAIL_TABLE_NAME, schema=EMAIL_SCHEMA)
+
+    if unsupported:
+        logger.error(
+            "[email_indexer] 자동 추가 불가한 누락 컬럼 %s — 테이블 재생성으로 폴백. "
+            "기존 메일은 다음 스캔에서 재인덱싱됩니다.", unsupported,
+        )
+        try:
+            db.drop_table(EMAIL_TABLE_NAME)
+        except Exception:
+            pass
+        return db.create_table(EMAIL_TABLE_NAME, schema=EMAIL_SCHEMA)
+
+    return table
+
+
 def get_or_create_emails_table(db):
-    """emails 테이블이 없으면 생성, 있으면 open해 반환한다."""
+    """emails 테이블이 없으면 생성, 있으면 open 후 스키마 마이그레이션해 반환한다."""
     if EMAIL_TABLE_NAME in db.table_names():
-        return db.open_table(EMAIL_TABLE_NAME)
+        table = db.open_table(EMAIL_TABLE_NAME)
+        return _migrate_emails_schema(db, table)
     return db.create_table(EMAIL_TABLE_NAME, schema=EMAIL_SCHEMA)
 
 

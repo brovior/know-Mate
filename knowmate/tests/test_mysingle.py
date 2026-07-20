@@ -153,6 +153,29 @@ class TestEmailIndexer:
         ei.delete_mail_chunks("knox:DEL001")
         assert not ei.is_indexed("knox:DEL001", 1000.0)
 
+    def test_migrates_pre_v3_table_missing_mail_date_ts(self, tmp_path):
+        """mail_date_ts 없는 구 스키마 테이블을 열면 컬럼이 자동 추가되고 인덱싱이 성공한다."""
+        import lancedb
+        import pyarrow as pa
+        from knowmate.rag.email_indexer import (
+            EMAIL_SCHEMA, EMAIL_TABLE_NAME, EmailIndexer, get_or_create_emails_table,
+        )
+        # v3 이전 스키마 재현: mail_date_ts 필드만 제거해 테이블 생성
+        old_schema = pa.schema([f for f in EMAIL_SCHEMA if f.name != "mail_date_ts"])
+        db = lancedb.connect(str(tmp_path))
+        db.create_table(EMAIL_TABLE_NAME, schema=old_schema)
+        assert "mail_date_ts" not in set(db.open_table(EMAIL_TABLE_NAME).schema.names)
+
+        # get_or_create가 마이그레이션으로 컬럼을 추가해야 한다
+        table = get_or_create_emails_table(db)
+        assert "mail_date_ts" in set(table.schema.names)
+
+        # 마이그레이션 후 실제 인덱싱(table.add)이 실패 없이 동작
+        ei = EmailIndexer(db_path=tmp_path, embed_client=_fake_embed())
+        chunk_ids = ei.index_mail(self._sample_parsed("knox:MIG001"), mtime=1000.0)
+        assert len(chunk_ids) > 0
+        assert ei.is_indexed("knox:MIG001", 1000.0)
+
 
 # ---------------------------------------------------------------------------
 # mail_scanner 테스트
