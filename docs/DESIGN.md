@@ -114,6 +114,17 @@ class WordComReader:
 ```
 > **매번 Quit() 하는 방식 절대 사용 금지.**
 
+**Office 점유 가드 (`secure/office_guard.py`)**
+
+COM 자동화는 대상 Office 프로세스가 이미 떠 있으면 그 인스턴스에 붙는다(사용자당 1 인스턴스). 백그라운드
+인덱싱이 사용자가 열어둔 창을 점유해 응답없음을 유발하는 것을 막기 위해, `AutoReader`는 COM 라우팅
+(`.doc/.xls/.ppt` + OLE2 오라벨 docx) **직전** `is_office_busy_for_ext(ext)`로 대상 앱 실행 여부를
+확인한다. 실행 중이면 `OfficeBusyError`를 던져 그 확장자만 **이번 사이클에서 연기**하고, 소비자
+루프(`scheduler`)는 이를 실패가 아닌 연기로 처리(state 미갱신 → 다음 유휴 사이클 자동 재시도). 감지는
+Toolhelp32 **프로세스 열거만** 수행하며 COM 객체를 생성·연결하지 않는다(사용자 창 무간섭). 비Windows·
+열거 실패 시 차단하지 않아(기존 동작 유지) 사외 테스트에 영향 없다. 정상 OOXML(docx 등)은 라이브러리
+파싱이라 가드 대상이 아니다.
+
 **xlsx 손상 복구 (`plain_reader._load_xlsx_sanitized`)**
 
 openpyxl이 `docProps/custom.xml` 타입 오류로 실패하면, custom.xml 파트와 `[Content_Types].xml` 내 해당 Override 엔트리를 함께 제거한 사본으로 재시도.

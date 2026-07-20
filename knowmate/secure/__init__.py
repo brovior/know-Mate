@@ -33,17 +33,33 @@ class AutoReader:
 
         확장자가 OOXML(.docx/.xlsx/.pptx)이라도 실제 내용이 OLE2 바이너리면
         오라벨 파일로 보고 COM 리더로 폴백한다.
+
+        COM 라우팅 직전, 해당 Office 앱을 사용자가 열어두었으면 OfficeBusyError를
+        발생시켜 이번 사이클에서 건너뛴다(사용자 창 점유·응답없음 방지). 정상
+        OOXML(.docx 등)은 라이브러리로 파싱하므로 이 가드의 영향을 받지 않는다.
         """
         ext = Path(path).suffix.lower()
         if ext in {".doc", ".xls", ".ppt"}:
+            self._guard_office_busy(ext, path)
             # COM 의존 코드: secure/ 안에서만 import
             from knowmate.secure.com_reader import ComReader
             return ComReader().extract(path)
         if ext in _OOXML_EXTS and is_ole2(path):
             logger.warning("확장자는 OOXML이나 실제 OLE2 → COM 폴백: %s", path)
+            self._guard_office_busy(ext, path)
             from knowmate.secure.com_reader import ComReader
             return ComReader().extract(path)
         return self._plain.extract(path)
+
+    @staticmethod
+    def _guard_office_busy(ext: str, path: str) -> None:
+        """대상 Office 앱이 실행 중이면 OfficeBusyError를 발생시킨다."""
+        from knowmate.secure.office_guard import OfficeBusyError, is_office_busy_for_ext, process_for_ext
+        if is_office_busy_for_ext(ext):
+            proc = process_for_ext(ext)
+            raise OfficeBusyError(
+                f"{proc} 실행 중 — {ext} COM 파싱을 이번 사이클에서 건너뜁니다: {path}"
+            )
 
 
 def get_extractor(mode: str) -> TextExtractor:

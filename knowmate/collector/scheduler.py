@@ -13,6 +13,7 @@ from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal
 from knowmate.collector.cleanup import CleanupManager
 from knowmate.collector.scanner import get_scope, iter_scan_folder
 from knowmate.collector.state import load_state, save_state
+from knowmate.secure.office_guard import OfficeBusyError
 
 if TYPE_CHECKING:
     from knowmate.rag.indexer import Indexer
@@ -272,6 +273,7 @@ class CollectorWorker(QThread):
 
         done = 0
         failed = []
+        deferred = []
 
         while True:
             task = task_queue.get()
@@ -325,6 +327,11 @@ class CollectorWorker(QThread):
                     "[%s] %s -> %d청크 (extract=%.2fs)",
                     task.action, task.path, len(chunk_ids), extract_sec,
                 )
+            except OfficeBusyError as exc:
+                # 사용자가 Office를 열어둔 상태 → 이번 사이클만 연기(실패 아님).
+                # state를 갱신하지 않으므로 다음 유휴 사이클에서 자동 재시도된다.
+                logger.warning("[collector] Office 점유로 연기(다음 사이클 재시도): %s", exc)
+                deferred.append(task.path)
             except Exception as exc:
                 logger.error("파일 처리 실패 (건너뜀): %s - %s", task.path, exc)
                 failed.append(task.path)
@@ -368,8 +375,12 @@ class CollectorWorker(QThread):
         )
         if mail_indexed:
             summary += f" / 메일 {mail_indexed}건"
+        if deferred:
+            summary += f" / Office 점유로 연기 {len(deferred)}건"
         if failed:
             logger.warning("실패 파일 목록: %s", failed)
+        if deferred:
+            logger.info("Office 점유로 연기된 파일 %d건(다음 사이클 재시도)", len(deferred))
         self.finished.emit(summary)
 
 

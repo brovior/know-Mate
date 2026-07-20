@@ -246,6 +246,54 @@ class TestAutoReader:
             get_extractor("unknown_mode")
 
 
+class TestOfficeGuard:
+    """사용자 Office 점유 감지 → COM 파싱 연기 (OfficeBusyError)."""
+
+    def test_process_for_ext_mapping(self):
+        """확장자별 Office 실행 파일명 매핑이 올바르다."""
+        from knowmate.secure.office_guard import process_for_ext
+        assert process_for_ext(".doc") == "WINWORD.EXE"
+        assert process_for_ext(".DOCX") == "WINWORD.EXE"
+        assert process_for_ext(".xls") == "EXCEL.EXE"
+        assert process_for_ext(".pptx") == "POWERPNT.EXE"
+        assert process_for_ext(".pdf") is None
+        assert process_for_ext(".txt") is None
+
+    def test_busy_false_when_not_running(self, monkeypatch):
+        """대상 프로세스가 안 떠 있으면 False."""
+        import knowmate.secure.office_guard as og
+        monkeypatch.setattr(og, "_running_process_names", lambda: {"EXPLORER.EXE"})
+        assert og.is_office_busy_for_ext(".doc") is False
+
+    def test_busy_true_when_running(self, monkeypatch):
+        """대상 프로세스가 떠 있으면 True."""
+        import knowmate.secure.office_guard as og
+        monkeypatch.setattr(og, "_running_process_names", lambda: {"WINWORD.EXE"})
+        assert og.is_office_busy_for_ext(".doc") is True
+        assert og.is_office_busy_for_ext(".docx") is True
+
+    def test_busy_false_for_non_office_ext_even_if_running(self, monkeypatch):
+        """대상 외 확장자는 프로세스가 떠 있어도 차단하지 않는다."""
+        import knowmate.secure.office_guard as og
+        monkeypatch.setattr(og, "_running_process_names", lambda: {"WINWORD.EXE"})
+        assert og.is_office_busy_for_ext(".pdf") is False
+
+    def test_busy_false_when_enumeration_unavailable(self, monkeypatch):
+        """프로세스 열거 불가(None, 비Windows 등)면 차단하지 않는다(기존 동작 유지)."""
+        import knowmate.secure.office_guard as og
+        monkeypatch.setattr(og, "_running_process_names", lambda: None)
+        assert og.is_office_busy_for_ext(".doc") is False
+
+    def test_autoreader_raises_office_busy_before_com(self, monkeypatch):
+        """Office 점유 시 AutoReader가 COM 진입 전에 OfficeBusyError를 낸다."""
+        import knowmate.secure.office_guard as og
+        from knowmate.secure import AutoReader
+        from knowmate.secure.office_guard import OfficeBusyError
+        monkeypatch.setattr(og, "is_office_busy_for_ext", lambda ext: True)
+        with pytest.raises(OfficeBusyError):
+            AutoReader().extract("C:/dummy/report.doc")
+
+
 class TestPlainReaderTables:
     """표·도형 추출 검증 (docx 표 / pptx 표 + 그룹 재귀)."""
 
