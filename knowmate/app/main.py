@@ -169,11 +169,13 @@ class MainWindow(QMainWindow):
             # 동일한 단일 워커를 재사용해 동시 실행을 방지한다.
             if cfg.get("collector", {}).get("idle_enabled", True):
                 idle_sec = cfg.get("collector", {}).get("idle_seconds", 60)
+                drm_idle_threshold_sec = cfg.get("collector", {}).get("drm_idle_threshold_sec", 480)
                 self._idle_scheduler = IdleScheduler(
                     trigger=self._trigger_idle_index,
                     is_busy=lambda: self._bridge._worker is not None
                     and self._bridge._worker.isRunning(),
                     idle_seconds=idle_sec,
+                    drm_idle_threshold_sec=drm_idle_threshold_sec,
                     parent=self,
                 )
                 self._idle_scheduler.start()

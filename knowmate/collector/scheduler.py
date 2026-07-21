@@ -502,6 +502,12 @@ class CollectorWorker(QThread):
 # 실제 유휴에 못 미칠 때 다음 재확인까지 최소 대기(너무 촘촘한 재확인 방지)
 _MIN_RECHECK_SECONDS = 5.0
 
+# 복귀 감지 워처(Phase D)의 폴링 간격과 "방금 활동함" 판정 임계.
+# _RECOVERY_ACTIVE_SECONDS는 이 워처의 폴링 간격보다 작아야 "막 돌아왔다"는
+# 신호로 유효하다(그렇지 않으면 유휴 지속 중에도 우연히 낮게 잡힐 수 있음).
+_RECOVERY_POLL_SECONDS = 15.0
+_RECOVERY_ACTIVE_SECONDS = 10.0
+
 
 class IdleScheduler(QObject):
     """실제 OS 유휴 시간이 임계를 넘었을 때만 인덱싱을 트리거한다.
@@ -514,9 +520,19 @@ class IdleScheduler(QObject):
     단일 워커를 공유하기 위해 워커를 직접 생성하지 않고,
     trigger/is_busy 콜백으로 외부 워커를 제어한다.
     이미 인덱싱(수동/유휴 무관)이 진행 중이면 건너뛴다.
+
+    복귀 감지(Phase D): 유휴가 `drm_idle_threshold_sec`를 넘으면(그 사이클들에서
+    DRM 의심 문서가 스킵됐을 가능성) 별도의 경량 폴링 워처가 그 사실을 기억해
+    두었다가, 사용자 활동이 재개된 직후(유휴가 다시 짧아진 시점) idle_elapsed=0으로
+    즉시 한 번 트리거한다 — DRM 스킵이 걸리지 않는 정상 사이클이라 밀린 DRM
+    문서가 자연히 캐치업된다. 다음 정기 유휴 사이클(최대 idle_seconds 뒤)까지
+    기다리지 않기 위함.
     """
 
-    def __init__(self, trigger, is_busy, idle_seconds=60, parent=None, get_idle_seconds=None):
+    def __init__(
+        self, trigger, is_busy, idle_seconds=60, parent=None, get_idle_seconds=None,
+        drm_idle_threshold_sec=480.0,
+    ):
         """스케줄러를 초기화한다.
 
         trigger: (idle_elapsed_sec: float) -> None, 인덱싱을 시작하는 콜백.
@@ -524,11 +540,15 @@ class IdleScheduler(QObject):
         is_busy: () -> bool, 인덱싱이 진행 중이면 True를 반환하는 콜백
         get_idle_seconds: () -> float, 실제 OS 유휴 경과초 조회(테스트 주입용,
             기본은 collector.idle_util.get_idle_seconds)
+        drm_idle_threshold_sec: 이 이상 유휴가 지속됐다가 활동이 재개되면
+            복귀 캐치업 트리거를 1회 발동한다(collector.drm_idle_threshold_sec와
+            동일 값을 넘겨 일관성을 유지해야 함).
         """
         super().__init__(parent)
         self._trigger = trigger
         self._is_busy = is_busy
         self._idle_seconds = idle_seconds
+        self._drm_idle_threshold_sec = drm_idle_threshold_sec
         if get_idle_seconds is None:
             from knowmate.collector.idle_util import get_idle_seconds as _default
             get_idle_seconds = _default
@@ -538,15 +558,24 @@ class IdleScheduler(QObject):
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._on_idle)
 
+        # 복귀 감지 워처 — idle_seconds 디바운스와 독립적으로 계속 도는 경량 폴링
+        self._was_long_idle = False
+        self._recovery_timer = QTimer(self)
+        self._recovery_timer.setInterval(int(_RECOVERY_POLL_SECONDS * 1000))
+        self._recovery_timer.timeout.connect(self._on_recovery_check)
+
     def start(self):
         """스케줄러를 시작한다."""
         self._timer.setInterval(self._idle_seconds * 1000)
         self._timer.start()
+        self._was_long_idle = False
+        self._recovery_timer.start()
         logger.info("IdleScheduler 시작 (idle=%ds)", self._idle_seconds)
 
     def stop(self):
         """스케줄러를 중지한다."""
         self._timer.stop()
+        self._recovery_timer.stop()
         logger.info("IdleScheduler 중지")
 
     def reset_idle(self):
@@ -590,3 +619,25 @@ class IdleScheduler(QObject):
             self._trigger(actual_idle)
         finally:
             self._timer.start()  # 다음 유휴 사이클 예약
+
+    def _on_recovery_check(self):
+        """장시간 유휴 뒤 활동 재개 순간을 포착해 DRM 캐치업 사이클을 즉시 트리거한다.
+
+        idle_seconds 디바운스와 무관하게 독립적으로 폴링한다 — 그래야 다음
+        정기 유휴 사이클까지 기다리지 않고 복귀 직후 즉시 캐치업할 수 있다.
+        """
+        if self._is_busy():
+            return  # 진행 중인 사이클이 끝난 뒤 다음 폴링에서 재판단
+
+        current = self._get_idle_seconds()
+        if current >= self._drm_idle_threshold_sec:
+            self._was_long_idle = True
+            return
+
+        if self._was_long_idle and current < _RECOVERY_ACTIVE_SECONDS:
+            self._was_long_idle = False
+            logger.info(
+                "IdleScheduler: 장시간 유휴(DRM 스킵 추정) 후 활동 재개 감지 "
+                "-> DRM 캐치업 사이클 즉시 실행"
+            )
+            self._trigger(0.0)  # idle_elapsed=0 → DRM 스킵 없이 정상 처리(밀린 DRM 문서 포함)

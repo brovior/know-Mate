@@ -868,13 +868,17 @@ class TestIdleUtil:
 
 @pytest.mark.skipif(not _HAS_PYQT6, reason="PyQt6 미설치 — 폐쇄망 외 환경")
 class TestIdleScheduler:
-    def _make_scheduler(self, get_idle_seconds, idle_seconds=60, trigger=None, is_busy=None):
+    def _make_scheduler(
+        self, get_idle_seconds, idle_seconds=60, trigger=None, is_busy=None,
+        drm_idle_threshold_sec=480.0,
+    ):
         from knowmate.collector.scheduler import IdleScheduler
         return IdleScheduler(
             trigger=trigger or MagicMock(),
             is_busy=is_busy or (lambda: False),
             idle_seconds=idle_seconds,
             get_idle_seconds=get_idle_seconds,
+            drm_idle_threshold_sec=drm_idle_threshold_sec,
         )
 
     def test_triggers_when_actual_idle_meets_threshold(self):
@@ -921,3 +925,61 @@ class TestIdleScheduler:
         sched._on_idle()
         trigger.assert_not_called()
         assert sched._timer.isActive()
+
+    # ── 복귀 감지 워처 (Phase D) ──────────────────────────────────
+
+    def test_recovery_triggers_catchup_after_long_idle(self):
+        """장시간 유휴 뒤 활동 재개를 감지하면 idle_elapsed=0으로 즉시 트리거한다."""
+        trigger = MagicMock()
+        readings = iter([500.0, 2.0])  # 1틱: 장시간 유휴 / 2틱: 방금 활동
+        sched = self._make_scheduler(
+            get_idle_seconds=lambda: next(readings), trigger=trigger, drm_idle_threshold_sec=480.0,
+        )
+        sched._on_recovery_check()  # 장시간 유휴 감지 — 아직 트리거 안 함
+        trigger.assert_not_called()
+        sched._on_recovery_check()  # 활동 재개 감지 — 캐치업 트리거
+        trigger.assert_called_once_with(0.0)
+
+    def test_recovery_does_not_trigger_without_prior_long_idle(self):
+        """장시간 유휴가 선행되지 않았으면 유휴가 짧아져도 캐치업을 트리거하지 않는다."""
+        trigger = MagicMock()
+        sched = self._make_scheduler(get_idle_seconds=lambda: 2.0, trigger=trigger)
+        sched._on_recovery_check()
+        trigger.assert_not_called()
+
+    def test_recovery_does_not_trigger_while_still_idle(self):
+        """유휴가 임계를 넘은 채 유지되면(아직 복귀 아님) 캐치업을 트리거하지 않는다."""
+        trigger = MagicMock()
+        sched = self._make_scheduler(
+            get_idle_seconds=lambda: 500.0, trigger=trigger, drm_idle_threshold_sec=480.0,
+        )
+        sched._on_recovery_check()
+        sched._on_recovery_check()
+        trigger.assert_not_called()
+
+    def test_recovery_skips_check_when_busy(self):
+        """인덱싱 진행 중이면 복귀 판정 자체를 보류한다(was_long_idle 상태 유지)."""
+        trigger = MagicMock()
+        readings = iter([500.0, 2.0])
+        sched = self._make_scheduler(
+            get_idle_seconds=lambda: next(readings), trigger=trigger,
+            drm_idle_threshold_sec=480.0, is_busy=lambda: True,
+        )
+        sched._on_recovery_check()  # busy — 500.0 소비했지만 판정 보류
+        sched._on_recovery_check()  # busy — 2.0도 소비, 여전히 보류
+        trigger.assert_not_called()
+
+    def test_start_resets_recovery_state_and_starts_watcher(self):
+        """start() 호출 시 복귀 워처가 시작되고 상태가 초기화된다."""
+        sched = self._make_scheduler(get_idle_seconds=lambda: 0.0)
+        sched._was_long_idle = True
+        sched.start()
+        assert sched._was_long_idle is False
+        assert sched._recovery_timer.isActive()
+
+    def test_stop_stops_recovery_watcher(self):
+        """stop() 호출 시 복귀 워처도 함께 멈춘다."""
+        sched = self._make_scheduler(get_idle_seconds=lambda: 0.0)
+        sched.start()
+        sched.stop()
+        assert not sched._recovery_timer.isActive()
