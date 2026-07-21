@@ -196,10 +196,16 @@ class MainWindow(QMainWindow):
         self._bridge.set_worker(worker)
         return worker
 
-    def _trigger_idle_index(self) -> None:
-        """유휴 인덱싱을 트리거한다. 공유 워커가 멈춰 있을 때만 시작한다."""
+    def _trigger_idle_index(self, idle_elapsed_sec: float = 0.0) -> None:
+        """유휴 인덱싱을 트리거한다. 공유 워커가 멈춰 있을 때만 시작한다.
+
+        idle_elapsed_sec: IdleScheduler가 측정한 실제 유휴 경과초. 워커에
+        전달해 DRM 의심 문서 스킵 판단(collector.drm_idle_threshold_sec)에
+        쓴다.
+        """
         worker = self._bridge._worker
         if worker is not None and not worker.isRunning():
+            worker.set_idle_context(idle_elapsed_sec)
             worker.start()
 
     def resizeEvent(self, event) -> None:

@@ -584,6 +584,126 @@ class TestQueuePriority:
 
 
 # ============================================================
+# TestDrmIdleSkip — 유휴 장기화 시 DRM 의심 문서 스킵 (PyQt6 필요)
+# ============================================================
+
+@pytest.mark.skipif(not _HAS_PYQT6, reason="PyQt6 미설치 — 폐쇄망 외 환경")
+class TestDrmIdleSkip:
+    def test_is_drm_suspected_classification(self, tmp_path: Path):
+        """정상 레거시(OLE2)·정상 OOXML(zip)은 스킵 대상 아님, 그 외만 의심."""
+        import zipfile
+        from knowmate.collector.scheduler import _is_drm_suspected
+
+        real_doc = tmp_path / "a.doc"
+        real_doc.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")  # 정상 OLE2
+        assert _is_drm_suspected(str(real_doc)) is False
+
+        drm_doc = tmp_path / "b.doc"
+        drm_doc.write_bytes(b"<## " + b"\x00" * 20)  # OLE2도 zip도 아님 → 의심
+        assert _is_drm_suspected(str(drm_doc)) is True
+
+        real_xlsx = tmp_path / "c.xlsx"
+        with zipfile.ZipFile(real_xlsx, "w") as zf:
+            zf.writestr("x.txt", "y")
+        assert _is_drm_suspected(str(real_xlsx)) is False  # 정상 zip
+
+        drm_xlsx = tmp_path / "d.xlsx"
+        drm_xlsx.write_bytes(b"<## " + b"\x00" * 20)
+        assert _is_drm_suspected(str(drm_xlsx)) is True
+
+        txt = tmp_path / "e.txt"
+        txt.write_bytes(b"hello")
+        assert _is_drm_suspected(str(txt)) is False  # office 확장자 아님 → 대상 아님
+
+    def test_drm_suspected_file_skipped_when_idle_exceeds_threshold(self, tmp_path: Path):
+        """유휴가 임계를 넘으면 DRM 의심 파일은 큐잉되지 않고(state 불변) 다음 사이클로 넘어간다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+        from knowmate.collector.state import load_state
+        from knowmate.secure.fake_reader import FakeReader
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        drm_file = folder / "drm.xlsx"
+        drm_file.write_bytes(b"<## " + b"\x00" * 20)  # DRM 의심
+        normal_file = folder / "normal.txt"
+        normal_file.write_bytes(b"hello")
+
+        config = _make_config(str(folder))
+        config["collector"]["drm_idle_threshold_sec"] = 100
+        state_file = tmp_path / "state.json"
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
+        )
+        worker.set_idle_context(200.0)  # 임계(100) 초과
+        worker.run()
+
+        state = load_state(state_file)
+        assert str(normal_file) in state          # 일반 파일은 정상 인덱싱
+        assert str(drm_file) not in state          # DRM 의심 파일은 스킵(state 불변)
+
+    def test_drm_suspected_file_processed_when_idle_below_threshold(self, tmp_path: Path):
+        """유휴가 임계 미만(기본값 0.0 포함)이면 DRM 의심 파일도 정상 처리된다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+        from knowmate.collector.state import load_state
+        from knowmate.secure.fake_reader import FakeReader
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        drm_file = folder / "drm.xlsx"
+        drm_file.write_bytes(b"<## " + b"\x00" * 20)
+
+        config = _make_config(str(folder))
+        config["collector"]["drm_idle_threshold_sec"] = 480
+        state_file = tmp_path / "state.json"
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
+        )
+        # set_idle_context 호출 안 함 → 기본 0.0 (수동 트리거와 동일 조건)
+        worker.run()
+
+        state = load_state(state_file)
+        assert str(drm_file) in state
+
+    def test_set_idle_context_is_consumed_once(self, tmp_path: Path):
+        """set_idle_context는 1회성 — 두 번째 run()은 기본값(0.0)으로 복귀한다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+        from knowmate.collector.state import load_state
+        from knowmate.secure.fake_reader import FakeReader
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        config = _make_config(str(folder))
+        config["collector"]["drm_idle_threshold_sec"] = 100
+        state_file = tmp_path / "state.json"
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
+        )
+        worker.set_idle_context(200.0)
+        worker.run()  # 1회 소비
+        assert worker._idle_elapsed_sec == 0.0
+
+        # 두 번째 파일 추가 후 재실행 — set_idle_context 재호출 없이 기본값(0.0) 적용
+        drm_file = folder / "drm2.xlsx"
+        drm_file.write_bytes(b"<## " + b"\x00" * 20)
+        worker.run()
+
+        state = load_state(state_file)
+        assert str(drm_file) in state  # 기본값 0.0이라 스킵되지 않음
+
+
+# ============================================================
 # TestPurgeRemovedFolders — _purge_removed_folders 안전장치 (베타 배포 전 발견된 이슈)
 # ============================================================
 
@@ -765,6 +885,13 @@ class TestIdleScheduler:
         trigger.assert_called_once()
         assert sched._timer.isActive()
         assert sched._timer.interval() == 60_000
+
+    def test_trigger_receives_actual_idle_seconds(self):
+        """트리거 콜백에 실제 유휴 경과초가 전달된다(Phase C DRM 스킵 판단용)."""
+        trigger = MagicMock()
+        sched = self._make_scheduler(get_idle_seconds=lambda: 123.0, idle_seconds=60, trigger=trigger)
+        sched._on_idle()
+        trigger.assert_called_once_with(123.0)
 
     def test_does_not_trigger_when_user_active(self):
         """실제 유휴 시간이 임계 미만(사용자 활동 중)이면 트리거하지 않고 재확인만 예약한다."""
