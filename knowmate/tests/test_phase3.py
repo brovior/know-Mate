@@ -1,4 +1,5 @@
 """Phase 3 수집기 pytest 테스트 - tmp_path 기반, 사외 환경 전부 통과."""
+import importlib.util
 import json
 import time
 from pathlib import Path
@@ -9,6 +10,8 @@ import pytest
 from knowmate.collector.state import load_state, save_state
 from knowmate.collector.scanner import scan_folder, classify_changes, get_scope
 from knowmate.collector.cleanup import CleanupManager, CleanupReport
+
+_HAS_PYQT6 = bool(importlib.util.find_spec("PyQt6"))
 
 
 # ============================================================
@@ -579,3 +582,97 @@ class TestPurgeRemovedFolders:
         # UI 알림 발행됨
         assert len(alerts) == 1
         assert "대량 삭제" in alerts[0]
+
+
+# ============================================================
+# TestIdleUtil — GetLastInputInfo 읽기전용 조회 (Qt 무관, 순수 로직)
+# ============================================================
+
+class TestIdleUtil:
+    def test_non_windows_returns_zero(self, monkeypatch):
+        """비Windows에서는 항상 0.0(안전 기본값)."""
+        import sys
+        from knowmate.collector import idle_util
+        monkeypatch.setattr(sys, "platform", "linux")
+        assert idle_util.get_idle_seconds() == 0.0
+
+    def test_windows_computes_elapsed_from_ticks(self, monkeypatch):
+        """last_input_tick과 tick_count 차이로 경과초를 계산한다."""
+        import sys
+        from knowmate.collector import idle_util
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(idle_util, "_query_last_input_tick", lambda: 10_000)
+        monkeypatch.setattr(idle_util, "_tick_count", lambda: 130_000)  # 120초 경과
+        assert idle_util.get_idle_seconds() == pytest.approx(120.0)
+
+    def test_windows_query_failure_returns_zero(self, monkeypatch):
+        """API 조회 실패(None) 시 0.0."""
+        import sys
+        from knowmate.collector import idle_util
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(idle_util, "_query_last_input_tick", lambda: None)
+        monkeypatch.setattr(idle_util, "_tick_count", lambda: 1000)
+        assert idle_util.get_idle_seconds() == 0.0
+
+    def test_tick_wraparound_returns_zero(self, monkeypatch):
+        """GetTickCount 랩어라운드로 음수 차이가 나오면 0.0(방금 활동함으로 간주)."""
+        import sys
+        from knowmate.collector import idle_util
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(idle_util, "_query_last_input_tick", lambda: 4_294_960_000)
+        monkeypatch.setattr(idle_util, "_tick_count", lambda: 100)  # 랩어라운드 직후
+        assert idle_util.get_idle_seconds() == 0.0
+
+
+# ============================================================
+# TestIdleScheduler — 실제 OS 유휴 시간 기반 트리거 (PyQt6 필요)
+# ============================================================
+
+@pytest.mark.skipif(not _HAS_PYQT6, reason="PyQt6 미설치 — 폐쇄망 외 환경")
+class TestIdleScheduler:
+    def _make_scheduler(self, get_idle_seconds, idle_seconds=60, trigger=None, is_busy=None):
+        from knowmate.collector.scheduler import IdleScheduler
+        return IdleScheduler(
+            trigger=trigger or MagicMock(),
+            is_busy=is_busy or (lambda: False),
+            idle_seconds=idle_seconds,
+            get_idle_seconds=get_idle_seconds,
+        )
+
+    def test_triggers_when_actual_idle_meets_threshold(self):
+        """실제 유휴 시간이 임계 이상이면 트리거하고 다음 사이클을 재예약한다."""
+        trigger = MagicMock()
+        sched = self._make_scheduler(get_idle_seconds=lambda: 90.0, idle_seconds=60, trigger=trigger)
+        sched._on_idle()
+        trigger.assert_called_once()
+        assert sched._timer.isActive()
+        assert sched._timer.interval() == 60_000
+
+    def test_does_not_trigger_when_user_active(self):
+        """실제 유휴 시간이 임계 미만(사용자 활동 중)이면 트리거하지 않고 재확인만 예약한다."""
+        trigger = MagicMock()
+        sched = self._make_scheduler(get_idle_seconds=lambda: 5.0, idle_seconds=60, trigger=trigger)
+        sched._on_idle()
+        trigger.assert_not_called()
+        assert sched._timer.isActive()
+        # 남은 시간(55s) 만큼 재예약 (최소 재확인 간격 5s보다 크므로 remaining 사용)
+        assert sched._timer.interval() == 55_000
+
+    def test_recheck_interval_has_minimum_floor(self):
+        """임계에 아주 근접해 남은 시간이 짧아도 최소 재확인 간격 이상으로 예약한다."""
+        trigger = MagicMock()
+        sched = self._make_scheduler(get_idle_seconds=lambda: 59.0, idle_seconds=60, trigger=trigger)
+        sched._on_idle()
+        trigger.assert_not_called()
+        from knowmate.collector.scheduler import _MIN_RECHECK_SECONDS
+        assert sched._timer.interval() == int(_MIN_RECHECK_SECONDS * 1000)
+
+    def test_busy_skips_trigger_even_if_idle(self):
+        """인덱싱 진행 중이면 유휴 조건을 만족해도 트리거하지 않는다."""
+        trigger = MagicMock()
+        sched = self._make_scheduler(
+            get_idle_seconds=lambda: 999.0, idle_seconds=60, trigger=trigger, is_busy=lambda: True,
+        )
+        sched._on_idle()
+        trigger.assert_not_called()
+        assert sched._timer.isActive()

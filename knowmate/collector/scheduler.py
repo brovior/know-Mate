@@ -395,24 +395,39 @@ class CollectorWorker(QThread):
         self.finished.emit(summary)
 
 
+# 실제 유휴에 못 미칠 때 다음 재확인까지 최소 대기(너무 촘촘한 재확인 방지)
+_MIN_RECHECK_SECONDS = 5.0
+
+
 class IdleScheduler(QObject):
-    """유휴 시간 경과 시 인덱싱을 트리거한다.
+    """실제 OS 유휴 시간이 임계를 넘었을 때만 인덱싱을 트리거한다.
+
+    이전 구현은 idle_seconds마다 무조건 도는 주기 타이머였다(사용자가
+    작업 중이어도 트리거됨 — 실제 유휴 감지가 없었다). 이제 타이머가
+    만료돼도 GetLastInputInfo(읽기전용)로 실제 유휴 시간을 확인해, 임계에
+    못 미치면 트리거하지 않고 남은 시간만큼만 재예약한다.
 
     단일 워커를 공유하기 위해 워커를 직접 생성하지 않고,
     trigger/is_busy 콜백으로 외부 워커를 제어한다.
     이미 인덱싱(수동/유휴 무관)이 진행 중이면 건너뛴다.
     """
 
-    def __init__(self, trigger, is_busy, idle_seconds=60, parent=None):
+    def __init__(self, trigger, is_busy, idle_seconds=60, parent=None, get_idle_seconds=None):
         """스케줄러를 초기화한다.
 
         trigger: () -> None, 인덱싱을 시작하는 콜백
         is_busy: () -> bool, 인덱싱이 진행 중이면 True를 반환하는 콜백
+        get_idle_seconds: () -> float, 실제 OS 유휴 경과초 조회(테스트 주입용,
+            기본은 collector.idle_util.get_idle_seconds)
         """
         super().__init__(parent)
         self._trigger = trigger
         self._is_busy = is_busy
         self._idle_seconds = idle_seconds
+        if get_idle_seconds is None:
+            from knowmate.collector.idle_util import get_idle_seconds as _default
+            get_idle_seconds = _default
+        self._get_idle_seconds = get_idle_seconds
         self._timer = QTimer(self)
         self._timer.setInterval(idle_seconds * 1000)
         self._timer.setSingleShot(True)
@@ -420,6 +435,7 @@ class IdleScheduler(QObject):
 
     def start(self):
         """스케줄러를 시작한다."""
+        self._timer.setInterval(self._idle_seconds * 1000)
         self._timer.start()
         logger.info("IdleScheduler 시작 (idle=%ds)", self._idle_seconds)
 
@@ -429,17 +445,42 @@ class IdleScheduler(QObject):
         logger.info("IdleScheduler 중지")
 
     def reset_idle(self):
-        """사용자 입력 이벤트 시 유휴 타이머를 리셋한다."""
+        """호환용: 유휴 타이머를 즉시 재시작한다.
+
+        실제 유휴 판정은 이제 OS 조회(_get_idle_seconds)로 하므로 필수는
+        아니지만, 사용자 활동을 안 시점에 다음 재확인을 즉시 원위치로
+        되돌리고 싶을 때 호출할 수 있다.
+        """
         if self._timer.isActive():
+            self._timer.setInterval(self._idle_seconds * 1000)
             self._timer.start()
 
     def _on_idle(self):
-        """유휴 시간 경과 시 인덱싱을 트리거한다. 진행 중이면 건너뛰고 재예약한다."""
+        """타이머 만료 시 실제 유휴 시간을 확인해 임계 이상이면 트리거한다.
+
+        진행 중이면 건너뛰고 재예약. 임계에 못 미치면(사용자가 작업 중)
+        남은 시간만큼만 재확인을 예약해 계속 폴링하지 않는다.
+        """
         if self._is_busy():
             logger.debug("IdleScheduler: 인덱싱 진행 중, 건너뜀")
-            self._timer.start()  # 다음 사이클에 재시도
+            self._timer.setInterval(self._idle_seconds * 1000)
+            self._timer.start()
             return
-        logger.info("IdleScheduler: 유휴 감지 -> 수집기 실행")
+
+        actual_idle = self._get_idle_seconds()
+        if actual_idle < self._idle_seconds:
+            remaining = self._idle_seconds - actual_idle
+            wait = max(remaining, _MIN_RECHECK_SECONDS)
+            logger.debug(
+                "IdleScheduler: 실제 유휴 %.0fs < 임계 %ds(사용자 활동 중) — %.0fs 후 재확인",
+                actual_idle, self._idle_seconds, wait,
+            )
+            self._timer.setInterval(int(wait * 1000))
+            self._timer.start()
+            return
+
+        logger.info("IdleScheduler: 유휴 감지(%.0fs) -> 수집기 실행", actual_idle)
+        self._timer.setInterval(self._idle_seconds * 1000)
         try:
             self._trigger()
         finally:
