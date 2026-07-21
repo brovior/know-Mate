@@ -2,15 +2,31 @@
 import logging
 from pathlib import Path
 
+from knowmate.secure.signature import UnreadableFormatError, is_zip
 from knowmate.secure.text_util import format_table
 
 logger = logging.getLogger(__name__)
 
+_OOXML_EXTS = {".docx", ".xlsx", ".pptx"}
+
 
 class PlainReader:
     def extract(self, path: str) -> str:
-        """확장자에 따라 적합한 파서로 파일을 읽어 텍스트를 반환한다."""
+        """확장자에 따라 적합한 파서로 파일을 읽어 텍스트를 반환한다.
+
+        OOXML 확장자인데 실제 zip이 아니면(DRM 래핑·손상 등) 바로
+        UnreadableFormatError를 낸다. python-docx/openpyxl/python-pptx는
+        내부적으로 zip을 열려다 실패하므로, 미리 걸러 의미 없는 재시도
+        (예: xlsx custom.xml 복구)를 건너뛴다. COM 경유가 가능한 환경에서는
+        AutoReader가 이 지점에 도달하기 전에 COM으로 라우팅한다.
+        """
         ext = Path(path).suffix.lower()
+        if ext in _OOXML_EXTS and not is_zip(path):
+            head_hex = self._peek_hex(path)
+            raise UnreadableFormatError(
+                f"OOXML 확장자({ext})이나 zip 아님(DRM/암호화·손상 추정, "
+                f"앞바이트 {head_hex}): {path}"
+            )
         if ext == ".docx":
             return self._read_docx(path)
         if ext == ".xlsx":
@@ -22,6 +38,15 @@ class PlainReader:
         if ext in {".txt", ".md", ".log"}:
             return Path(path).read_text(encoding="utf-8", errors="replace")
         raise ValueError(f"지원하지 않는 파일 형식: {ext!r} ({path})")
+
+    @staticmethod
+    def _peek_hex(path: str) -> str:
+        """진단용으로 파일 앞 4바이트를 hex 문자열로 반환한다."""
+        try:
+            with open(path, "rb") as f:
+                return f.read(4).hex().upper()
+        except OSError:
+            return "????"
 
     def _read_docx(self, path: str) -> str:
         """python-docx로 docx를 읽어 문단·표 텍스트를 문서 순서대로 반환한다."""

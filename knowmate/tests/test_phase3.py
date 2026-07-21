@@ -1,4 +1,5 @@
 """Phase 3 수집기 pytest 테스트 - tmp_path 기반, 사외 환경 전부 통과."""
+import importlib.util
 import json
 import time
 from pathlib import Path
@@ -9,6 +10,8 @@ import pytest
 from knowmate.collector.state import load_state, save_state
 from knowmate.collector.scanner import scan_folder, classify_changes, get_scope
 from knowmate.collector.cleanup import CleanupManager, CleanupReport
+
+_HAS_PYQT6 = bool(importlib.util.find_spec("PyQt6"))
 
 
 # ============================================================
@@ -463,6 +466,244 @@ class TestCollectorWorker:
 
 
 # ============================================================
+# TestQueuePriority — COM 우선순위 캐싱 (PyQt6 필요)
+# ============================================================
+
+@pytest.mark.skipif(not _HAS_PYQT6, reason="PyQt6 미설치 — 폐쇄망 외 환경")
+class TestQueuePriority:
+    """state.json에 캐시된 method(com/plain)로 다음 사이클 처리 순서를 보정한다."""
+
+    class _RecordingExtractor:
+        """extract() 호출 순서를 기록하는 래퍼(FakeReader 위임)."""
+
+        def __init__(self):
+            from knowmate.secure.fake_reader import FakeReader
+            self._inner = FakeReader()
+            self.order: list[str] = []
+
+        def extract(self, path: str) -> str:
+            self.order.append(path)
+            return self._inner.extract(path)
+
+    def test_priority_queue_orders_new_before_modified(self):
+        """정렬 키(action우선순위, com_rank)로 NEW가 MODIFIED보다 먼저 나온다.
+
+        생산자·소비자가 별도 스레드로 동시에 도는 실제 사이클에서는 아직
+        큐에 없는 항목까지 재정렬할 수 없으므로(스트리밍 구조의 본질적
+        한계), 정렬 메커니즘 자체는 스레드 경합 없이 직접 검증한다.
+        """
+        import queue as _queue
+        from knowmate.collector.scheduler import IndexTask, PRIORITY_NEW, PRIORITY_MODIFIED, _PLAIN_RANK
+
+        q: "_queue.PriorityQueue" = _queue.PriorityQueue()
+        # 일부러 반대 순서로 삽입 — 우선순위 정렬이 실제로 동작함을 검증
+        q.put(((PRIORITY_MODIFIED, _PLAIN_RANK), 0, IndexTask(PRIORITY_MODIFIED, "old.txt", "modified")))
+        q.put(((PRIORITY_NEW, _PLAIN_RANK), 1, IndexTask(PRIORITY_NEW, "new.txt", "new")))
+
+        first = q.get()[2]
+        second = q.get()[2]
+        assert first.path == "new.txt"
+        assert second.path == "old.txt"
+
+    def test_priority_queue_orders_com_before_plain_in_same_tier(self):
+        """같은 action(modified) 내에서 com_rank=0(COM 캐시)이 plain보다 먼저 나온다."""
+        import queue as _queue
+        from knowmate.collector.scheduler import IndexTask, PRIORITY_MODIFIED, _COM_RANK, _PLAIN_RANK
+
+        q: "_queue.PriorityQueue" = _queue.PriorityQueue()
+        q.put(((PRIORITY_MODIFIED, _PLAIN_RANK), 0, IndexTask(PRIORITY_MODIFIED, "plain.txt", "modified", _PLAIN_RANK)))
+        q.put(((PRIORITY_MODIFIED, _COM_RANK), 1, IndexTask(PRIORITY_MODIFIED, "com.txt", "modified", _COM_RANK)))
+
+        first = q.get()[2]
+        assert first.path == "com.txt"
+
+    def test_sentinel_always_sorts_last(self):
+        """종료 신호(_SENTINEL_KEY)는 어떤 실제 우선순위보다도 낮다(항상 마지막에 소비)."""
+        import queue as _queue
+        from knowmate.collector.scheduler import (
+            IndexTask, PRIORITY_ORPHAN, _SENTINEL_KEY, _PLAIN_RANK,
+        )
+
+        q: "_queue.PriorityQueue" = _queue.PriorityQueue()
+        q.put((_SENTINEL_KEY, 0, None))
+        q.put(((PRIORITY_ORPHAN, _PLAIN_RANK), 1, IndexTask(PRIORITY_ORPHAN, "last_real.txt", "orphan")))
+
+        first = q.get()[2]
+        second = q.get()[2]
+        assert first is not None and first.path == "last_real.txt"
+        assert second is None
+
+    def test_classify_extract_method(self, tmp_path: Path):
+        """확장자·zip 서명으로 다음 사이클 우선순위 힌트(method)를 분류한다."""
+        from knowmate.collector.scheduler import _classify_extract_method
+        import zipfile
+
+        doc = tmp_path / "a.doc"
+        doc.write_bytes(b"\xd0\xcf\x11\xe0")  # OLE2 매직 — 확장자만으로도 com
+        assert _classify_extract_method(str(doc)) == "com"
+
+        drm_xlsx = tmp_path / "b.xlsx"
+        drm_xlsx.write_bytes(b"<## " + b"\x00" * 20)  # zip 아님 → com
+        assert _classify_extract_method(str(drm_xlsx)) == "com"
+
+        real_xlsx = tmp_path / "c.xlsx"
+        with zipfile.ZipFile(real_xlsx, "w") as zf:
+            zf.writestr("dummy.txt", "content")
+        assert _classify_extract_method(str(real_xlsx)) == "plain"
+
+        txt = tmp_path / "d.txt"
+        txt.write_bytes(b"hello")
+        assert _classify_extract_method(str(txt)) == "plain"
+
+    def test_method_recorded_in_state_after_success(self, tmp_path: Path):
+        """인덱싱 성공 후 state에 method(com/plain)가 기록된다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+        from knowmate.collector.state import load_state
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        f = folder / "plain.docx"
+        import zipfile
+        with zipfile.ZipFile(f, "w") as zf:
+            zf.writestr("dummy.txt", "zip content")  # 실제 zip 서명 → plain 분류
+
+        state_file = tmp_path / "state.json"
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        from knowmate.secure.fake_reader import FakeReader
+        worker = CollectorWorker(
+            config=_make_config(str(folder)), indexer=indexer,
+            extractor=FakeReader(), state_file=state_file,
+        )
+        worker.run()
+
+        state = load_state(state_file)
+        assert state[str(f)]["method"] == "plain"
+
+
+# ============================================================
+# TestDrmIdleSkip — 유휴 장기화 시 DRM 의심 문서 스킵 (PyQt6 필요)
+# ============================================================
+
+@pytest.mark.skipif(not _HAS_PYQT6, reason="PyQt6 미설치 — 폐쇄망 외 환경")
+class TestDrmIdleSkip:
+    def test_is_drm_suspected_classification(self, tmp_path: Path):
+        """정상 레거시(OLE2)·정상 OOXML(zip)은 스킵 대상 아님, 그 외만 의심."""
+        import zipfile
+        from knowmate.collector.scheduler import _is_drm_suspected
+
+        real_doc = tmp_path / "a.doc"
+        real_doc.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1")  # 정상 OLE2
+        assert _is_drm_suspected(str(real_doc)) is False
+
+        drm_doc = tmp_path / "b.doc"
+        drm_doc.write_bytes(b"<## " + b"\x00" * 20)  # OLE2도 zip도 아님 → 의심
+        assert _is_drm_suspected(str(drm_doc)) is True
+
+        real_xlsx = tmp_path / "c.xlsx"
+        with zipfile.ZipFile(real_xlsx, "w") as zf:
+            zf.writestr("x.txt", "y")
+        assert _is_drm_suspected(str(real_xlsx)) is False  # 정상 zip
+
+        drm_xlsx = tmp_path / "d.xlsx"
+        drm_xlsx.write_bytes(b"<## " + b"\x00" * 20)
+        assert _is_drm_suspected(str(drm_xlsx)) is True
+
+        txt = tmp_path / "e.txt"
+        txt.write_bytes(b"hello")
+        assert _is_drm_suspected(str(txt)) is False  # office 확장자 아님 → 대상 아님
+
+    def test_drm_suspected_file_skipped_when_idle_exceeds_threshold(self, tmp_path: Path):
+        """유휴가 임계를 넘으면 DRM 의심 파일은 큐잉되지 않고(state 불변) 다음 사이클로 넘어간다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+        from knowmate.collector.state import load_state
+        from knowmate.secure.fake_reader import FakeReader
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        drm_file = folder / "drm.xlsx"
+        drm_file.write_bytes(b"<## " + b"\x00" * 20)  # DRM 의심
+        normal_file = folder / "normal.txt"
+        normal_file.write_bytes(b"hello")
+
+        config = _make_config(str(folder))
+        config["collector"]["drm_idle_threshold_sec"] = 100
+        state_file = tmp_path / "state.json"
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
+        )
+        worker.set_idle_context(200.0)  # 임계(100) 초과
+        worker.run()
+
+        state = load_state(state_file)
+        assert str(normal_file) in state          # 일반 파일은 정상 인덱싱
+        assert str(drm_file) not in state          # DRM 의심 파일은 스킵(state 불변)
+
+    def test_drm_suspected_file_processed_when_idle_below_threshold(self, tmp_path: Path):
+        """유휴가 임계 미만(기본값 0.0 포함)이면 DRM 의심 파일도 정상 처리된다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+        from knowmate.collector.state import load_state
+        from knowmate.secure.fake_reader import FakeReader
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        drm_file = folder / "drm.xlsx"
+        drm_file.write_bytes(b"<## " + b"\x00" * 20)
+
+        config = _make_config(str(folder))
+        config["collector"]["drm_idle_threshold_sec"] = 480
+        state_file = tmp_path / "state.json"
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
+        )
+        # set_idle_context 호출 안 함 → 기본 0.0 (수동 트리거와 동일 조건)
+        worker.run()
+
+        state = load_state(state_file)
+        assert str(drm_file) in state
+
+    def test_set_idle_context_is_consumed_once(self, tmp_path: Path):
+        """set_idle_context는 1회성 — 두 번째 run()은 기본값(0.0)으로 복귀한다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+        from knowmate.collector.state import load_state
+        from knowmate.secure.fake_reader import FakeReader
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        config = _make_config(str(folder))
+        config["collector"]["drm_idle_threshold_sec"] = 100
+        state_file = tmp_path / "state.json"
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
+        )
+        worker.set_idle_context(200.0)
+        worker.run()  # 1회 소비
+        assert worker._idle_elapsed_sec == 0.0
+
+        # 두 번째 파일 추가 후 재실행 — set_idle_context 재호출 없이 기본값(0.0) 적용
+        drm_file = folder / "drm2.xlsx"
+        drm_file.write_bytes(b"<## " + b"\x00" * 20)
+        worker.run()
+
+        state = load_state(state_file)
+        assert str(drm_file) in state  # 기본값 0.0이라 스킵되지 않음
+
+
+# ============================================================
 # TestPurgeRemovedFolders — _purge_removed_folders 안전장치 (베타 배포 전 발견된 이슈)
 # ============================================================
 
@@ -579,3 +820,166 @@ class TestPurgeRemovedFolders:
         # UI 알림 발행됨
         assert len(alerts) == 1
         assert "대량 삭제" in alerts[0]
+
+
+# ============================================================
+# TestIdleUtil — GetLastInputInfo 읽기전용 조회 (Qt 무관, 순수 로직)
+# ============================================================
+
+class TestIdleUtil:
+    def test_non_windows_returns_zero(self, monkeypatch):
+        """비Windows에서는 항상 0.0(안전 기본값)."""
+        import sys
+        from knowmate.collector import idle_util
+        monkeypatch.setattr(sys, "platform", "linux")
+        assert idle_util.get_idle_seconds() == 0.0
+
+    def test_windows_computes_elapsed_from_ticks(self, monkeypatch):
+        """last_input_tick과 tick_count 차이로 경과초를 계산한다."""
+        import sys
+        from knowmate.collector import idle_util
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(idle_util, "_query_last_input_tick", lambda: 10_000)
+        monkeypatch.setattr(idle_util, "_tick_count", lambda: 130_000)  # 120초 경과
+        assert idle_util.get_idle_seconds() == pytest.approx(120.0)
+
+    def test_windows_query_failure_returns_zero(self, monkeypatch):
+        """API 조회 실패(None) 시 0.0."""
+        import sys
+        from knowmate.collector import idle_util
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(idle_util, "_query_last_input_tick", lambda: None)
+        monkeypatch.setattr(idle_util, "_tick_count", lambda: 1000)
+        assert idle_util.get_idle_seconds() == 0.0
+
+    def test_tick_wraparound_returns_zero(self, monkeypatch):
+        """GetTickCount 랩어라운드로 음수 차이가 나오면 0.0(방금 활동함으로 간주)."""
+        import sys
+        from knowmate.collector import idle_util
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(idle_util, "_query_last_input_tick", lambda: 4_294_960_000)
+        monkeypatch.setattr(idle_util, "_tick_count", lambda: 100)  # 랩어라운드 직후
+        assert idle_util.get_idle_seconds() == 0.0
+
+
+# ============================================================
+# TestIdleScheduler — 실제 OS 유휴 시간 기반 트리거 (PyQt6 필요)
+# ============================================================
+
+@pytest.mark.skipif(not _HAS_PYQT6, reason="PyQt6 미설치 — 폐쇄망 외 환경")
+class TestIdleScheduler:
+    def _make_scheduler(
+        self, get_idle_seconds, idle_seconds=60, trigger=None, is_busy=None,
+        drm_idle_threshold_sec=480.0,
+    ):
+        from knowmate.collector.scheduler import IdleScheduler
+        return IdleScheduler(
+            trigger=trigger or MagicMock(),
+            is_busy=is_busy or (lambda: False),
+            idle_seconds=idle_seconds,
+            get_idle_seconds=get_idle_seconds,
+            drm_idle_threshold_sec=drm_idle_threshold_sec,
+        )
+
+    def test_triggers_when_actual_idle_meets_threshold(self):
+        """실제 유휴 시간이 임계 이상이면 트리거하고 다음 사이클을 재예약한다."""
+        trigger = MagicMock()
+        sched = self._make_scheduler(get_idle_seconds=lambda: 90.0, idle_seconds=60, trigger=trigger)
+        sched._on_idle()
+        trigger.assert_called_once()
+        assert sched._timer.isActive()
+        assert sched._timer.interval() == 60_000
+
+    def test_trigger_receives_actual_idle_seconds(self):
+        """트리거 콜백에 실제 유휴 경과초가 전달된다(Phase C DRM 스킵 판단용)."""
+        trigger = MagicMock()
+        sched = self._make_scheduler(get_idle_seconds=lambda: 123.0, idle_seconds=60, trigger=trigger)
+        sched._on_idle()
+        trigger.assert_called_once_with(123.0)
+
+    def test_does_not_trigger_when_user_active(self):
+        """실제 유휴 시간이 임계 미만(사용자 활동 중)이면 트리거하지 않고 재확인만 예약한다."""
+        trigger = MagicMock()
+        sched = self._make_scheduler(get_idle_seconds=lambda: 5.0, idle_seconds=60, trigger=trigger)
+        sched._on_idle()
+        trigger.assert_not_called()
+        assert sched._timer.isActive()
+        # 남은 시간(55s) 만큼 재예약 (최소 재확인 간격 5s보다 크므로 remaining 사용)
+        assert sched._timer.interval() == 55_000
+
+    def test_recheck_interval_has_minimum_floor(self):
+        """임계에 아주 근접해 남은 시간이 짧아도 최소 재확인 간격 이상으로 예약한다."""
+        trigger = MagicMock()
+        sched = self._make_scheduler(get_idle_seconds=lambda: 59.0, idle_seconds=60, trigger=trigger)
+        sched._on_idle()
+        trigger.assert_not_called()
+        from knowmate.collector.scheduler import _MIN_RECHECK_SECONDS
+        assert sched._timer.interval() == int(_MIN_RECHECK_SECONDS * 1000)
+
+    def test_busy_skips_trigger_even_if_idle(self):
+        """인덱싱 진행 중이면 유휴 조건을 만족해도 트리거하지 않는다."""
+        trigger = MagicMock()
+        sched = self._make_scheduler(
+            get_idle_seconds=lambda: 999.0, idle_seconds=60, trigger=trigger, is_busy=lambda: True,
+        )
+        sched._on_idle()
+        trigger.assert_not_called()
+        assert sched._timer.isActive()
+
+    # ── 복귀 감지 워처 (Phase D) ──────────────────────────────────
+
+    def test_recovery_triggers_catchup_after_long_idle(self):
+        """장시간 유휴 뒤 활동 재개를 감지하면 idle_elapsed=0으로 즉시 트리거한다."""
+        trigger = MagicMock()
+        readings = iter([500.0, 2.0])  # 1틱: 장시간 유휴 / 2틱: 방금 활동
+        sched = self._make_scheduler(
+            get_idle_seconds=lambda: next(readings), trigger=trigger, drm_idle_threshold_sec=480.0,
+        )
+        sched._on_recovery_check()  # 장시간 유휴 감지 — 아직 트리거 안 함
+        trigger.assert_not_called()
+        sched._on_recovery_check()  # 활동 재개 감지 — 캐치업 트리거
+        trigger.assert_called_once_with(0.0)
+
+    def test_recovery_does_not_trigger_without_prior_long_idle(self):
+        """장시간 유휴가 선행되지 않았으면 유휴가 짧아져도 캐치업을 트리거하지 않는다."""
+        trigger = MagicMock()
+        sched = self._make_scheduler(get_idle_seconds=lambda: 2.0, trigger=trigger)
+        sched._on_recovery_check()
+        trigger.assert_not_called()
+
+    def test_recovery_does_not_trigger_while_still_idle(self):
+        """유휴가 임계를 넘은 채 유지되면(아직 복귀 아님) 캐치업을 트리거하지 않는다."""
+        trigger = MagicMock()
+        sched = self._make_scheduler(
+            get_idle_seconds=lambda: 500.0, trigger=trigger, drm_idle_threshold_sec=480.0,
+        )
+        sched._on_recovery_check()
+        sched._on_recovery_check()
+        trigger.assert_not_called()
+
+    def test_recovery_skips_check_when_busy(self):
+        """인덱싱 진행 중이면 복귀 판정 자체를 보류한다(was_long_idle 상태 유지)."""
+        trigger = MagicMock()
+        readings = iter([500.0, 2.0])
+        sched = self._make_scheduler(
+            get_idle_seconds=lambda: next(readings), trigger=trigger,
+            drm_idle_threshold_sec=480.0, is_busy=lambda: True,
+        )
+        sched._on_recovery_check()  # busy — 500.0 소비했지만 판정 보류
+        sched._on_recovery_check()  # busy — 2.0도 소비, 여전히 보류
+        trigger.assert_not_called()
+
+    def test_start_resets_recovery_state_and_starts_watcher(self):
+        """start() 호출 시 복귀 워처가 시작되고 상태가 초기화된다."""
+        sched = self._make_scheduler(get_idle_seconds=lambda: 0.0)
+        sched._was_long_idle = True
+        sched.start()
+        assert sched._was_long_idle is False
+        assert sched._recovery_timer.isActive()
+
+    def test_stop_stops_recovery_watcher(self):
+        """stop() 호출 시 복귀 워처도 함께 멈춘다."""
+        sched = self._make_scheduler(get_idle_seconds=lambda: 0.0)
+        sched.start()
+        sched.stop()
+        assert not sched._recovery_timer.isActive()

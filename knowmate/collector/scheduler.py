@@ -14,6 +14,7 @@ from knowmate.collector.cleanup import CleanupManager
 from knowmate.collector.scanner import get_scope, iter_scan_folder
 from knowmate.collector.state import load_state, save_state
 from knowmate.secure.office_guard import OfficeBusyError
+from knowmate.secure.signature import UnreadableFormatError, is_ole2, is_zip
 
 if TYPE_CHECKING:
     from knowmate.rag.indexer import Indexer
@@ -26,6 +27,46 @@ PRIORITY_NEW = 1
 PRIORITY_MODIFIED = 2
 PRIORITY_ORPHAN = 3
 
+# state.json에 캐시된 추출 방식(method)에 따른 큐 내 우선순위 보정.
+# COM 경유(구형 바이너리·DRM 래핑) 파일은 사용자 세션(DRM/SSO)이 유효한
+# 유휴 초입에 먼저 처리되도록 같은 action 우선순위 내에서 앞당긴다.
+_COM_RANK = 0
+_PLAIN_RANK = 1
+
+# state 캐싱용 방식 분류 — AutoReader의 실제 라우팅 판단(secure/__init__.py)과
+# 동일한 기준(확장자 + zip 서명)을 재사용한다. extractor 모드가 auto가 아니어도
+# (fake/plain) 무해 — 다음 사이클 큐 우선순위 힌트로만 쓰이고 실제 추출
+# 경로에는 전혀 영향을 주지 않는다.
+_COM_EXTS = {".doc", ".xls", ".ppt"}
+_OOXML_EXTS = {".docx", ".xlsx", ".pptx"}
+
+
+def _classify_extract_method(path: str) -> str:
+    """다음 사이클 우선순위 힌트로 쓸 추출 방식을 분류한다 ('com' | 'plain')."""
+    ext = Path(path).suffix.lower()
+    if ext in _COM_EXTS:
+        return "com"
+    if ext in _OOXML_EXTS and not is_zip(path):
+        return "com"
+    return "plain"
+
+
+def _is_drm_suspected(path: str) -> bool:
+    """DRM 세션 만료 시 COM Open이 무의미(또는 로그인 대기로 위험)할 수 있는
+    파일인지 판별한다.
+
+    정상 레거시 바이너리(OLE2 매직)나 정상 OOXML(zip 매직)은 COM을 타더라도
+    (전자는 항상, 후자는 오라벨·DRM일 때만) 실제 파일 자체가 온전하므로
+    DRM 세션 여부와 무관하게 열린다 — 스킵 대상이 아니다. 두 시그니처 중
+    어느 것도 아닌 파일만 DRM 래핑으로 의심해 스킵 후보로 삼는다.
+    """
+    ext = Path(path).suffix.lower()
+    if ext in _COM_EXTS:
+        return not is_ole2(path)
+    if ext in _OOXML_EXTS:
+        return not is_zip(path)
+    return False
+
 
 @dataclass(order=True)
 class IndexTask:
@@ -34,6 +75,7 @@ class IndexTask:
     priority: int
     path: str = field(compare=False)
     action: str = field(compare=False)
+    com_rank: int = field(default=_PLAIN_RANK, compare=False)
 
 
 class CollectorWorker(QThread):
@@ -52,14 +94,28 @@ class CollectorWorker(QThread):
         self._extractor = extractor
         self._email_indexer = email_indexer
         self._cancelled = False
+        # IdleScheduler가 트리거 직전 실제 유휴 경과초를 전달하는 용도(set_idle_context).
+        # 기본 0.0(방금 활동함) — 수동 재인덱싱·온보딩 최초 스캔은 이 메서드를 호출하지
+        # 않으므로 항상 0.0이 적용돼 DRM 스킵 로직이 절대 관여하지 않는다.
+        self._idle_elapsed_sec = 0.0
         from knowmate.config import get_data_dir
         default_state_file = get_data_dir() / "index_state.json"
         self._state_file = state_file or default_state_file
+
+    def set_idle_context(self, idle_elapsed_sec: float) -> None:
+        """다음 run() 사이클 1회에 적용할 실제 유휴 경과초를 설정한다(1회성).
+
+        run() 시작 시 소비되고 0.0으로 복귀하므로, 이후 수동 트리거는 다시
+        기본값(활동 중으로 간주)으로 돌아간다.
+        """
+        self._idle_elapsed_sec = idle_elapsed_sec
 
     def run(self):
         """증분 스캔 사이클 1회를 실행한다."""
         self._cancelled = False
         start = time.time()
+        idle_elapsed_sec = self._idle_elapsed_sec
+        self._idle_elapsed_sec = 0.0  # 1회성 소비
 
         # QThread에서 COM 사용 시 초기화 필수.
         # MTA로 초기화해야 메시지 펌프 없이 Office STA 서버를 호출할 수 있다.
@@ -75,7 +131,7 @@ class CollectorWorker(QThread):
             logger.warning("COM 초기화 경고: %s", exc)
 
         try:
-            self._run_cycle()
+            self._run_cycle(idle_elapsed_sec)
         except Exception as exc:
             logger.exception("수집기 예외 발생: %s", exc)
             self.error.emit(str(exc))
@@ -189,8 +245,12 @@ class CollectorWorker(QThread):
             except Exception as exc:
                 logger.warning("[purge] optimize 실패: %s", exc)
 
-    def _run_cycle(self):
-        """스캔 -> 분류 -> 인덱싱 -> orphan 정리 -> 저장 순으로 사이클을 실행한다."""
+    def _run_cycle(self, idle_elapsed_sec: float = 0.0):
+        """스캔 -> 분류 -> 인덱싱 -> orphan 정리 -> 저장 순으로 사이클을 실행한다.
+
+        idle_elapsed_sec: IdleScheduler가 트리거 직전 측정한 실제 유휴 경과초.
+            0.0(기본값)은 "방금 활동함"(수동 트리거 등)으로 간주한다.
+        """
         from datetime import datetime, timezone
         collector_cfg = self._config.get("collector", {})
         cleanup_cfg = self._config.get("cleanup", {})
@@ -205,6 +265,18 @@ class CollectorWorker(QThread):
         max_chunks_per_file = int(chunk_cfg.get("max_chunks_per_file", 500))
         xlsx_max_rows_per_sheet = int(chunk_cfg.get("xlsx_max_rows_per_sheet", 2000))
 
+        # 유휴가 이 임계를 넘으면 DRM/SSO 세션이 만료됐을 가능성이 크다고 보고,
+        # DRM 래핑으로 의심되는 파일(COM Open이 실패하거나 로그인 대기로 멈출 수
+        # 있음)만 이번 사이클에서 건너뛴다. 정상 레거시(OLE2)·정상 OOXML(zip)
+        # 문서는 COM을 타더라도 세션과 무관하게 동작하므로 대상이 아니다.
+        drm_idle_threshold_sec = float(collector_cfg.get("drm_idle_threshold_sec", 480))
+        skip_drm_suspected = idle_elapsed_sec >= drm_idle_threshold_sec
+        if skip_drm_suspected:
+            logger.info(
+                "[collector] 유휴 %.0fs >= DRM 임계 %.0fs — DRM 의심 문서는 이번 사이클 스킵",
+                idle_elapsed_sec, drm_idle_threshold_sec,
+            )
+
         self._indexer._chunk_size = chunk_size
         self._indexer._overlap = overlap
         self._indexer._max_chunks_per_file = max_chunks_per_file
@@ -216,12 +288,22 @@ class CollectorWorker(QThread):
         # 생산자 스레드: 폴더를 walk 하며 신규/변경 파일을 큐에 넣는다(os.walk+stat만).
         # 소비자(현재 스레드): 큐에서 꺼내 즉시 인덱싱(추출·임베딩·LanceDB 쓰기는 여기서만).
         # 열거 완료 전엔 total 미정(-2)으로, 완료 후엔 확정 total 로 진행률을 emit 한다.
+        #
+        # 우선순위 큐: (action우선순위, com_rank) 오름차순 — NEW가 MODIFIED보다,
+        # COM 경유(전 사이클에 method='com'으로 기록된) 파일이 같은 action 내에서
+        # plain보다 먼저 처리된다. 정렬 키에 단조증가 seq를 끼워 넣어 IndexTask나
+        # 종료 신호(_SENTINEL)끼리 직접 비교되는 일이 없도록 한다(타입 비교 오류 방지).
+        # 종료 신호는 스캔이 끝난 뒤에만 최저 우선순위로 넣으므로, 그 시점까지 큐에
+        # 들어온 모든 실제 항목보다 항상 나중에 소비된다.
+        import itertools
         import queue as _queue
         import threading as _threading
 
-        task_queue: "_queue.Queue" = _queue.Queue()
+        task_queue: "_queue.PriorityQueue" = _queue.PriorityQueue()
         _SENTINEL = None
-        producer_state = {"total": None, "seen": set()}
+        _SENTINEL_KEY = (PRIORITY_ORPHAN + 1, _PLAIN_RANK + 1)  # 모든 실제 항목보다 낮은 우선순위
+        _seq = itertools.count()
+        producer_state = {"total": None, "seen": set(), "drm_deferred": 0}
 
         logger.info("[collector] 작업 시작 — 폴더 스캔·인덱싱 파이프라인")
         self.progress.emit(0, -2, "인덱싱 시작...")
@@ -257,8 +339,19 @@ class CollectorWorker(QThread):
                             action = "modified"
                         else:
                             continue  # 변경 없음 → 인덱싱 대상 아님
+                        if skip_drm_suspected and _is_drm_suspected(path):
+                            # 유휴가 길어 DRM 세션 만료가 의심되는 상황 — COM Open이
+                            # 실패하거나 로그인 대기로 멈출 수 있어 이번 사이클엔
+                            # 큐에 넣지 않는다. state 불변 → 다음 유효 사이클에 재시도.
+                            producer_state["drm_deferred"] += 1
+                            continue
                         priority = PRIORITY_NEW if action == "new" else PRIORITY_MODIFIED
-                        task_queue.put(IndexTask(priority, path, action))
+                        # 이전 사이클에 COM 경유로 기록된 파일이면 우선순위를 앞당긴다
+                        # (DRM/구형 바이너리 — 세션 유효한 유휴 초입에 먼저 처리).
+                        # 처음 보는 파일은 힌트가 없어 plain과 동일하게 취급된다.
+                        com_rank = _COM_RANK if (prev or {}).get("method") == "com" else _PLAIN_RANK
+                        sort_key = (priority, com_rank)
+                        task_queue.put((sort_key, next(_seq), IndexTask(priority, path, action, com_rank)))
                         found += 1
                     if self._cancelled:
                         break
@@ -266,7 +359,7 @@ class CollectorWorker(QThread):
                 logger.exception("[collector] 스캔 생산자 예외: %s", exc)
             finally:
                 producer_state["total"] = found  # 확정 총계
-                task_queue.put(_SENTINEL)         # 소비자 종료 신호(무한대기 방지)
+                task_queue.put((_SENTINEL_KEY, next(_seq), _SENTINEL))  # 소비자 종료 신호(항상 마지막)
 
         producer = _threading.Thread(target=_producer, name="scan-producer", daemon=True)
         producer.start()
@@ -274,9 +367,10 @@ class CollectorWorker(QThread):
         done = 0
         failed = []
         deferred = []
+        unreadable = []
 
         while True:
-            task = task_queue.get()
+            _sort_key, _seq_no, task = task_queue.get()
             if task is _SENTINEL:
                 break
             if self._cancelled:
@@ -316,12 +410,16 @@ class CollectorWorker(QThread):
                 )
                 logger.debug("[단계5] 임베딩·저장 완료: %s -> %d청크", task.path, len(chunk_ids))
                 from knowmate.rag.indexer import DOC_INDEX_VERSION
+                # 다음 사이클 큐 우선순위 힌트용 — COM 경유 파일이었는지 기록
+                # (실제 추출 경로와 무관하게 확장자·zip 서명으로 분류하는 저비용 재확인).
+                method = _classify_extract_method(task.path)
                 state[task.path] = {
                     "mtime": stat.st_mtime,
                     "size": stat.st_size,
                     "indexed_at": datetime.now(timezone.utc).isoformat(),
                     "chunk_ids": chunk_ids,
                     "index_version": DOC_INDEX_VERSION,
+                    "method": method,
                 }
                 logger.info(
                     "[%s] %s -> %d청크 (extract=%.2fs)",
@@ -332,6 +430,11 @@ class CollectorWorker(QThread):
                 # state를 갱신하지 않으므로 다음 유휴 사이클에서 자동 재시도된다.
                 logger.warning("[collector] Office 점유로 연기(다음 사이클 재시도): %s", exc)
                 deferred.append(task.path)
+            except UnreadableFormatError as exc:
+                # OOXML 확장자이나 zip 아님(DRM 래핑·손상 등)에 COM도 불가한 경우.
+                # 일반 실패와 구분해 로그·요약에 표시 — "버그"가 아니라 DRM/손상임을 알림.
+                logger.warning("[collector] 판독불가(DRM/암호화·손상 추정): %s", exc)
+                unreadable.append(task.path)
             except Exception as exc:
                 logger.error("파일 처리 실패 (건너뜀): %s - %s", task.path, exc)
                 failed.append(task.path)
@@ -377,59 +480,164 @@ class CollectorWorker(QThread):
             summary += f" / 메일 {mail_indexed}건"
         if deferred:
             summary += f" / Office 점유로 연기 {len(deferred)}건"
+        if unreadable:
+            summary += f" / 판독불가 {len(unreadable)}건"
+        drm_deferred_count = producer_state.get("drm_deferred", 0)
+        if drm_deferred_count:
+            summary += f" / 유휴로 DRM 문서 스킵 {drm_deferred_count}건"
         if failed:
             logger.warning("실패 파일 목록: %s", failed)
         if deferred:
             logger.info("Office 점유로 연기된 파일 %d건(다음 사이클 재시도)", len(deferred))
+        if unreadable:
+            logger.info("판독불가(DRM/암호화·손상 추정) 파일 %d건: %s", len(unreadable), unreadable)
+        if drm_deferred_count:
+            logger.info(
+                "유휴 %.0fs로 DRM 세션 만료 추정 — DRM 의심 문서 %d건 이번 사이클 스킵(활동 재개 후 재시도)",
+                idle_elapsed_sec, drm_deferred_count,
+            )
         self.finished.emit(summary)
 
 
+# 실제 유휴에 못 미칠 때 다음 재확인까지 최소 대기(너무 촘촘한 재확인 방지)
+_MIN_RECHECK_SECONDS = 5.0
+
+# 복귀 감지 워처(Phase D)의 폴링 간격과 "방금 활동함" 판정 임계.
+# _RECOVERY_ACTIVE_SECONDS는 이 워처의 폴링 간격보다 작아야 "막 돌아왔다"는
+# 신호로 유효하다(그렇지 않으면 유휴 지속 중에도 우연히 낮게 잡힐 수 있음).
+_RECOVERY_POLL_SECONDS = 15.0
+_RECOVERY_ACTIVE_SECONDS = 10.0
+
+
 class IdleScheduler(QObject):
-    """유휴 시간 경과 시 인덱싱을 트리거한다.
+    """실제 OS 유휴 시간이 임계를 넘었을 때만 인덱싱을 트리거한다.
+
+    이전 구현은 idle_seconds마다 무조건 도는 주기 타이머였다(사용자가
+    작업 중이어도 트리거됨 — 실제 유휴 감지가 없었다). 이제 타이머가
+    만료돼도 GetLastInputInfo(읽기전용)로 실제 유휴 시간을 확인해, 임계에
+    못 미치면 트리거하지 않고 남은 시간만큼만 재예약한다.
 
     단일 워커를 공유하기 위해 워커를 직접 생성하지 않고,
     trigger/is_busy 콜백으로 외부 워커를 제어한다.
     이미 인덱싱(수동/유휴 무관)이 진행 중이면 건너뛴다.
+
+    복귀 감지(Phase D): 유휴가 `drm_idle_threshold_sec`를 넘으면(그 사이클들에서
+    DRM 의심 문서가 스킵됐을 가능성) 별도의 경량 폴링 워처가 그 사실을 기억해
+    두었다가, 사용자 활동이 재개된 직후(유휴가 다시 짧아진 시점) idle_elapsed=0으로
+    즉시 한 번 트리거한다 — DRM 스킵이 걸리지 않는 정상 사이클이라 밀린 DRM
+    문서가 자연히 캐치업된다. 다음 정기 유휴 사이클(최대 idle_seconds 뒤)까지
+    기다리지 않기 위함.
     """
 
-    def __init__(self, trigger, is_busy, idle_seconds=60, parent=None):
+    def __init__(
+        self, trigger, is_busy, idle_seconds=60, parent=None, get_idle_seconds=None,
+        drm_idle_threshold_sec=480.0,
+    ):
         """스케줄러를 초기화한다.
 
-        trigger: () -> None, 인덱싱을 시작하는 콜백
+        trigger: (idle_elapsed_sec: float) -> None, 인덱싱을 시작하는 콜백.
+            실제 유휴 경과초를 전달받아 DRM 스킵 판단(Phase C) 등에 쓸 수 있다.
         is_busy: () -> bool, 인덱싱이 진행 중이면 True를 반환하는 콜백
+        get_idle_seconds: () -> float, 실제 OS 유휴 경과초 조회(테스트 주입용,
+            기본은 collector.idle_util.get_idle_seconds)
+        drm_idle_threshold_sec: 이 이상 유휴가 지속됐다가 활동이 재개되면
+            복귀 캐치업 트리거를 1회 발동한다(collector.drm_idle_threshold_sec와
+            동일 값을 넘겨 일관성을 유지해야 함).
         """
         super().__init__(parent)
         self._trigger = trigger
         self._is_busy = is_busy
         self._idle_seconds = idle_seconds
+        self._drm_idle_threshold_sec = drm_idle_threshold_sec
+        if get_idle_seconds is None:
+            from knowmate.collector.idle_util import get_idle_seconds as _default
+            get_idle_seconds = _default
+        self._get_idle_seconds = get_idle_seconds
         self._timer = QTimer(self)
         self._timer.setInterval(idle_seconds * 1000)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self._on_idle)
 
+        # 복귀 감지 워처 — idle_seconds 디바운스와 독립적으로 계속 도는 경량 폴링
+        self._was_long_idle = False
+        self._recovery_timer = QTimer(self)
+        self._recovery_timer.setInterval(int(_RECOVERY_POLL_SECONDS * 1000))
+        self._recovery_timer.timeout.connect(self._on_recovery_check)
+
     def start(self):
         """스케줄러를 시작한다."""
+        self._timer.setInterval(self._idle_seconds * 1000)
         self._timer.start()
+        self._was_long_idle = False
+        self._recovery_timer.start()
         logger.info("IdleScheduler 시작 (idle=%ds)", self._idle_seconds)
 
     def stop(self):
         """스케줄러를 중지한다."""
         self._timer.stop()
+        self._recovery_timer.stop()
         logger.info("IdleScheduler 중지")
 
     def reset_idle(self):
-        """사용자 입력 이벤트 시 유휴 타이머를 리셋한다."""
+        """호환용: 유휴 타이머를 즉시 재시작한다.
+
+        실제 유휴 판정은 이제 OS 조회(_get_idle_seconds)로 하므로 필수는
+        아니지만, 사용자 활동을 안 시점에 다음 재확인을 즉시 원위치로
+        되돌리고 싶을 때 호출할 수 있다.
+        """
         if self._timer.isActive():
+            self._timer.setInterval(self._idle_seconds * 1000)
             self._timer.start()
 
     def _on_idle(self):
-        """유휴 시간 경과 시 인덱싱을 트리거한다. 진행 중이면 건너뛰고 재예약한다."""
+        """타이머 만료 시 실제 유휴 시간을 확인해 임계 이상이면 트리거한다.
+
+        진행 중이면 건너뛰고 재예약. 임계에 못 미치면(사용자가 작업 중)
+        남은 시간만큼만 재확인을 예약해 계속 폴링하지 않는다.
+        """
         if self._is_busy():
             logger.debug("IdleScheduler: 인덱싱 진행 중, 건너뜀")
-            self._timer.start()  # 다음 사이클에 재시도
+            self._timer.setInterval(self._idle_seconds * 1000)
+            self._timer.start()
             return
-        logger.info("IdleScheduler: 유휴 감지 -> 수집기 실행")
+
+        actual_idle = self._get_idle_seconds()
+        if actual_idle < self._idle_seconds:
+            remaining = self._idle_seconds - actual_idle
+            wait = max(remaining, _MIN_RECHECK_SECONDS)
+            logger.debug(
+                "IdleScheduler: 실제 유휴 %.0fs < 임계 %ds(사용자 활동 중) — %.0fs 후 재확인",
+                actual_idle, self._idle_seconds, wait,
+            )
+            self._timer.setInterval(int(wait * 1000))
+            self._timer.start()
+            return
+
+        logger.info("IdleScheduler: 유휴 감지(%.0fs) -> 수집기 실행", actual_idle)
+        self._timer.setInterval(self._idle_seconds * 1000)
         try:
-            self._trigger()
+            self._trigger(actual_idle)
         finally:
             self._timer.start()  # 다음 유휴 사이클 예약
+
+    def _on_recovery_check(self):
+        """장시간 유휴 뒤 활동 재개 순간을 포착해 DRM 캐치업 사이클을 즉시 트리거한다.
+
+        idle_seconds 디바운스와 무관하게 독립적으로 폴링한다 — 그래야 다음
+        정기 유휴 사이클까지 기다리지 않고 복귀 직후 즉시 캐치업할 수 있다.
+        """
+        if self._is_busy():
+            return  # 진행 중인 사이클이 끝난 뒤 다음 폴링에서 재판단
+
+        current = self._get_idle_seconds()
+        if current >= self._drm_idle_threshold_sec:
+            self._was_long_idle = True
+            return
+
+        if self._was_long_idle and current < _RECOVERY_ACTIVE_SECONDS:
+            self._was_long_idle = False
+            logger.info(
+                "IdleScheduler: 장시간 유휴(DRM 스킵 추정) 후 활동 재개 감지 "
+                "-> DRM 캐치업 사이클 즉시 실행"
+            )
+            self._trigger(0.0)  # idle_elapsed=0 → DRM 스킵 없이 정상 처리(밀린 DRM 문서 포함)
