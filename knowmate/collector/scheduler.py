@@ -33,6 +33,10 @@ PRIORITY_ORPHAN = 3
 _COM_RANK = 0
 _PLAIN_RANK = 1
 
+# 큐 종료 신호의 정렬 키 — 모든 실제 항목((PRIORITY_ORPHAN, _PLAIN_RANK)까지)보다
+# 항상 낮은 우선순위라 스캔이 끝난 뒤 넣어도 실제 항목보다 먼저 소비되지 않는다.
+_SENTINEL_KEY = (PRIORITY_ORPHAN + 1, _PLAIN_RANK + 1)
+
 # state 캐싱용 방식 분류 — AutoReader의 실제 라우팅 판단(secure/__init__.py)과
 # 동일한 기준(확장자 + zip 서명)을 재사용한다. extractor 모드가 auto가 아니어도
 # (fake/plain) 무해 — 다음 사이클 큐 우선순위 힌트로만 쓰이고 실제 추출
@@ -301,7 +305,6 @@ class CollectorWorker(QThread):
 
         task_queue: "_queue.PriorityQueue" = _queue.PriorityQueue()
         _SENTINEL = None
-        _SENTINEL_KEY = (PRIORITY_ORPHAN + 1, _PLAIN_RANK + 1)  # 모든 실제 항목보다 낮은 우선순위
         _seq = itertools.count()
         producer_state = {"total": None, "seen": set(), "drm_deferred": 0}
 
