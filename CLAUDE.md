@@ -1,6 +1,6 @@
 # CLAUDE.md — Aegis Desk
-> Phase 1~4 완료, Phase 5a(메일) 완료, 5c(포터블 빌드) 완료 · 베타 배포 단계 | 2026-07-17
-> 제품명: **Aegis Desk (이지스 데스크)** — 구 KnowMate. 버전 `knowmate/version.py` (현재 0.9.0-beta1).
+> Phase 1~4 완료, Phase 5a(메일) 완료, 5c(포터블 빌드) 완료 · 베타 배포 단계 | 2026-07-21
+> 제품명: **Aegis Desk (이지스 데스크)** — 구 KnowMate. 버전 `knowmate/version.py` (현재 0.9.0-beta2).
 > 데이터 폴더 `%APPDATA%/AegisDesk` (구 KnowMate 폴더는 최초 실행 시 자동 이전). config.yaml·index·logs·km.key·index_state.json 모두 여기 위치.
 
 ## 모델 사용 정책
