@@ -466,6 +466,124 @@ class TestCollectorWorker:
 
 
 # ============================================================
+# TestQueuePriority — COM 우선순위 캐싱 (PyQt6 필요)
+# ============================================================
+
+@pytest.mark.skipif(not _HAS_PYQT6, reason="PyQt6 미설치 — 폐쇄망 외 환경")
+class TestQueuePriority:
+    """state.json에 캐시된 method(com/plain)로 다음 사이클 처리 순서를 보정한다."""
+
+    class _RecordingExtractor:
+        """extract() 호출 순서를 기록하는 래퍼(FakeReader 위임)."""
+
+        def __init__(self):
+            from knowmate.secure.fake_reader import FakeReader
+            self._inner = FakeReader()
+            self.order: list[str] = []
+
+        def extract(self, path: str) -> str:
+            self.order.append(path)
+            return self._inner.extract(path)
+
+    def test_priority_queue_orders_new_before_modified(self):
+        """정렬 키(action우선순위, com_rank)로 NEW가 MODIFIED보다 먼저 나온다.
+
+        생산자·소비자가 별도 스레드로 동시에 도는 실제 사이클에서는 아직
+        큐에 없는 항목까지 재정렬할 수 없으므로(스트리밍 구조의 본질적
+        한계), 정렬 메커니즘 자체는 스레드 경합 없이 직접 검증한다.
+        """
+        import queue as _queue
+        from knowmate.collector.scheduler import IndexTask, PRIORITY_NEW, PRIORITY_MODIFIED, _PLAIN_RANK
+
+        q: "_queue.PriorityQueue" = _queue.PriorityQueue()
+        # 일부러 반대 순서로 삽입 — 우선순위 정렬이 실제로 동작함을 검증
+        q.put(((PRIORITY_MODIFIED, _PLAIN_RANK), 0, IndexTask(PRIORITY_MODIFIED, "old.txt", "modified")))
+        q.put(((PRIORITY_NEW, _PLAIN_RANK), 1, IndexTask(PRIORITY_NEW, "new.txt", "new")))
+
+        first = q.get()[2]
+        second = q.get()[2]
+        assert first.path == "new.txt"
+        assert second.path == "old.txt"
+
+    def test_priority_queue_orders_com_before_plain_in_same_tier(self):
+        """같은 action(modified) 내에서 com_rank=0(COM 캐시)이 plain보다 먼저 나온다."""
+        import queue as _queue
+        from knowmate.collector.scheduler import IndexTask, PRIORITY_MODIFIED, _COM_RANK, _PLAIN_RANK
+
+        q: "_queue.PriorityQueue" = _queue.PriorityQueue()
+        q.put(((PRIORITY_MODIFIED, _PLAIN_RANK), 0, IndexTask(PRIORITY_MODIFIED, "plain.txt", "modified", _PLAIN_RANK)))
+        q.put(((PRIORITY_MODIFIED, _COM_RANK), 1, IndexTask(PRIORITY_MODIFIED, "com.txt", "modified", _COM_RANK)))
+
+        first = q.get()[2]
+        assert first.path == "com.txt"
+
+    def test_sentinel_always_sorts_last(self):
+        """종료 신호(_SENTINEL_KEY)는 어떤 실제 우선순위보다도 낮다(항상 마지막에 소비)."""
+        import queue as _queue
+        from knowmate.collector.scheduler import (
+            IndexTask, PRIORITY_ORPHAN, _SENTINEL_KEY, _PLAIN_RANK,
+        )
+
+        q: "_queue.PriorityQueue" = _queue.PriorityQueue()
+        q.put((_SENTINEL_KEY, 0, None))
+        q.put(((PRIORITY_ORPHAN, _PLAIN_RANK), 1, IndexTask(PRIORITY_ORPHAN, "last_real.txt", "orphan")))
+
+        first = q.get()[2]
+        second = q.get()[2]
+        assert first is not None and first.path == "last_real.txt"
+        assert second is None
+
+    def test_classify_extract_method(self, tmp_path: Path):
+        """확장자·zip 서명으로 다음 사이클 우선순위 힌트(method)를 분류한다."""
+        from knowmate.collector.scheduler import _classify_extract_method
+        import zipfile
+
+        doc = tmp_path / "a.doc"
+        doc.write_bytes(b"\xd0\xcf\x11\xe0")  # OLE2 매직 — 확장자만으로도 com
+        assert _classify_extract_method(str(doc)) == "com"
+
+        drm_xlsx = tmp_path / "b.xlsx"
+        drm_xlsx.write_bytes(b"<## " + b"\x00" * 20)  # zip 아님 → com
+        assert _classify_extract_method(str(drm_xlsx)) == "com"
+
+        real_xlsx = tmp_path / "c.xlsx"
+        with zipfile.ZipFile(real_xlsx, "w") as zf:
+            zf.writestr("dummy.txt", "content")
+        assert _classify_extract_method(str(real_xlsx)) == "plain"
+
+        txt = tmp_path / "d.txt"
+        txt.write_bytes(b"hello")
+        assert _classify_extract_method(str(txt)) == "plain"
+
+    def test_method_recorded_in_state_after_success(self, tmp_path: Path):
+        """인덱싱 성공 후 state에 method(com/plain)가 기록된다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+        from knowmate.collector.state import load_state
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        f = folder / "plain.docx"
+        import zipfile
+        with zipfile.ZipFile(f, "w") as zf:
+            zf.writestr("dummy.txt", "zip content")  # 실제 zip 서명 → plain 분류
+
+        state_file = tmp_path / "state.json"
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        from knowmate.secure.fake_reader import FakeReader
+        worker = CollectorWorker(
+            config=_make_config(str(folder)), indexer=indexer,
+            extractor=FakeReader(), state_file=state_file,
+        )
+        worker.run()
+
+        state = load_state(state_file)
+        assert state[str(f)]["method"] == "plain"
+
+
+# ============================================================
 # TestPurgeRemovedFolders — _purge_removed_folders 안전장치 (베타 배포 전 발견된 이슈)
 # ============================================================
 

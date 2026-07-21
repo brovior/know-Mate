@@ -14,7 +14,7 @@ from knowmate.collector.cleanup import CleanupManager
 from knowmate.collector.scanner import get_scope, iter_scan_folder
 from knowmate.collector.state import load_state, save_state
 from knowmate.secure.office_guard import OfficeBusyError
-from knowmate.secure.signature import UnreadableFormatError
+from knowmate.secure.signature import UnreadableFormatError, is_zip
 
 if TYPE_CHECKING:
     from knowmate.rag.indexer import Indexer
@@ -27,6 +27,29 @@ PRIORITY_NEW = 1
 PRIORITY_MODIFIED = 2
 PRIORITY_ORPHAN = 3
 
+# state.json에 캐시된 추출 방식(method)에 따른 큐 내 우선순위 보정.
+# COM 경유(구형 바이너리·DRM 래핑) 파일은 사용자 세션(DRM/SSO)이 유효한
+# 유휴 초입에 먼저 처리되도록 같은 action 우선순위 내에서 앞당긴다.
+_COM_RANK = 0
+_PLAIN_RANK = 1
+
+# state 캐싱용 방식 분류 — AutoReader의 실제 라우팅 판단(secure/__init__.py)과
+# 동일한 기준(확장자 + zip 서명)을 재사용한다. extractor 모드가 auto가 아니어도
+# (fake/plain) 무해 — 다음 사이클 큐 우선순위 힌트로만 쓰이고 실제 추출
+# 경로에는 전혀 영향을 주지 않는다.
+_COM_EXTS = {".doc", ".xls", ".ppt"}
+_OOXML_EXTS = {".docx", ".xlsx", ".pptx"}
+
+
+def _classify_extract_method(path: str) -> str:
+    """다음 사이클 우선순위 힌트로 쓸 추출 방식을 분류한다 ('com' | 'plain')."""
+    ext = Path(path).suffix.lower()
+    if ext in _COM_EXTS:
+        return "com"
+    if ext in _OOXML_EXTS and not is_zip(path):
+        return "com"
+    return "plain"
+
 
 @dataclass(order=True)
 class IndexTask:
@@ -35,6 +58,7 @@ class IndexTask:
     priority: int
     path: str = field(compare=False)
     action: str = field(compare=False)
+    com_rank: int = field(default=_PLAIN_RANK, compare=False)
 
 
 class CollectorWorker(QThread):
@@ -217,11 +241,21 @@ class CollectorWorker(QThread):
         # 생산자 스레드: 폴더를 walk 하며 신규/변경 파일을 큐에 넣는다(os.walk+stat만).
         # 소비자(현재 스레드): 큐에서 꺼내 즉시 인덱싱(추출·임베딩·LanceDB 쓰기는 여기서만).
         # 열거 완료 전엔 total 미정(-2)으로, 완료 후엔 확정 total 로 진행률을 emit 한다.
+        #
+        # 우선순위 큐: (action우선순위, com_rank) 오름차순 — NEW가 MODIFIED보다,
+        # COM 경유(전 사이클에 method='com'으로 기록된) 파일이 같은 action 내에서
+        # plain보다 먼저 처리된다. 정렬 키에 단조증가 seq를 끼워 넣어 IndexTask나
+        # 종료 신호(_SENTINEL)끼리 직접 비교되는 일이 없도록 한다(타입 비교 오류 방지).
+        # 종료 신호는 스캔이 끝난 뒤에만 최저 우선순위로 넣으므로, 그 시점까지 큐에
+        # 들어온 모든 실제 항목보다 항상 나중에 소비된다.
+        import itertools
         import queue as _queue
         import threading as _threading
 
-        task_queue: "_queue.Queue" = _queue.Queue()
+        task_queue: "_queue.PriorityQueue" = _queue.PriorityQueue()
         _SENTINEL = None
+        _SENTINEL_KEY = (PRIORITY_ORPHAN + 1, _PLAIN_RANK + 1)  # 모든 실제 항목보다 낮은 우선순위
+        _seq = itertools.count()
         producer_state = {"total": None, "seen": set()}
 
         logger.info("[collector] 작업 시작 — 폴더 스캔·인덱싱 파이프라인")
@@ -259,7 +293,12 @@ class CollectorWorker(QThread):
                         else:
                             continue  # 변경 없음 → 인덱싱 대상 아님
                         priority = PRIORITY_NEW if action == "new" else PRIORITY_MODIFIED
-                        task_queue.put(IndexTask(priority, path, action))
+                        # 이전 사이클에 COM 경유로 기록된 파일이면 우선순위를 앞당긴다
+                        # (DRM/구형 바이너리 — 세션 유효한 유휴 초입에 먼저 처리).
+                        # 처음 보는 파일은 힌트가 없어 plain과 동일하게 취급된다.
+                        com_rank = _COM_RANK if (prev or {}).get("method") == "com" else _PLAIN_RANK
+                        sort_key = (priority, com_rank)
+                        task_queue.put((sort_key, next(_seq), IndexTask(priority, path, action, com_rank)))
                         found += 1
                     if self._cancelled:
                         break
@@ -267,7 +306,7 @@ class CollectorWorker(QThread):
                 logger.exception("[collector] 스캔 생산자 예외: %s", exc)
             finally:
                 producer_state["total"] = found  # 확정 총계
-                task_queue.put(_SENTINEL)         # 소비자 종료 신호(무한대기 방지)
+                task_queue.put((_SENTINEL_KEY, next(_seq), _SENTINEL))  # 소비자 종료 신호(항상 마지막)
 
         producer = _threading.Thread(target=_producer, name="scan-producer", daemon=True)
         producer.start()
@@ -278,7 +317,7 @@ class CollectorWorker(QThread):
         unreadable = []
 
         while True:
-            task = task_queue.get()
+            _sort_key, _seq_no, task = task_queue.get()
             if task is _SENTINEL:
                 break
             if self._cancelled:
@@ -318,12 +357,16 @@ class CollectorWorker(QThread):
                 )
                 logger.debug("[단계5] 임베딩·저장 완료: %s -> %d청크", task.path, len(chunk_ids))
                 from knowmate.rag.indexer import DOC_INDEX_VERSION
+                # 다음 사이클 큐 우선순위 힌트용 — COM 경유 파일이었는지 기록
+                # (실제 추출 경로와 무관하게 확장자·zip 서명으로 분류하는 저비용 재확인).
+                method = _classify_extract_method(task.path)
                 state[task.path] = {
                     "mtime": stat.st_mtime,
                     "size": stat.st_size,
                     "indexed_at": datetime.now(timezone.utc).isoformat(),
                     "chunk_ids": chunk_ids,
                     "index_version": DOC_INDEX_VERSION,
+                    "method": method,
                 }
                 logger.info(
                     "[%s] %s -> %d청크 (extract=%.2fs)",
