@@ -983,3 +983,60 @@ class TestIdleScheduler:
         sched.start()
         sched.stop()
         assert not sched._recovery_timer.isActive()
+
+
+# ============================================================
+# TestSingleInstance — 중복 실행 방지 (PyQt6 필요)
+# ============================================================
+
+@pytest.mark.skipif(not _HAS_PYQT6, reason="PyQt6 미설치 — 폐쇄망 외 환경")
+class TestSingleInstance:
+    """QLocalServer/Socket 기반 단일 인스턴스 가드. 두 인스턴스가 같은
+    LanceDB/state 파일에 동시에 쓰는 것을 막기 위함(원칙8과 같은 이유)."""
+
+    @pytest.fixture(autouse=True)
+    def _no_leftover_server(self):
+        """테스트 전후로 서버 이름이 남아있지 않도록 정리한다(테스트 간 격리)."""
+        from PyQt6.QtNetwork import QLocalServer
+        from knowmate.app.single_instance import _SERVER_NAME
+        QLocalServer.removeServer(_SERVER_NAME)
+        yield
+        QLocalServer.removeServer(_SERVER_NAME)
+
+    def test_first_instance_acquires(self):
+        """서버가 없으면 True(내가 1등 인스턴스)를 반환한다."""
+        from knowmate.app.single_instance import try_acquire_or_notify_existing
+        assert try_acquire_or_notify_existing() is True
+
+    def test_second_instance_detects_and_notifies(self):
+        """서버가 이미 떠 있으면 False를 반환하고 기존 서버의 show_requested가 발동된다."""
+        from PyQt6.QtWidgets import QApplication
+        from knowmate.app.single_instance import (
+            SingleInstanceServer, try_acquire_or_notify_existing,
+        )
+
+        server = SingleInstanceServer()
+        received = []
+        server.show_requested.connect(lambda: received.append(True))
+        try:
+            assert try_acquire_or_notify_existing() is False
+
+            app = QApplication.instance()
+            for _ in range(50):
+                app.processEvents()
+                if received:
+                    break
+                time.sleep(0.02)
+            assert received == [True]
+        finally:
+            server.close()
+
+    def test_server_close_allows_new_acquisition(self):
+        """서버를 닫으면 이후 다시 첫 인스턴스로 획득할 수 있다."""
+        from knowmate.app.single_instance import (
+            SingleInstanceServer, try_acquire_or_notify_existing,
+        )
+        server = SingleInstanceServer()
+        assert try_acquire_or_notify_existing() is False
+        server.close()
+        assert try_acquire_or_notify_existing() is True

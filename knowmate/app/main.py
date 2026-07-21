@@ -336,7 +336,20 @@ def main() -> None:
     app.setApplicationName("Aegis Desk")
     if APP_ICON.exists():
         app.setWindowIcon(QIcon(str(APP_ICON)))
+
+    # 단일 인스턴스 보장 — 이미 실행 중이면 기존 창을 띄우도록 알리고 조용히 종료.
+    # 트레이 상주 앱이라 중복 실행이 쉬운데, 두 인스턴스가 같은 LanceDB·state
+    # 파일에 동시 쓰면 데이터 손상 위험이 있다(원칙8과 같은 이유).
+    from knowmate.app.single_instance import (
+        SingleInstanceServer, try_acquire_or_notify_existing,
+    )
+    if not try_acquire_or_notify_existing():
+        return
+
     win = MainWindow()
+    single_instance_server = SingleInstanceServer(parent=win)
+    single_instance_server.show_requested.connect(win._show_from_tray)
+
     win.show()
     sys.exit(app.exec())
 

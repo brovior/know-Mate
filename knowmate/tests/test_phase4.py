@@ -259,30 +259,76 @@ class TestOfficeGuard:
         assert process_for_ext(".pdf") is None
         assert process_for_ext(".txt") is None
 
+    @pytest.fixture(autouse=True)
+    def _clear_owned(self):
+        """각 테스트 전후로 스레드 소유 PID를 비운다(테스트 간 격리)."""
+        import knowmate.secure.office_guard as og
+        og.clear_owned_pids()
+        yield
+        og.clear_owned_pids()
+
     def test_busy_false_when_not_running(self, monkeypatch):
         """대상 프로세스가 안 떠 있으면 False."""
         import knowmate.secure.office_guard as og
-        monkeypatch.setattr(og, "_running_process_names", lambda: {"EXPLORER.EXE"})
+        monkeypatch.setattr(og, "_cached_processes", lambda: [("EXPLORER.EXE", 100)])
         assert og.is_office_busy_for_ext(".doc") is False
 
     def test_busy_true_when_running(self, monkeypatch):
-        """대상 프로세스가 떠 있으면 True."""
+        """대상 프로세스가 (우리 소유가 아닌 채) 떠 있으면 True."""
         import knowmate.secure.office_guard as og
-        monkeypatch.setattr(og, "_running_process_names", lambda: {"WINWORD.EXE"})
+        monkeypatch.setattr(og, "_cached_processes", lambda: [("WINWORD.EXE", 200)])
         assert og.is_office_busy_for_ext(".doc") is True
         assert og.is_office_busy_for_ext(".docx") is True
+
+    def test_busy_false_when_running_process_is_ours(self, monkeypatch):
+        """우리가 띄운(소유) 프로세스뿐이면 점유로 보지 않는다(자기 감지 방지)."""
+        import knowmate.secure.office_guard as og
+        monkeypatch.setattr(og, "_cached_processes", lambda: [("WINWORD.EXE", 200)])
+        og.register_owned_pids({200})
+        assert og.is_office_busy_for_ext(".doc") is False
+
+    def test_busy_true_when_external_and_owned_coexist(self, monkeypatch):
+        """우리 소유 인스턴스가 있어도 사용자(외부) 인스턴스가 별도로 있으면 True."""
+        import knowmate.secure.office_guard as og
+        monkeypatch.setattr(
+            og, "_cached_processes",
+            lambda: [("WINWORD.EXE", 200), ("WINWORD.EXE", 201)],
+        )
+        og.register_owned_pids({200})  # 200은 우리 것, 201은 사용자 것
+        assert og.is_office_busy_for_ext(".doc") is True
 
     def test_busy_false_for_non_office_ext_even_if_running(self, monkeypatch):
         """대상 외 확장자는 프로세스가 떠 있어도 차단하지 않는다."""
         import knowmate.secure.office_guard as og
-        monkeypatch.setattr(og, "_running_process_names", lambda: {"WINWORD.EXE"})
+        monkeypatch.setattr(og, "_cached_processes", lambda: [("WINWORD.EXE", 200)])
         assert og.is_office_busy_for_ext(".pdf") is False
 
     def test_busy_false_when_enumeration_unavailable(self, monkeypatch):
         """프로세스 열거 불가(None, 비Windows 등)면 차단하지 않는다(기존 동작 유지)."""
         import knowmate.secure.office_guard as og
-        monkeypatch.setattr(og, "_running_process_names", lambda: None)
+        monkeypatch.setattr(og, "_cached_processes", lambda: None)
         assert og.is_office_busy_for_ext(".doc") is False
+
+    def test_clear_owned_pids_returns_and_empties(self):
+        """clear_owned_pids는 기존 소유 집합을 반환하고 비운다."""
+        import knowmate.secure.office_guard as og
+        og.register_owned_pids({10, 11})
+        assert og.clear_owned_pids() == {10, 11}
+        assert og.clear_owned_pids() == set()
+
+    def test_terminate_owned_only_kills_live_office_pids(self, monkeypatch):
+        """소유 PID 중 '지금도 Office 실행 파일인' 것만 종료한다(PID 재활용 안전)."""
+        import knowmate.secure.office_guard as og
+        monkeypatch.setattr(og.sys, "platform", "win32")
+        # 200=우리 Word(살아있음), 201=이미 죽음(목록에 없음), 202=다른 프로세스로 재활용됨
+        monkeypatch.setattr(
+            og, "_enumerate_processes",
+            lambda: [("WINWORD.EXE", 200), ("CHROME.EXE", 202)],
+        )
+        killed = []
+        monkeypatch.setattr(og, "_terminate_pid", lambda pid: killed.append(pid))
+        og.terminate_owned_office_processes({200, 201, 202})
+        assert killed == [200]  # 201(죽음)·202(재활용)는 건드리지 않음
 
     def test_autoreader_raises_office_busy_before_com(self, monkeypatch):
         """Office 점유 시 AutoReader가 COM 진입 전에 OfficeBusyError를 낸다."""
