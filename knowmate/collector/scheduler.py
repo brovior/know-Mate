@@ -14,6 +14,7 @@ from knowmate.collector.cleanup import CleanupManager
 from knowmate.collector.scanner import get_scope, iter_scan_folder
 from knowmate.collector.state import load_state, save_state
 from knowmate.secure.office_guard import OfficeBusyError
+from knowmate.secure.signature import UnreadableFormatError
 
 if TYPE_CHECKING:
     from knowmate.rag.indexer import Indexer
@@ -274,6 +275,7 @@ class CollectorWorker(QThread):
         done = 0
         failed = []
         deferred = []
+        unreadable = []
 
         while True:
             task = task_queue.get()
@@ -332,6 +334,11 @@ class CollectorWorker(QThread):
                 # state를 갱신하지 않으므로 다음 유휴 사이클에서 자동 재시도된다.
                 logger.warning("[collector] Office 점유로 연기(다음 사이클 재시도): %s", exc)
                 deferred.append(task.path)
+            except UnreadableFormatError as exc:
+                # OOXML 확장자이나 zip 아님(DRM 래핑·손상 등)에 COM도 불가한 경우.
+                # 일반 실패와 구분해 로그·요약에 표시 — "버그"가 아니라 DRM/손상임을 알림.
+                logger.warning("[collector] 판독불가(DRM/암호화·손상 추정): %s", exc)
+                unreadable.append(task.path)
             except Exception as exc:
                 logger.error("파일 처리 실패 (건너뜀): %s - %s", task.path, exc)
                 failed.append(task.path)
@@ -377,10 +384,14 @@ class CollectorWorker(QThread):
             summary += f" / 메일 {mail_indexed}건"
         if deferred:
             summary += f" / Office 점유로 연기 {len(deferred)}건"
+        if unreadable:
+            summary += f" / 판독불가 {len(unreadable)}건"
         if failed:
             logger.warning("실패 파일 목록: %s", failed)
         if deferred:
             logger.info("Office 점유로 연기된 파일 %d건(다음 사이클 재시도)", len(deferred))
+        if unreadable:
+            logger.info("판독불가(DRM/암호화·손상 추정) 파일 %d건: %s", len(unreadable), unreadable)
         self.finished.emit(summary)
 
 

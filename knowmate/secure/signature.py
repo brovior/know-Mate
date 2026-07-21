@@ -27,3 +27,10 @@ def is_zip(path: str) -> bool:
             return f.read(4) == _ZIP_MAGIC
     except OSError:
         return False
+
+
+class UnreadableFormatError(RuntimeError):
+    """확장자는 OOXML이나 실제 zip이 아니어서(DRM 래핑·손상 등) 라이브러리로
+    파싱할 수 없을 때 발생한다. COM 경유도 불가한 최종 안전망(fake/plain 모드,
+    비Windows 등)에서만 발생 — COM 가능 환경(AutoReader)에서는 이 예외 대신
+    COM 경로로 라우팅되어 정상 처리된다."""

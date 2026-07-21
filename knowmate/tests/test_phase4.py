@@ -294,6 +294,40 @@ class TestOfficeGuard:
             AutoReader().extract("C:/dummy/report.doc")
 
 
+class TestPlainReaderUnreadableFormat:
+    """OOXML 확장자인데 zip이 아닌 파일(DRM 래핑·손상 등)에 대한 안전망."""
+
+    def test_non_zip_xlsx_raises_unreadable_immediately(self, tmp_path: Path):
+        """zip 아닌 xlsx는 openpyxl 재시도 없이 즉시 UnreadableFormatError."""
+        from knowmate.secure.plain_reader import PlainReader
+        from knowmate.secure.signature import UnreadableFormatError
+
+        p = tmp_path / "drm.xlsx"
+        p.write_bytes(b"<## " + b"\x00" * 60)
+        with pytest.raises(UnreadableFormatError, match="3C232320"):
+            PlainReader().extract(str(p))
+
+    def test_non_zip_pptx_raises_unreadable(self, tmp_path: Path):
+        """zip 아닌 pptx도 동일하게 UnreadableFormatError."""
+        from knowmate.secure.plain_reader import PlainReader
+        from knowmate.secure.signature import UnreadableFormatError
+
+        p = tmp_path / "drm.pptx"
+        p.write_bytes(b"<## " + b"\x00" * 60)
+        with pytest.raises(UnreadableFormatError):
+            PlainReader().extract(str(p))
+
+    def test_ole2_xlsx_also_raises_unreadable_via_plain(self, tmp_path: Path):
+        """PlainReader 단독 사용 시 OLE2 오라벨 xlsx도 UnreadableFormatError(COM 우회 없음)."""
+        from knowmate.secure.plain_reader import PlainReader
+        from knowmate.secure.signature import UnreadableFormatError
+
+        p = tmp_path / "mislabeled.xlsx"
+        p.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 16)
+        with pytest.raises(UnreadableFormatError):
+            PlainReader().extract(str(p))
+
+
 class TestPlainReaderTables:
     """표·도형 추출 검증 (docx 표 / pptx 표 + 그룹 재귀)."""
 
@@ -360,8 +394,16 @@ class TestSignature:
         from knowmate.secure.signature import is_ole2
         assert is_ole2("C:/nope/missing.xlsx") is False
 
+    def test_is_zip_false_for_drm_wrapped(self, tmp_path: Path):
+        """DRM 래핑 등 임의 헤더(zip도 OLE2도 아님)는 is_zip False."""
+        from knowmate.secure.signature import is_ole2, is_zip
+        p = tmp_path / "drm.xlsx"
+        p.write_bytes(b"<## " + b"\x00" * 60)  # 실측된 DRM 래퍼 헤더 패턴
+        assert is_zip(str(p)) is False
+        assert is_ole2(str(p)) is False
 
-# ── AutoReader OLE2 폴백 라우팅 ──────────────────────────────────
+
+# ── AutoReader OLE2/DRM 폴백 라우팅 ──────────────────────────────
 
 class TestAutoReaderOle2Fallback:
     def test_ole2_labeled_xlsx_routes_to_com(self, tmp_path, monkeypatch):
@@ -382,6 +424,45 @@ class TestAutoReaderOle2Fallback:
         p.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 16)  # OLE2 magic
         assert AutoReader().extract(str(p)) == "COM_RESULT"
         assert captured["path"] == str(p)
+
+    def test_drm_wrapped_xlsx_routes_to_com(self, tmp_path, monkeypatch):
+        """확장자는 .xlsx인데 zip도 OLE2도 아닌 DRM 래핑이면 ComReader로 폴백한다.
+
+        Office는 사내 DRM 화이트리스트 프로세스라 COM으로 열면 투명 복호화된
+        내용을 읽을 수 있다 — 탐색기에서는 열리는데 우리 파서만 실패하던 DRM
+        문서를 이 경로로 구제한다.
+        """
+        import knowmate.secure.com_reader as com_mod
+        from knowmate.secure import AutoReader
+
+        captured = {}
+
+        class _FakeCom:
+            def extract(self, path):
+                captured["path"] = path
+                return "COM_RESULT"
+
+        monkeypatch.setattr(com_mod, "ComReader", _FakeCom)
+
+        p = tmp_path / "drm.xlsx"
+        p.write_bytes(b"<## " + b"\x00" * 60)  # zip도 OLE2도 아닌 임의 헤더
+        assert AutoReader().extract(str(p)) == "COM_RESULT"
+        assert captured["path"] == str(p)
+
+    def test_drm_wrapped_pptx_routes_to_com(self, tmp_path, monkeypatch):
+        """pptx도 동일하게 DRM 래핑이면 ComReader로 폴백한다."""
+        import knowmate.secure.com_reader as com_mod
+        from knowmate.secure import AutoReader
+
+        class _FakeCom:
+            def extract(self, path):
+                return "COM_RESULT"
+
+        monkeypatch.setattr(com_mod, "ComReader", _FakeCom)
+
+        p = tmp_path / "drm.pptx"
+        p.write_bytes(b"<## " + b"\x00" * 60)
+        assert AutoReader().extract(str(p)) == "COM_RESULT"
 
     def test_real_xlsx_uses_plain(self, tmp_path, monkeypatch):
         """정상 OOXML(.xlsx)은 PlainReader 경로로 간다(COM 호출 안 함)."""
