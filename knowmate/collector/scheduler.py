@@ -114,13 +114,16 @@ class CollectorWorker(QThread):
     indexing_needed = pyqtSignal(str)
 
     def __init__(self, config, indexer, extractor, state_file=None, email_indexer=None,
-                 parent=None, get_idle_seconds=None):
+                 parent=None, get_idle_seconds=None, com_restart_fn=None):
         """수집기 워커를 초기화한다.
 
         get_idle_seconds: () -> float, 현재 OS 유휴 경과초 조회(테스트 주입용,
             기본은 collector.idle_util.get_idle_seconds). DRM 세션 만료 추정에
             쓴다 — 사이클 시작 시 1회가 아니라 파일 처리 중 실시간으로 조회해,
             긴 사이클 도중 세션이 만료되면 그 시점부터 DRM 문서를 건너뛴다.
+        com_restart_fn: () -> None, COM Office 주기 재기동 시 호출(테스트 주입용,
+            기본은 secure.com_reader.quit_com_apps). COM 파일 N건 처리마다 Office를
+            선제적으로 재기동해 장시간 사이클에서의 핸들·메모리 누수를 완화한다.
         """
         super().__init__(parent)
         self._config = config
@@ -132,6 +135,10 @@ class CollectorWorker(QThread):
             from knowmate.collector.idle_util import get_idle_seconds as _default
             get_idle_seconds = _default
         self._get_idle_seconds = get_idle_seconds
+        if com_restart_fn is None:
+            from knowmate.secure.com_reader import quit_com_apps as _default_restart
+            com_restart_fn = _default_restart
+        self._com_restart_fn = com_restart_fn
         from knowmate.config import get_data_dir
         default_state_file = get_data_dir() / "index_state.json"
         self._state_file = state_file or default_state_file
@@ -303,6 +310,11 @@ class CollectorWorker(QThread):
         com_timeout_per_mb = float(collector_cfg.get("com_timeout_per_mb_sec", 20))
         com_timeout_cap = float(collector_cfg.get("com_timeout_max_sec", 600))
 
+        # COM Office 주기 재기동 — COM 파일을 이 건수만큼 처리하면 Office를 선제적으로
+        # 재기동(quit_com_apps)해 장시간 사이클에서의 핸들·메모리 누수를 완화한다.
+        # 워치독(반응적, 행오버 시 kill)과 달리 이건 선제적 예방책. 0 이하면 비활성.
+        com_restart_every = int(collector_cfg.get("com_restart_every_n_files", 30))
+
         self._indexer._chunk_size = chunk_size
         self._indexer._overlap = overlap
         self._indexer._max_chunks_per_file = max_chunks_per_file
@@ -416,6 +428,8 @@ class CollectorWorker(QThread):
         failed = []
         deferred = []
         unreadable = []
+        com_since_restart = 0
+        restart_count = 0
 
         while True:
             _sort_key, _seq_no, task = task_queue.get()
@@ -434,13 +448,16 @@ class CollectorWorker(QThread):
             total_known = producer_state["total"]
             self.progress.emit(done, total_known if total_known is not None else -2, filename)
 
+            is_com = _classify_extract_method(task.path) == "com"
+            com_used = False
+
             try:
                 logger.debug("[단계1] 텍스트 추출 시작: %s", task.path)
                 _extract_t0 = time.perf_counter()
                 # COM 경유 파일만 워치독 무장(plain은 COM을 안 타 무의미하고, 느린
                 # openpyxl 파싱 중 애먼 Office를 죽이는 오발을 피함).
                 _wd_exe = None
-                if watchdog is not None and _classify_extract_method(task.path) == "com":
+                if watchdog is not None and is_com:
                     _wd_exe = _og.process_for_ext(Path(task.path).suffix.lower())
                 try:
                     if _wd_exe:
@@ -489,9 +506,12 @@ class CollectorWorker(QThread):
                     "[%s] %s -> %d청크 (extract=%.2fs)",
                     task.action, task.path, len(chunk_ids), extract_sec,
                 )
+                com_used = is_com
             except OfficeBusyError as exc:
                 # 사용자가 Office를 열어둔 상태 → 이번 사이클만 연기(실패 아님).
                 # state를 갱신하지 않으므로 다음 유휴 사이클에서 자동 재시도된다.
+                # 가드가 Dispatch 전에 차단해 우리 COM을 실제로 쓰지 않았으므로
+                # 주기 재기동 카운트 대상이 아니다(com_used는 False로 유지).
                 logger.warning("[collector] Office 점유로 연기(다음 사이클 재시도): %s", exc)
                 deferred.append(task.path)
             except UnreadableFormatError as exc:
@@ -499,9 +519,25 @@ class CollectorWorker(QThread):
                 # 일반 실패와 구분해 로그·요약에 표시 — "버그"가 아니라 DRM/손상임을 알림.
                 logger.warning("[collector] 판독불가(DRM/암호화·손상 추정): %s", exc)
                 unreadable.append(task.path)
+                com_used = is_com
             except Exception as exc:
                 logger.error("파일 처리 실패 (건너뜀): %s - %s", task.path, exc)
                 failed.append(task.path)
+                com_used = is_com
+
+            if com_used:
+                com_since_restart += 1
+                if com_restart_every > 0 and com_since_restart >= com_restart_every:
+                    try:
+                        self._com_restart_fn()
+                        restart_count += 1
+                        logger.info(
+                            "[collector] COM Office 주기 재기동: %d개 COM 파일 처리 후",
+                            com_since_restart,
+                        )
+                    except Exception as exc:
+                        logger.warning("[collector] COM 주기 재기동 실패(무시): %s", exc)
+                    com_since_restart = 0
 
         # 생산자 스레드 정리 (정상 종료 시 이미 끝나 있음)
         producer.join(timeout=5)
@@ -552,6 +588,8 @@ class CollectorWorker(QThread):
         com_timeout_count = watchdog.timeout_count if watchdog is not None else 0
         if com_timeout_count:
             summary += f" / COM 시간초과 강제해제 {com_timeout_count}건"
+        if restart_count:
+            summary += f" / COM 재기동 {restart_count}회"
         if failed:
             logger.warning("실패 파일 목록: %s", failed)
         if deferred:

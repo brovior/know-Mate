@@ -32,6 +32,7 @@ collector:
   com_timeout_base_sec: 60     # 크기 무관 기본 여유(Open + 오버헤드)
   com_timeout_per_mb_sec: 20   # MB당 가산(셀 단위 COM 왕복이 느린 대형 파일 보호)
   com_timeout_max_sec: 600     # 상한(안전망)
+  com_restart_every_n_files: 30  # COM 파일 이 건수마다 Office를 선제 재기동(핸들/메모리 누수 완화). 0이면 비활성.
 cleanup:
   dry_run: true
   max_delete_ratio: 0.3

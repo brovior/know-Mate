@@ -466,6 +466,160 @@ class TestCollectorWorker:
 
 
 # ============================================================
+# TestComRestart — COM Office 주기 재기동 (PyQt6 필요)
+# ============================================================
+
+@pytest.mark.skipif(not _HAS_PYQT6, reason="PyQt6 미설치 — 폐쇄망 외 환경")
+class TestComRestart:
+    """COM 파일 N건 처리마다 com_restart_fn이 호출되는지 검증한다.
+
+    FakeReader를 쓰므로 실제 COM은 호출되지 않지만, is_com 분류는
+    확장자/시그니처 기반(_classify_extract_method)이라 FakeReader와 무관하게
+    동작한다 — .doc는 항상 com으로 분류된다.
+    """
+
+    def _make_worker_with_spy(self, tmp_path: Path, watch_folder: str, restart_every: int):
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.secure.fake_reader import FakeReader
+        from knowmate.collector.scheduler import CollectorWorker
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        extractor = FakeReader()
+        config = {
+            "collector": {
+                "watch_folders": [watch_folder],
+                "idle_seconds": 60,
+                "com_restart_every_n_files": restart_every,
+            },
+            "cleanup": {"dry_run": True, "max_delete_ratio": 0.30},
+            "chunking": {"chunk_size": 400, "overlap": 80},
+        }
+        state_file = tmp_path / "state.json"
+        spy = MagicMock()
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=extractor, state_file=state_file,
+            com_restart_fn=spy,
+        )
+        return worker, spy
+
+    def test_restart_fires_every_n_com_files(self, tmp_path: Path):
+        """COM 파일(.doc) 6개, 주기 3 -> 재기동 2회."""
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        for i in range(6):
+            (folder / f"file{i}.doc").write_bytes(b"legacy doc content")
+
+        worker, spy = self._make_worker_with_spy(tmp_path, str(folder), restart_every=3)
+        worker.run()
+
+        assert spy.call_count == 2
+
+    def test_restart_disabled_when_zero(self, tmp_path: Path):
+        """com_restart_every_n_files=0 -> 재기동 안 함."""
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        for i in range(6):
+            (folder / f"file{i}.doc").write_bytes(b"legacy doc content")
+
+        worker, spy = self._make_worker_with_spy(tmp_path, str(folder), restart_every=0)
+        worker.run()
+
+        spy.assert_not_called()
+
+    def test_plain_files_not_counted(self, tmp_path: Path):
+        """plain 파일(.txt)만 있으면 COM 카운트 대상이 아니라 재기동 안 함."""
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        for i in range(6):
+            (folder / f"file{i}.txt").write_bytes(b"normal text content")
+
+        worker, spy = self._make_worker_with_spy(tmp_path, str(folder), restart_every=3)
+        worker.run()
+
+        spy.assert_not_called()
+
+    def test_office_busy_deferred_not_counted(self, tmp_path: Path):
+        """OfficeBusyError로 연기된 파일은 COM을 실제로 쓰지 않아 카운트 대상이 아니다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+        from knowmate.secure.office_guard import OfficeBusyError
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        for i in range(6):
+            (folder / f"file{i}.doc").write_bytes(b"legacy doc content")
+
+        class AlwaysBusyExtractor:
+            def extract(self, path: str) -> str:
+                raise OfficeBusyError("사용자 Office 점유 중")
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        config = {
+            "collector": {
+                "watch_folders": [str(folder)],
+                "idle_seconds": 60,
+                "com_restart_every_n_files": 3,
+            },
+            "cleanup": {"dry_run": True, "max_delete_ratio": 0.30},
+            "chunking": {"chunk_size": 400, "overlap": 80},
+        }
+        state_file = tmp_path / "state.json"
+        spy = MagicMock()
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=AlwaysBusyExtractor(), state_file=state_file,
+            com_restart_fn=spy,
+        )
+        worker.run()
+
+        spy.assert_not_called()
+
+    def test_restart_failure_does_not_stop_cycle(self, tmp_path: Path):
+        """com_restart_fn이 예외를 던져도 사이클은 계속 완료된다."""
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        for i in range(4):
+            (folder / f"file{i}.doc").write_bytes(b"legacy doc content")
+
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.secure.fake_reader import FakeReader
+        from knowmate.collector.scheduler import CollectorWorker
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        config = {
+            "collector": {
+                "watch_folders": [str(folder)],
+                "idle_seconds": 60,
+                "com_restart_every_n_files": 2,
+            },
+            "cleanup": {"dry_run": True, "max_delete_ratio": 0.30},
+            "chunking": {"chunk_size": 400, "overlap": 80},
+        }
+        state_file = tmp_path / "state.json"
+
+        def failing_restart():
+            raise RuntimeError("재기동 실패")
+
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
+            com_restart_fn=failing_restart,
+        )
+        finished_msgs = []
+        worker.finished.connect(finished_msgs.append)
+        worker.run()
+
+        from knowmate.collector.state import load_state
+        state = load_state(state_file)
+        assert len(state) == 4
+        assert len(finished_msgs) == 1
+
+
+# ============================================================
 # TestQueuePriority — COM 우선순위 캐싱 (PyQt6 필요)
 # ============================================================
 
