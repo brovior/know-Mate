@@ -1087,3 +1087,68 @@ class TestSingleInstance:
         assert try_acquire_or_notify_existing() is False
         server.close()
         assert try_acquire_or_notify_existing() is True
+
+
+# ============================================================
+# TestStopWorker — 종료 시 워커 정리 에스컬레이션 (PyQt6 무관)
+# ============================================================
+
+class TestStopWorker:
+    """정상 종료 → 강제 종료 → 하드 종료 단계적 강제. 워커가 COM에 멈춰도
+    트레이 [종료]가 프로세스를 반드시 끝내도록 보장하는 로직."""
+
+    class _FakeWorker:
+        def __init__(self, running=True, wait_results=None):
+            self._running = running
+            self._wait_results = list(wait_results or [])
+            self.cancelled = False
+            self.terminated = False
+
+        def isRunning(self):
+            return self._running
+
+        def cancel(self):
+            self.cancelled = True
+
+        def wait(self, ms):
+            return self._wait_results.pop(0) if self._wait_results else True
+
+        def terminate(self):
+            self.terminated = True
+
+    def test_graceful_stop_no_terminate_no_hardexit(self):
+        """첫 wait에 정상 종료되면 terminate·하드종료 없이 끝난다."""
+        from knowmate.app.lifecycle import stop_worker
+        w = self._FakeWorker(running=True, wait_results=[True])
+        hard = []
+        stop_worker(w, hard_exit=lambda c: hard.append(c))
+        assert w.cancelled and not w.terminated and hard == []
+
+    def test_terminate_when_graceful_times_out(self):
+        """정상 종료 실패 → terminate 후 성공하면 하드 종료는 안 한다."""
+        from knowmate.app.lifecycle import stop_worker
+        w = self._FakeWorker(running=True, wait_results=[False, True])
+        hard = []
+        stop_worker(w, hard_exit=lambda c: hard.append(c))
+        assert w.terminated and hard == []
+
+    def test_hard_exit_when_terminate_also_fails(self):
+        """정상·강제 모두 실패하면 프로세스 하드 종료(0)를 호출한다."""
+        from knowmate.app.lifecycle import stop_worker
+        w = self._FakeWorker(running=True, wait_results=[False, False])
+        hard = []
+        stop_worker(w, hard_exit=lambda c: hard.append(c))
+        assert w.terminated and hard == [0]
+
+    def test_noop_when_not_running(self):
+        """이미 멈춘 워커는 아무것도 하지 않는다."""
+        from knowmate.app.lifecycle import stop_worker
+        w = self._FakeWorker(running=False)
+        hard = []
+        stop_worker(w, hard_exit=lambda c: hard.append(c))
+        assert not w.cancelled and hard == []
+
+    def test_noop_when_none(self):
+        """worker가 None이어도 예외 없이 통과한다."""
+        from knowmate.app.lifecycle import stop_worker
+        stop_worker(None, hard_exit=lambda c: (_ for _ in ()).throw(AssertionError("호출되면 안 됨")))
