@@ -1152,3 +1152,107 @@ class TestStopWorker:
         """worker가 None이어도 예외 없이 통과한다."""
         from knowmate.app.lifecycle import stop_worker
         stop_worker(None, hard_exit=lambda c: (_ for _ in ()).throw(AssertionError("호출되면 안 됨")))
+
+
+# ============================================================
+# TestComWatchdog — COM 행오버 워치독 (PyQt6 무관)
+# ============================================================
+
+class TestComWatchdog:
+    """세대 토큰·발화/해제 경합·daemon 타이머를 검증한다. 실제 COM/kill 없이
+    terminate_fn·timer_factory를 주입해 로직만 확인."""
+
+    class _FakeTimer:
+        """start/cancel을 기록하고, fire()로 콜백을 수동 발화하는 가짜 타이머."""
+        def __init__(self, interval, callback):
+            self.interval = interval
+            self.callback = callback
+            self.started = False
+            self.cancelled = False
+
+        def start(self):
+            self.started = True
+
+        def cancel(self):
+            self.cancelled = True
+
+        def fire(self):
+            self.callback()
+
+    def _make(self, terminate_results=None):
+        """ComWatchdog + 마지막 생성 타이머 캡처 + terminate 호출 기록."""
+        from knowmate.collector.com_watchdog import ComWatchdog
+        timers = []
+        term_calls = []
+        results = list(terminate_results or [])
+
+        def _terminate(exe):
+            term_calls.append(exe)
+            return results.pop(0) if results else 1
+
+        def _factory(interval, cb):
+            t = self._FakeTimer(interval, cb)
+            timers.append(t)
+            return t
+
+        wd = ComWatchdog(terminate_fn=_terminate, timer_factory=_factory)
+        return wd, timers, term_calls
+
+    def test_arm_starts_timer_with_timeout(self):
+        wd, timers, _ = self._make()
+        wd.arm("EXCEL.EXE", 300.0)
+        assert len(timers) == 1
+        assert timers[0].interval == 300.0
+        assert timers[0].started
+
+    def test_fire_terminates_when_active(self):
+        wd, timers, term = self._make(terminate_results=[2])
+        wd.arm("EXCEL.EXE", 300.0)
+        timers[0].fire()
+        assert term == ["EXCEL.EXE"]
+        assert wd.timeout_count == 1
+
+    def test_disarm_prevents_fire(self):
+        """정상 완료(disarm) 후 타이머가 뒤늦게 발화해도 종료하지 않는다."""
+        wd, timers, term = self._make()
+        wd.arm("EXCEL.EXE", 300.0)
+        wd.disarm()
+        assert timers[0].cancelled
+        timers[0].fire()  # 취소됐어야 하지만 강제로 콜백을 불러도
+        assert term == []  # active=False라 무시
+
+    def test_stale_generation_does_not_fire(self):
+        """이전 파일의 타이머가 다음 파일 처리 중 발화해도 오사살하지 않는다."""
+        wd, timers, term = self._make()
+        wd.arm("EXCEL.EXE", 300.0)   # 파일1 (gen1)
+        wd.disarm()
+        wd.arm("WINWORD.EXE", 300.0)  # 파일2 (gen2)
+        # 파일1의 타이머가 이제야 발화
+        timers[0].fire()
+        assert term == []  # gen 불일치 → 무시
+        # 파일2 타이머는 정상 발화
+        timers[1].fire()
+        assert term == ["WINWORD.EXE"]
+
+    def test_fire_only_once_per_arm(self):
+        """한 번 발화 후에는 같은 세대에서 다시 발화해도 중복 종료하지 않는다."""
+        wd, timers, term = self._make()
+        wd.arm("EXCEL.EXE", 300.0)
+        timers[0].fire()
+        timers[0].fire()
+        assert term == ["EXCEL.EXE"]  # 1회만
+
+    def test_no_terminate_count_when_nothing_killed(self):
+        """종료 대상이 0개면 timeout_count를 올리지 않는다."""
+        wd, timers, term = self._make(terminate_results=[0])
+        wd.arm("EXCEL.EXE", 300.0)
+        timers[0].fire()
+        assert term == ["EXCEL.EXE"]
+        assert wd.timeout_count == 0
+
+    def test_default_timer_is_daemon(self):
+        """기본 타이머는 daemon이어야 한다(프로세스 종료를 막지 않도록)."""
+        from knowmate.collector.com_watchdog import ComWatchdog
+        t = ComWatchdog._default_timer(300.0, lambda: None)
+        assert t.daemon is True
+        t.cancel()

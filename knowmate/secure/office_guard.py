@@ -46,9 +46,18 @@ _OFFICE_EXES = set(_EXT_TO_PROCESS.values())
 _CACHE_TTL_SEC = 2.0
 _cache: dict[str, object] = {"ts": 0.0, "procs": None}  # procs: list[(name, pid)] | None
 
-# 우리 자동화(COM Dispatch)가 띄운 Office 프로세스 PID (스레드별).
-# COM은 스레드별로 쓰이므로(_tls) 소유 PID도 스레드별로 관리한다.
-_tls = threading.local()
+# 우리 자동화(COM Dispatch)가 띄운 Office 프로세스 PID.
+# 워치독(별도 스레드)이 행오버 시 이 목록을 읽어 강제 종료해야 하므로 모듈
+# 레벨 + 락으로 관리한다(COM 자체는 단일 워커 스레드에서만 쓰임).
+_owned_lock = threading.Lock()
+_owned_pids: set = set()
+
+# 현재 진행 중인 COM 파싱 작업의 컨텍스트(워치독의 Dispatch-hang 대비).
+# begin_com_op이 대상 exe와 '시작 전 존재하던 그 exe PID'를 기록해, 소유로
+# 등록되기 전(Dispatch가 반환 전) 멈춘 경우에도 '작업 시작 후 새로 뜬' 프로세스를
+# 우리 것으로 보고 종료할 수 있게 한다.
+_op_lock = threading.Lock()
+_op: dict = {"exe": None, "baseline": frozenset()}
 
 
 class OfficeBusyError(RuntimeError):
@@ -60,13 +69,10 @@ def process_for_ext(ext: str) -> str | None:
     return _EXT_TO_PROCESS.get(ext.lower())
 
 
-def _owned() -> set:
-    """현재 스레드의 '우리 소유' Office PID 집합을 반환한다(없으면 생성)."""
-    s = getattr(_tls, "owned", None)
-    if s is None:
-        s = set()
-        _tls.owned = s
-    return s
+def _owned_snapshot() -> set:
+    """소유 PID 집합의 사본을 반환한다(락 보호)."""
+    with _owned_lock:
+        return set(_owned_pids)
 
 
 def _enumerate_processes():
@@ -153,15 +159,16 @@ def register_owned_pids(pids: set) -> None:
     """우리(COM 자동화)가 띄운 Office 프로세스 PID를 소유로 등록한다."""
     if not pids:
         return
-    _owned().update(pids)
+    with _owned_lock:
+        _owned_pids.update(pids)
     logger.debug("우리 소유 Office PID 등록: %s", sorted(pids))
 
 
 def clear_owned_pids() -> set:
-    """현재 스레드의 소유 PID 집합을 반환하고 비운다(사이클 종료 정리용)."""
-    owned = _owned()
-    prev = set(owned)
-    owned.clear()
+    """소유 PID 집합을 반환하고 비운다(사이클 종료 정리용)."""
+    with _owned_lock:
+        prev = set(_owned_pids)
+        _owned_pids.clear()
     return prev
 
 
@@ -178,8 +185,59 @@ def is_office_busy_for_ext(ext: str) -> bool:
     if procs is None:  # 판단 불가 → 기존 동작 유지(차단하지 않음)
         return False
     running = _pids_for(proc, procs)
-    external = running - _owned()  # 우리가 띄운 인스턴스 제외
+    external = running - _owned_snapshot()  # 우리가 띄운 인스턴스 제외
     return bool(external)
+
+
+def begin_com_op(exe: str) -> None:
+    """COM 파싱 작업 시작을 기록한다(워치독의 Dispatch-hang 대비).
+
+    시작 전 존재하던 해당 exe PID를 baseline으로 저장 — 이후 새로 뜬(=우리)
+    프로세스를 소유 등록 전이라도 워치독이 종료할 수 있게 한다.
+    """
+    if not exe:
+        return
+    baseline = office_pids_live(exe)
+    with _op_lock:
+        _op["exe"] = exe.upper()
+        _op["baseline"] = frozenset(baseline)
+
+
+def end_com_op() -> None:
+    """COM 파싱 작업 종료를 기록한다(워치독 컨텍스트 해제)."""
+    with _op_lock:
+        _op["exe"] = None
+        _op["baseline"] = frozenset()
+
+
+def terminate_stuck_office(exe: str) -> int:
+    """워치독 발동 — 블로킹된 COM 호출을 풀기 위해 해당 exe의 '우리' 프로세스를 종료.
+
+    우선 우리 소유 PID를 대상으로 하고, 없으면(Dispatch가 반환 전 멈춰 소유 등록이
+    안 된 경우) begin_com_op 이후 새로 뜬 PID를 대상으로 한다. PID 재활용을 피하려
+    '지금도 그 exe인' 프로세스만 종료한다. 반환: 종료 시도한 프로세스 수.
+    """
+    if not exe or sys.platform != "win32":
+        return 0
+    procs = _enumerate_processes()
+    if procs is None:
+        return 0
+    up = exe.upper()
+    current = {pid for (name, pid) in procs if name == up}
+    targets = _owned_snapshot() & current
+    if not targets:
+        # 소유 등록 전 Dispatch-hang 의심 → 작업 시작 후 새로 뜬 그 exe만 종료
+        with _op_lock:
+            baseline = _op["baseline"] if _op["exe"] == up else frozenset(current)
+        targets = current - baseline
+    for pid in targets:
+        _terminate_pid(pid)
+    if targets:
+        logger.warning(
+            "COM 행오버 추정 — %s 프로세스 %d개 강제 종료(블로킹 해제): %s",
+            up, len(targets), sorted(targets),
+        )
+    return len(targets)
 
 
 def terminate_owned_office_processes(owned: set) -> None:

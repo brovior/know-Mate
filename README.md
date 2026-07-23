@@ -103,6 +103,9 @@ build.bat
 | `collector.idle_enabled` | `true` | 유휴 시 자동 인덱싱 on/off | ✅ |
 | `collector.idle_seconds` | `60` | 유휴 감지 후 자동 인덱싱 간격(초) | ✅(분 단위) |
 | `collector.drm_idle_threshold_sec` | `480` | 이 시간(초) 이상 유휴면 DRM/SSO 세션 만료로 보고 DRM 의심 문서를 해당 사이클에서 건너뜀 | |
+| `collector.com_timeout_base_sec` | `60` | COM 추출 행오버 워치독: 크기 무관 기본 타임아웃(0 이하면 비활성) | |
+| `collector.com_timeout_per_mb_sec` | `20` | COM 워치독: 파일 MB당 가산 시간 | |
+| `collector.com_timeout_max_sec` | `600` | COM 워치독: 타임아웃 상한 | |
 | `cleanup.dry_run` | `true` | true이면 제거된 폴더의 인덱스를 실제 삭제하지 않고 로그만 | ✅(자동삭제 토글) |
 | `cleanup.max_delete_ratio` | `0.3` | 대량 삭제 차단 임계(전체의 30% 초과 삭제 시 차단) | |
 | `mail.enabled` | `true` | 메일 파일 자동 인덱싱 on/off | ✅ |

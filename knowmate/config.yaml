@@ -26,6 +26,12 @@ collector:
   drm_idle_threshold_sec: 480  # 이 시간(초) 이상 유휴면 DRM/SSO 세션 만료로 보고
                                 # DRM 의심 문서(구형 바이너리·오라벨 OOXML)는 해당
                                 # 사이클에서 건너뜀(다음 유효 사이클에 자동 재시도)
+  # COM 추출 행오버 방지 워치독 — Office Open/셀 순회가 멈추면 파일 크기 비례
+  # 시간(base + per_mb×MB, cap 상한) 뒤 해당 Office 프로세스를 강제 종료해 블로킹을
+  # 풀고 그 파일만 실패 처리한다(사이클은 계속). base를 0 이하로 두면 비활성.
+  com_timeout_base_sec: 60     # 크기 무관 기본 여유(Open + 오버헤드)
+  com_timeout_per_mb_sec: 20   # MB당 가산(셀 단위 COM 왕복이 느린 대형 파일 보호)
+  com_timeout_max_sec: 600     # 상한(안전망)
 cleanup:
   dry_run: true
   max_delete_ratio: 0.3

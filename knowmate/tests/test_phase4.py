@@ -261,11 +261,13 @@ class TestOfficeGuard:
 
     @pytest.fixture(autouse=True)
     def _clear_owned(self):
-        """각 테스트 전후로 스레드 소유 PID를 비운다(테스트 간 격리)."""
+        """각 테스트 전후로 소유 PID·COM 작업 컨텍스트를 비운다(테스트 간 격리)."""
         import knowmate.secure.office_guard as og
         og.clear_owned_pids()
+        og.end_com_op()
         yield
         og.clear_owned_pids()
+        og.end_com_op()
 
     def test_busy_false_when_not_running(self, monkeypatch):
         """대상 프로세스가 안 떠 있으면 False."""
@@ -329,6 +331,44 @@ class TestOfficeGuard:
         monkeypatch.setattr(og, "_terminate_pid", lambda pid: killed.append(pid))
         og.terminate_owned_office_processes({200, 201, 202})
         assert killed == [200]  # 201(죽음)·202(재활용)는 건드리지 않음
+
+    def test_terminate_stuck_office_kills_owned_first(self, monkeypatch):
+        """행오버 워치독: 우리 소유 프로세스만 종료하고 외부(사용자) 인스턴스는 보호한다."""
+        import knowmate.secure.office_guard as og
+        monkeypatch.setattr(og.sys, "platform", "win32")
+        monkeypatch.setattr(
+            og, "_enumerate_processes",
+            lambda: [("EXCEL.EXE", 500), ("EXCEL.EXE", 999), ("CHROME.EXE", 77)],
+        )
+        killed = []
+        monkeypatch.setattr(og, "_terminate_pid", lambda pid: killed.append(pid))
+        og.register_owned_pids({500})  # 500=우리 것, 999=사용자 것
+        assert og.terminate_stuck_office("EXCEL.EXE") == 1
+        assert killed == [500]
+
+    def test_terminate_stuck_office_dispatch_hang_uses_baseline(self, monkeypatch):
+        """소유 등록 전 Dispatch-hang이면 begin_com_op 이후 새로 뜬 PID만 종료한다."""
+        import knowmate.secure.office_guard as og
+        monkeypatch.setattr(og.sys, "platform", "win32")
+        killed = []
+        monkeypatch.setattr(og, "_terminate_pid", lambda pid: killed.append(pid))
+        # begin 시점: 300(사용자)만 존재 → baseline={300}
+        monkeypatch.setattr(og, "_enumerate_processes", lambda: [("WINWORD.EXE", 300)])
+        og.begin_com_op("WINWORD.EXE")
+        # 이후 우리 Dispatch로 301이 떴는데 아직 소유 등록 전(반환 전 멈춤)
+        monkeypatch.setattr(
+            og, "_enumerate_processes",
+            lambda: [("WINWORD.EXE", 300), ("WINWORD.EXE", 301)],
+        )
+        assert og.terminate_stuck_office("WINWORD.EXE") == 1
+        assert killed == [301]  # 새로 뜬 것만, 사용자(300) 보호
+        og.end_com_op()
+
+    def test_terminate_stuck_office_noop_on_non_windows(self, monkeypatch):
+        """비Windows/열거 실패면 아무것도 종료하지 않는다."""
+        import knowmate.secure.office_guard as og
+        monkeypatch.setattr(og.sys, "platform", "linux")
+        assert og.terminate_stuck_office("EXCEL.EXE") == 0
 
     def test_autoreader_raises_office_busy_before_com(self, monkeypatch):
         """Office 점유 시 AutoReader가 COM 진입 전에 OfficeBusyError를 낸다."""
