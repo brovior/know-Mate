@@ -27,6 +27,12 @@ hiddenimports += [
     "cryptography",
     "win32crypt",
     "win32com",
+    # win32timezone: pywin32가 COM 날짜/시간(VT_DATE) 값을 변환할 때 지연 import.
+    # Excel 날짜 셀 파싱 시 필요한데 정적 분석으로는 안 잡혀 exe에서만
+    # "No module named win32timezone"으로 실패했다(소스 실행은 정상).
+    "win32timezone",
+    "pywintypes",
+    "pythoncom",
     "docx",
     "openpyxl",
     "pptx",

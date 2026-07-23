@@ -5,6 +5,10 @@
 
 ---
 
+## 2026-07-23 (목)
+
+- **배포판(exe)에서 날짜가 든 Excel 파일이 인덱싱 실패하던 문제 수정**: 빌드에 `win32timezone` 모듈이 빠져 `No module named win32timezone` 오류로 실패하던 것을 해결(다음 빌드부터 적용)
+
 ## 2026-07-21 (화) — v0.9.0-beta2
 
 - **DRM 보호 문서 인덱싱 지원**: `File is not a zip file` / `Package not found`로 실패하던 DRM 보호 xlsx/pptx/docx를 Office를 통해 자동으로 열어 인덱싱하도록 수정
