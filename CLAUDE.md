@@ -125,7 +125,7 @@ scripts/          diag_search.py · inspect_index.py · test_shared_db.py(5b 사
 
 - **OS**: Windows 10/11 · **Python**: 3.11
 - **임베딩 운영 모드**: 반드시 `mode: api` (config 기본값도 api). `local` 모드는 폐쇄망에서 모델 다운로드 불가로 무한 대기 발생.
-- **패키지**: PyQt6, PyQt6-WebEngine, lancedb, pyarrow, pywin32, cryptography, PyMuPDF, python-docx, openpyxl, python-pptx, pytest. 빌드 시 pyinstaller 추가.
+- **패키지**: PyQt6, PyQt6-WebEngine, lancedb, pyarrow, pywin32, cryptography, PyMuPDF, python-docx, openpyxl, xlrd, python-pptx, pytest. 빌드 시 pyinstaller 추가.
 - **배포**: `build.bat` → `dist/AegisDesk/`(exe + `_internal` 폴더) 를 통째로 zip 배포. exe만 단독 배포 불가.
 - **네트워크 드라이브**: 일반 SMB(K: 등)는 정상. EFSS2 DRM 드라이브(M: 등)는 화이트리스트 프로세스만 접근 가능해 인덱싱 불가. 나스카 DRM 문서는 SSO 로그인 유지 중에만 복호화.
 
