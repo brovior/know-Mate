@@ -616,7 +616,7 @@ class TestDrmIdleSkip:
         assert _is_drm_suspected(str(txt)) is False  # office 확장자 아님 → 대상 아님
 
     def test_drm_suspected_file_skipped_when_idle_exceeds_threshold(self, tmp_path: Path):
-        """유휴가 임계를 넘으면 DRM 의심 파일은 큐잉되지 않고(state 불변) 다음 사이클로 넘어간다."""
+        """실시간 유휴가 임계를 넘으면 DRM 의심 파일은 큐잉되지 않고(state 불변) 넘어간다."""
         from knowmate.rag.embedding import EmbeddingClient
         from knowmate.rag.indexer import Indexer
         from knowmate.collector.scheduler import CollectorWorker
@@ -637,8 +637,8 @@ class TestDrmIdleSkip:
         indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
         worker = CollectorWorker(
             config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
+            get_idle_seconds=lambda: 200.0,  # 임계(100) 초과 상태를 실시간으로 보고
         )
-        worker.set_idle_context(200.0)  # 임계(100) 초과
         worker.run()
 
         state = load_state(state_file)
@@ -646,7 +646,7 @@ class TestDrmIdleSkip:
         assert str(drm_file) not in state          # DRM 의심 파일은 스킵(state 불변)
 
     def test_drm_suspected_file_processed_when_idle_below_threshold(self, tmp_path: Path):
-        """유휴가 임계 미만(기본값 0.0 포함)이면 DRM 의심 파일도 정상 처리된다."""
+        """실시간 유휴가 임계 미만(사용자 활동 중)이면 DRM 의심 파일도 정상 처리된다."""
         from knowmate.rag.embedding import EmbeddingClient
         from knowmate.rag.indexer import Indexer
         from knowmate.collector.scheduler import CollectorWorker
@@ -665,15 +665,18 @@ class TestDrmIdleSkip:
         indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
         worker = CollectorWorker(
             config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
+            get_idle_seconds=lambda: 5.0,  # 방금 활동함 → 스킵 안 함
         )
-        # set_idle_context 호출 안 함 → 기본 0.0 (수동 트리거와 동일 조건)
         worker.run()
 
         state = load_state(state_file)
         assert str(drm_file) in state
 
-    def test_set_idle_context_is_consumed_once(self, tmp_path: Path):
-        """set_idle_context는 1회성 — 두 번째 run()은 기본값(0.0)으로 복귀한다."""
+    def test_drm_skip_kicks_in_mid_cycle_when_session_expires(self, tmp_path: Path):
+        """사이클 도중 유휴가 임계를 넘어서면 그 시점부터 DRM 의심 파일이 스킵된다.
+
+        시작 시엔 유휴가 낮아 앞쪽 DRM 파일은 처리되지만, 유휴가 임계를 넘긴
+        뒤 도달한 DRM 파일은 스킵된다(수동 재인덱싱 후 퇴근 시나리오의 핵심)."""
         from knowmate.rag.embedding import EmbeddingClient
         from knowmate.rag.indexer import Indexer
         from knowmate.collector.scheduler import CollectorWorker
@@ -682,6 +685,54 @@ class TestDrmIdleSkip:
 
         folder = tmp_path / "docs"
         folder.mkdir()
+        # 여러 DRM 의심 파일 — 유휴가 파일 처리 도중 임계를 넘어가도록 시뮬레이션
+        drm_files = []
+        for i in range(6):
+            f = folder / f"drm{i}.xlsx"
+            f.write_bytes(b"<## " + b"\x00" * 20)
+            drm_files.append(f)
+
+        config = _make_config(str(folder))
+        config["collector"]["drm_idle_threshold_sec"] = 100
+        state_file = tmp_path / "state.json"
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+
+        # 처음 몇 번은 낮은 유휴(50) → 이후 높은 유휴(300)로 전환
+        readings = iter([50.0, 50.0])
+
+        def _idle():
+            try:
+                return next(readings)
+            except StopIteration:
+                return 300.0  # 세션 만료 추정 구간
+
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
+            get_idle_seconds=_idle,
+        )
+        worker.run()
+
+        state = load_state(state_file)
+        indexed = [f for f in drm_files if str(f) in state]
+        skipped = [f for f in drm_files if str(f) not in state]
+        # 초반(낮은 유휴)엔 처리, 후반(높은 유휴)엔 스킵 — 둘 다 존재해야 한다
+        assert len(indexed) >= 1
+        assert len(skipped) >= 1
+
+    def test_non_drm_never_skipped_regardless_of_idle(self, tmp_path: Path):
+        """유휴가 아무리 길어도 DRM 의심이 아닌 일반 파일은 절대 스킵되지 않는다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+        from knowmate.collector.state import load_state
+        from knowmate.secure.fake_reader import FakeReader
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        normal = folder / "normal.txt"
+        normal.write_bytes(b"hello")
+
         config = _make_config(str(folder))
         config["collector"]["drm_idle_threshold_sec"] = 100
         state_file = tmp_path / "state.json"
@@ -689,15 +740,11 @@ class TestDrmIdleSkip:
         indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
         worker = CollectorWorker(
             config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
+            get_idle_seconds=lambda: 99999.0,  # 아주 긴 유휴
         )
-        worker.set_idle_context(200.0)
-        worker.run()  # 1회 소비
-        assert worker._idle_elapsed_sec == 0.0
-
-        # 두 번째 파일 추가 후 재실행 — set_idle_context 재호출 없이 기본값(0.0) 적용
-        drm_file = folder / "drm2.xlsx"
-        drm_file.write_bytes(b"<## " + b"\x00" * 20)
         worker.run()
+
+        assert str(normal) in load_state(state_file)
 
         state = load_state(state_file)
         assert str(drm_file) in state  # 기본값 0.0이라 스킵되지 않음
@@ -890,12 +937,12 @@ class TestIdleScheduler:
         assert sched._timer.isActive()
         assert sched._timer.interval() == 60_000
 
-    def test_trigger_receives_actual_idle_seconds(self):
-        """트리거 콜백에 실제 유휴 경과초가 전달된다(Phase C DRM 스킵 판단용)."""
+    def test_trigger_called_without_idle_argument(self):
+        """트리거 콜백은 인자 없이 호출된다(DRM 스킵은 워커가 실시간 유휴로 판정)."""
         trigger = MagicMock()
         sched = self._make_scheduler(get_idle_seconds=lambda: 123.0, idle_seconds=60, trigger=trigger)
         sched._on_idle()
-        trigger.assert_called_once_with(123.0)
+        trigger.assert_called_once_with()
 
     def test_does_not_trigger_when_user_active(self):
         """실제 유휴 시간이 임계 미만(사용자 활동 중)이면 트리거하지 않고 재확인만 예약한다."""
@@ -929,7 +976,7 @@ class TestIdleScheduler:
     # ── 복귀 감지 워처 (Phase D) ──────────────────────────────────
 
     def test_recovery_triggers_catchup_after_long_idle(self):
-        """장시간 유휴 뒤 활동 재개를 감지하면 idle_elapsed=0으로 즉시 트리거한다."""
+        """장시간 유휴 뒤 활동 재개를 감지하면 즉시 트리거한다(인자 없이)."""
         trigger = MagicMock()
         readings = iter([500.0, 2.0])  # 1틱: 장시간 유휴 / 2틱: 방금 활동
         sched = self._make_scheduler(
@@ -938,7 +985,7 @@ class TestIdleScheduler:
         sched._on_recovery_check()  # 장시간 유휴 감지 — 아직 트리거 안 함
         trigger.assert_not_called()
         sched._on_recovery_check()  # 활동 재개 감지 — 캐치업 트리거
-        trigger.assert_called_once_with(0.0)
+        trigger.assert_called_once_with()
 
     def test_recovery_does_not_trigger_without_prior_long_idle(self):
         """장시간 유휴가 선행되지 않았으면 유휴가 짧아져도 캐치업을 트리거하지 않는다."""
