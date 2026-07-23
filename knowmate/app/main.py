@@ -198,16 +198,14 @@ class MainWindow(QMainWindow):
         self._bridge.set_worker(worker)
         return worker
 
-    def _trigger_idle_index(self, idle_elapsed_sec: float = 0.0) -> None:
+    def _trigger_idle_index(self) -> None:
         """유휴 인덱싱을 트리거한다. 공유 워커가 멈춰 있을 때만 시작한다.
 
-        idle_elapsed_sec: IdleScheduler가 측정한 실제 유휴 경과초. 워커에
-        전달해 DRM 의심 문서 스킵 판단(collector.drm_idle_threshold_sec)에
-        쓴다.
+        DRM 의심 문서 스킵 판단(collector.drm_idle_threshold_sec)은 워커가
+        사이클 도중 실시간 유휴를 직접 조회하므로 여기서 유휴 값을 넘기지 않는다.
         """
         worker = self._bridge._worker
         if worker is not None and not worker.isRunning():
-            worker.set_idle_context(idle_elapsed_sec)
             worker.start()
 
     def resizeEvent(self, event) -> None:
@@ -235,20 +233,37 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _shutdown(self) -> None:
-        """스케줄러·워커·트레이를 정리해 스레드 누수를 방지한다."""
+        """스케줄러·워커·트레이를 정리한다. 종료 시에만 호출된다(트레이 숨김 경로 제외).
+
+        워커가 COM Open 등에 블로킹돼 취소 플래그를 못 보는 경우(로그가 특정
+        파일에서 멈추는 행오버) 정상 종료가 안 돼 프로세스가 잔존하고 자원을
+        계속 물어 PC가 버벅일 수 있다. 그래서 정상 종료가 안 되면 스레드를 강제
+        종료하고, 그래도 남으면 프로세스를 하드 종료해 트레이 [종료]가 반드시
+        프로세스를 끝내도록 보장한다.
+        """
+        # 각 단계를 독립 try로 감싸 한 곳의 실패가 이후 정리(특히 워커 종료)를
+        # 건너뛰지 않게 한다.
         try:
             scheduler = getattr(self, "_idle_scheduler", None)
             if scheduler is not None:
                 scheduler.stop()
-            worker = getattr(self._bridge, "_worker", None)
-            if worker is not None and worker.isRunning():
-                worker.cancel()
-                # 현재 처리 중인 파일 완료 후 종료될 때까지 대기 (최대 10초)
-                worker.wait(10000)
+        except Exception as exc:
+            logger.warning("스케줄러 정리 중 예외: %s", exc)
+
+        # 프로세스가 끝까지 못 죽더라도 트레이 아이콘은 먼저 치운다.
+        try:
             if self._tray is not None:
                 self._tray.hide()
         except Exception as exc:
-            logger.warning("종료 정리 중 예외: %s", exc)
+            logger.warning("트레이 정리 중 예외: %s", exc)
+
+        # 워커 종료 에스컬레이션(정상→강제→하드)은 lifecycle.stop_worker로 분리
+        # (PyQt6 비의존이라 단위 테스트 가능). 스케줄러·트레이 정리는 위에서 이미 시도함.
+        try:
+            from knowmate.app.lifecycle import stop_worker
+            stop_worker(getattr(self._bridge, "_worker", None))
+        except Exception as exc:
+            logger.warning("워커 정리 중 예외: %s", exc)
 
 
 def _inject_qwebchannel_js(view: QWebEngineView) -> None:
