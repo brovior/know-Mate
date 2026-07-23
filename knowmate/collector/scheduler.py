@@ -80,6 +80,18 @@ class IndexTask:
     path: str = field(compare=False)
     action: str = field(compare=False)
     com_rank: int = field(default=_PLAIN_RANK, compare=False)
+    size: int = field(default=0, compare=False)  # COM 워치독 타임아웃(크기 비례) 산정용
+
+
+def _com_timeout_for_size(size_bytes: int, base: float, per_mb: float, cap: float) -> float:
+    """파일 크기에 비례한 COM 추출 타임아웃(초)을 반환한다.
+
+    크기가 파싱 시간과 완벽 비례하진 않지만(시트 수·수식 복잡도 변수) 충분한
+    근사다. 작은 파일의 행오버는 빨리(base) 잡고, 셀 단위 COM 왕복이 느린 대형
+    파일은 넉넉히(base + per_mb×MB) 보호하되 cap으로 상한을 둔다.
+    """
+    mb = max(size_bytes, 0) / (1024 * 1024)
+    return min(base + per_mb * mb, cap)
 
 
 class CollectorWorker(QThread):
@@ -273,6 +285,13 @@ class CollectorWorker(QThread):
         # 판정된다(0이면 판정 비활성).
         drm_idle_threshold_sec = float(collector_cfg.get("drm_idle_threshold_sec", 480))
 
+        # COM 추출 행오버 방지 워치독 — Office Open/셀 순회가 멈추면 그 파일 크기에
+        # 비례한 시간(base + per_mb×MB, cap 상한) 뒤 해당 Office 프로세스를 강제
+        # 종료해 블로킹을 풀고 그 파일만 실패 처리한다(사이클은 계속). base<=0이면 비활성.
+        com_timeout_base = float(collector_cfg.get("com_timeout_base_sec", 60))
+        com_timeout_per_mb = float(collector_cfg.get("com_timeout_per_mb_sec", 20))
+        com_timeout_cap = float(collector_cfg.get("com_timeout_max_sec", 600))
+
         self._indexer._chunk_size = chunk_size
         self._indexer._overlap = overlap
         self._indexer._max_chunks_per_file = max_chunks_per_file
@@ -299,6 +318,11 @@ class CollectorWorker(QThread):
         _SENTINEL = None
         _seq = itertools.count()
         producer_state = {"total": None, "seen": set(), "drm_deferred": 0, "drm_skip_logged": False}
+
+        # COM 추출 행오버 워치독 (base<=0이면 비활성)
+        from knowmate.collector.com_watchdog import ComWatchdog
+        from knowmate.secure import office_guard as _og
+        watchdog = ComWatchdog(terminate_fn=_og.terminate_stuck_office) if com_timeout_base > 0 else None
 
         logger.info("[collector] 작업 시작 — 폴더 스캔·인덱싱 파이프라인")
         self.progress.emit(0, -2, "인덱싱 시작...")
@@ -361,7 +385,10 @@ class CollectorWorker(QThread):
                         # 처음 보는 파일은 힌트가 없어 plain과 동일하게 취급된다.
                         com_rank = _COM_RANK if (prev or {}).get("method") == "com" else _PLAIN_RANK
                         sort_key = (priority, com_rank)
-                        task_queue.put((sort_key, next(_seq), IndexTask(priority, path, action, com_rank)))
+                        task_queue.put((
+                            sort_key, next(_seq),
+                            IndexTask(priority, path, action, com_rank, size=meta.get("size", 0)),
+                        ))
                         found += 1
                     if self._cancelled:
                         break
@@ -399,7 +426,23 @@ class CollectorWorker(QThread):
             try:
                 logger.debug("[단계1] 텍스트 추출 시작: %s", task.path)
                 _extract_t0 = time.perf_counter()
-                text = self._extractor.extract(task.path)
+                # COM 경유 파일만 워치독 무장(plain은 COM을 안 타 무의미하고, 느린
+                # openpyxl 파싱 중 애먼 Office를 죽이는 오발을 피함).
+                _wd_exe = None
+                if watchdog is not None and _classify_extract_method(task.path) == "com":
+                    _wd_exe = _og.process_for_ext(Path(task.path).suffix.lower())
+                try:
+                    if _wd_exe:
+                        _timeout = _com_timeout_for_size(
+                            task.size, com_timeout_base, com_timeout_per_mb, com_timeout_cap
+                        )
+                        _og.begin_com_op(_wd_exe)
+                        watchdog.arm(_wd_exe, _timeout)
+                    text = self._extractor.extract(task.path)
+                finally:
+                    if _wd_exe:
+                        watchdog.disarm()
+                        _og.end_com_op()
                 extract_sec = time.perf_counter() - _extract_t0
                 logger.debug("[단계2] 텍스트 추출 완료: %s (%d자, %.2fs)", task.path, len(text), extract_sec)
                 stat = Path(task.path).stat()
@@ -495,6 +538,9 @@ class CollectorWorker(QThread):
         drm_deferred_count = producer_state.get("drm_deferred", 0)
         if drm_deferred_count:
             summary += f" / 유휴로 DRM 문서 스킵 {drm_deferred_count}건"
+        com_timeout_count = watchdog.timeout_count if watchdog is not None else 0
+        if com_timeout_count:
+            summary += f" / COM 시간초과 강제해제 {com_timeout_count}건"
         if failed:
             logger.warning("실패 파일 목록: %s", failed)
         if deferred:
@@ -505,6 +551,11 @@ class CollectorWorker(QThread):
             logger.info(
                 "DRM 세션 만료 추정으로 DRM 의심 문서 %d건 스킵(활동 재개·세션 유효 시 재시도)",
                 drm_deferred_count,
+            )
+        if com_timeout_count:
+            logger.warning(
+                "COM 추출 행오버 %d건을 타임아웃으로 강제 해제(해당 파일은 실패·다음 사이클 재시도)",
+                com_timeout_count,
             )
         self.finished.emit(summary)
 
