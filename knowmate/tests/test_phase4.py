@@ -1,8 +1,11 @@
 """Phase 4 보안 모듈 pytest 테스트 -- fake 모드 기준, 사외 환경 전부 통과."""
+import importlib.util
 from pathlib import Path
 import pytest
 from knowmate.rag.embedding import EmbeddingClient, VECTOR_DIM
 from knowmate.secure.crypto import FakeCryptoManager, get_crypto_manager
+
+_HAS_XLRD = bool(importlib.util.find_spec("xlrd"))
 
 
 def _fake_embed_client() -> EmbeddingClient:
@@ -218,6 +221,64 @@ class TestAutoReader:
             from knowmate.secure.com_reader import ComUnavailableError
             with pytest.raises(ComUnavailableError):
                 reader.extract("C:/dummy/nonexistent.doc")
+
+    def test_auto_reader_xls_tries_plain_first(self, monkeypatch, tmp_path: Path):
+        """xlrd(plain) 파싱이 성공하면 COM은 전혀 호출되지 않는다."""
+        from knowmate.secure import AutoReader
+        import knowmate.secure.com_reader as com_mod
+
+        class _BoomCom:
+            def extract(self, path):
+                raise AssertionError("xlrd 성공 케이스인데 COM으로 갔다")
+
+        monkeypatch.setattr(com_mod, "ComReader", _BoomCom)
+
+        reader = AutoReader()
+        monkeypatch.setattr(reader._plain, "extract", lambda path: "xlrd 텍스트")
+        p = tmp_path / "sample.xls"
+        p.write_bytes(b"dummy")
+        assert reader.extract(str(p)) == "xlrd 텍스트"
+
+    def test_auto_reader_xls_falls_back_to_com_on_plain_failure(self, monkeypatch, tmp_path: Path):
+        """xlrd 파싱이 실패하면(DRM·손상 등) COM으로 폴백한다."""
+        from knowmate.secure import AutoReader
+        import knowmate.secure.com_reader as com_mod
+        import knowmate.secure.office_guard as og
+
+        monkeypatch.setattr(og, "is_office_busy_for_ext", lambda ext: False)
+
+        captured = {}
+
+        class _FakeCom:
+            def extract(self, path):
+                captured["path"] = path
+                return "COM_RESULT"
+
+        monkeypatch.setattr(com_mod, "ComReader", _FakeCom)
+
+        reader = AutoReader()
+
+        def _boom(path):
+            raise ValueError("xlrd 파싱 실패(시뮬레이션)")
+
+        monkeypatch.setattr(reader._plain, "extract", _boom)
+        p = tmp_path / "drm.xls"
+        p.write_bytes(b"<## " + b"\x00" * 20)
+        assert reader.extract(str(p)) == "COM_RESULT"
+        assert captured["path"] == str(p)
+
+    def test_auto_reader_xls_without_xlrd_or_com_raises(self):
+        """xlrd·win32com 둘 다 없는 환경에서 .xls는 결국 ComUnavailableError로 귀결된다."""
+        from knowmate.secure import AutoReader
+        reader = AutoReader()
+        try:
+            import win32com.client  # noqa: F401
+            with pytest.raises(Exception):
+                reader.extract("C:/dummy/nonexistent.xls")
+        except ImportError:
+            from knowmate.secure.com_reader import ComUnavailableError
+            with pytest.raises(ComUnavailableError):
+                reader.extract("C:/dummy/nonexistent.xls")
 
     def test_get_extractor_auto_returns_auto_reader(self):
         """get_extractor(auto)가 AutoReader 인스턴스를 반환한다."""
@@ -567,6 +628,84 @@ class TestAutoReaderOle2Fallback:
         p = tmp_path / "ok.xlsx"
         wb.save(str(p))
         assert "정상셀" in AutoReader().extract(str(p))
+
+
+# ── xls(BIFF) — xlrd 셀 서식 변환 ────────────────────────────────
+
+@pytest.mark.skipif(not _HAS_XLRD, reason="xlrd 미설치 — 폐쇄망 외 환경")
+class TestXlrdCellText:
+    """PlainReader._xlrd_cell_text의 날짜·숫자·불리언 서식 변환 로직."""
+
+    class _FakeCell:
+        def __init__(self, ctype, value):
+            self.ctype = ctype
+            self.value = value
+
+    def test_empty_and_blank_cells_are_empty_string(self):
+        import xlrd
+        from knowmate.secure.plain_reader import PlainReader
+        assert PlainReader._xlrd_cell_text(self._FakeCell(xlrd.XL_CELL_EMPTY, ""), 0) == ""
+        assert PlainReader._xlrd_cell_text(self._FakeCell(xlrd.XL_CELL_BLANK, ""), 0) == ""
+
+    def test_integer_number_has_no_decimal(self):
+        import xlrd
+        from knowmate.secure.plain_reader import PlainReader
+        assert PlainReader._xlrd_cell_text(self._FakeCell(xlrd.XL_CELL_NUMBER, 42.0), 0) == "42"
+
+    def test_float_number_keeps_decimal(self):
+        import xlrd
+        from knowmate.secure.plain_reader import PlainReader
+        assert PlainReader._xlrd_cell_text(self._FakeCell(xlrd.XL_CELL_NUMBER, 3.14), 0) == "3.14"
+
+    def test_boolean_cell(self):
+        import xlrd
+        from knowmate.secure.plain_reader import PlainReader
+        assert PlainReader._xlrd_cell_text(self._FakeCell(xlrd.XL_CELL_BOOLEAN, 1), 0) == "TRUE"
+        assert PlainReader._xlrd_cell_text(self._FakeCell(xlrd.XL_CELL_BOOLEAN, 0), 0) == "FALSE"
+
+    def test_error_cell_is_empty_string(self):
+        import xlrd
+        from knowmate.secure.plain_reader import PlainReader
+        assert PlainReader._xlrd_cell_text(self._FakeCell(xlrd.XL_CELL_ERROR, 42), 0) == ""
+
+    def test_date_cell_without_time_is_date_only(self):
+        import xlrd
+        from knowmate.secure.plain_reader import PlainReader
+        # 2026-03-14 (엑셀 1900 날짜 시스템, datemode=0)
+        xldate = xlrd.xldate.xldate_from_date_tuple((2026, 3, 14), 0)
+        result = PlainReader._xlrd_cell_text(self._FakeCell(xlrd.XL_CELL_DATE, xldate), 0)
+        assert result == "2026-03-14"
+
+    def test_date_cell_with_time_includes_time(self):
+        import xlrd
+        from knowmate.secure.plain_reader import PlainReader
+        xldate = xlrd.xldate.xldate_from_datetime_tuple((2026, 3, 14, 9, 32, 0), 0)
+        result = PlainReader._xlrd_cell_text(self._FakeCell(xlrd.XL_CELL_DATE, xldate), 0)
+        assert result == "2026-03-14 09:32:00"
+
+
+@pytest.mark.skipif(not _HAS_XLRD, reason="xlrd 미설치 — 폐쇄망 외 환경")
+class TestReadXlsEndToEnd:
+    """실제 xls 파일을 xlrd로 읽어 시트 헤더·셀 텍스트를 검증한다."""
+
+    def test_reads_sheet_with_header_and_values(self, tmp_path: Path):
+        pytest.importorskip("xlwt", reason="xls 생성용 xlwt 없음 — 사내 환경에서만 검증")
+        import xlwt
+        from knowmate.secure.plain_reader import PlainReader
+
+        wb = xlwt.Workbook()
+        ws = wb.add_sheet("Sheet1")
+        ws.write(0, 0, "이름")
+        ws.write(0, 1, "값")
+        ws.write(1, 0, "홍길동")
+        ws.write(1, 1, 100)
+        p = tmp_path / "sample.xls"
+        wb.save(str(p))
+
+        text = PlainReader()._read_xls(str(p))
+        assert "=== 시트: Sheet1 ===" in text
+        assert "이름\t값" in text
+        assert "홍길동\t100" in text
 
 
 # ── xlsx 손상(custom.xml) 복구 ──────────────────────────────────

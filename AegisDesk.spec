@@ -35,6 +35,7 @@ hiddenimports += [
     "pythoncom",
     "docx",
     "openpyxl",
+    "xlrd",
     "pptx",
     "fitz",
 ]

@@ -87,10 +87,23 @@ SCHEMA = pa.schema([
 ```python
 def get_reader(path):
     ext = Path(path).suffix.lower()
-    if ext in {".doc", ".xls", ".ppt"}:
-        return com_reader    # 구형 바이너리 → COM
+    if ext == ".xls":
+        return plain_reader  # xlrd 우선 시도, 실패 시(DRM·손상)만 COM 폴백
+    if ext in {".doc", ".ppt"}:
+        return com_reader    # xlrd 대응 없음 → 항상 COM
     return plain_reader      # docx/xlsx/pptx/pdf/txt → 라이브러리
 ```
+
+**xls는 xlrd 우선 (`plain_reader._read_xls` + `secure/__init__.py` AutoReader)**
+
+`.doc/.xls/.ppt` 중 `.xls`만 순수 파이썬 라이브러리(`xlrd`, Office 불필요)로 직접 파싱할 수 있다.
+`AutoReader.extract`가 `.xls`를 먼저 `PlainReader`(xlrd)로 시도하고, 실패(DRM 래핑·손상 등 소수)
+시에만 `except Exception`으로 잡아 COM으로 폴백한다. 이렇게 하면 **정상 xls 대부분이 COM 경로를
+아예 타지 않아** 행오버·좀비 프로세스·`win32timezone`(COM이 날짜 셀을 변환할 때만 필요) 문제가
+원천 차단된다. `scheduler._classify_extract_method`/`_is_drm_suspected`도 `.xls`를 OLE2 시그니처로
+판정해(정상 OLE2 → plain, 아니면 → com) 우선순위 큐잉·DRM 유휴 스킵·COM 워치독 무장 여부를 실제
+라우팅과 일치시킨다. `.doc/.ppt`는 대응하는 순수 파이썬 라이브러리가 없어 그대로 COM만 사용한다
+(행오버는 COM 워치독이 보호).
 
 **COM 싱글톤 패턴 (★ 반드시 준수)**
 

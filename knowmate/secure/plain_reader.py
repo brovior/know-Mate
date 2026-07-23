@@ -31,6 +31,8 @@ class PlainReader:
             return self._read_docx(path)
         if ext == ".xlsx":
             return self._read_xlsx(path)
+        if ext == ".xls":
+            return self._read_xls(path)
         if ext == ".pptx":
             return self._read_pptx(path)
         if ext == ".pdf":
@@ -144,6 +146,63 @@ class PlainReader:
                     zout.writestr(item, data)
         buf.seek(0)
         return openpyxl.load_workbook(buf, read_only=True, data_only=True)
+
+    def _read_xls(self, path: str) -> str:
+        """xlrd로 구형 xls(BIFF) 파일을 읽어 셀값을 탭 구분 텍스트로 반환한다.
+
+        순수 파이썬 파싱이라 Office/COM이 전혀 필요 없다 — 정상 xls 대부분을
+        COM 경로 밖으로 빼서 행오버·좀비 프로세스·win32timezone 문제를 원천
+        차단한다(win32timezone은 COM이 날짜 셀을 변환할 때만 필요했음). DRM
+        래핑이나 손상으로 xlrd가 못 여는 파일은 예외를 그대로 전파해
+        AutoReader가 COM으로 폴백하게 한다(여기서 잡지 않는다).
+        """
+        import xlrd  # type: ignore
+
+        wb = xlrd.open_workbook(path)
+        try:
+            lines: list[str] = []
+            for sheet in wb.sheets():
+                sheet_lines: list[str] = []
+                for row_idx in range(sheet.nrows):
+                    cells = [
+                        self._xlrd_cell_text(sheet.cell(row_idx, col_idx), wb.datemode)
+                        for col_idx in range(sheet.ncols)
+                    ]
+                    row_text = "\t".join(cells)
+                    if row_text.strip():
+                        sheet_lines.append(row_text)
+                if sheet_lines:
+                    # chunker가 시트 경계를 인식할 수 있도록 헤더 삽입(openpyxl 경로와 동일 포맷)
+                    lines.append(f"=== 시트: {sheet.name} ===")
+                    lines.extend(sheet_lines)
+            return "\n".join(lines)
+        finally:
+            wb.release_resources()
+
+    @staticmethod
+    def _xlrd_cell_text(cell, datemode: int) -> str:
+        """xlrd 셀 값을 사람이 읽을 텍스트로 변환한다(날짜·정수·불리언 서식 정리)."""
+        import xlrd  # type: ignore
+
+        if cell.ctype == xlrd.XL_CELL_EMPTY or cell.ctype == xlrd.XL_CELL_BLANK:
+            return ""
+        if cell.ctype == xlrd.XL_CELL_DATE:
+            try:
+                from xlrd.xldate import xldate_as_datetime
+                dt = xldate_as_datetime(cell.value, datemode)
+                if dt.time() == dt.min.time():
+                    return dt.strftime("%Y-%m-%d")
+                return dt.strftime("%Y-%m-%d %H:%M:%S")
+            except Exception:
+                return str(cell.value)
+        if cell.ctype == xlrd.XL_CELL_NUMBER:
+            v = cell.value
+            return str(int(v)) if v == int(v) else str(v)
+        if cell.ctype == xlrd.XL_CELL_BOOLEAN:
+            return "TRUE" if cell.value else "FALSE"
+        if cell.ctype == xlrd.XL_CELL_ERROR:
+            return ""
+        return str(cell.value)
 
     def _read_pptx(self, path: str) -> str:
         """python-pptx로 pptx를 읽어 슬라이드별 텍스트를 반환한다.

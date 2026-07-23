@@ -41,15 +41,22 @@ _SENTINEL_KEY = (PRIORITY_ORPHAN + 1, _PLAIN_RANK + 1)
 # 동일한 기준(확장자 + zip 서명)을 재사용한다. extractor 모드가 auto가 아니어도
 # (fake/plain) 무해 — 다음 사이클 큐 우선순위 힌트로만 쓰이고 실제 추출
 # 경로에는 전혀 영향을 주지 않는다.
-_COM_EXTS = {".doc", ".xls", ".ppt"}
+#
+# .xls는 xlrd(순수 파이썬) 대응이 있어 실제 OLE2 시그니처일 때만 plain으로
+# 분류한다(secure/__init__.py AutoReader의 xlrd-우선 라우팅과 동일 판정 기준).
+# .doc/.ppt는 xlrd 대응 라이브러리가 없어 항상 com.
+_COM_ONLY_EXTS = {".doc", ".ppt"}
+_XLRD_EXT = ".xls"
 _OOXML_EXTS = {".docx", ".xlsx", ".pptx"}
 
 
 def _classify_extract_method(path: str) -> str:
     """다음 사이클 우선순위 힌트로 쓸 추출 방식을 분류한다 ('com' | 'plain')."""
     ext = Path(path).suffix.lower()
-    if ext in _COM_EXTS:
+    if ext in _COM_ONLY_EXTS:
         return "com"
+    if ext == _XLRD_EXT:
+        return "plain" if is_ole2(path) else "com"
     if ext in _OOXML_EXTS and not is_zip(path):
         return "com"
     return "plain"
@@ -63,9 +70,13 @@ def _is_drm_suspected(path: str) -> bool:
     (전자는 항상, 후자는 오라벨·DRM일 때만) 실제 파일 자체가 온전하므로
     DRM 세션 여부와 무관하게 열린다 — 스킵 대상이 아니다. 두 시그니처 중
     어느 것도 아닌 파일만 DRM 래핑으로 의심해 스킵 후보로 삼는다.
+
+    .xls는 xlrd로 처리되면(OLE2 정상) COM을 아예 타지 않으므로 대상이 아니다.
     """
     ext = Path(path).suffix.lower()
-    if ext in _COM_EXTS:
+    if ext in _COM_ONLY_EXTS:
+        return not is_ole2(path)
+    if ext == _XLRD_EXT:
         return not is_ole2(path)
     if ext in _OOXML_EXTS:
         return not is_zip(path)
