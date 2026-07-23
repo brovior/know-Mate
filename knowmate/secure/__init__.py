@@ -38,12 +38,28 @@ class AutoReader:
         읽을 수 있다 — 탐색기·오피스에서는 정상 열리는데 우리 파서만 실패하던
         DRM 문서를 이 경로로 구제한다.
 
+        .xls는 먼저 xlrd(순수 파이썬, Office 불필요)로 시도한다 — 대부분의
+        정상 xls를 COM 경로 밖으로 빼서 행오버·좀비 프로세스·win32timezone
+        문제를 원천 차단한다. xlrd가 실패하면(DRM 래핑·손상 등 소수) COM으로
+        폴백해 기존과 동일하게 동작한다. .doc/.ppt는 xlrd 대응 라이브러리가
+        없어 그대로 COM만 사용한다.
+
         COM 라우팅 직전, 해당 Office 앱을 사용자가 열어두었으면 OfficeBusyError를
         발생시켜 이번 사이클에서 건너뛴다(사용자 창 점유·응답없음 방지). 정상
         OOXML(.docx 등)은 라이브러리로 파싱하므로 이 가드의 영향을 받지 않는다.
         """
         ext = Path(path).suffix.lower()
-        if ext in {".doc", ".xls", ".ppt"}:
+        if ext == ".xls":
+            try:
+                return self._plain.extract(path)
+            except Exception as exc:
+                logger.warning(
+                    "xlrd 파싱 실패(%s: %s) → COM 폴백: %s", type(exc).__name__, exc, path
+                )
+                self._guard_office_busy(ext, path)
+                from knowmate.secure.com_reader import ComReader
+                return ComReader().extract(path)
+        if ext in {".doc", ".ppt"}:
             self._guard_office_busy(ext, path)
             # COM 의존 코드: secure/ 안에서만 import
             from knowmate.secure.com_reader import ComReader

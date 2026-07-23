@@ -126,11 +126,13 @@ build.bat
 | 확장자 | 파서 | 비고 |
 |---|---|---|
 | docx, xlsx, pptx, pdf, txt | python-docx / openpyxl / python-pptx / PyMuPDF | 직접 파싱 |
-| doc, xls, ppt | win32com (COM) | 구형 바이너리, Windows 전용 (Office 설치 필요) |
+| xls | xlrd (실패 시 win32com 폴백) | 순수 파이썬, Office 불필요. DRM·손상 시에만 COM |
+| doc, ppt | win32com (COM) | 구형 바이너리, Windows 전용 (Office 설치 필요) |
 | .mysingle, .eml | 표준 `email` 라이브러리 (RFC822+MIME) | 메일. Knox 백업 + 표준 이메일 |
 
 - xlsx 파일에서 `docProps/custom.xml` 손상으로 인한 로드 실패는 자동 복구합니다.
 - pptx의 SmartArt·OLE 등 인식 불가 도형이 있어도 파일 전체가 실패하지 않고 추출 가능한 텍스트만 인덱싱합니다.
+- xls는 xlrd로 먼저 시도해 대부분 Office/COM 없이 처리됩니다. DRM 보호되거나 손상된 xls만 COM으로 폴백합니다.
 - Outlook `.msg`/PST는 미지원 (전용 파서·COM 필요, 차후 과제).
 
 ---

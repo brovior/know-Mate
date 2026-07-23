@@ -555,6 +555,20 @@ class TestQueuePriority:
         txt.write_bytes(b"hello")
         assert _classify_extract_method(str(txt)) == "plain"
 
+    def test_classify_xls_by_ole2_signature(self, tmp_path: Path):
+        """.xls는 xlrd 대응이 있어 정상 OLE2면 plain, 아니면(DRM 등) com으로 분류된다."""
+        from knowmate.collector.scheduler import _classify_extract_method, _is_drm_suspected
+
+        real_xls = tmp_path / "a.xls"
+        real_xls.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 16)  # 정상 OLE2
+        assert _classify_extract_method(str(real_xls)) == "plain"
+        assert _is_drm_suspected(str(real_xls)) is False
+
+        drm_xls = tmp_path / "b.xls"
+        drm_xls.write_bytes(b"<## " + b"\x00" * 20)  # OLE2 아님 → DRM 의심
+        assert _classify_extract_method(str(drm_xls)) == "com"
+        assert _is_drm_suspected(str(drm_xls)) is True
+
     def test_method_recorded_in_state_after_success(self, tmp_path: Path):
         """인덱싱 성공 후 state에 method(com/plain)가 기록된다."""
         from knowmate.rag.embedding import EmbeddingClient
