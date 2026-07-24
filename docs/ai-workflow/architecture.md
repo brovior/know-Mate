@@ -129,7 +129,8 @@ daemon 사실이 성립하는 한 불필요 — 미도입).
 | 새 종료 경로 추가 시 `_shutdown()` 미경유 | 코드 리뷰 규칙 | `_quit_app`/`closeEvent` 외 종료 경로 금지 문서화 |
 | `_shutdown()` 중복 진입(근접한 이중 종료 요청) | `_shutdown_done` 플래그 | 멱등 가드 — 두 번째 진입은 즉시 반환. "정확히 하나"는 **프로세스 수명 기준**이며 중복 호출 테스트로 고정(리뷰6 m-1) |
 | 하드 종료 직전 `logging.shutdown()`이 로깅 핸들러 락 대기로 영구 블록 | 코드 검토 | `_default_hard_exit`는 `logging.shutdown()`을 호출하지 않고 즉시 `os._exit()`만 실행(리뷰9 B-1) — 로그 유실을 감수하고 종료 확실성을 우선 |
-| LanceDB 쓰기(add/delete/optimize) 도중 강제 종료 시 손상 범위 미확정 | **`lifecycle.check_and_clear_dirty_shutdown()`** — `hard_exit` 직전 `mark_dirty()`로 남긴 표식을 다음 시작 시 확인(read-then-clear) | 자동 감지·복구는 여전히 추측성 위험 판단으로 미구현이나(후속 과제, 리뷰8 M-1), **강제 종료가 있었다는 사실만은 저비용으로 기록** — 다음 시작 시 WARNING 로그로 "검색 결과가 이상하면 재인덱싱 권장" 안내(리뷰10 M-1, 8·9차보다 범위가 좁은 감지 전용 장치라 채택). 자동 격리·재구축은 하지 않는다 — "인덱스는 재생성 가능한 파생 데이터"라 사용자가 폴더 재추가로 직접 재인덱싱 가능 |
+| LanceDB 쓰기(add/delete/optimize) 도중 강제 종료 시 손상 범위 미확정 | **`lifecycle.check_and_remark_dirty_shutdown()`** — 앱 **시작 시** 표식을 확인·재기록(read-then-remark). 정상 quit 확정 시에만 `clear_dirty_shutdown()`으로 지운다(리뷰11 B-1로 방식 변경 — 아래 참조) | 자동 감지·복구는 여전히 추측성 위험 판단으로 미구현이나(후속 과제, 리뷰8 M-1), **강제 종료가 있었다는 사실만은 저비용으로 기록** — 다음 시작 시 WARNING 로그 + 트레이 풍선 알림(리뷰11 M-1 — 로그만으로는 GUI 사용자가 놓치기 쉬움)으로 "검색 결과가 이상하면 재인덱싱 권장" 안내. 자동 격리·재구축은 하지 않는다 — "인덱스는 재생성 가능한 파생 데이터"라 사용자가 폴더 재추가로 직접 재인덱싱 가능 |
+| **(리뷰11 B-1)** 표식 기록이 hard-exit 직전 동기 파일 I/O였다면, 그 I/O 자체가 블록(백신·네트워크 드라이브 등)될 때 최후 안전망인 하드 종료가 멈출 수 있음 | 코드 검토 | 표식 기록 위치를 **hard-exit 직전 → 앱 시작 시**로 이동. hard-exit 경로(`stop_worker`/`finalize_shutdown`의 hard_exit 분기)는 이제 파일 I/O를 전혀 거치지 않고 `hard_exit()`만 호출한다 — 9차 B-1로 확립한 "하드 종료는 무조건·즉시" 불변식과 재정합 |
 
 ### 검증 계획
 - 사외 단위: `_shutdown()`이 각 단계(스케줄러 stop → stop_worker → quit) **순서대로** 호출하고,
@@ -139,9 +140,10 @@ daemon 사실이 성립하는 한 불필요 — 미도입).
   또는 hard_exit(워커 잔존)가 **정확히 하나만** 호출됨을 검증. 보조 스레드 daemon 속성 테스트 유지.
 - 사외 단위(리뷰9 B-1): `_default_hard_exit`가 `logging.shutdown()`을 호출하지 않고 즉시
   `os._exit()`만 부르는지 스파이로 검증.
-- 사외 단위(리뷰10 M-1): `stop_worker`/`finalize_shutdown`의 모든 hard_exit 분기에서
-  `mark_dirty()`가 `hard_exit()`보다 먼저 호출되는지(순서 포함), quit 경로에서는 `mark_dirty`가
-  호출되지 않는지 검증. `check_and_clear_dirty_shutdown`의 read-then-clear 왕복(표식 있음/없음)
+- 사외 단위(리뷰10 M-1 → 리뷰11 B-1로 갱신): `stop_worker`/`finalize_shutdown`의 모든 hard_exit
+  분기가 파일 I/O 없이(콜백 미주입) 즉시 `hard_exit()`만 호출하는지, quit 경로에서만
+  `clear_dirty()`가 `quit_fn()`보다 먼저 호출되는지 검증. `check_and_remark_dirty_shutdown`의
+  왕복(첫 실행=표식 없음이나 기록됨 / 표식 남은 상태=dirty 보고 후 재기록 / clear 후=다시 없음)
   단위 테스트.
 - 사외 통합(가능 시): `QT_QPA_PLATFORM=offscreen`으로 QApplication을 띄워 창 숨김/표시/
   `close_action=quit` 세 분기에서 이벤트 루프가 실제 종료되는지 통합 테스트(리뷰 m-2 반영).
@@ -251,7 +253,7 @@ meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_stat
 ### 실패 모드
 | 실패 | 감지 | 대응(격리/재시도/중단) |
 |---|---|---|
-| projection API가 배포 고정 lancedb 버전에 없음 | `table.search().select([...])` 호출 자체가 `AttributeError`/예외로 실패 | DB 조회 실패로 처리되어 purge가 "failed" 결과 → 백오프로 자연 대응(호환 전체-로드 모드 없음 — 요구와 모순되는 폴백 자체를 두지 않음, 리뷰3 M-2). lancedb 0.34.0에서 실측 검증 완료(위 핵심 결정 참조), requirements.txt에 버전 검증 코멘트 기록 |
+| projection API가 배포 고정 lancedb 버전에 없음 | `table.search().select([...])` 호출이 `AttributeError` | **"unsupported"로 분류**(리뷰11 M-2) — 재시도로 복구되지 않는 영구 장애이므로 일시적 DB I/O 실패("failed", 30분 백오프)와 구분한다. `on_blocked`와 동일하게 동일 op_sig에서 장기 억제(반복 재시도 없음) + 1회 UI 알림("앱 업데이트 필요"). 호환 전체-로드 모드 없음 — 요구와 모순되는 폴백 자체를 두지 않음(리뷰3 M-2). lancedb 0.34.0에서 실측 검증 완료(위 핵심 결정 참조) |
 | purge 도중 일시적 예외 | purge 반환/예외 | failed_sig+next_retry_ts 기록, 백오프(기본 30분) 중 **DB 조회 없이 return**(판정 1·2가 성공 스킵보다 선행 — 리뷰3 B-1) |
 | 대량삭제 차단 지속 | 차단 판정 | blocked_sig 기록 — 동일 op_sig 자동 재시도 안 함, 구성·차단율 변경 시에만 재실행, UI 알림 1회. 이 상태의 미복구는 FR-3 예외로 요구에 명문화(리뷰3 B-2) |
 | last_purge_ts가 미래값 | now < last_purge_ts | 성공 스킵 무효 → purge 실행(모든 미래값 무효) |
@@ -276,9 +278,12 @@ meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_stat
   `indexing_needed` 알림이 발행되는지(fail-closed) 통합 검증.
 - 사내 실측: 유휴 방치 1시간 동안 작업관리자 RSS 추이 — 수정 전(우상향 눌러앉음) 대비 평탄화 확인.
   lancedb 실환경에서 projection API의 컬럼 미로드(pushdown) 실측(리뷰 '확인 필요' 반영).
-- 성능 수용(리뷰5 m-2): 대표 길이 file_path 10만 건 테스트 DB에서 강제 reconciliation 1회 실행 →
-  전후 peak RSS(또는 Arrow memory pool 최대치) 비교로 "baseline 대비 추가 할당 수십 MB 이내"
-  (NFR-1 상한) 판정 — RSS 추이 관찰과 별도로 1회 peak를 직접 측정.
+- **성능 수용 — 필수(리뷰5 m-2, 리뷰11 m-1로 승격)**: 결과 스키마에 벡터/원문이 없다는 사실과
+  약 6배 속도 향상은 강한 정황이지만, projection이 저장소 스캔 단계에서 실제로 컬럼을 건너뛴다는
+  직접 증거는 아니다(리뷰11 m-1 지적) — 배포 전 아래를 **필수**로 확보한다: 대표 길이 file_path
+  10만 건 테스트 DB에서 강제 reconciliation 1회 실행 → 전후 peak RSS(또는 Arrow memory pool
+  최대치) 비교로 "baseline 대비 추가 할당 수십 MB 이내"(NFR-1 상한) 판정. 가능하면 LanceDB의
+  query plan/스토리지 read 통계도 함께 기록해 컬럼 프루닝을 직접 근거로 남긴다.
 
 ### 리뷰 이력
 - reviews/REVIEW-20260724-...-projectio{,-2,...,-8}.md (GPT 채널 B, 8회) → 1~4·7차

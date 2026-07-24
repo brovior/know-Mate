@@ -67,3 +67,26 @@
 - `_shutdown_done`이 최종 판정 전에 설정되더라도 첫 번째 `_shutdown()` 호출이 모든 예외에서 반드시 `finalize_shutdown()`까지 도달하도록 최외곽 `finally`가 구현되어 있는지 확인 필요.
 - `mark_dirty_shutdown()`이 단순 예외 처리만 하는지, 별도의 시간 제한이나 사전 생성 방식이 있는지 소스 확인 필요.
 - `table.search().select(["file_path"]).to_arrow()`의 실제 peak RSS 및 column pruning 검증 결과가 문서의 계획대로 확보되었는지 확인 필요.
+
+---
+
+## 처리 기록 (Claude, 2026-07-24)
+
+| ID | 판단 | 사유 / 반영 커밋 |
+|---|---|---|
+| B-1 | 수용 | 실제 자기모순 확인 — 9차에서 "하드 종료는 로그 flush도 포기하고 무조건 즉시 os._exit()"라고 확립해놓고, 10차에서 바로 그 경로에 동기 파일쓰기(mark_dirty)를 다시 넣었음. 표식 기록 위치를 **hard-exit 직전 → 앱 시작 시**로 전면 수정(대안 1 채택): `check_and_remark_dirty_shutdown()`을 main() 시작 시 호출해 표식 확인+재기록, `clear_dirty_shutdown()`은 `finalize_shutdown`의 **정상 quit 경로에서만** 호출. `stop_worker`/`finalize_shutdown`의 hard-exit 분기는 이제 파일 I/O가 전혀 없음. 관련 테스트 전면 재작성 → 반영: 구현 PR #60 후속 커밋 |
+| M-1 | 수용(최소 범위) | "로그만으로는 GUI 사용자가 놓친다" 지적 타당. 전체 UI 상태 표시·검색 비활성화·재인덱싱 버튼 연동(대안 1·2)은 베타 단계 대비 과한 기능 확장이라 미채택. 대안 3(기존 UI 알림 채널 재사용)만 최소 구현: MainWindow 생성 시 dirty 감지되면 기존 트레이 `showMessage` 패턴으로 1회 풍선 알림 |
+| M-2 | 수용 | "미지원 API를 일시 장애처럼 백오프 처리"가 실제 설계 결함이라는 지적 타당 — projection 호출이 `AttributeError`면 "unsupported"로 별도 분류해 `on_blocked`와 동일하게 장기 억제(반복 재시도 없음) + 1회 "앱 업데이트 필요" 알림으로 구분. 시작 시 capability smoke test·CI 버전 강제(대안 1)는 이 저장소에 CI 파이프라인이 없어 범위 밖 — requirements.txt 코멘트로 검증 버전만 명시 유지 |
+| m-1 | 수용 | 결과 스키마·속도 향상이 "요청 컬럼만 스캔"의 직접 증거는 아니라는 지적 타당 — peak RSS 실측을 "필수" 수용 테스트로 승격, query plan/스토리지 read 통계 기록도 권고로 추가 |
+| m-2 | 수용 | ADR 리뷰 표기를 "1~8차" → "1~11차"로 갱신, Accepted 판정을 최신 라운드 기준으로 재확인 |
+
+**확인 필요 항목 답변**: ① lancedb 버전 강제는 CI 없는 현 저장소 구조상 requirements.txt 코멘트가
+현실적 최선(위 M-2 처리 참조). ② `_shutdown()`은 각 단계(scheduler.stop/tray.hide/stop_worker)가
+**개별** try/except로 이미 예외를 흡수하므로, 그 사이 코드(getattr 기본값 조회, 이미 로드된 모듈
+import)는 현실적으로 실패하지 않아 별도 외곽 finally 없이도 finalize_shutdown 도달이 보장됨(불필요한
+방어 코드 추가는 지양 — CLAUDE.md 코딩 원칙). ③ 표식 기록은 이제 시작 시 1회(hard-exit 직전 아님) —
+B-1 처리로 이미 답변됨. ④ peak RSS 검증은 사내(lancedb 실환경) 실측 항목으로 아직 미실행 — m-1 처리로
+필수 항목화, 실제 실측은 배포 전 별도 세션에서 수행 필요.
+
+**종결 판정**: Blocker 1건·Major 2건·Minor 2건 전건 수용·반영(M-1은 축소 범위 채택). 신규 미해결
+항목 없음(사내 실측 1건만 배포 전 별도 수행 필요로 남음).

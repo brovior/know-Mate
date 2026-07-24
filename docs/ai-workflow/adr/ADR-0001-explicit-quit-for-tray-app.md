@@ -2,7 +2,7 @@
 
 | 상태 | 날짜 | 결정자 | 리뷰 |
 |---|---|---|---|
-| Accepted | 2026-07-24 | Claude (Chief Architect) | reviews/REVIEW-20260724-adr-0001-explicit-quit-for-tray-app-adr-0002-purge-projectio-*.md (1~8차, Blocker/Major 전건 처리·구현 반영) |
+| Accepted | 2026-07-24 | Claude (Chief Architect) | reviews/REVIEW-20260724-adr-0001-explicit-quit-for-tray-app-adr-0002-purge-projectio-*.md (1~11차, Blocker/Major 전건 처리·구현 반영, 리뷰11 M-1 축소채택 근거 명시) |
 
 ## 맥락 (Context)
 - 베타 실사용에서 트레이 [종료] 후 `AegisDesk.exe`가 항상 잔존한다. 트레이 아이콘은

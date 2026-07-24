@@ -42,7 +42,14 @@ logger = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, dirty_shutdown_detected: bool = False) -> None:
+        """메인 윈도우를 초기화한다.
+
+        dirty_shutdown_detected: 이전 실행이 강제 종료됐는지(main()이 시작 시
+            check_and_remark_dirty_shutdown()으로 판정) — True면 트레이 초기화 후
+            풍선 알림으로 재인덱싱을 권장한다(설계 리뷰 11차 M-1, 로그만으로는
+            GUI 사용자가 놓치기 쉬움).
+        """
         super().__init__()
         self.setWindowTitle("Aegis Desk")
         if APP_ICON.exists():
@@ -69,6 +76,14 @@ class MainWindow(QMainWindow):
 
         self._init_collector()
         self._init_tray()
+        if dirty_shutdown_detected and self._tray is not None:
+            self._tray.showMessage(
+                "Aegis Desk",
+                "이전 실행이 정상적으로 종료되지 않았습니다. 검색 결과가 이상하면 "
+                "폴더를 제거 후 재추가해 재인덱싱하는 것을 권장합니다.",
+                QSystemTrayIcon.MessageIcon.Warning,
+                8000,
+            )
 
         _inject_qwebchannel_js(self._view)
         self._view.load(QUrl.fromLocalFile(str(UI_DIR / "index.html")))
@@ -369,12 +384,14 @@ def main() -> None:
 
     logger.info("Aegis Desk %s 시작 (platform=%s)", __version__, sys.platform)
 
-    # 이전 실행이 강제 종료(하드 종료)됐다면 표식이 남아있다 — LanceDB 쓰기 도중이었을
-    # 가능성을 배제할 수 없으므로(커밋 원자성 미검증, 설계 리뷰 10차 M-1) 자동 복구는
-    # 하지 않되, 진단에 쓸 수 있게 경고만 남긴다. read-then-clear라 다음 시작 때는
-    # 다시 뜨지 않는다.
-    from knowmate.app.lifecycle import check_and_clear_dirty_shutdown
-    if check_and_clear_dirty_shutdown():
+    # 이번 실행을 위한 강제 종료 표식을 지금 남긴다(정상 quit에서만 지워짐 — 설계
+    # 리뷰 11차 B-1). 반환값은 "직전 실행이 표식을 못 지우고 끝났는가" = 강제 종료
+    # 여부. LanceDB 쓰기 도중이었을 가능성을 배제할 수 없으므로(커밋 원자성 미검증,
+    # 리뷰10 M-1) 자동 복구는 하지 않되, 로그 + 트레이 알림(MainWindow 생성 후)으로
+    # 재인덱싱을 권장한다.
+    from knowmate.app.lifecycle import check_and_remark_dirty_shutdown
+    dirty_shutdown_detected = check_and_remark_dirty_shutdown()
+    if dirty_shutdown_detected:
         logger.warning(
             "이전 실행이 강제 종료됐습니다 — 검색 결과가 이상하면 설정 패널에서 해당 "
             "폴더를 제거 후 재추가해 재인덱싱하는 것을 권장합니다."
@@ -401,7 +418,7 @@ def main() -> None:
     if not try_acquire_or_notify_existing():
         return
 
-    win = MainWindow()
+    win = MainWindow(dirty_shutdown_detected=dirty_shutdown_detected)
     single_instance_server = SingleInstanceServer(parent=win)
     single_instance_server.show_requested.connect(win._show_from_tray)
 

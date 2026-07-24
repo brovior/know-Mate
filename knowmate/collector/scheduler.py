@@ -196,7 +196,9 @@ class CollectorWorker(QThread):
         미로드)을 기준으로 삭제해 state와 DB 불일치 상황도 처리한다.
 
         반환: "success"(정상 완료 또는 삭제 대상 없음) | "blocked"(대량삭제 차단) |
-        "failed"(DB 조회·삭제 예외) — 호출부(purge_meta 상태 전이)가 사용한다.
+        "failed"(DB 조회·삭제의 일시적 예외 — 백오프 후 재시도) |
+        "unsupported"(projection API 자체가 없음 — 배포 lancedb 버전 비호환, 영구
+        장애이므로 재시도로 복구되지 않는다) — 호출부(purge_meta 상태 전이)가 사용한다.
 
         안전장치:
         - normalized_folders가 비어 있으면(온보딩 전·config 초기화 직후 등) 아무것도
@@ -213,10 +215,19 @@ class CollectorWorker(QThread):
             return "success"
 
         # file_path 컬럼만 projection 조회 — 벡터(1024차원)·암호화 원문 미로드.
+        # AttributeError는 "이 lancedb 버전엔 select()가 없다"는 API 비호환(영구 장애)
+        # 신호라 일시적 DB 오류와 구분한다 — 재시도로 복구될 수 없으므로 백오프를
+        # 반복하지 않고 차단과 동일하게 장기 억제한다(설계 리뷰 11차 M-2).
         try:
             tbl = self._indexer.table.search().select(["file_path"]).to_arrow()
+        except AttributeError as exc:
+            logger.error(
+                "[purge] projection API(table.search().select) 미지원 — 배포된 lancedb "
+                "버전과 호환되지 않습니다(영구 장애, 재시도 무의미): %s", exc,
+            )
+            return "unsupported"
         except Exception as exc:
-            logger.warning("[purge] DB 조회 실패: %s", exc)
+            logger.warning("[purge] DB 조회 실패(일시적 장애로 간주, 백오프 후 재시도): %s", exc)
             return "failed"
 
         all_paths = tbl.column("file_path").to_pylist()
@@ -580,6 +591,16 @@ class CollectorWorker(QThread):
             if result == "success":
                 purge_meta_state = purge_meta.on_success(purge_meta_state, purge_op_sig, purge_meta_now)
             elif result == "blocked":
+                purge_meta_state = purge_meta.on_blocked(purge_meta_state, purge_op_sig)
+            elif result == "unsupported":
+                # 영구 장애(API 비호환) — 30분 백오프로 반복 재시도해도 복구되지 않으므로
+                # on_blocked와 동일하게 동일 op_sig에서는 장기 억제한다(구성 변경 또는
+                # 앱 업데이트로 op_sig가 바뀌어야 재시도). 1회만 알림.
+                if purge_meta_state.blocked_sig != purge_op_sig:
+                    self.indexing_needed.emit(
+                        "제거된 폴더 정리 기능이 이 배포 환경과 호환되지 않습니다. "
+                        "앱을 최신 버전으로 업데이트하세요."
+                    )
                 purge_meta_state = purge_meta.on_blocked(purge_meta_state, purge_op_sig)
             else:  # "failed"
                 purge_meta_state = purge_meta.on_transient_failure(

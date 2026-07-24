@@ -343,12 +343,16 @@ hard_exit 주입) 사외 단위 테스트가 가능하다.
 방어). `finalize_shutdown`도 `stop_worker`와 동형으로 PyQt6 비의존 분리 — `quit_fn`/`hard_exit`
 주입으로 사외 단위 테스트 가능(`knowmate/tests/test_phase3.py::TestFinalizeShutdown`).
 
-**강제 종료 표식 (dirty-shutdown marker, 설계 리뷰 10차 M-1)**: 자동 손상 감지·복구는 여전히
-보류하지만(아래), "강제 종료가 있었다"는 사실 자체는 저비용으로 남긴다. `stop_worker`/
-`finalize_shutdown`이 `hard_exit`를 호출하기 **직전**에 `lifecycle.mark_dirty_shutdown()`이
-`%APPDATA%/AegisDesk/dirty_shutdown.flag`를 기록하고(실패해도 종료를 막지 않음), 다음 앱 시작
-시 `main()`이 `check_and_clear_dirty_shutdown()`으로 그 표식을 확인·삭제(read-then-clear, 1회만
-보고)하며 존재하면 WARNING 로그로 재인덱싱을 권장한다. 정상 quit 경로에서는 표식을 남기지 않는다.
+**강제 종료 표식 (dirty-shutdown marker, 설계 리뷰 10차 M-1 → 11차 B-1로 방식 수정)**: 자동
+손상 감지·복구는 여전히 보류하지만(아래), "강제 종료가 있었다"는 사실 자체는 저비용으로 남긴다.
+처음엔 hard-exit 직전에 표식을 기록하는 방식이었으나, 그 동기 파일 쓰기 자체가 블록되면(백신·
+네트워크 드라이브 등) 최후 안전망인 하드 종료가 멈추는 모순이 있어(9차 B-1로 확립한 "하드 종료는
+무조건·즉시" 불변식과 충돌 — 11차 B-1) 방식을 바꿨다: `main()`이 **시작 시** 미리
+`lifecycle.check_and_remark_dirty_shutdown()`으로 `%APPDATA%/AegisDesk/dirty_shutdown.flag`를
+확인·재기록하고, `finalize_shutdown`의 **정상 quit 경로에서만** `clear_dirty_shutdown()`으로
+지운다. `stop_worker`/`finalize_shutdown`의 hard-exit 분기는 이제 파일 I/O를 전혀 거치지 않는다.
+표식이 남아있던 채로 시작되면(직전 실행이 못 지웠다는 뜻) WARNING 로그 + 트레이 풍선 알림(로그만
+으로는 GUI 사용자가 놓치기 쉬움, 11차 M-1)으로 재인덱싱을 권장한다.
 
 **남은 한계(후속 과제, 설계 리뷰 8차 M-1 — 보류)**: `QThread.terminate()`/`os._exit()`가 LanceDB
 쓰기(add/delete/optimize) 도중 발생했을 때의 커밋 원자성은 실제 손상 시나리오를 재현·검증할 수

@@ -23,42 +23,49 @@ _WAIT_AFTER_TERMINATE_MS = 3000
 _DIRTY_MARKER_NAME = "dirty_shutdown.flag"
 
 
-def _default_mark_dirty_shutdown() -> None:
-    """강제 종료 직전에 표식 파일을 남긴다(설계 리뷰 10차 M-1).
+def check_and_remark_dirty_shutdown(marker_path=None) -> bool:
+    """앱 시작 시 **1회만** 호출한다. 이전 실행의 표식이 남아있으면(=지난 실행이
+    정상 종료되지 못했으면) True를 반환하고, 이번 실행을 위한 새 표식을 남긴다.
 
-    LanceDB add/delete/optimize가 진행 중일 수 있는 상태에서 워커 스레드를
-    강제 종료하거나 프로세스를 하드 종료하면, 그 쓰기의 커밋 원자성은 배포
-    lancedb 버전에 따라 미확정이다(추측성 자동 손상 감지·복구는 검증 불가능한
-    상태에서 넣는 게 더 위험하다고 판단해 미구현 — docs/DESIGN.md § 종료 확실화
-    참조). 대신 "강제 종료가 있었다"는 사실 자체는 저비용으로 기록해, 다음 실행
-    시작 시 사용자에게 재인덱싱을 권장할 근거로 삼는다(check_and_clear_dirty_shutdown).
-    표식 기록 자체의 실패(디스크 오류 등)는 종료를 막지 않도록 무시한다.
-    """
-    try:
-        from knowmate.config import get_data_dir
-        marker = get_data_dir() / _DIRTY_MARKER_NAME
-        marker.write_text("1", encoding="utf-8")
-    except OSError as exc:
-        logger.debug("강제 종료 표식 기록 실패(무시): %s", exc)
-
-
-def check_and_clear_dirty_shutdown(marker_path=None) -> bool:
-    """이전 실행이 강제 종료됐는지 확인하고 표식을 지운다(read-then-clear — 다음
-    시작 시 1회만 보고). 반환: 이전 실행에 강제 종료 표식이 있었으면 True.
+    설계 리뷰 10차 M-1(강제 종료 감지) → 11차 B-1로 구현 방식을 수정: 표식을
+    **hard-exit 직전이 아니라 시작 시점에 미리** 써 두고 **정상 종료(quit) 확정
+    시에만** `clear_dirty_shutdown()`으로 지운다. 이러면 hard-exit 경로는 어떤
+    파일 I/O도 거치지 않고 os._exit()만 호출해도(9차 B-1로 확립한 "하드 종료는
+    무조건·즉시" 불변식 유지) 다음 시작 때 표식이 그대로 남아있는 것만으로 강제
+    종료였음을 알 수 있다. (이전 설계는 hard-exit 직전에 동기 파일 쓰기를 했는데,
+    파일시스템·백신·네트워크 드라이브에서 그 쓰기 자체가 블록되면 최후 안전망인
+    하드 종료가 멈추는 모순이 있었다 — 리뷰11 B-1.)
 
     marker_path: 표식 파일 경로(테스트 주입용, 기본은 %APPDATA%/AegisDesk/dirty_shutdown.flag).
+    표식 기록 자체의 실패(디스크 오류 등)는 무시한다 — 감지 기능 저하일 뿐 앱 동작을
+    막아서는 안 된다.
     """
     try:
         if marker_path is None:
             from knowmate.config import get_data_dir
             marker_path = get_data_dir() / _DIRTY_MARKER_NAME
-        existed = marker_path.exists()
-        if existed:
-            marker_path.unlink(missing_ok=True)
-        return existed
+        was_dirty = marker_path.exists()
+        marker_path.parent.mkdir(parents=True, exist_ok=True)
+        marker_path.write_text("1", encoding="utf-8")
+        return was_dirty
     except OSError as exc:
-        logger.debug("강제 종료 표식 확인 실패(무시): %s", exc)
+        logger.debug("강제 종료 표식 확인/기록 실패(무시): %s", exc)
         return False
+
+
+def clear_dirty_shutdown(marker_path=None) -> None:
+    """정상 종료(quit)가 확정된 시점에 호출해 표식을 지운다.
+
+    hard-exit 경로에서는 절대 호출하지 않는다 — 그래야 표식이 "정상 종료 못 함"의
+    증거로 남는다. 실패(디스크 오류 등)는 무시한다.
+    """
+    try:
+        if marker_path is None:
+            from knowmate.config import get_data_dir
+            marker_path = get_data_dir() / _DIRTY_MARKER_NAME
+        marker_path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.debug("강제 종료 표식 삭제 실패(무시): %s", exc)
 
 
 def _default_hard_exit(code: int = 0) -> None:
@@ -76,12 +83,16 @@ def _default_hard_exit(code: int = 0) -> None:
     os._exit(code)
 
 
-def stop_worker(worker, hard_exit=_default_hard_exit, mark_dirty=_default_mark_dirty_shutdown) -> None:
+def stop_worker(worker, hard_exit=_default_hard_exit) -> None:
     """워커를 정상 종료 → 실패 시 강제 종료 → 그래도 실패 시 프로세스 하드 종료.
 
     worker: cancel()/isRunning()/wait(ms)->bool/terminate() 를 갖는 객체(또는 None).
     hard_exit: 최종 프로세스 종료 콜백(기본 os._exit 래퍼, 테스트 주입용).
-    mark_dirty: 하드 종료 직전에 호출할 강제 종료 표식 콜백(테스트 주입용, 설계 리뷰 10차 M-1).
+
+    하드 종료 경로는 어떤 파일 I/O·정리 코드도 거치지 않고 hard_exit만 호출한다
+    (설계 리뷰 9·11차 B-1 — "하드 종료는 무조건·즉시" 불변식). 강제 종료 감지는
+    이 함수가 아니라 check_and_remark_dirty_shutdown/clear_dirty_shutdown이
+    시작·정상종료 시점에 담당한다.
     """
     if worker is None or not worker.isRunning():
         return
@@ -99,13 +110,10 @@ def stop_worker(worker, hard_exit=_default_hard_exit, mark_dirty=_default_mark_d
 
     # 강제 종료 후에도 잔존 → 프로세스 하드 종료(사용자가 의도한 종료이므로 0)
     logger.error("워커 스레드가 강제 종료 후에도 잔존 — 프로세스 하드 종료(os._exit)")
-    mark_dirty()
     hard_exit(0)
 
 
-def finalize_shutdown(
-    worker, quit_fn, hard_exit=_default_hard_exit, mark_dirty=_default_mark_dirty_shutdown
-) -> None:
+def finalize_shutdown(worker, quit_fn, hard_exit=_default_hard_exit, clear_dirty=clear_dirty_shutdown) -> None:
     """종료 최종 판정 — quit_fn(워커 비실행 확인) 또는 hard_exit(실행 중·판정 불가) 중 정확히 하나.
 
     _shutdown()의 앞 단계(scheduler.stop/tray.hide/stop_worker)가 예외로 이탈하더라도 항상
@@ -115,21 +123,23 @@ def finalize_shutdown(
 
     worker: cancel()/isRunning()/wait(ms)->bool/terminate() 를 갖는 객체(또는 None).
     quit_fn: () -> None, 워커 비실행이 확인됐을 때 호출할 정상 종료 콜백(QApplication.quit 등).
-    hard_exit: 최종 프로세스 종료 콜백(기본 os._exit 래퍼, 테스트 주입용).
-    mark_dirty: 하드 종료 직전에 호출할 강제 종료 표식 콜백(테스트 주입용, 설계 리뷰 10차 M-1).
+    hard_exit: 최종 프로세스 종료 콜백(기본 os._exit 래퍼, 테스트 주입용). **파일 I/O 없이**
+        즉시 실행되어야 하므로(리뷰11 B-1) 이 분기에서는 clear_dirty를 호출하지 않는다 —
+        강제 종료 표식은 시작 시 미리 기록돼 있고(check_and_remark_dirty_shutdown), 정상
+        quit 경로에서만 지워진다.
+    clear_dirty: 정상 quit이 확정됐을 때 호출할 강제 종료 표식 해제 콜백(테스트 주입용).
     """
     try:
         is_running = worker is not None and worker.isRunning()
     except Exception as exc:
         logger.warning("워커 실행 상태 조회 실패(판정 불가) — 보수적으로 하드 종료: %s", exc)
-        mark_dirty()
         hard_exit(0)
         return
 
     if is_running:
         logger.error("최종 판정 시점에도 워커가 실행 중 — 프로세스 하드 종료(os._exit)")
-        mark_dirty()
         hard_exit(0)
         return
 
+    clear_dirty()
     quit_fn()

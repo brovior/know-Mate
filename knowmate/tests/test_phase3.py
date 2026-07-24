@@ -887,6 +887,37 @@ class TestPurgeRemovedFolders:
         assert len(alerts) == 1
         assert "대량 삭제" in alerts[0]
 
+    def test_projection_api_missing_returns_unsupported(self, tmp_path: Path):
+        """table.search()에 select()가 없는(lancedb 버전 비호환) 경우 "failed"(일시적
+        장애)가 아니라 "unsupported"(영구 장애)로 구분된다(설계 리뷰 11차 M-2) —
+        재시도로 복구되지 않으므로 30분 백오프를 반복하지 않고 장기 억제해야 한다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+
+        class _NoSelectQueryBuilder:
+            def select(self, *a, **kw):
+                raise AttributeError("이 lancedb 버전엔 select()가 없음(시뮬레이션)")
+
+        class _TableWithoutSelect:
+            def search(self):
+                return _NoSelectQueryBuilder()
+
+        worker = CollectorWorker(
+            config=_make_config(str(folder)), indexer=indexer,
+            extractor=None, state_file=tmp_path / "state.json",
+        )
+        worker._indexer._table = _TableWithoutSelect()  # projection 미지원 시뮬레이션(table은 읽기전용 프로퍼티)
+
+        result = worker._purge_removed_folders([str(folder)], {}, dry_run=False, max_delete_ratio=0.30)
+        assert result == "unsupported"
+
 
 # ============================================================
 # TestPurgeMetaIntegration — CollectorWorker + purge_meta 스킵/강제 reconciliation 통합
@@ -1295,35 +1326,66 @@ class TestDefaultHardExit:
 
 
 class TestDirtyShutdownMarker:
-    """강제 종료 사실을 저비용으로 기록·확인하는 표식(설계 리뷰 10차 M-1).
+    """강제 종료 사실을 저비용으로 기록·확인하는 표식(설계 리뷰 10차 M-1 → 11차 B-1로
+    구현 방식 수정).
 
     LanceDB 쓰기 도중 강제 종료됐을 가능성을 자동으로 감지·복구하지는 않지만(검증
     불가능한 추측성 로직은 미구현 — docs/DESIGN.md 참조), "강제 종료가 있었다"는
-    사실만은 다음 시작 시 사용자에게 알릴 수 있게 read-then-clear로 기록한다.
+    사실만은 사용자에게 알릴 수 있게 기록한다. 표식은 **시작 시 미리** 남기고
+    **정상 quit에서만** 지운다 — hard-exit 경로는 파일 I/O를 전혀 거치지 않아야
+    "하드 종료는 무조건·즉시" 불변식이 깨지지 않는다(리뷰11 B-1).
     """
 
-    def test_check_and_clear_roundtrip(self, tmp_path: Path):
-        from knowmate.app.lifecycle import check_and_clear_dirty_shutdown
+    def test_first_run_not_dirty_but_marks_for_this_run(self, tmp_path: Path):
+        """표식이 없던 상태(첫 실행) → False 반환하지만, 이번 실행을 위한 표식은 남긴다."""
+        from knowmate.app.lifecycle import check_and_remark_dirty_shutdown
 
         marker = tmp_path / "dirty_shutdown.flag"
         assert not marker.exists()
-        assert check_and_clear_dirty_shutdown(marker) is False  # 표식 없음 → False
+        assert check_and_remark_dirty_shutdown(marker) is False
+        assert marker.exists()  # 이번 실행 보호용 표식은 기록됨
 
+    def test_stale_marker_reports_dirty_and_rewrites(self, tmp_path: Path):
+        """이전 실행이 표식을 못 지우고 끝났다면(강제 종료) True를 반환하고, 이번
+        실행을 위해 다시 기록한다."""
+        from knowmate.app.lifecycle import check_and_remark_dirty_shutdown
+
+        marker = tmp_path / "dirty_shutdown.flag"
         marker.write_text("1", encoding="utf-8")
-        assert check_and_clear_dirty_shutdown(marker) is True  # 표식 있음 → True + 삭제
+        assert check_and_remark_dirty_shutdown(marker) is True
+        assert marker.exists()  # 확인 후에도 이번 실행 보호용으로 다시 기록됨
+
+    def test_clear_removes_marker(self, tmp_path: Path):
+        """정상 quit 확정 시 clear_dirty_shutdown이 표식을 지운다."""
+        from knowmate.app.lifecycle import check_and_remark_dirty_shutdown, clear_dirty_shutdown
+
+        marker = tmp_path / "dirty_shutdown.flag"
+        check_and_remark_dirty_shutdown(marker)  # 시작 시 기록
+        assert marker.exists()
+        clear_dirty_shutdown(marker)  # 정상 종료 시 제거
         assert not marker.exists()
 
-        # 지운 뒤 다시 확인하면 더는 표식이 없다(1회만 보고)
-        assert check_and_clear_dirty_shutdown(marker) is False
+    def test_clear_missing_marker_is_noop(self, tmp_path: Path):
+        """표식이 없는 상태에서 clear를 호출해도 예외가 없다."""
+        from knowmate.app.lifecycle import clear_dirty_shutdown
+        clear_dirty_shutdown(tmp_path / "no_such_marker.flag")
 
-    def test_default_mark_dirty_shutdown_writes_file(self, tmp_path: Path, monkeypatch):
-        import knowmate.app.lifecycle as lifecycle
+    def test_full_cycle_dirty_then_clean(self, tmp_path: Path):
+        """실행1: 시작(마크) → 강제종료(표식 안 지움). 실행2: 시작 시 dirty=True 확인
+        → 정상 종료로 clear → 실행3: 시작 시 dirty=False."""
+        from knowmate.app.lifecycle import check_and_remark_dirty_shutdown, clear_dirty_shutdown
+        marker = tmp_path / "dirty_shutdown.flag"
 
-        monkeypatch.setattr("knowmate.config.get_data_dir", lambda: tmp_path)
-        lifecycle._default_mark_dirty_shutdown()
+        # 실행1 시작 (첫 실행이라 dirty=False), 강제 종료라고 가정 — clear 호출 안 함
+        assert check_and_remark_dirty_shutdown(marker) is False
 
-        marker = tmp_path / lifecycle._DIRTY_MARKER_NAME
-        assert marker.exists()
+        # 실행2 시작 — 실행1이 표식을 못 지웠으므로 dirty=True
+        assert check_and_remark_dirty_shutdown(marker) is True
+        # 실행2는 정상 종료
+        clear_dirty_shutdown(marker)
+
+        # 실행3 시작 — 실행2가 정상 종료했으므로 dirty=False
+        assert check_and_remark_dirty_shutdown(marker) is False
 
 
 class TestStopWorker:
@@ -1354,7 +1416,7 @@ class TestStopWorker:
         from knowmate.app.lifecycle import stop_worker
         w = self._FakeWorker(running=True, wait_results=[True])
         hard = []
-        stop_worker(w, hard_exit=lambda c: hard.append(c), mark_dirty=lambda: None)
+        stop_worker(w, hard_exit=lambda c: hard.append(c))
         assert w.cancelled and not w.terminated and hard == []
 
     def test_terminate_when_graceful_times_out(self):
@@ -1362,7 +1424,7 @@ class TestStopWorker:
         from knowmate.app.lifecycle import stop_worker
         w = self._FakeWorker(running=True, wait_results=[False, True])
         hard = []
-        stop_worker(w, hard_exit=lambda c: hard.append(c), mark_dirty=lambda: None)
+        stop_worker(w, hard_exit=lambda c: hard.append(c))
         assert w.terminated and hard == []
 
     def test_hard_exit_when_terminate_also_fails(self):
@@ -1370,38 +1432,21 @@ class TestStopWorker:
         from knowmate.app.lifecycle import stop_worker
         w = self._FakeWorker(running=True, wait_results=[False, False])
         hard = []
-        stop_worker(w, hard_exit=lambda c: hard.append(c), mark_dirty=lambda: None)
+        stop_worker(w, hard_exit=lambda c: hard.append(c))
         assert w.terminated and hard == [0]
-
-    def test_marks_dirty_before_hard_exit(self):
-        """하드 종료 직전에 강제 종료 표식을 남긴다(설계 리뷰 10차 M-1) — 순서까지 검증
-        (mark_dirty가 hard_exit보다 먼저 호출돼야 함)."""
-        from knowmate.app.lifecycle import stop_worker
-        w = self._FakeWorker(running=True, wait_results=[False, False])
-        calls = []
-        stop_worker(
-            w,
-            hard_exit=lambda c: calls.append(("hard_exit", c)),
-            mark_dirty=lambda: calls.append(("mark_dirty",)),
-        )
-        assert calls == [("mark_dirty",), ("hard_exit", 0)]
 
     def test_noop_when_not_running(self):
         """이미 멈춘 워커는 아무것도 하지 않는다."""
         from knowmate.app.lifecycle import stop_worker
         w = self._FakeWorker(running=False)
         hard = []
-        stop_worker(w, hard_exit=lambda c: hard.append(c), mark_dirty=lambda: None)
+        stop_worker(w, hard_exit=lambda c: hard.append(c))
         assert not w.cancelled and hard == []
 
     def test_noop_when_none(self):
         """worker가 None이어도 예외 없이 통과한다."""
         from knowmate.app.lifecycle import stop_worker
-        stop_worker(
-            None,
-            hard_exit=lambda c: (_ for _ in ()).throw(AssertionError("호출되면 안 됨")),
-            mark_dirty=lambda: (_ for _ in ()).throw(AssertionError("호출되면 안 됨")),
-        )
+        stop_worker(None, hard_exit=lambda c: (_ for _ in ()).throw(AssertionError("호출되면 안 됨")))
 
 
 class TestFinalizeShutdown:
@@ -1424,7 +1469,7 @@ class TestFinalizeShutdown:
         quit_calls, hard_calls = [], []
         finalize_shutdown(
             None, quit_fn=lambda: quit_calls.append(1),
-            hard_exit=lambda c: hard_calls.append(c), mark_dirty=lambda: None,
+            hard_exit=lambda c: hard_calls.append(c), clear_dirty=lambda: None,
         )
         assert quit_calls == [1] and hard_calls == []
 
@@ -1435,66 +1480,44 @@ class TestFinalizeShutdown:
         quit_calls, hard_calls = [], []
         finalize_shutdown(
             w, quit_fn=lambda: quit_calls.append(1),
-            hard_exit=lambda c: hard_calls.append(c), mark_dirty=lambda: None,
+            hard_exit=lambda c: hard_calls.append(c), clear_dirty=lambda: None,
         )
         assert quit_calls == [1] and hard_calls == []
 
     def test_hard_exit_when_worker_still_running(self):
-        """워커가 여전히 실행 중이면 hard_exit만 호출된다(quit 안 함)."""
+        """워커가 여전히 실행 중이면 hard_exit만 호출된다(quit 안 함, clear_dirty도 안 함)."""
         from knowmate.app.lifecycle import finalize_shutdown
         w = self._FakeWorker(running=True)
-        quit_calls, hard_calls = [], []
+        quit_calls, hard_calls, clear_calls = [], [], []
         finalize_shutdown(
             w, quit_fn=lambda: quit_calls.append(1),
-            hard_exit=lambda c: hard_calls.append(c), mark_dirty=lambda: None,
+            hard_exit=lambda c: hard_calls.append(c), clear_dirty=lambda: clear_calls.append(1),
         )
-        assert hard_calls == [0] and quit_calls == []
+        assert hard_calls == [0] and quit_calls == [] and clear_calls == []
 
     def test_hard_exit_when_is_running_raises(self):
-        """isRunning() 조회 자체가 실패(판정 불가)하면 보수적으로 hard_exit만 호출된다."""
+        """isRunning() 조회 자체가 실패(판정 불가)하면 보수적으로 hard_exit만 호출된다
+        (clear_dirty도 호출되지 않음 — 하드 종료 경로는 파일 I/O가 전혀 없어야 함, 리뷰11 B-1)."""
         from knowmate.app.lifecycle import finalize_shutdown
         w = self._FakeWorker(raise_on_is_running=True)
-        quit_calls, hard_calls = [], []
+        quit_calls, hard_calls, clear_calls = [], [], []
         finalize_shutdown(
             w, quit_fn=lambda: quit_calls.append(1),
-            hard_exit=lambda c: hard_calls.append(c), mark_dirty=lambda: None,
+            hard_exit=lambda c: hard_calls.append(c), clear_dirty=lambda: clear_calls.append(1),
         )
-        assert hard_calls == [0] and quit_calls == []
+        assert hard_calls == [0] and quit_calls == [] and clear_calls == []
 
-    def test_marks_dirty_before_hard_exit_when_worker_running(self):
-        """워커가 실행 중이라 하드 종료할 때, 표식을 hard_exit보다 먼저 남긴다."""
-        from knowmate.app.lifecycle import finalize_shutdown
-        w = self._FakeWorker(running=True)
-        calls = []
-        finalize_shutdown(
-            w, quit_fn=lambda: calls.append(("quit",)),
-            hard_exit=lambda c: calls.append(("hard_exit", c)),
-            mark_dirty=lambda: calls.append(("mark_dirty",)),
-        )
-        assert calls == [("mark_dirty",), ("hard_exit", 0)]
-
-    def test_marks_dirty_before_hard_exit_when_is_running_raises(self):
-        """isRunning() 조회 실패(판정 불가)로 하드 종료할 때도 표식을 먼저 남긴다."""
-        from knowmate.app.lifecycle import finalize_shutdown
-        w = self._FakeWorker(raise_on_is_running=True)
-        calls = []
-        finalize_shutdown(
-            w, quit_fn=lambda: calls.append(("quit",)),
-            hard_exit=lambda c: calls.append(("hard_exit", c)),
-            mark_dirty=lambda: calls.append(("mark_dirty",)),
-        )
-        assert calls == [("mark_dirty",), ("hard_exit", 0)]
-
-    def test_no_mark_dirty_when_quit(self):
-        """정상 quit 경로에서는 강제 종료 표식을 남기지 않는다."""
+    def test_clear_dirty_before_quit(self):
+        """정상 quit 경로에서는 clear_dirty가 quit보다 먼저 호출된다."""
         from knowmate.app.lifecycle import finalize_shutdown
         w = self._FakeWorker(running=False)
-        mark_calls = []
+        calls = []
         finalize_shutdown(
-            w, quit_fn=lambda: None, hard_exit=lambda c: None,
-            mark_dirty=lambda: mark_calls.append(1),
+            w, quit_fn=lambda: calls.append(("quit",)),
+            hard_exit=lambda c: calls.append(("hard_exit", c)),
+            clear_dirty=lambda: calls.append(("clear_dirty",)),
         )
-        assert mark_calls == []
+        assert calls == [("clear_dirty",), ("quit",)]
 
 
 # ============================================================
