@@ -1458,41 +1458,50 @@ class TestStopWorker:
             self.terminated = True
 
     def test_graceful_stop_no_terminate_no_hardexit(self):
-        """첫 wait에 정상 종료되면 terminate·하드종료 없이 끝난다."""
+        """첫 wait에 정상 종료되면 terminate·하드종료 없이 끝나고 False(강제 아님)를 반환한다."""
         from knowmate.app.lifecycle import stop_worker
         w = self._FakeWorker(running=True, wait_results=[True])
         hard = []
-        stop_worker(w, hard_exit=lambda c: hard.append(c))
+        result = stop_worker(w, hard_exit=lambda c: hard.append(c))
         assert w.cancelled and not w.terminated and hard == []
+        assert result is False
 
     def test_terminate_when_graceful_times_out(self):
-        """정상 종료 실패 → terminate 후 성공하면 하드 종료는 안 한다."""
+        """정상 종료 실패 → terminate 후 성공하면 하드 종료는 안 하지만, terminate()가
+        쓰였으므로 True(강제 중단됨)를 반환한다(설계 리뷰 15차 B-1 — 호출부가 이 값을
+        finalize_shutdown(force_hard_exit=True)로 넘겨 quit 대신 hard_exit로 수렴시켜야
+        한다. terminate()로 멈춘 스레드는 임의 지점에서 강제 중단된 것이라 락을 쥔 채
+        죽었을 수 있어 "정상 종료"로 취급할 수 없다)."""
         from knowmate.app.lifecycle import stop_worker
         w = self._FakeWorker(running=True, wait_results=[False, True])
         hard = []
-        stop_worker(w, hard_exit=lambda c: hard.append(c))
+        result = stop_worker(w, hard_exit=lambda c: hard.append(c))
         assert w.terminated and hard == []
+        assert result is True
 
     def test_hard_exit_when_terminate_also_fails(self):
-        """정상·강제 모두 실패하면 프로세스 하드 종료(0)를 호출한다."""
+        """정상·강제 모두 실패하면 프로세스 하드 종료(0)를 호출하고 True를 반환한다."""
         from knowmate.app.lifecycle import stop_worker
         w = self._FakeWorker(running=True, wait_results=[False, False])
         hard = []
-        stop_worker(w, hard_exit=lambda c: hard.append(c))
+        result = stop_worker(w, hard_exit=lambda c: hard.append(c))
         assert w.terminated and hard == [0]
+        assert result is True
 
     def test_noop_when_not_running(self):
-        """이미 멈춘 워커는 아무것도 하지 않는다."""
+        """이미 멈춘 워커는 아무것도 하지 않고 False를 반환한다."""
         from knowmate.app.lifecycle import stop_worker
         w = self._FakeWorker(running=False)
         hard = []
-        stop_worker(w, hard_exit=lambda c: hard.append(c))
+        result = stop_worker(w, hard_exit=lambda c: hard.append(c))
         assert not w.cancelled and hard == []
+        assert result is False
 
     def test_noop_when_none(self):
-        """worker가 None이어도 예외 없이 통과한다."""
+        """worker가 None이어도 예외 없이 통과하고 False를 반환한다."""
         from knowmate.app.lifecycle import stop_worker
-        stop_worker(None, hard_exit=lambda c: (_ for _ in ()).throw(AssertionError("호출되면 안 됨")))
+        result = stop_worker(None, hard_exit=lambda c: (_ for _ in ()).throw(AssertionError("호출되면 안 됨")))
+        assert result is False
 
 
 class TestFinalizeShutdown:
@@ -1552,6 +1561,32 @@ class TestFinalizeShutdown:
             hard_exit=lambda c: hard_calls.append(c),
         )
         assert hard_calls == [0] and quit_calls == []
+
+    def test_force_hard_exit_overrides_confirmed_stopped(self):
+        """리뷰15 B-1: isRunning()이 False로 확인돼도 force_hard_exit=True(stop_worker가
+        terminate()를 사용했음을 의미)면 quit 대신 hard_exit로 수렴한다 — terminate()로
+        강제 중단된 스레드는 락을 쥔 채 죽었을 수 있어 "정상 종료"로 취급할 수 없다."""
+        from knowmate.app.lifecycle import finalize_shutdown
+        w = self._FakeWorker(running=False)
+        quit_calls, hard_calls = [], []
+        finalize_shutdown(
+            w, quit_fn=lambda: quit_calls.append(1),
+            hard_exit=lambda c: hard_calls.append(c),
+            force_hard_exit=True,
+        )
+        assert hard_calls == [0] and quit_calls == []
+
+    def test_force_hard_exit_false_allows_normal_quit(self):
+        """force_hard_exit=False(기본값, 기존 동작)면 워커 비실행 확인 시 여전히 quit된다."""
+        from knowmate.app.lifecycle import finalize_shutdown
+        w = self._FakeWorker(running=False)
+        quit_calls, hard_calls = [], []
+        finalize_shutdown(
+            w, quit_fn=lambda: quit_calls.append(1),
+            hard_exit=lambda c: hard_calls.append(c),
+            force_hard_exit=False,
+        )
+        assert quit_calls == [1] and hard_calls == []
 
     def test_finalize_shutdown_never_clears_dirty_marker(self):
         """리뷰13 M-1: finalize_shutdown은 표식 해제를 전혀 하지 않는다 — quit()은

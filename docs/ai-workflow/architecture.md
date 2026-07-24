@@ -135,6 +135,7 @@ daemon 사실이 성립하는 한 불필요 — 미도입).
 | **(리뷰14 M-2)** daemon 스레드에 삭제를 맡기고 대기 없이 반환하면, 호출 직후 인터프리터가 곧바로 종료돼(`main()`의 마지막 단계) 스레드가 실행되기 전/`unlink()` 완료 전에 잘려 정상 종료에서도 삭제가 보장되지 않음 | 코드 검토 | daemon 스레드 시작 후 **최대 1초(`_CLEAR_DIRTY_JOIN_TIMEOUT_SEC`)만 `join()`**(best-effort 상한). 이 위치(리뷰13 M-1로 `app.exec()` 정상 반환 후로 이동됨)는 이벤트 루프가 이미 끝난 뒤라, 짧은 상한 대기가 "종료는 반드시 된다" 불변식을 재위협하지 않는다 — 1초를 넘겨도 종료를 계속한다 |
 | **(리뷰13 M-1)** `quit_fn()`(QApplication.quit) 호출은 이벤트 루프 종료를 "요청"할 뿐 완료를 보장하지 않는데, `finalize_shutdown()`이 그 직전에 표식을 지우면 요청~실제 반환 사이 크래시 시 다음 시작에서 강제 종료를 탐지 못하는 false negative가 생김 | 코드 검토 | `finalize_shutdown()`에서 `clear_dirty()` 호출을 완전히 제거. 표식 해제는 `main()`에서 `app.exec()`가 **정상 반환한 뒤**로 이동 — hard-exit 경로는 `os._exit()`로 `app.exec()`에 절대 반환하지 않으므로 "app.exec() 반환 = 정상 quit 확정"이 성립해, 이 위치가 표식 해제의 유일하게 안전한 시점이다 |
 | **(리뷰12 M-1)** 보조 인스턴스가 단일 인스턴스 판정 전에 표식을 건드리면 실행 중인 주 인스턴스의 표식을 오염시켜 오탐/누락 유발 | 코드 검토 | 시작 흐름을 `QApplication 생성 → 단일 인스턴스 획득/기존 인스턴스 통지(실패 시 즉시 return) → 소유권 획득 성공 시에만 표식 확인·재기록 → MainWindow 생성 → app.exec()`로 고정. 기존 인스턴스를 발견한 보조 프로세스는 표식 API를 전혀 호출하지 않고 `return`으로 조기 종료한다 |
+| **(리뷰15 B-1)** `QThread.terminate()`가 스레드를 멈추는 데 성공하면(`isRunning()==False`) 기존 최종 판정이 이를 "정상 종료"로 분류해 `quit()`으로 넘어감 — 그러나 강제 중단된 스레드는 임의 지점에서 멈춘 것이라 로깅 핸들러 락·LanceDB 파일 락 등을 쥔 채 죽었을 수 있어, `quit()` 이후 인터프리터 종료가 블록되거나 `app.exec()`가 그래도 반환돼 dirty-shutdown marker가 false negative로 지워질 수 있음 | 코드 검토 | `stop_worker()`가 `terminate()` 사용 여부를 bool로 반환하도록 변경, `_shutdown()`이 이 값을 `finalize_shutdown(force_hard_exit=...)`로 그대로 전달. `force_hard_exit=True`면 `isRunning()` 값과 무관하게 항상 `hard_exit()`한다 — `terminate()`가 한 번이라도 쓰이면 그 이후는 "정상 종료" 분류를 절대 하지 않는다 |
 
 ### 검증 계획
 - 사외 단위: `_shutdown()`이 각 단계(스케줄러 stop → stop_worker → quit) **순서대로** 호출하고,
@@ -153,6 +154,10 @@ daemon 사실이 성립하는 한 불필요 — 미도입).
   즉시 반환(리뷰12 B-1) 단위 테스트.
 - 사외 단위(리뷰12 M-1): 단일 인스턴스 획득 실패(보조 인스턴스) 시 `check_and_remark_dirty_shutdown`/
   `clear_dirty_shutdown` 어느 쪽도 호출되지 않음을 `main()` 흐름 검토·통합 테스트로 고정.
+- 사외 단위(리뷰15 B-1): `stop_worker()`가 `terminate()`를 사용한 모든 경우(성공/실패 둘 다)
+  `True`를 반환하고, 정상 종료(첫 wait 성공) 시에는 `False`를 반환함을 검증. `finalize_shutdown`이
+  `force_hard_exit=True`이면 `isRunning()`이 False로 확인돼도 `quit_fn()`을 호출하지 않고
+  `hard_exit()`만 호출함을(반대로 `force_hard_exit=False`면 기존처럼 정상 quit) 스파이로 검증.
 - 사외 통합(가능 시): `QT_QPA_PLATFORM=offscreen`으로 QApplication을 띄워 창 숨김/표시/
   `close_action=quit` 세 분기에서 이벤트 루프가 실제 종료되는지 통합 테스트(리뷰 m-2 반영).
   offscreen 불가 환경이면 closeEvent 분기 단위 테스트 + 아래 실기 3경로를 릴리스 체크리스트로 고정.
@@ -193,7 +198,7 @@ state 기반이라 무관 — 변경 없음.
 |---|---|---|
 | `_purge_removed_folders` | `file_path`만 projection 조회, 삭제 판단·실행(기존 안전장치 유지), 성공 완료 여부 반환 | `knowmate/collector/scheduler.py` |
 | `_run_cycle` | 사이클 시작 시 불변 스냅샷·op_sig 계산, 스킵 판정(서명·0건·24h), 성공 시에만 meta 갱신 | `knowmate/collector/scheduler.py` |
-| purge 메타 sidecar | 전체 필드 보관(tmp→replace 원자 교체): `reconciled_sig`(성공 서명)·`last_purge_ts`(성공 시각)·`failed_sig`+`next_retry_ts`(일시 실패 백오프)·`blocked_sig`(대량삭제 차단) + 스키마 버전. 필드별 유효성 규칙은 데이터 흐름 참조. 기존 state 스키마 불변 | `index_state.meta.json` (신규) |
+| purge 메타 sidecar | 전체 필드 보관(tmp→replace 원자 교체): `reconciled_sig`(성공 서명)·`last_purge_ts`(성공 시각)·`failed_sig`+`next_retry_ts`(일시 실패 백오프)·`blocked_sig`+`blocked_reason`(대량삭제 차단 또는 unsupported, 리뷰12 m-1)·`blocked_capability_sig`(unsupported 전용 억제 키, 리뷰14/15 M-1) + 스키마 버전. 필드별 유효성 규칙은 데이터 흐름 참조. 기존 state 스키마 불변 | `index_state.meta.json` (신규) |
 
 ### 데이터 흐름
 ```
@@ -211,13 +216,19 @@ state 기반이라 무관 — 변경 없음.
   op_sig = SHA-256(canonical JSON)   # {"v":1, "folders":[...], "dry_run":bool,
                                      #  "max_delete_ratio":float} 를 sort_keys=True·고정
                                      # separator·UTF-8로 직렬화(필드 경계 모호성 제거, 리뷰2 m-2)
-사이클 종료부 — 판정 순서 고정(억제 판정이 성공 스킵보다 먼저, 리뷰3 B-1):
+사이클 종료부 — 판정 순서 고정(리뷰15 M-2로 unsupported capability 억제를 최우선으로 명문화):
+  capability_sig = compute_capability_sig()   # lancedb 버전 + 앱 버전 +
+                                               # PROJECTION_STRATEGY_VERSION의 SHA-256(리뷰15 M-1)
   # 시각 필드 검증은 필드별로 다르다(리뷰4 B-1 — next_retry_ts는 정의상 미래값이 정상):
   #  - last_purge_ts: **모든 미래값 무효**(스킵 불가) — 스킵 조건 0 <= (now-last_purge_ts)와
   #    동일 문언으로 통일, 오차허용 없음(리뷰6 m-3)
   #  - next_retry_ts: now < 값 <= now + 설정백오프 범위만 유효.
   #    그보다 먼 미래값은 손상으로 간주 → 백오프 무시(억제 해제)
-  1) if meta["blocked_sig"] == op_sig:
+  0) if meta["blocked_sig"] is not None and meta["blocked_reason"] == "unsupported":
+         if meta["blocked_capability_sig"] == capability_sig:
+             return (DB 조회 없음)  # unsupported 영구 장애 억제 — op_sig와 무관, capability_sig로만 판정
+         # capability_sig 불명/변경(앱·lancedb 업데이트) → 억제 해제, 아래로 진행
+  1) elif meta["blocked_sig"] == op_sig:
          return (DB 조회 없음)      # 대량삭제 차단 상태 — 동일 설정으론 자동 재시도 안 함
   2) if meta["failed_sig"] == op_sig and next_retry_ts가 유효 범위 and now < next_retry_ts:
          return (DB 조회 없음)      # 일시적 실패 백오프(기본 30분, config화)
@@ -229,7 +240,7 @@ state 기반이라 무관 — 변경 없음.
                    # Arrow 컬럼 직접 순회 — pandas 변환 생략
       (이하 기존과 동일: 소속 판정 → 대량삭제 차단 → dry_run → 삭제 → optimize)
       성공 완료: meta["reconciled_sig"]=op_sig; meta["last_purge_ts"]=now;
-                 failed_sig·blocked_sig·next_retry_ts 해제                # 원자 갱신
+                 failed_sig·blocked_sig·blocked_reason·blocked_capability_sig·next_retry_ts 모두 해제  # 원자 갱신
                  # 커밋 규칙(리뷰6 m-2, 대안1): 성공 메타는 **메모리에 즉시 승격**하고 sidecar
                  # 저장은 결과에 영향 없음 — 저장 실패 시 현 프로세스는 정상 스킵을 계속하고
                  # (매분 O(N) 재조회 방지), **재시작 후에만** 보수적으로 재실행된다(멱등이라
@@ -238,8 +249,12 @@ state 기반이라 무관 — 변경 없음.
                  **meta["reconciled_sig"] 해제**   # 실패한 op_sig의 성공 스킵 자격 무효화 —
                  # 백오프 만료 후 이전 성공 메타가 3)을 참으로 만들어 재시도를 24h까지
                  # 가로막는 결함 방지(리뷰4 B-2, 대안2 채택: 별도 강제분기보다 상태가 단순)
-      대량삭제 차단: meta["blocked_sig"]=op_sig + 기존 UI 알림(1회) —
+      대량삭제 차단: meta["blocked_sig"]=op_sig; meta["blocked_reason"]="mass_delete" + 기존 UI 알림(1회) —
                  구성·차단율 변경으로 op_sig가 바뀌어야 재실행
+      unsupported(projection API 비호환, `AttributeError`): meta["blocked_sig"]=op_sig;
+                 meta["blocked_reason"]="unsupported"; meta["blocked_capability_sig"]=capability_sig
+                 + UI 알림(capability_sig 변화 기준 1회) — **24h 강제 reconciliation 예외**
+                 (시간이 아니라 capability_sig 변화로만 재검증, 리뷰14/15 M-1)
   # 실패·차단 상태는 sidecar 저장과 **무관하게 프로세스 내 메모리에 즉시 반영**(리뷰4 M-2) —
   # sidecar 저장 실패(권한·디스크·백신 잠금)여도 현재 프로세스에서는 억제·알림 1회가 유지된다.
   # 저장 실패는 ERROR 로그로 관측, 다음 메타 갱신 기회에 자연 재시도.
@@ -296,12 +311,12 @@ meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_stat
   `indexing_needed` 알림이 발행되는지(fail-closed) 통합 검증.
 - 사내 실측: 유휴 방치 1시간 동안 작업관리자 RSS 추이 — 수정 전(우상향 눌러앉음) 대비 평탄화 확인.
   lancedb 실환경에서 projection API의 컬럼 미로드(pushdown) 실측(리뷰 '확인 필요' 반영).
-- **성능 수용 — 필수(리뷰5 m-2, 리뷰11 m-1로 승격, 리뷰12 m-2 → 리뷰13 M-3/m-1 → 리뷰14 M-3로
-  절차 재정정)**: 결과 스키마에 벡터/원문이 없다는 사실과 약 6배 속도 향상은 강한 정황이지만,
-  projection이 저장소 스캔 단계에서 실제로 컬럼을 건너뛴다는 직접 증거는 아니다(리뷰11 m-1
-  지적) — 배포 전 아래 절차로 **필수** 확보한다. (리뷰12 m-2가 제시한 "동일 프로세스에서
-  `ru_maxrss` 5회 반복 차분" 방식은 `ru_maxrss`가 프로세스 수명 **누적** peak라 첫 회 이후
-  차분이 구조적으로 0에 수렴해 거짓 합격할 수 있음이 리뷰13 M-3에서 지적돼 폐기했다.)
+- **성능 수용 — 필수(리뷰5 m-2, 리뷰11 m-1로 승격, 리뷰12 m-2 → 리뷰13 M-3/m-1 → 리뷰14 M-3 →
+  리뷰15 m-1로 절차 재정정)**: 결과 스키마에 벡터/원문이 없다는 사실과 약 6배 속도 향상은 강한
+  정황이지만, projection이 저장소 스캔 단계에서 실제로 컬럼을 건너뛴다는 직접 증거는 아니다
+  (리뷰11 m-1 지적) — 배포 전 아래 절차로 **필수** 확보한다. (리뷰12 m-2가 제시한 "동일
+  프로세스에서 `ru_maxrss` 5회 반복 차분" 방식은 `ru_maxrss`가 프로세스 수명 **누적** peak라
+  첫 회 이후 차분이 구조적으로 0에 수렴해 거짓 합격할 수 있음이 리뷰13 M-3에서 지적돼 폐기했다.)
   - 테스트 DB: 10만 행, file_path는 사내 실사용 경로 분포를 대표하는 길이(30~200자 구간에서
     표본화)로 생성. 제거 대상 경로를 테이블의 앞·중간·끝 위치에 각각 배치해 반환 행 수와
     삭제 후보 분류의 완전성도 함께 확인한다(리뷰13 m-1).
@@ -311,11 +326,19 @@ meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_stat
     순회는 warm-up에 절대 포함하지 않는다(리뷰14 M-3: 측정 대상과 동일한 전체 쿼리를
     warm-up에서 먼저 실행하면 CPython/pyarrow가 해제 후에도 OS에 반환하지 않는 메모리가
     baseline에 흡수돼, 이후 "max - baseline" 차분이 실제 첫 purge 비용을 과소평가하는
-    거짓 합격을 만든다). baseline 확정 후 강제 reconciliation(프로젝션 쿼리 전체 스캔 + Arrow
-    순회 + 삭제 대상 구성 + `optimize()`까지 포함한 end-to-end, **프로세스 최초 1회**)을
-    실행하는 동안 짧은 간격(예: 50ms)으로 RSS를 샘플링해 `max(sampled_rss) - baseline_rss`를
-    그 프로세스의 추가 할당량으로 기록한다. RSS 측정은
-    `psutil.Process().memory_info().rss`(Windows 포함 크로스플랫폼) 사용.
+    거짓 합격을 만든다). baseline 확정 후 **두 단계를 분리 측정**한다(리뷰15 m-1 — 샘플링
+    누락으로 인한 짧은 피크 오차와, projection/optimize 중 어느 단계가 메모리를 쓰는지 원인
+    분석 불가 문제를 함께 완화):
+    1. **projection + Arrow 순회 단계**(`file_path` 컬럼 projection 쿼리 → Arrow 컬럼 추출)만
+       별도로 측정.
+    2. 이어서 **전체 end-to-end**(1 + 소속 판정 + 삭제 대상 구성 + `optimize()`)를 측정.
+    각 단계는 짧은 간격(예: 50ms 이하, 가능하면 10ms)으로 RSS를 샘플링해
+    `max(sampled_rss) - baseline_rss`를 기록한다. 샘플링 간격보다 짧게 유지되는 피크를 놓칠
+    수 있음을 감안해, 가능한 플랫폼(Windows)에서는 OS 수준 프로세스 피크 카운터(예:
+    `PeakWorkingSetSize`)를 함께 기록해 샘플링 오차를 상호 검증한다. **최종 NFR 합격 판정은
+    end-to-end(2) 결과로 한다** — 두 단계를 나눠 기록하는 목적은 판정이 아니라, 불합격 시
+    projection 자체의 회귀인지 `optimize()`의 별도 비용인지 원인 분석을 가능하게 하는 것.
+    RSS 측정은 `psutil.Process().memory_info().rss`(Windows 포함 크로스플랫폼) 사용.
     - 결과 검증: projection 반환 행 수가 실제 테이블 행 수와 일치하고, 앞·중간·끝에 배치한
       제거 대상 경로가 모두 삭제 후보로 분류되는지 확인(리뷰13 m-1 — 불일치 시 그 자체로
       불합격, 메모리 기준과 무관하게 회귀로 취급).

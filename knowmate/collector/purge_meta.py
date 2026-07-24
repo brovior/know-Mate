@@ -50,21 +50,45 @@ def is_valid_positive_seconds(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0
 
 
+PROJECTION_STRATEGY_VERSION = 1
+"""purge projection 호출 방식(`table.search().select([...]).to_arrow()`)의 내부 구현
+버전 — 이 값을 바꾸면(예: 호출 방식을 다른 API로 교체) 배포 lancedb 버전이 그대로여도
+capability_sig가 바뀌어 unsupported 억제가 재검증된다(설계 리뷰 15차 M-1)."""
+
+
 def compute_capability_sig() -> str:
-    """projection API 가용성에 영향을 주는 배포 환경 지문(lancedb 버전).
+    """projection API 가용성에 영향을 주는 배포 환경 지문 — lancedb 버전 + 앱 버전 +
+    projection 호출 방식 버전의 canonical JSON SHA-256.
 
     `op_sig`(폴더·설정 기반)와 달리 `"unsupported"` 억제 해제는 **watch_folders가
     아니라 앱/의존성 업데이트에 반응**해야 한다(설계 리뷰 14차 M-1) — projection API
-    미지원은 폴더 구성과 무관한 환경 문제이므로, op_sig가 그대로여도 lancedb 버전이
-    바뀌면(사용자가 안내대로 앱을 업데이트하면) 억제를 해제하고 재검증해야 한다.
-    lancedb import 실패 등 조회 자체가 안 되는 극단적 상황은 "unknown"으로 취급해
-    안전하게(억제 미해제 방향이 아니라 재시도 방향으로) 폴백한다.
+    미지원은 폴더 구성과 무관한 환경 문제이므로, op_sig가 그대로여도 이 지문이 바뀌면
+    (사용자가 안내대로 앱을 업데이트하면) 억제를 해제하고 재검증해야 한다. lancedb
+    버전만으로는 **동일 lancedb 버전에서 앱 쪽 projection 호출 코드만 수정한 업데이트**를
+    식별하지 못하는 결함이 있었다(설계 리뷰 15차 M-1) — 앱 버전과
+    `PROJECTION_STRATEGY_VERSION`을 함께 넣어, 의존성 변경과 앱 측 호환 구현 변경
+    양쪽 모두 재검증을 유도한다. 조회 자체가 실패하는 극단적 상황(lancedb/버전 정보
+    조회 예외)은 "unknown"이 섞인 지문으로 취급해 안전하게(억제 미해제 방향이 아니라
+    재시도 방향으로) 폴백한다.
     """
     try:
         import lancedb
-        return str(getattr(lancedb, "__version__", "unknown"))
+        lancedb_version = str(getattr(lancedb, "__version__", "unknown"))
     except Exception:
-        return "unknown"
+        lancedb_version = "unknown"
+
+    try:
+        from knowmate.version import __version__ as app_version
+    except Exception:
+        app_version = "unknown"
+
+    payload = {
+        "lancedb_version": lancedb_version,
+        "app_version": app_version,
+        "projection_strategy": PROJECTION_STRATEGY_VERSION,
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _normalize_path_str(s: str) -> str:

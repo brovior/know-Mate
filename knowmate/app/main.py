@@ -288,20 +288,26 @@ class MainWindow(QMainWindow):
 
         # 워커 종료 에스컬레이션(정상→강제→하드)은 lifecycle.stop_worker로 분리
         # (PyQt6 비의존이라 단위 테스트 가능). 스케줄러·트레이 정리는 위에서 이미 시도함.
+        # 반환값(terminate() 사용 여부)은 finalize_shutdown의 force_hard_exit로 그대로
+        # 넘긴다(설계 리뷰 15차 B-1) — 예외로 이탈하면 "판정 불가"와 동일하게 False로
+        # 취급해 finalize_shutdown의 isRunning() 재조회에 맡긴다.
+        terminated = False
         try:
             from knowmate.app.lifecycle import stop_worker
-            stop_worker(getattr(self._bridge, "_worker", None))
+            terminated = stop_worker(getattr(self._bridge, "_worker", None))
         except Exception as exc:
             logger.warning("워커 정리 중 예외: %s", exc)
 
         # 최종 판정 — 항상 도달한다. stop_worker()가 정상 반환했다면 워커는 이미 멈췄지만,
         # stop_worker() 자체가 예외로 이탈했을 경우를 대비해 워커 실행 여부를 다시 조회한다.
-        # 비실행 확인 시 quit(), 실행 중이거나 조회 자체가 실패(판정 불가)하면 보수적으로
-        # hard_exit — quit과 hard_exit는 정확히 하나만 실행된다.
+        # 비실행 확인 시 quit(), 실행 중이거나 조회 자체가 실패(판정 불가)하거나 terminate()로
+        # 강제 중단됐으면(락 보유 가능성) 보수적으로 hard_exit — quit과 hard_exit는 정확히
+        # 하나만 실행된다.
         from knowmate.app.lifecycle import finalize_shutdown
         finalize_shutdown(
             getattr(self._bridge, "_worker", None),
             quit_fn=QApplication.instance().quit,
+            force_hard_exit=terminated,
         )
 
 

@@ -109,11 +109,21 @@ def _default_hard_exit(code: int = 0) -> None:
     os._exit(code)
 
 
-def stop_worker(worker, hard_exit=_default_hard_exit) -> None:
+def stop_worker(worker, hard_exit=_default_hard_exit) -> bool:
     """워커를 정상 종료 → 실패 시 강제 종료 → 그래도 실패 시 프로세스 하드 종료.
 
     worker: cancel()/isRunning()/wait(ms)->bool/terminate() 를 갖는 객체(또는 None).
     hard_exit: 최종 프로세스 종료 콜백(기본 os._exit 래퍼, 테스트 주입용).
+
+    반환값: `terminate()`가 이번 호출에서 사용됐는지(bool). 호출부(`finalize_shutdown`)가
+    이 값을 `force_hard_exit`로 넘겨야 한다(설계 리뷰 15차 B-1) — `QThread.terminate()`는
+    스레드를 임의 지점에서 강제 중단하므로, 그 결과 `isRunning()`이 False가 되더라도
+    "정상 종료"로 취급할 수 없다. 강제 중단된 스레드가 로깅 핸들러 락·LanceDB 파일 락 등을
+    쥔 채 사라졌을 수 있고(9차 B-1이 같은 이유로 하드 종료 경로에서 `logging.shutdown()`을
+    제거한 근거와 동일), `terminate()` 이후 `quit()`으로 넘어가면 그 락이 정상 인터프리터
+    종료를 블록하거나, `app.exec()`가 어쨌든 반환돼 dirty-shutdown marker가 지워지는
+    false negative(실제로는 강제 중단이 있었는데 다음 시작에서 정상 종료로 오인)가 생긴다.
+    따라서 `terminate()`가 한 번이라도 쓰이면 그 이후는 항상 하드 종료로 수렴시킨다.
 
     하드 종료 경로는 어떤 파일 I/O·정리 코드도 거치지 않고 hard_exit만 호출한다
     (설계 리뷰 9·11차 B-1 — "하드 종료는 무조건·즉시" 불변식). 강제 종료 감지는
@@ -121,31 +131,43 @@ def stop_worker(worker, hard_exit=_default_hard_exit) -> None:
     시작·정상종료 시점에 담당한다.
     """
     if worker is None or not worker.isRunning():
-        return
+        return False
 
     worker.cancel()
     # 현재 처리 중인 파일 완료 후 정상 종료 대기
     if worker.wait(_WAIT_GRACEFUL_MS):
-        return
+        return False
 
     # COM Open 등에 블로킹돼 취소 플래그를 못 본 상태 → 스레드 강제 종료
     logger.warning("워커가 제때 종료되지 않음(COM 블로킹 추정) — 스레드 강제 종료")
     worker.terminate()
     if worker.wait(_WAIT_AFTER_TERMINATE_MS):
-        return
+        # terminate()가 스레드를 멈추는 데는 성공했지만, 임의 지점에서 강제 중단된 것이라
+        # 락을 보유한 채 죽었을 가능성이 있어 "정상 종료"로 취급하지 않는다(리뷰15 B-1) —
+        # 호출부가 이 반환값을 finalize_shutdown(force_hard_exit=True)로 넘겨야 한다.
+        logger.error("워커 스레드가 강제 종료됨(terminate) — 락 보유 가능성으로 하드 종료 강제")
+        return True
 
     # 강제 종료 후에도 잔존 → 프로세스 하드 종료(사용자가 의도한 종료이므로 0)
     logger.error("워커 스레드가 강제 종료 후에도 잔존 — 프로세스 하드 종료(os._exit)")
     hard_exit(0)
+    return True
 
 
-def finalize_shutdown(worker, quit_fn, hard_exit=_default_hard_exit) -> None:
-    """종료 최종 판정 — quit_fn(워커 비실행 확인) 또는 hard_exit(실행 중·판정 불가) 중 정확히 하나.
+def finalize_shutdown(worker, quit_fn, hard_exit=_default_hard_exit, force_hard_exit: bool = False) -> None:
+    """종료 최종 판정 — quit_fn(워커 비실행 확인) 또는 hard_exit(실행 중·판정 불가·강제중단됨) 중 정확히 하나.
 
     _shutdown()의 앞 단계(scheduler.stop/tray.hide/stop_worker)가 예외로 이탈하더라도 항상
     도달해야 하는 마지막 안전망(설계 A-0001). stop_worker()가 정상 반환했다면 워커는 이미
     멈춘 상태이지만, stop_worker() 자체가 예외를 던졌거나 isRunning() 조회 자체가 실패하면
     "판정 불가" 상태이므로 quit()만으로는 QThread가 잔존할 수 있어 보수적으로 hard_exit한다.
+
+    force_hard_exit: `stop_worker()`가 `terminate()`를 사용했으면(반환값 True) 호출부가
+    이 값을 그대로 넘겨야 한다(설계 리뷰 15차 B-1). `terminate()`는 스레드를 임의 지점에서
+    강제 중단하므로 이후 `isRunning()`이 False가 되어도 "정상 종료"가 아니다 — 락을 쥔 채
+    죽었을 수 있어 `quit()`으로 넘어가면 인터프리터 종료가 블록되거나, `app.exec()`가
+    반환돼 dirty-shutdown marker가 false negative로 지워질 수 있다. 이 플래그가 True면
+    `isRunning()` 값과 무관하게 항상 `hard_exit()`한다.
 
     강제 종료 표식(clear_dirty_shutdown) 해제는 **여기서 하지 않는다**(설계 리뷰 13차 M-1).
     `quit_fn()`(QApplication.quit)은 이벤트 루프 종료를 "요청"할 뿐 프로세스의 정상 종료
@@ -160,6 +182,11 @@ def finalize_shutdown(worker, quit_fn, hard_exit=_default_hard_exit) -> None:
     hard_exit: 최종 프로세스 종료 콜백(기본 os._exit 래퍼, 테스트 주입용). **파일 I/O 없이**
         즉시 실행되어야 한다(리뷰11 B-1).
     """
+    if force_hard_exit:
+        logger.error("워커가 terminate()로 강제 중단됨 — 락 보유 가능성으로 정상 quit 대신 하드 종료")
+        hard_exit(0)
+        return
+
     try:
         is_running = worker is not None and worker.isRunning()
     except Exception as exc:

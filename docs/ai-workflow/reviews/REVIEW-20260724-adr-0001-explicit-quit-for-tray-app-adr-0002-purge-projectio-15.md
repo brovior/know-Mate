@@ -51,3 +51,16 @@
 - 소스 코드가 제공되지 않아 `terminate()` 성공 후 실제 반환값, `finalize_shutdown()` 분기, unsupported 메타 필드 및 판정 순서가 문서와 동일하게 구현됐는지 확인이 필요하다.
 - `AttributeError` 분류가 `.select()` 메서드 부재에만 좁게 적용되는지 확인이 필요하다. 넓은 호출 구간의 모든 `AttributeError`를 unsupported로 분류하면 데이터·드라이버의 다른 결함을 영구 억제로 오분류할 수 있다.
 - watch folder에 상대 경로가 허용되는지 확인이 필요하다. 허용된다면 `abspath()` 결과가 프로세스 시작 디렉터리에 의존하므로 op_sig와 소속 판정의 안정성을 위해 기준 디렉터리를 고정해야 한다.
+
+## 처리 기록 (중립 검토)
+
+| ID | 판단 | 사유/반영 |
+|---|---|---|
+| B-1 | 수용 | `stop_worker()`가 `terminate()` 사용 여부를 bool로 반환하도록 변경(그래프풀 성공=False, terminate 성공/실패 둘 다=True). `_shutdown()`이 이 값을 `finalize_shutdown(force_hard_exit=)`로 전달, `force_hard_exit=True`면 `isRunning()` 값과 무관하게 항상 `hard_exit()`한다. 리뷰가 제시한 대안 중 "terminate() 후 항상 hard_exit"(대안 1의 핵심)을 반환값 전파 방식으로 채택 — "graceful 후 terminate 생략, 바로 hard_exit"(더 단순한 대안)은 terminate()가 COM 등 일부 행오버를 실제로 풀어주는 경우까지 걷어내 불필요하게 보수적이라 기각. `knowmate/app/lifecycle.py`, `knowmate/app/main.py`. |
+| M-1 | 수용 | `compute_capability_sig()`를 lancedb 버전 단독에서 `{lancedb_version, app_version, projection_strategy}`의 canonical JSON SHA-256으로 확장 — 동일 lancedb 버전에서 앱 쪽 projection 호출 코드만 수정한 업데이트도 재검증을 유도한다. `PROJECTION_STRATEGY_VERSION` 상수로 호출 방식 자체가 바뀌는 경우도 커버. `knowmate/collector/purge_meta.py`. |
+| M-2 | 수용 | A-0002의 sidecar "전체 필드" 목록·판정 순서 의사코드에 `blocked_reason`·`blocked_capability_sig`를 반영하고, unsupported capability 억제를 대량삭제 차단보다 먼저 검사하는 0단계로 명문화. 이 필드들은 리뷰12/14에서 이미 코드에 구현돼 있었으나 이 표·의사코드에 반영되지 않아 지적대로 문서-코드 불일치가 있었음을 인정 — 문서만 갱신. `docs/ai-workflow/architecture.md`. |
+| m-1 | 수용 | 성능 수용 절차를 "projection+Arrow 순회 단계"와 "전체 end-to-end(+optimize)" 2단계로 나눠 각각 샘플링하도록 재작성(원인 분석 가능성 확보) + 가능하면 OS 피크 카운터(`PeakWorkingSetSize`)를 병행 기록해 샘플링 오차를 상호 검증하도록 명시. 최종 NFR 합격 판정은 지적대로 end-to-end 결과로 유지(리뷰가 제시한 대안 그대로). `docs/ai-workflow/architecture.md`. |
+
+**확인 필요 대응**: `AttributeError` 분류는 이미 `table.search().select()` 호출 지점 1곳에서만 좁게 캐치하고 있음을 코드 재확인(리뷰11 M-2 이후 유지) — 별도 조치 불필요. watch folder 상대 경로 허용 여부는 이번 설계 범위 밖의 기존 동작(config 로더)이라 이번 라운드에서는 다루지 않음 — 별도 이슈로 후속 검토 필요 시 제기.
+
+**종결 판정**: B-1(Blocker)·M-1·M-2(Major 2건) 모두 실질적 결함으로 확인돼 수정 반영. m-1도 수용. Blocker/Major 잔존 0건.
