@@ -21,8 +21,17 @@ _WAIT_AFTER_TERMINATE_MS = 3000
 
 
 def _default_hard_exit(code: int = 0) -> None:
-    """로그를 flush하고 프로세스를 즉시 종료한다(마지막 수단)."""
-    logging.shutdown()
+    """프로세스를 무조건·즉시 종료한다(마지막 수단 — 어떤 정리 코드도 먼저 실행하지 않음).
+
+    이전에는 os._exit() 전에 logging.shutdown()으로 로그를 flush했지만, 이는 하드
+    종료의 "무조건 종료" 불변식을 깰 수 있다: QThread.terminate()는 스레드를 임의
+    지점에서 강제 중단하는데, 그 지점이 하필 logging 핸들러 락(RLock)을 쥔 채
+    logger.info() 등을 호출하던 중이라면 그 락은 영원히 풀리지 않는다. 그러면 메인
+    스레드의 logging.shutdown()이 그 락을 기다리며 영구 대기해, 최후 안전망이어야 할
+    hard_exit 자체가 멈추는 모순이 생긴다(설계 리뷰 9차 B-1). 하드 종료 경로에서는
+    로그 flush를 포기하고 os._exit()만 호출한다 — 로그 유실은 감수하되(정상/graceful
+    종료 경로에서는 여전히 flush됨) "반드시 종료된다"는 최상위 불변식을 지킨다.
+    """
     os._exit(code)
 
 

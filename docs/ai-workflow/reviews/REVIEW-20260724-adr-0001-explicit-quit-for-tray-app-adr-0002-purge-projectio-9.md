@@ -63,3 +63,16 @@
 - 실제 채택된 LanceDB projection 호출, 고정 패키지 버전, 컬럼 pushdown 실측 결과를 확인해야 한다.
 - `_default_hard_exit`가 실제로 `logging.shutdown()`을 동기 호출하는지와 `QThread.terminate()` 이후 해당 경로가 실행되는지 소스 확인이 필요하다.
 - LanceDB 쓰기·삭제·optimize 중 프로세스 강제 종료 후 DB 재개방 및 전체 재인덱싱 복구 테스트 결과를 확인해야 한다.
+
+---
+
+## 처리 기록 (Claude, 2026-07-24)
+
+| ID | 판단 | 사유 / 반영 커밋 |
+|---|---|---|
+| B-1 | 수용 | 실제 결함 확인 — `_default_hard_exit`가 `logging.shutdown()` 후 `os._exit()`를 호출했는데, `QThread.terminate()`가 로깅 핸들러 락을 쥔 채 스레드를 강제 중단시키면 그 락을 영원히 기다려 최후 안전망(하드 종료) 자체가 멈추는 모순이었음. `logging.shutdown()` 호출을 제거하고 즉시 `os._exit()`만 실행(대안 1 채택). 회귀 테스트(`TestDefaultHardExit`) 추가, architecture.md 정합화 → 반영: 구현 PR #60 후속 커밋 |
+| M-1 | 수용 | Accepted 상태인데 문서가 기각한 API(`to_lance()`)를 아직 명시하고 있던 것은 실제 오류 — architecture.md·ADR-0002를 실제 구현·검증된 `table.search().select(["file_path"]).to_arrow()`로 갱신, lancedb 0.34.0 실측 결과(컬럼만 실림·약 6배 빠름·숨은 limit 없음) 기록 |
+| M-2 | 수용 | "커밋 원자성 미검증"과 "잃는 것은 state뿐"이 한 문단 안에서 모순된다는 지적 타당 — 후자의 단정적 문장을 제거하고 불확실성을 일관되게 서술. 자동 손상 감지·복구 구현 자체는 8차 리뷰에서 이미 "검증 불가능한 추측성 로직" 근거로 보류 결정했고 이번에도 같은 판단 유지(실패 모드 표에 후속 과제로 명시) — 반복 지적이나 새로 제기된 "문서 내부 모순"만 수정, 신규 구현은 미추가 |
+| m-1 | 수용 | architecture.md 최상위 상태 테이블을 Draft에서 Accepted(2026-07-24)로 갱신 |
+
+**종결 판정**: Blocker 1건·Major 2건·Minor 1건 전건 수용·반영, 신규 미해결 항목 없음.

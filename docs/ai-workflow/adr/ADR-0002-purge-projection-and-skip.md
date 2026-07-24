@@ -36,9 +36,12 @@
 취급(억제 해제). 메타 부재·타입/범위 이상은 부재와 동일 취급(스킵 없이 실행). purge 성공 후 메타
 저장 실패의 재실행은 삭제(file_path 기준)·optimize의 멱등성으로 안전. ⑤ op_sig는 스키마 버전을 포함한 canonical JSON(sort_keys·고정
 separator·UTF-8)의 SHA-256이며, 경로는 서명·소속판정 공용 정규화 함수 1개의 결과만 사용.
-⑥ projection 조회는 Arrow 컬럼 직접 순회(pandas 변환 생략). 배포 고정 lancedb 버전에서 공개
-projection API와 컬럼 pushdown을 구현 착수 시 검증하는 것이 **채택 전제조건**이며, 미지원이면
-이 변경을 배포하지 않는다(호환 전체-로드 모드를 두지 않음).
+⑥ projection 조회는 **`table.search().select(["file_path"]).to_arrow()`**로 확정(Arrow 직접
+순회, pandas 변환 생략). lancedb 0.34.0에서 실측 검증됨(결과 스키마에 `file_path`만 실림, 전체
+로드 대비 약 6배 빠름, 숨은 기본 limit 없음 — 상세는 architecture.md § 핵심 결정과 트레이드오프).
+검토했던 `table.to_lance().to_table(columns=[...])`는 별도 `pylance` 설치가 필요해 기각. 미지원
+lancedb 버전에서는 `.select()` 호출 자체가 예외로 실패해 DB 조회 실패로 처리되고 purge는 백오프로
+자연 대응한다(호환 전체-로드 모드를 두지 않음 — 조용한 폴백 금지).
 
 ## 검토한 대안 (Alternatives)
 | 대안 | 장점 | 단점 | 기각 사유 |

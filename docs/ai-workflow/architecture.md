@@ -2,7 +2,7 @@
 
 | 상태 | 마지막 갱신 | 연결 문서 |
 |---|---|---|
-| Draft | (채택일로 갱신) | requirements.md, adr/, reviews/ |
+| Accepted (A-0001·A-0002 모두) | 2026-07-24 | requirements.md, adr/, reviews/ |
 
 > **사용법**: requirements.md의 Approved 요구를 받아 설계 블록을 작성한다.
 > 상태 흐름: Draft → (GPT 독립 검증 = reviews/REVIEW-*.md) → Reviewed → (Claude 최종 확정) → Accepted.
@@ -90,8 +90,11 @@ X (close_action=tray) → event.ignore() + hide()               # 종료 아님(
    (`CollectorWorker._run_cycle`의 취소 분기·정상 완료 경로 모두 `save_state` 후 종료 — 기존 코드).
    `save_state`는 tmp→replace **원자 교체**(기존 `test_atomic_save_uses_tmp_then_replace`로 보장).
 3. **COM 정리**: 워커 `run()`의 finally가 `quit_com_apps()`로 소유 Office를 정리(기존 코드).
-4. **로그 flush**: 정상 경로는 인터프리터 종료 시 `logging.shutdown()`(atexit), 하드 종료 경로는
-   `_default_hard_exit`가 명시적으로 `logging.shutdown()` 후 `os._exit`(기존 코드).
+4. **로그 flush**: 정상 경로(quit → 정상 인터프리터 종료)는 `logging.shutdown()`(atexit)이 flush를
+   보장한다. **하드 종료 경로는 flush를 포기하고 즉시 `os._exit()`만 호출한다**(설계 리뷰 9차 B-1) —
+   `logging.shutdown()`을 먼저 부르면, `QThread.terminate()`가 로깅 핸들러 락을 쥔 채로 스레드를
+   강제 중단시켰을 경우 그 락을 영원히 기다려 하드 종료(최후 안전망) 자체가 멈추는 모순이 생긴다.
+   하드 종료는 "반드시 종료된다"는 불변식이 로그 보존보다 우선한다.
 **단계별 실패 정책 (리뷰3 M-1 — "보장 후 quit"과 "예외 무관 quit"의 관계 명확화)**:
 위 계약은 **정상 경로**의 보장이고, 앞 단계가 실패한 경우는 데이터 무결성 예외로 다음과 같이
 처리한다(무결성 완주보다 "종료는 반드시 된다"를 우선 — R-0001 FR-1이 최상위):
@@ -102,11 +105,13 @@ X (close_action=tray) → event.ignore() + hide()               # 종료 아님(
   hard_exit(quit만으로는 QThread 잔존 가능 — 리뷰5 M-2, "실행 중 또는 판정 불가 → hard_exit").
   quit/hard_exit는 정확히 하나만 호출된다(ADR-0001 결정과 일치 — 리뷰5 M-1로 ADR 갱신).
 - terminate/`os._exit` 강제 경로에서는 계약 2·3(그 사이클의 state 저장·COM 정리)이 생략될 수
-  있다 — **최소한** 그 사이클의 state 갱신이 유실되며(다음 사이클 재인덱싱으로 자가 복구),
-  LanceDB 쓰기 도중이었다면 영향 범위는 LanceDB의 커밋 원자성에 의존한다(구현 단계에서 버전·API
-  근거 확인, 리뷰7 m-1 — 재시작 후 DB open·재인덱싱 복구 테스트 포함). 또한 8초
-  graceful 대기는 "정상적으로 오래 걸리는 추출"에도 만료될 수 있음을 인정한다 — 이 경우에도 종료
-  우선 원칙은 동일하며, 잃는 것은 그 사이클의 state 갱신뿐(자가 복구됨).
+  있다. 그 사이클의 state 갱신 유실은 확실하며 다음 사이클 재인덱싱으로 자가 복구된다. **다만
+  LanceDB 쓰기(add/delete/optimize) 도중 강제 종료됐을 경우의 영향 범위는 현재 미확정이다** —
+  커밋 원자성이 검증되지 않았으므로 "state 갱신만 잃는다"고 단정하지 않는다(리뷰9 M-2로 이전의
+  단정적 서술을 정정). 검증·복구 계획은 아래 "남은 한계" 항목 및 `docs/DESIGN.md` § 종료 확실화
+  참조 — 현재는 최악의 경우 인덱스 폴더 삭제 후 전체 재인덱싱이 항상 유효한 복구 경로임을
+  근거로 후속 과제화했다(추측성 자동 복구 로직 대신). 또한 8초 graceful 대기는 "정상적으로 오래
+  걸리는 추출"에도 만료될 수 있음을 인정한다 — 이 경우에도 종료 우선 원칙은 동일하다.
 
 **보조 실행 단위의 종료 계약 (리뷰4 M-1)**: 워커가 만드는 파이썬 스레드는 전부 **daemon**이다 —
 스캔 생산자 스레드는 `daemon=True`(scheduler.py `scan-producer`), 워치독 타이머는 daemon
@@ -123,6 +128,8 @@ daemon 사실이 성립하는 한 불필요 — 미도입).
 | `_shutdown()` 도중 예외 | 각 단계 독립 try/except(기존) | 다음 단계 계속 → **최종 판정에는 항상 도달**해 quit 또는 hard_exit 중 하나를 실행(리뷰6 M-1) |
 | 새 종료 경로 추가 시 `_shutdown()` 미경유 | 코드 리뷰 규칙 | `_quit_app`/`closeEvent` 외 종료 경로 금지 문서화 |
 | `_shutdown()` 중복 진입(근접한 이중 종료 요청) | `_shutdown_done` 플래그 | 멱등 가드 — 두 번째 진입은 즉시 반환. "정확히 하나"는 **프로세스 수명 기준**이며 중복 호출 테스트로 고정(리뷰6 m-1) |
+| 하드 종료 직전 `logging.shutdown()`이 로깅 핸들러 락 대기로 영구 블록 | 코드 검토 | `_default_hard_exit`는 `logging.shutdown()`을 호출하지 않고 즉시 `os._exit()`만 실행(리뷰9 B-1) — 로그 유실을 감수하고 종료 확실성을 우선 |
+| LanceDB 쓰기(add/delete/optimize) 도중 강제 종료 시 손상 범위 미확정 | 실제 손상 재현 불가(구현 단계 한계) | 자동 감지·복구는 추측성 위험 판단으로 미구현. "인덱스는 재생성 가능한 파생 데이터"라 최악의 경우 인덱스 폴더 삭제 후 재인덱싱이 항상 유효한 복구 경로 — 후속 과제화(리뷰8 M-1, 리뷰9 M-2) |
 
 ### 검증 계획
 - 사외 단위: `_shutdown()`이 각 단계(스케줄러 stop → stop_worker → quit) **순서대로** 호출하고,
@@ -222,9 +229,13 @@ meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_stat
   이 사이클은 O(N)이되 경로 데이터만 다룬다(R-0002 NFR-1 개정 문언과 일치 — 리뷰2 B-1/M-1 반영).
 
 ### 핵심 결정과 트레이드오프
-- 결정: projection 방식은 `table.search().select(["file_path"]).limit(...)` 대신
-  **`table.to_lance().to_table(columns=["file_path"])`** 계열(전건 조회에 limit 불필요·벡터 미로드)
-  을 1순위로 검토하되, 설치된 lancedb 0.6+ API에서 동작 확인 후 확정 → 근거·대안은 ADR-0002
+- 결정(확정, 구현 완료 — 리뷰9 M-1 반영): projection 방식은 **`table.search().select(["file_path"]).to_arrow()`**로
+  확정했다. 검토했던 `table.to_lance().to_table(columns=[...])`는 별도 `pylance` 패키지 설치가
+  추가로 필요해 기각. lancedb 0.34.0(이 저장소 개발 환경)에서 실측 검증: ① `.select()`로 지정한
+  컬럼(`file_path`)만 결과 스키마에 실림(vector·text 컬럼 자체가 응답에 없음 — "결과에서만 버리는"
+  방식이 아니라 요청한 컬럼만 스캔) ② 벡터 컬럼 포함 전체 로드 대비 20,000행 기준 약 6배 빠름
+  (0.046s vs 0.273s) ③ 벡터 쿼리 없이 호출해도 숨은 기본 limit이 없어 전건이 반환됨(500/500행
+  확인). → 근거·대안은 ADR-0002
 - 결정: 스킵 조건은 "op_sig(구성+dry_run+차단율) 불변 && 처리 0건 && 24h 미경과". 서명은 purge가
   **성공 완료된 경우에만** 갱신한다(실패·차단 시 미갱신 → 재시도 보존). → 근거는 ADR-0002
 - 결정: 메타는 sidecar 파일(index_state.meta.json) — 기존 state 스키마·소비자 무변경 (리뷰 M-2 반영)
@@ -234,7 +245,7 @@ meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_stat
 ### 실패 모드
 | 실패 | 감지 | 대응(격리/재시도/중단) |
 |---|---|---|
-| projection API가 배포 고정 lancedb 버전에 없음 | **구현 착수 시 검증(채택 전제조건)** | 미지원이면 이 변경을 배포하지 않는다(호환 전체-로드 모드 없음 — 요구와 모순되는 폴백 자체를 두지 않음, 리뷰3 M-2). requirements.txt에 검증된 버전 고정 |
+| projection API가 배포 고정 lancedb 버전에 없음 | `table.search().select([...])` 호출 자체가 `AttributeError`/예외로 실패 | DB 조회 실패로 처리되어 purge가 "failed" 결과 → 백오프로 자연 대응(호환 전체-로드 모드 없음 — 요구와 모순되는 폴백 자체를 두지 않음, 리뷰3 M-2). lancedb 0.34.0에서 실측 검증 완료(위 핵심 결정 참조), requirements.txt에 버전 검증 코멘트 기록 |
 | purge 도중 일시적 예외 | purge 반환/예외 | failed_sig+next_retry_ts 기록, 백오프(기본 30분) 중 **DB 조회 없이 return**(판정 1·2가 성공 스킵보다 선행 — 리뷰3 B-1) |
 | 대량삭제 차단 지속 | 차단 판정 | blocked_sig 기록 — 동일 op_sig 자동 재시도 안 함, 구성·차단율 변경 시에만 재실행, UI 알림 1회. 이 상태의 미복구는 FR-3 예외로 요구에 명문화(리뷰3 B-2) |
 | last_purge_ts가 미래값 | now < last_purge_ts | 성공 스킵 무효 → purge 실행(모든 미래값 무효) |

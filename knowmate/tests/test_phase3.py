@@ -1222,6 +1222,30 @@ class TestSingleInstance:
 # TestStopWorker — 종료 시 워커 정리 에스컬레이션 (PyQt6 무관)
 # ============================================================
 
+class TestDefaultHardExit:
+    """하드 종료 경로가 logging.shutdown()을 기다리지 않는지 검증한다(설계 리뷰 9차 B-1).
+
+    QThread.terminate()가 로깅 핸들러 락을 쥔 채로 스레드를 강제 중단시켰다면
+    logging.shutdown()이 그 락을 영원히 기다려, 최후 안전망이어야 할 하드 종료 자체가
+    멈추는 모순이 생긴다. 실제 os._exit는 프로세스를 죽이므로 pytest 안에서 직접
+    호출할 수는 없어, os._exit와 logging.shutdown을 각각 스파이로 치환해 호출 여부·
+    순서만 검증한다.
+    """
+
+    def test_does_not_call_logging_shutdown(self, monkeypatch):
+        import knowmate.app.lifecycle as lifecycle
+
+        shutdown_calls = []
+        exit_calls = []
+        monkeypatch.setattr(lifecycle.logging, "shutdown", lambda: shutdown_calls.append(1))
+        monkeypatch.setattr(lifecycle.os, "_exit", lambda code: exit_calls.append(code))
+
+        lifecycle._default_hard_exit(0)
+
+        assert exit_calls == [0]
+        assert shutdown_calls == []  # logging.shutdown()을 기다리지 않는다
+
+
 class TestStopWorker:
     """정상 종료 → 강제 종료 → 하드 종료 단계적 강제. 워커가 COM에 멈춰도
     트레이 [종료]가 프로세스를 반드시 끝내도록 보장하는 로직."""
