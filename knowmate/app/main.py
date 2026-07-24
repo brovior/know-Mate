@@ -52,6 +52,7 @@ class MainWindow(QMainWindow):
 
         self._tray: QSystemTrayIcon | None = None
         self._really_quit = False
+        self._shutdown_done = False
 
         self._view = QWebEngineView(self)
         self.setCentralWidget(self._view)
@@ -233,15 +234,28 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def _shutdown(self) -> None:
-        """스케줄러·워커·트레이를 정리한다. 종료 시에만 호출된다(트레이 숨김 경로 제외).
+        """스케줄러·워커·트레이를 정리하고 프로세스를 반드시 끝낸다. 종료 시에만 호출된다
+        (트레이 숨김 경로 제외).
 
-        워커가 COM Open 등에 블로킹돼 취소 플래그를 못 보는 경우(로그가 특정
-        파일에서 멈추는 행오버) 정상 종료가 안 돼 프로세스가 잔존하고 자원을
-        계속 물어 PC가 버벅일 수 있다. 그래서 정상 종료가 안 되면 스레드를 강제
-        종료하고, 그래도 남으면 프로세스를 하드 종료해 트레이 [종료]가 반드시
-        프로세스를 끝내도록 보장한다.
+        이전에는 이벤트 루프 종료를 Qt의 암묵 규칙(quitOnLastWindowClosed)에만 의존해,
+        창이 트레이로 숨겨진 상태에서는 "보이는 창이 닫히는" 사건이 없어 app.exec()가
+        영영 반환되지 않고 프로세스가 잔존했다(설계 ADR-0001). 이제 main()에서
+        setQuitOnLastWindowClosed(False)로 암묵 종료를 끄고, 이 메서드 마지막의 최종
+        판정(finalize_shutdown)이 창 가시성과 무관하게 항상 종료를 완수한다.
+
+        워커가 COM Open 등에 블로킹돼 취소 플래그를 못 보는 경우(행오버) 정상 종료가
+        안 되면 lifecycle.stop_worker가 스레드 강제 종료 → 프로세스 하드 종료로
+        에스컬레이션한다. 앞 단계(스케줄러 정지·트레이 숨김·stop_worker) 중 하나가
+        예외로 이탈해도 최종 판정에는 항상 도달한다 — quit() 또는 hard_exit() 중
+        정확히 하나만 실행된다.
         """
-        # 각 단계를 독립 try로 감싸 한 곳의 실패가 이후 정리(특히 워커 종료)를
+        # 근접한 이중 종료 요청(트레이 [종료]와 X가 거의 동시 등)이 스케줄러·워커 정리를
+        # 중복 실행하지 않도록 프로세스 수명 기준으로 1회만 수행한다.
+        if self._shutdown_done:
+            return
+        self._shutdown_done = True
+
+        # 각 단계를 독립 try로 감싸 한 곳의 실패가 이후 정리(특히 최종 판정)를
         # 건너뛰지 않게 한다.
         try:
             scheduler = getattr(self, "_idle_scheduler", None)
@@ -264,6 +278,16 @@ class MainWindow(QMainWindow):
             stop_worker(getattr(self._bridge, "_worker", None))
         except Exception as exc:
             logger.warning("워커 정리 중 예외: %s", exc)
+
+        # 최종 판정 — 항상 도달한다. stop_worker()가 정상 반환했다면 워커는 이미 멈췄지만,
+        # stop_worker() 자체가 예외로 이탈했을 경우를 대비해 워커 실행 여부를 다시 조회한다.
+        # 비실행 확인 시 quit(), 실행 중이거나 조회 자체가 실패(판정 불가)하면 보수적으로
+        # hard_exit — quit과 hard_exit는 정확히 하나만 실행된다.
+        from knowmate.app.lifecycle import finalize_shutdown
+        finalize_shutdown(
+            getattr(self._bridge, "_worker", None),
+            quit_fn=QApplication.instance().quit,
+        )
 
 
 def _inject_qwebchannel_js(view: QWebEngineView) -> None:
@@ -349,6 +373,11 @@ def main() -> None:
     _set_windows_app_id("AegisDesk.App")
     app = QApplication(sys.argv)
     app.setApplicationName("Aegis Desk")
+    # 트레이 상주 앱 표준 관용구: 창이 트레이로 숨겨진 상태(hide())에서는 "보이는 창이
+    # 닫히는" 사건 자체가 없어 기본값(True)으로는 lastWindowClosed가 오지 않아
+    # app.exec()가 반환되지 않는다(종료 프로세스 잔존의 원인 — 설계 ADR-0001). 종료는
+    # 전적으로 MainWindow._shutdown()의 명시적 quit()/hard_exit 판정에 맡긴다.
+    app.setQuitOnLastWindowClosed(False)
     if APP_ICON.exists():
         app.setWindowIcon(QIcon(str(APP_ICON)))
 

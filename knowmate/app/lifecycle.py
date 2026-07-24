@@ -49,3 +49,30 @@ def stop_worker(worker, hard_exit=_default_hard_exit) -> None:
     # 강제 종료 후에도 잔존 → 프로세스 하드 종료(사용자가 의도한 종료이므로 0)
     logger.error("워커 스레드가 강제 종료 후에도 잔존 — 프로세스 하드 종료(os._exit)")
     hard_exit(0)
+
+
+def finalize_shutdown(worker, quit_fn, hard_exit=_default_hard_exit) -> None:
+    """종료 최종 판정 — quit_fn(워커 비실행 확인) 또는 hard_exit(실행 중·판정 불가) 중 정확히 하나.
+
+    _shutdown()의 앞 단계(scheduler.stop/tray.hide/stop_worker)가 예외로 이탈하더라도 항상
+    도달해야 하는 마지막 안전망(설계 A-0001). stop_worker()가 정상 반환했다면 워커는 이미
+    멈춘 상태이지만, stop_worker() 자체가 예외를 던졌거나 isRunning() 조회 자체가 실패하면
+    "판정 불가" 상태이므로 quit()만으로는 QThread가 잔존할 수 있어 보수적으로 hard_exit한다.
+
+    worker: cancel()/isRunning()/wait(ms)->bool/terminate() 를 갖는 객체(또는 None).
+    quit_fn: () -> None, 워커 비실행이 확인됐을 때 호출할 정상 종료 콜백(QApplication.quit 등).
+    hard_exit: 최종 프로세스 종료 콜백(기본 os._exit 래퍼, 테스트 주입용).
+    """
+    try:
+        is_running = worker is not None and worker.isRunning()
+    except Exception as exc:
+        logger.warning("워커 실행 상태 조회 실패(판정 불가) — 보수적으로 하드 종료: %s", exc)
+        hard_exit(0)
+        return
+
+    if is_running:
+        logger.error("최종 판정 시점에도 워커가 실행 중 — 프로세스 하드 종료(os._exit)")
+        hard_exit(0)
+        return
+
+    quit_fn()

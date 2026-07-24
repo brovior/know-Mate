@@ -32,6 +32,11 @@ collector:
   com_timeout_base_sec: 60     # 크기 무관 기본 여유(Open + 오버헤드)
   com_timeout_per_mb_sec: 20   # MB당 가산(셀 단위 COM 왕복이 느린 대형 파일 보호)
   com_timeout_max_sec: 600     # 상한(안전망)
+  # purge(제거된 폴더 청크 정리) 스킵/강제 reconciliation — 유휴 방치 중 매 사이클
+  # LanceDB 전체를 로드하지 않도록, 구성 불변+처리 0건이면 스킵하되 아래 주기로
+  # 강제 재확인한다. 일시적 실패는 이 간격만큼 재시도를 늦춘다.
+  purge_force_reconcile_sec: 86400  # 24시간 — 스킵이 계속돼도 이 주기로 강제 1회 실행
+  purge_backoff_sec: 1800           # 30분 — purge 일시 실패 후 재시도 대기
 cleanup:
   dry_run: true
   max_delete_ratio: 0.3

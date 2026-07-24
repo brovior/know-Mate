@@ -290,7 +290,7 @@ def _make_worker(tmp_path: Path, watch_folder: str):
     extractor = FakeReader()
     config = _make_config(watch_folder)
     state_file = tmp_path / "state.json"
-    return CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file), indexer, state_file
+    return CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json"), indexer, state_file
 
 
 class TestCollectorWorker:
@@ -327,7 +327,7 @@ class TestCollectorWorker:
         config = _make_config(str(folder))
         state_file = tmp_path / "state.json"
 
-        worker = CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file)
+        worker = CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json")
         worker.run()
 
         from knowmate.collector.state import load_state
@@ -339,7 +339,7 @@ class TestCollectorWorker:
         f.write_bytes(b"modified content - different from original")
 
         # 같은 indexer 재사용 (DB 재생성 충돌 방지)
-        worker2 = CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file)
+        worker2 = CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json")
         worker2.run()
 
         state2 = load_state(state_file)
@@ -374,7 +374,7 @@ class TestCollectorWorker:
             "chunking": {"chunk_size": 400, "overlap": 80},
         }
         state_file = tmp_path / "state.json"
-        worker = CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file)
+        worker = CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json")
         worker.run()
 
         from knowmate.collector.state import load_state
@@ -384,7 +384,7 @@ class TestCollectorWorker:
         del_path = str(files[0])
         files[0].unlink()
 
-        worker2 = CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file)
+        worker2 = CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json")
         worker2.run()
 
         # orphan 파일의 청크가 soft delete 마킹되었는지 확인
@@ -446,7 +446,7 @@ class TestCollectorWorker:
         indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
         config = _make_config(str(folder))
         state_file = tmp_path / "state.json"
-        worker = CollectorWorker(config=config, indexer=indexer, extractor=FailingExtractor(), state_file=state_file)
+        worker = CollectorWorker(config=config, indexer=indexer, extractor=FailingExtractor(), state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json")
 
         finished_msgs = []
         worker.finished.connect(finished_msgs.append)
@@ -590,6 +590,7 @@ class TestQueuePriority:
         worker = CollectorWorker(
             config=_make_config(str(folder)), indexer=indexer,
             extractor=FakeReader(), state_file=state_file,
+            purge_meta_file=tmp_path / "purge_meta.json",
         )
         worker.run()
 
@@ -651,6 +652,7 @@ class TestDrmIdleSkip:
         indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
         worker = CollectorWorker(
             config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
+            purge_meta_file=tmp_path / "purge_meta.json",
             get_idle_seconds=lambda: 200.0,  # 임계(100) 초과 상태를 실시간으로 보고
         )
         worker.run()
@@ -679,6 +681,7 @@ class TestDrmIdleSkip:
         indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
         worker = CollectorWorker(
             config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
+            purge_meta_file=tmp_path / "purge_meta.json",
             get_idle_seconds=lambda: 5.0,  # 방금 활동함 → 스킵 안 함
         )
         worker.run()
@@ -723,6 +726,7 @@ class TestDrmIdleSkip:
 
         worker = CollectorWorker(
             config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
+            purge_meta_file=tmp_path / "purge_meta.json",
             get_idle_seconds=_idle,
         )
         worker.run()
@@ -754,6 +758,7 @@ class TestDrmIdleSkip:
         indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
         worker = CollectorWorker(
             config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
+            purge_meta_file=tmp_path / "purge_meta.json",
             get_idle_seconds=lambda: 99999.0,  # 아주 긴 유휴
         )
         worker.run()
@@ -881,6 +886,116 @@ class TestPurgeRemovedFolders:
         # UI 알림 발행됨
         assert len(alerts) == 1
         assert "대량 삭제" in alerts[0]
+
+
+# ============================================================
+# TestPurgeMetaIntegration — CollectorWorker + purge_meta 스킵/강제 reconciliation 통합
+# ============================================================
+
+class TestPurgeMetaIntegration:
+    """유휴 방치 중(변경 0건) purge DB 조회가 실제로 스킵되는지, 구성 변경 시
+    즉시 재실행되는지를 full-cycle(run())로 검증한다(설계 A-0002 AC-2)."""
+
+    def _make_worker_with_meta(self, tmp_path: Path, indexer, watch_folder: str, meta_file: Path):
+        from knowmate.secure.fake_reader import FakeReader
+        from knowmate.collector.scheduler import CollectorWorker
+
+        config = _make_config(watch_folder)
+        state_file = tmp_path / "state.json"
+        return CollectorWorker(
+            config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
+            purge_meta_file=meta_file,
+        )
+
+    def test_first_cycle_runs_purge_no_prior_meta(self, tmp_path: Path):
+        """메타가 없는 첫 사이클은 purge를 실행하고(스킵하지 않고) 메타를 남긴다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from unittest.mock import patch as _patch
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        (folder / "doc.txt").write_bytes(b"hello")
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        meta_file = tmp_path / "meta.json"
+        worker = self._make_worker_with_meta(tmp_path, indexer, str(folder), meta_file)
+
+        with _patch.object(worker, "_purge_removed_folders", wraps=worker._purge_removed_folders) as spy:
+            worker.run()
+        assert spy.call_count == 1
+        assert meta_file.exists()
+
+    def test_second_cycle_skips_purge_when_unchanged_and_zero_processed(self, tmp_path: Path):
+        """구성 불변 + 두 번째 사이클에 처리할 신규/변경 파일이 없으면 purge DB 조회가
+        스킵된다(AC-2)."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from unittest.mock import patch as _patch
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        (folder / "doc.txt").write_bytes(b"hello")
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        meta_file = tmp_path / "meta.json"
+
+        worker1 = self._make_worker_with_meta(tmp_path, indexer, str(folder), meta_file)
+        worker1.run()  # 1차: 신규 파일 1건 처리 + purge 실행 → 메타 기록
+
+        worker2 = self._make_worker_with_meta(tmp_path, indexer, str(folder), meta_file)
+        with _patch.object(worker2, "_purge_removed_folders", wraps=worker2._purge_removed_folders) as spy:
+            worker2.run()  # 2차: 변경 파일 없음(처리 0건) + 구성 동일 → purge 스킵
+        assert spy.call_count == 0
+
+    def test_purge_runs_again_when_watch_folders_change(self, tmp_path: Path):
+        """watch_folders 구성이 바뀌면(op_sig 변경) 처리 0건이어도 purge가 즉시 재실행된다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from unittest.mock import patch as _patch
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        (folder / "doc.txt").write_bytes(b"hello")
+        other_folder = tmp_path / "other"
+        other_folder.mkdir()
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        meta_file = tmp_path / "meta.json"
+
+        worker1 = self._make_worker_with_meta(tmp_path, indexer, str(folder), meta_file)
+        worker1.run()
+
+        # watch_folders를 다른 폴더로 변경 (op_sig 변경)
+        worker2 = self._make_worker_with_meta(tmp_path, indexer, str(other_folder), meta_file)
+        with _patch.object(worker2, "_purge_removed_folders", wraps=worker2._purge_removed_folders) as spy:
+            worker2.run()
+        assert spy.call_count == 1
+
+    def test_meta_persists_across_worker_instances(self, tmp_path: Path):
+        """sidecar 파일이 원자 저장되어 다음 워커 인스턴스(프로세스 재시작 시뮬레이션)가
+        읽을 수 있다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector import purge_meta
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        (folder / "doc.txt").write_bytes(b"hello")
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        meta_file = tmp_path / "meta.json"
+
+        worker1 = self._make_worker_with_meta(tmp_path, indexer, str(folder), meta_file)
+        worker1.run()
+
+        loaded = purge_meta.load_purge_meta(meta_file)
+        assert loaded.reconciled_sig is not None
+        assert loaded.last_purge_ts is not None
 
 
 # ============================================================
@@ -1166,6 +1281,52 @@ class TestStopWorker:
         """worker가 None이어도 예외 없이 통과한다."""
         from knowmate.app.lifecycle import stop_worker
         stop_worker(None, hard_exit=lambda c: (_ for _ in ()).throw(AssertionError("호출되면 안 됨")))
+
+
+class TestFinalizeShutdown:
+    """종료 최종 판정 — 워커 비실행 확인 시 quit, 실행 중·판정 불가 시 hard_exit.
+    quit과 hard_exit는 정확히 하나만 호출되어야 한다(설계 A-0001/ADR-0001)."""
+
+    class _FakeWorker:
+        def __init__(self, running=False, raise_on_is_running=False):
+            self._running = running
+            self._raise = raise_on_is_running
+
+        def isRunning(self):
+            if self._raise:
+                raise RuntimeError("워커 상태 조회 실패")
+            return self._running
+
+    def test_quit_when_worker_none(self):
+        """worker가 None이면 quit만 호출된다."""
+        from knowmate.app.lifecycle import finalize_shutdown
+        quit_calls, hard_calls = [], []
+        finalize_shutdown(None, quit_fn=lambda: quit_calls.append(1), hard_exit=lambda c: hard_calls.append(c))
+        assert quit_calls == [1] and hard_calls == []
+
+    def test_quit_when_worker_confirmed_stopped(self):
+        """isRunning()이 False로 확인되면 quit만 호출된다."""
+        from knowmate.app.lifecycle import finalize_shutdown
+        w = self._FakeWorker(running=False)
+        quit_calls, hard_calls = [], []
+        finalize_shutdown(w, quit_fn=lambda: quit_calls.append(1), hard_exit=lambda c: hard_calls.append(c))
+        assert quit_calls == [1] and hard_calls == []
+
+    def test_hard_exit_when_worker_still_running(self):
+        """워커가 여전히 실행 중이면 hard_exit만 호출된다(quit 안 함)."""
+        from knowmate.app.lifecycle import finalize_shutdown
+        w = self._FakeWorker(running=True)
+        quit_calls, hard_calls = [], []
+        finalize_shutdown(w, quit_fn=lambda: quit_calls.append(1), hard_exit=lambda c: hard_calls.append(c))
+        assert hard_calls == [0] and quit_calls == []
+
+    def test_hard_exit_when_is_running_raises(self):
+        """isRunning() 조회 자체가 실패(판정 불가)하면 보수적으로 hard_exit만 호출된다."""
+        from knowmate.app.lifecycle import finalize_shutdown
+        w = self._FakeWorker(raise_on_is_running=True)
+        quit_calls, hard_calls = [], []
+        finalize_shutdown(w, quit_fn=lambda: quit_calls.append(1), hard_exit=lambda c: hard_calls.append(c))
+        assert hard_calls == [0] and quit_calls == []
 
 
 # ============================================================

@@ -114,13 +114,16 @@ class CollectorWorker(QThread):
     indexing_needed = pyqtSignal(str)
 
     def __init__(self, config, indexer, extractor, state_file=None, email_indexer=None,
-                 parent=None, get_idle_seconds=None):
+                 parent=None, get_idle_seconds=None, purge_meta_file=None):
         """수집기 워커를 초기화한다.
 
         get_idle_seconds: () -> float, 현재 OS 유휴 경과초 조회(테스트 주입용,
             기본은 collector.idle_util.get_idle_seconds). DRM 세션 만료 추정에
             쓴다 — 사이클 시작 시 1회가 아니라 파일 처리 중 실시간으로 조회해,
             긴 사이클 도중 세션이 만료되면 그 시점부터 DRM 문서를 건너뛴다.
+        purge_meta_file: purge 스킵/reconciliation 상태 sidecar 경로(테스트 주입용,
+            기본은 %APPDATA%/AegisDesk/index_state.meta.json). index_state.json과
+            분리된 별도 파일이라 기존 state 스키마·소비자에 영향이 없다.
         """
         super().__init__(parent)
         self._config = config
@@ -135,6 +138,12 @@ class CollectorWorker(QThread):
         from knowmate.config import get_data_dir
         default_state_file = get_data_dir() / "index_state.json"
         self._state_file = state_file or default_state_file
+        default_purge_meta_file = get_data_dir() / "index_state.meta.json"
+        self._purge_meta_file = purge_meta_file or default_purge_meta_file
+        # 사이클 안에서 억제·성공 상태를 sidecar 저장과 무관하게 즉시 반영하기 위한
+        # 인메모리 캐시(설계 리뷰6 m-2) — 프로세스 재시작 전까지 sidecar 저장 실패가
+        # 매 사이클 재조회를 유발하지 않도록 한다.
+        self._purge_meta_cache = None
 
     def run(self):
         """증분 스캔 사이클 1회를 실행한다."""
@@ -178,49 +187,48 @@ class CollectorWorker(QThread):
         logger.info("수집기 취소 요청됨")
 
     def _purge_removed_folders(
-        self, watch_folders: list[str], state: dict, dry_run: bool = True,
+        self, normalized_folders: list[str], state: dict, dry_run: bool = True,
         max_delete_ratio: float = 0.30,
-    ) -> None:
-        """watch_folders에 속하지 않는 청크를 LanceDB에서 직접 삭제한다.
+    ) -> str:
+        """정규화된 watch_folders에 속하지 않는 청크를 LanceDB에서 직접 삭제한다.
 
-        state.json 대신 LanceDB의 file_path 컬럼을 기준으로 삭제해
-        state와 DB 불일치 상황도 처리한다.
+        state.json 대신 LanceDB의 file_path 컬럼(projection 조회 — 벡터·암호문
+        미로드)을 기준으로 삭제해 state와 DB 불일치 상황도 처리한다.
+
+        반환: "success"(정상 완료 또는 삭제 대상 없음) | "blocked"(대량삭제 차단) |
+        "failed"(DB 조회·삭제 예외) — 호출부(purge_meta 상태 전이)가 사용한다.
 
         안전장치:
-        - watch_folders가 비어 있으면(온보딩 전·config 초기화 직후 등) 아무것도
+        - normalized_folders가 비어 있으면(온보딩 전·config 초기화 직후 등) 아무것도
           "제거된 폴더"로 간주하지 않고 즉시 건너뛴다. 빈 목록을 "전부 삭제"로
           해석하지 않는다.
         - dry_run=True이면 state·DB 어느 쪽도 변경하지 않는다(완전한 예행연습).
-          기존에는 dry_run이어도 state 항목이 먼저 지워지는 버그가 있었다.
         - 삭제 대상이 전체 인덱스의 max_delete_ratio를 초과하면 CleanupManager와
-          동일한 대량 삭제 차단을 적용한다(이 함수엔 원래 이 안전장치가 없었다).
+          동일한 대량 삭제 차단을 적용한다.
         """
-        if not watch_folders:
+        from knowmate.collector import purge_meta
+
+        if not normalized_folders:
             logger.info("[purge] watch_folders 비어 있음 — 정리 건너뜀 (전체 삭제 오판 방지)")
-            return
+            return "success"
 
-        normalized = [f.replace("\\", "/").rstrip("/") for f in watch_folders]
-
-        def belongs_to_any(path_str: str) -> bool:
-            p = path_str.replace("\\", "/")
-            return any(p.startswith(w + "/") or p == w for w in normalized)
-
-        # LanceDB에서 현재 file_path 목록 조회
+        # file_path 컬럼만 projection 조회 — 벡터(1024차원)·암호화 원문 미로드.
         try:
-            df = self._indexer.table.to_arrow().to_pandas()
+            tbl = self._indexer.table.search().select(["file_path"]).to_arrow()
         except Exception as exc:
             logger.warning("[purge] DB 조회 실패: %s", exc)
-            return
+            return "failed"
 
-        if df.empty:
-            return
+        all_paths = tbl.column("file_path").to_pylist()
+        if not all_paths:
+            return "success"
 
-        total_indexed = df["file_path"].nunique()
-        stale_mask = ~df["file_path"].apply(belongs_to_any)
-        stale_paths_db = df.loc[stale_mask, "file_path"].unique().tolist()
+        unique_paths = set(all_paths)
+        total_indexed = len(unique_paths)
+        stale_paths_db = [p for p in unique_paths if not purge_meta.belongs_to_any(p, normalized_folders)]
 
         if not stale_paths_db:
-            return
+            return "success"
 
         # 대량 삭제 차단 (CleanupManager.run()의 안전장치와 대칭)
         ratio = len(stale_paths_db) / total_indexed if total_indexed else 1.0
@@ -229,13 +237,13 @@ class CollectorWorker(QThread):
                 "[purge] 대량 삭제 차단 (%.0f%% > %.0f%%): %d/%d개 경로. "
                 "watch_folders 설정을 확인하세요: %s",
                 ratio * 100, max_delete_ratio * 100,
-                len(stale_paths_db), total_indexed, watch_folders,
+                len(stale_paths_db), total_indexed, normalized_folders,
             )
             self.indexing_needed.emit(
                 f"대량 삭제가 감지되어 정리를 건너뛰었습니다 "
                 f"({len(stale_paths_db)}/{total_indexed}개 경로). watch_folders 설정을 확인하세요."
             )
-            return
+            return "blocked"
 
         if dry_run:
             logger.info(
@@ -243,10 +251,12 @@ class CollectorWorker(QThread):
                 len(stale_paths_db),
                 stale_paths_db,
             )
-            return
+            return "success"
 
         # 실제 삭제 시에만 state에서도 제거 (dry_run 시엔 state를 건드리지 않는다)
-        stale_state_paths = [p for p in list(state.keys()) if not belongs_to_any(p)]
+        stale_state_paths = [
+            p for p in list(state.keys()) if not purge_meta.belongs_to_any(p, normalized_folders)
+        ]
         for p in stale_state_paths:
             state.pop(p, None)
 
@@ -254,6 +264,7 @@ class CollectorWorker(QThread):
 
         # 경로별로 삭제 (SQL 길이 제한 방지)
         any_deleted = False
+        delete_failed = False
         for path_str in stale_paths_db:
             try:
                 safe = path_str.replace("'", "''")
@@ -262,12 +273,15 @@ class CollectorWorker(QThread):
                 logger.info("[purge] 삭제 완료: %s", path_str)
             except Exception as exc:
                 logger.error("[purge] 삭제 실패: %s - %s", path_str, exc)
+                delete_failed = True
 
         if any_deleted:
             try:
                 self._indexer.optimize()
             except Exception as exc:
                 logger.warning("[purge] optimize 실패: %s", exc)
+
+        return "failed" if delete_failed else "success"
 
     def _run_cycle(self):
         """스캔 -> 분류 -> 인덱싱 -> orphan 정리 -> 저장 순으로 사이클을 실행한다."""
@@ -302,6 +316,18 @@ class CollectorWorker(QThread):
         com_timeout_base = float(collector_cfg.get("com_timeout_base_sec", 60))
         com_timeout_per_mb = float(collector_cfg.get("com_timeout_per_mb_sec", 20))
         com_timeout_cap = float(collector_cfg.get("com_timeout_max_sec", 600))
+
+        # purge(제거된 폴더 청크 정리) 스킵/강제 reconciliation 판정 — 설계
+        # docs/ai-workflow/architecture.md § A-0002. op_sig는 이번 사이클의 watch_folders
+        # 구성·dry_run·max_delete_ratio로 결정되며, 변경 0건 + 동일 op_sig + 마지막 성공
+        # purge 후 강제주기 미경과면 DB 조회 없이 스킵한다(유휴 방치 중 매분 전체 로드 방지).
+        from knowmate.collector import purge_meta
+        purge_force_reconcile_sec = float(
+            collector_cfg.get("purge_force_reconcile_sec", purge_meta.DEFAULT_FORCE_RECONCILE_SEC)
+        )
+        purge_backoff_sec = float(collector_cfg.get("purge_backoff_sec", purge_meta.DEFAULT_BACKOFF_SEC))
+        normalized_watch_folders = purge_meta.normalize_folders(watch_folders)
+        purge_op_sig = purge_meta.compute_op_sig(normalized_watch_folders, dry_run, max_delete_ratio)
 
         self._indexer._chunk_size = chunk_size
         self._indexer._overlap = overlap
@@ -506,10 +532,36 @@ class CollectorWorker(QThread):
         # 생산자 스레드 정리 (정상 종료 시 이미 끝나 있음)
         producer.join(timeout=5)
 
-        # watch_folders에서 제거된 폴더의 청크를 정리한다 (dry_run·대량삭제차단 준수)
-        self._purge_removed_folders(
-            watch_folders, state, dry_run=dry_run, max_delete_ratio=max_delete_ratio,
+        # watch_folders에서 제거된 폴더의 청크를 정리한다 (dry_run·대량삭제차단 준수).
+        # 판정 순서는 차단 → 백오프 → 성공 스킵 → 실행 순으로 고정(purge_meta.decide) —
+        # 실패 직후 성공 서명을 해제하지 않으면 백오프가 성공 스킵에 가려 무력화된다.
+        purge_meta_now = time.time()
+        purge_meta_state = self._purge_meta_cache
+        if purge_meta_state is None:
+            purge_meta_state = purge_meta.load_purge_meta(self._purge_meta_file)
+        decision = purge_meta.decide(
+            purge_meta_state, purge_op_sig, done, purge_meta_now,
+            force_reconcile_sec=purge_force_reconcile_sec, backoff_sec=purge_backoff_sec,
         )
+        if not decision.should_run:
+            logger.debug("[purge] 스킵(%s)", decision.reason)
+        else:
+            result = self._purge_removed_folders(
+                normalized_watch_folders, state, dry_run=dry_run, max_delete_ratio=max_delete_ratio,
+            )
+            if result == "success":
+                purge_meta_state = purge_meta.on_success(purge_meta_state, purge_op_sig, purge_meta_now)
+            elif result == "blocked":
+                purge_meta_state = purge_meta.on_blocked(purge_meta_state, purge_op_sig)
+            else:  # "failed"
+                purge_meta_state = purge_meta.on_transient_failure(
+                    purge_meta_state, purge_op_sig, purge_meta_now, backoff_sec=purge_backoff_sec,
+                )
+            # 성공·실패·차단 상태 모두 sidecar 저장 성공 여부와 무관하게 프로세스 내
+            # 캐시에 즉시 반영한다 — 저장이 실패해도 이번 프로세스 안에서는 판정이
+            # 유지된다(성공=정상 스킵 지속, 실패·차단=억제·알림 1회 유지).
+            self._purge_meta_cache = purge_meta_state
+            purge_meta.save_purge_meta(self._purge_meta_file, purge_meta_state)
 
         cleanup = CleanupManager(
             indexer=self._indexer,

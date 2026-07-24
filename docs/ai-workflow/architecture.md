@@ -45,7 +45,7 @@
 
 <!-- 여기부터 실제 설계 블록을 추가한다. -->
 
-## A-0001: 트레이 상주 앱 종료 모델 — 명시적 quit  (상태: Reviewed / 대응 요구: R-0001)
+## A-0001: 트레이 상주 앱 종료 모델 — 명시적 quit  (상태: Accepted / 대응 요구: R-0001)
 
 ### 개요
 현재 앱은 이벤트 루프 종료를 Qt의 암묵 규칙 `quitOnLastWindowClosed`(기본 True)에만 의존하고,
@@ -140,11 +140,12 @@ daemon 사실이 성립하는 한 불필요 — 미도입).
   프로세스 소멸까지 측정, 릴리스 체크리스트에 고정.
 
 ### 리뷰 이력
-- reviews/REVIEW-20260724-...-projectio{,-2,-3,-4,-5}.md (GPT 채널 B, 5회) → 1~4차 REQUEST_CHANGES
-  전건 처리(수용 위주, 일부 근거 기각), 5차 APPROVE_WITH_CHANGES 전건 수용 → Blocker/Major 미종결
-  0건, Reviewed 승격 (2026-07-24)
+- reviews/REVIEW-20260724-...-projectio{,-2,...,-8}.md (GPT 채널 B, 8회) → 1~4·7차
+  REQUEST_CHANGES 전건 처리(수용 위주, 일부 근거 기각), 5·6차 APPROVE_WITH_CHANGES 전건 수용,
+  8차(PR #59 머지 후 도착) M-1 보류(후속 과제화)·나머지 수용 → Blocker/Major 미종결 0건,
+  구현 완료 후 Accepted 승격 (2026-07-24)
 
-## A-0002: purge 조회 경량화 — 컬럼 projection + 조건부 스킵  (상태: Reviewed / 대응 요구: R-0002)
+## A-0002: purge 조회 경량화 — 컬럼 projection + 조건부 스킵  (상태: Accepted / 대응 요구: R-0002)
 
 ### 개요
 `_purge_removed_folders`는 "watch_folders에서 제거된 폴더의 청크를 DB에서 삭제"하는 정리
@@ -258,6 +259,7 @@ meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_stat
   (NFR-1 상한) 판정 — RSS 추이 관찰과 별도로 1회 peak를 직접 측정.
 
 ### 리뷰 이력
-- reviews/REVIEW-20260724-...-projectio{,-2,-3,-4,-5}.md (GPT 채널 B, 5회) → 1~4차 REQUEST_CHANGES
-  전건 처리(수용 위주, 일부 근거 기각), 5차 APPROVE_WITH_CHANGES 전건 수용 → Blocker/Major 미종결
-  0건, Reviewed 승격 (2026-07-24)
+- reviews/REVIEW-20260724-...-projectio{,-2,...,-8}.md (GPT 채널 B, 8회) → 1~4·7차
+  REQUEST_CHANGES 전건 처리(수용 위주, 일부 근거 기각), 5·6차 APPROVE_WITH_CHANGES 전건 수용,
+  8차(PR #59 머지 후 도착) M-1 보류(후속 과제화)·나머지 수용 → Blocker/Major 미종결 0건,
+  구현 완료 후 Accepted 승격 (2026-07-24)
