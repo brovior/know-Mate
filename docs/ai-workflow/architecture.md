@@ -59,7 +59,7 @@
 | 컴포넌트 | 책임 | 위치(모듈/경로) |
 |---|---|---|
 | `main()` | `app.setQuitOnLastWindowClosed(False)` 설정 | `knowmate/app/main.py` |
-| `MainWindow._shutdown()` | 스케줄러 정지 → 트레이 숨김 → 워커 종료 → **마지막에 `QApplication.instance().quit()`** | `knowmate/app/main.py` |
+| `MainWindow._shutdown()` | 스케줄러 정지 → 트레이 숨김 → 워커 종료 → **최종 판정: 워커 비실행 확인 시 `quit()`, 실행 중·판정 불가 시 `hard_exit`(정확히 하나)** | `knowmate/app/main.py` |
 | `lifecycle.stop_worker()` | 행오버 워커 에스컬레이션(기존 유지, 변경 없음) | `knowmate/app/lifecycle.py` |
 
 ### 데이터 흐름
@@ -69,7 +69,9 @@ X (close_action=quit) ─┴→ close() → closeEvent → _shutdown()
                                       ├ scheduler.stop()
                                       ├ tray.hide()
                                       ├ stop_worker(worker)   # 행오버면 os._exit까지 에스컬레이션
-                                      └ QApplication.quit()   # ★ 신규 — 창 가시성과 무관하게 루프 종료
+                                      └ 최종 판정(★ 신규 — 항상 도달, 창 가시성과 무관):
+                                          worker 비실행 확인 → QApplication.quit()
+                                          실행 중·판정 불가 → hard_exit  (정확히 하나만 실행)
 X (close_action=tray) → event.ignore() + hide()               # 종료 아님(기존 유지)
 ```
 
@@ -116,8 +118,9 @@ daemon 사실이 성립하는 한 불필요 — 미도입).
 | 실패 | 감지 | 대응(격리/재시도/중단) |
 |---|---|---|
 | `quit()` 후에도 잔존(비Qt 요인: 워커 행오버) | `stop_worker`의 wait 타임아웃 | 기존 에스컬레이션이 `os._exit(0)` (유지) |
-| `_shutdown()` 도중 예외 | 각 단계 독립 try/except(기존) | 다음 단계 계속 → `quit()`은 finally 위치로 보장 |
+| `_shutdown()` 도중 예외 | 각 단계 독립 try/except(기존) | 다음 단계 계속 → **최종 판정에는 항상 도달**해 quit 또는 hard_exit 중 하나를 실행(리뷰6 M-1) |
 | 새 종료 경로 추가 시 `_shutdown()` 미경유 | 코드 리뷰 규칙 | `_quit_app`/`closeEvent` 외 종료 경로 금지 문서화 |
+| `_shutdown()` 중복 진입(근접한 이중 종료 요청) | `_shutdown_done` 플래그 | 멱등 가드 — 두 번째 진입은 즉시 반환. "정확히 하나"는 **프로세스 수명 기준**이며 중복 호출 테스트로 고정(리뷰6 m-1) |
 
 ### 검증 계획
 - 사외 단위: `_shutdown()`이 각 단계(스케줄러 stop → stop_worker → quit) **순서대로** 호출하고,
@@ -144,8 +147,8 @@ daemon 사실이 성립하는 한 불필요 — 미도입).
 `_purge_removed_folders`는 "watch_folders에서 제거된 폴더의 청크를 DB에서 삭제"하는 정리
 단계인데, 판단에 `file_path` 목록만 필요함에도 매 사이클 전체 테이블(벡터+암호문 포함)을
 pandas로 로드한다. 수정 ①: 조회를 `file_path` 단일 컬럼 projection으로 교체. 수정 ②:
-watch_folders 구성이 직전 사이클과 동일하고 이번 사이클 처리 건수가 0이면 purge 자체를 스킵
-(구성 변화가 없으면 "제거된 폴더"가 새로 생길 수 없음). CleanupManager(파일 단위 orphan)는
+"동일 op_sig(구성+dry_run+차단율)·처리 0건·마지막 성공 purge 후 24h 미만이며 실패/차단 억제
+상태가 아닌 경우"에만 purge를 스킵(최종 조건 전체 — 상세는 데이터 흐름). CleanupManager(파일 단위 orphan)는
 state 기반이라 무관 — 변경 없음.
 
 ### 컴포넌트와 책임
@@ -173,8 +176,9 @@ state 기반이라 무관 — 변경 없음.
                                      # separator·UTF-8로 직렬화(필드 경계 모호성 제거, 리뷰2 m-2)
 사이클 종료부 — 판정 순서 고정(억제 판정이 성공 스킵보다 먼저, 리뷰3 B-1):
   # 시각 필드 검증은 필드별로 다르다(리뷰4 B-1 — next_retry_ts는 정의상 미래값이 정상):
-  #  - last_purge_ts: 미래값(> now + 오차허용)이면 무효 → 성공 스킵 불가
-  #  - next_retry_ts: now < 값 <= now + 설정백오프 + 오차허용 범위만 유효.
+  #  - last_purge_ts: **모든 미래값 무효**(스킵 불가) — 스킵 조건 0 <= (now-last_purge_ts)와
+  #    동일 문언으로 통일, 오차허용 없음(리뷰6 m-3)
+  #  - next_retry_ts: now < 값 <= now + 설정백오프 범위만 유효.
   #    그보다 먼 미래값은 손상으로 간주 → 백오프 무시(억제 해제)
   1) if meta["blocked_sig"] == op_sig:
          return (DB 조회 없음)      # 대량삭제 차단 상태 — 동일 설정으론 자동 재시도 안 함
@@ -189,10 +193,10 @@ state 기반이라 무관 — 변경 없음.
       (이하 기존과 동일: 소속 판정 → 대량삭제 차단 → dry_run → 삭제 → optimize)
       성공 완료: meta["reconciled_sig"]=op_sig; meta["last_purge_ts"]=now;
                  failed_sig·blocked_sig·next_retry_ts 해제                # 원자 갱신
-                 # 커밋 규칙(리뷰5 m-1): 성공 메타는 sidecar replace **성공 후에만** 메모리
-                 # committed 상태로 승격 — 저장 실패 시 메모리에도 반영하지 않아 같은 프로세스의
-                 # 다음 사이클이 스킵하지 않고 재실행(멱등이라 안전). 실패·차단 상태만 저장과
-                 # 무관하게 메모리 즉시 반영(억제는 보수적으로 유지, 스킵은 보수적으로 해제)
+                 # 커밋 규칙(리뷰6 m-2, 대안1): 성공 메타는 **메모리에 즉시 승격**하고 sidecar
+                 # 저장은 결과에 영향 없음 — 저장 실패 시 현 프로세스는 정상 스킵을 계속하고
+                 # (매분 O(N) 재조회 방지), **재시작 후에만** 보수적으로 재실행된다(멱등이라
+                 # 안전). 저장 실패는 ERROR 로그. 실패·차단 상태도 동일하게 메모리 즉시 반영
       일시적 예외: meta["failed_sig"]=op_sig; meta["next_retry_ts"]=now+백오프;
                  **meta["reconciled_sig"] 해제**   # 실패한 op_sig의 성공 스킵 자격 무효화 —
                  # 백오프 만료 후 이전 성공 메타가 3)을 참으로 만들어 재시도를 24h까지
