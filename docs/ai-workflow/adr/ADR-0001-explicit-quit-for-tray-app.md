@@ -2,7 +2,7 @@
 
 | 상태 | 날짜 | 결정자 | 리뷰 |
 |---|---|---|---|
-| Accepted | 2026-07-24 | Claude (Chief Architect) | reviews/REVIEW-20260724-adr-0001-explicit-quit-for-tray-app-adr-0002-purge-projectio-*.md (1~16차, Blocker/Major 전건 처리·구현 반영, 리뷰11 M-1 축소채택·리뷰12 marker 비동기화/단일인스턴스 순서 정정·리뷰13 marker 해제 위치 재이동·리뷰14 unsupported capability_sig 재설계/marker join 상한 추가·리뷰15 terminate() 강제종료 시 hard_exit 강제/capability_sig 확장·리뷰16 stop_worker 계약 문서화/unsupported capability probe 좁힘 근거 명시) |
+| Accepted | 2026-07-24 | Claude (Chief Architect) | reviews/REVIEW-20260724-adr-0001-explicit-quit-for-tray-app-adr-0002-purge-projectio-*.md (1~17차, Blocker/Major/Minor 전건 처리·구현 반영. 17차 APPROVE_WITH_CHANGES(hard_exit NoReturn 계약 명시·성능 기준 수치 확정)로 최종 승인 근거 명시) |
 
 ## 맥락 (Context)
 - 베타 실사용에서 트레이 [종료] 후 `AegisDesk.exe`가 항상 잔존한다. 트레이 아이콘은
@@ -29,6 +29,12 @@
 `terminate()` 사용 여부를 반환하고, `_shutdown()`이 이 값을 `finalize_shutdown(force_hard_exit=)`로
 전달한다. 기존 `stop_worker` 에스컬레이션(정상→terminate→`os._exit`) 구조는 유지하며,
 `_shutdown()`의 이 최종 분기는 stop_worker가 예외로 이탈한 경우까지 커버하는 마지막 안전망이다.
+"quit과 hard_exit는 정확히 하나만 실행된다"는 보장은 `hard_exit`가 **절대 반환하지 않는다**는
+전제(`HardExit = Callable[[int], NoReturn]`)에 의존한다(리뷰17 m-1) — 반환하면 `stop_worker()`
+안에서 호출한 hard_exit 뒤에도 실행이 이어져 `finalize_shutdown()`이 다시 판정하게 되므로,
+운영 기본값(`os._exit`)이 이 계약을 만족함을 타입 별칭으로 명시한다. `stop_worker()`의 `bool`
+반환값 기반 설계 자체가 "hard_exit가 반환하더라도 다음 판정이 다시 보수적으로 hard_exit로
+수렴"하는 방어선이라, 테스트 더블이 비복귀를 완전히 모사하지 않아도 안전하다고 판단했다.
 
 ## 검토한 대안 (Alternatives)
 | 대안 | 장점 | 단점 | 기각 사유 |

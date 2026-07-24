@@ -38,3 +38,12 @@
 ## 확인 필요
 - 소스 코드가 제공되지 않아 문서에서 “구현 완료”라고 한 `stop_worker()` 반환값 전파, hard-exit 분기의 파일 I/O 부재, marker 처리 순서, purge 메타 전이 및 projection 호출 구현은 실제 코드와 대조하지 못했다.
 - 배포 의존성이 실제로 LanceDB 0.34.0으로 고정되는지 확인이 필요하다. 고정되지 않는다면 `search`와 `select`는 존재하지만 `to_arrow` 계약이나 무제한 전건 반환 의미가 다른 버전에 대한 호환성 시험도 필요하다.
+
+## 처리 기록 (중립 검토)
+
+| ID | 판단 | 사유/반영 |
+|---|---|---|
+| m-1 | 수용 | `knowmate/app/lifecycle.py`에 `HardExit = Callable[[int], NoReturn]` 타입 별칭을 추가하고 `_default_hard_exit`/`stop_worker`/`finalize_shutdown`의 `hard_exit` 파라미터에 적용, 모듈 docstring에 비복귀 계약과 그 근거를 명시. 더 강한 대안("stop_worker가 결과만 반환하고 hard_exit 호출은 finalize_shutdown 한 곳에서만")은 이미 사실상 그렇게 되어 있음(stop_worker의 자체 hard_exit 호출은 "그래도 잔존" 케이스의 조기 종료 최적화일 뿐, bool 반환값이 있어 finalize_shutdown이 항상 최종 판정을 다시 함) — 굳이 stop_worker의 자체 hard_exit 호출을 제거할 실익이 없다고 판단해 타입 계약 명시로 충분하다고 봄. |
+| m-2 | 수용 | 성능 수용 기준을 "예: 60MB"에서 "중앙값 ≤30MB, 개별 ≤60MB"로 확정(사후 해석 여지 제거), Windows 릴리스 시험에서 `PeakWorkingSetSize` 병행 측정을 선택에서 필수로 승격. `docs/ai-workflow/architecture.md`. |
+
+**종결 판정**: Blocker/Major 없음(이번 라운드 최초 APPROVE_WITH_CHANGES). Minor 2건 모두 수용해 반영. Blocker/Major/Minor 잔존 0건.

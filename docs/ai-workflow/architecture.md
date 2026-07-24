@@ -61,6 +61,7 @@
 | `main()` | `app.setQuitOnLastWindowClosed(False)` 설정 | `knowmate/app/main.py` |
 | `MainWindow._shutdown()` | 스케줄러 정지 → 트레이 숨김 → 워커 종료 → **최종 판정: 워커 비실행 확인 시 `quit()`, 실행 중·판정 불가 시 `hard_exit`(정확히 하나)** | `knowmate/app/main.py` |
 | `lifecycle.stop_worker()` | 행오버 워커 에스컬레이션(정상→terminate→하드 종료 순서는 기존 유지). **반환값 계약이 변경됨**(리뷰15 B-1) — `terminate()`가 이번 호출에서 쓰였는지 `bool`로 반환하고, 호출부(`_shutdown()`)가 이 값을 `finalize_shutdown(force_hard_exit=)`로 전달해야 한다(누락 시 강제 중단된 워커가 정상 종료로 오분류됨, 리뷰16 M-1) | `knowmate/app/lifecycle.py` |
+| `HardExit` (타입 별칭) | `hard_exit` 콜백의 계약을 `Callable[[int], NoReturn]`으로 명시(리뷰17 m-1) — "quit/hard_exit 정확히 하나만 실행"이라는 보장은 `stop_worker()`가 부른 hard_exit가 **절대 반환하지 않는다**는 전제에 의존한다(반환하면 그 다음 `finalize_shutdown()`이 다시 판정해 두 번째 hard_exit 또는 quit이 관측될 수 있음). 운영 기본값(`os._exit`)은 이 계약을 만족. 테스트 더블은 비복귀를 모사하지 않지만, `stop_worker()`의 `bool` 반환값 기반 설계가 "hard_exit가 반환하더라도 다음 판정이 다시 보수적으로 hard_exit로 수렴"하는 방어선을 이미 갖춰 안전 | `knowmate/app/lifecycle.py` |
 
 ### 데이터 흐름
 ```
@@ -190,6 +191,11 @@ daemon 사실이 성립하는 한 불필요 — 미도입).
   반환값 계약 변경을 컴포넌트 표에 반영(M-1)·unsupported 판정을 API 메서드 존재
   여부만으로 좁게 확인하도록 capability probe 도입(M-3)·성능 시험의 DB 격리(프로세스별
   seed DB 복제) 명시(m-1) — 전 라운드 Blocker/Major 전건 처리, 미종결 0건 유지
+- reviews/REVIEW-20260724-...-projectio-17.md (APPROVE_WITH_CHANGES — 최초로 Blocker/Major
+  없이 Minor만 도착) — hard_exit 콜백 계약을 `HardExit = Callable[[int], NoReturn]` 타입
+  별칭으로 명시(m-1)·성능 수용 기준을 "예시" 문구 없이 중앙값 ≤30MB·개별 ≤60MB로 확정하고
+  Windows 릴리스 시험에서 `PeakWorkingSetSize` 병행 측정을 필수로 승격(m-2). 이 라운드로
+  Blocker/Major/Minor 전건 처리 완료, Accepted 재확인
 
 ## A-0002: purge 조회 경량화 — 컬럼 projection + 조건부 스킵  (상태: Accepted / 대응 요구: R-0002)
 
@@ -352,18 +358,23 @@ meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_stat
     1. **projection + Arrow 순회 단계**(`file_path` 컬럼 projection 쿼리 → Arrow 컬럼 추출)만
        별도로 측정.
     2. 이어서 **전체 end-to-end**(1 + 소속 판정 + 삭제 대상 구성 + `optimize()`)를 측정.
-    각 단계는 짧은 간격(예: 50ms 이하, 가능하면 10ms)으로 RSS를 샘플링해
-    `max(sampled_rss) - baseline_rss`를 기록한다. 샘플링 간격보다 짧게 유지되는 피크를 놓칠
-    수 있음을 감안해, 가능한 플랫폼(Windows)에서는 OS 수준 프로세스 피크 카운터(예:
-    `PeakWorkingSetSize`)를 함께 기록해 샘플링 오차를 상호 검증한다. **최종 NFR 합격 판정은
-    end-to-end(2) 결과로 한다** — 두 단계를 나눠 기록하는 목적은 판정이 아니라, 불합격 시
-    projection 자체의 회귀인지 `optimize()`의 별도 비용인지 원인 분석을 가능하게 하는 것.
-    RSS 측정은 `psutil.Process().memory_info().rss`(Windows 포함 크로스플랫폼) 사용.
+    각 단계는 짧은 간격(10ms)으로 RSS를 샘플링해 `max(sampled_rss) - baseline_rss`를
+    기록한다. RSS 측정은 `psutil.Process().memory_info().rss`(크로스플랫폼) 사용. 배포
+    대상이 Windows 10/11이므로, **배포 전 릴리스 시험에서는 `psutil` 샘플링에 더해
+    Windows OS 수준 프로세스 피크 카운터(`GetProcessMemoryInfo`의
+    `PeakWorkingSetSize`)를 필수로 함께 기록**한다(리뷰17 m-2 — 샘플링 간격보다 짧게
+    유지되는 피크를 놓칠 위험을 보조 측정이 아니라 필수 상호 검증으로 승격. 개발
+    샌드박스 등 Windows가 아닌 환경에서 하는 사전 점검은 `psutil` 단독으로 충분). **최종
+    NFR 합격 판정은 end-to-end(2) 결과로 한다** — 두 단계를 나눠 기록하는 목적은 판정이
+    아니라, 불합격 시 projection 자체의 회귀인지 `optimize()`의 별도 비용인지 원인
+    분석을 가능하게 하는 것.
     - 결과 검증: projection 반환 행 수가 실제 테이블 행 수와 일치하고, 앞·중간·끝에 배치한
       제거 대상 경로가 모두 삭제 후보로 분류되는지 확인(리뷰13 m-1 — 불일치 시 그 자체로
       불합격, 메모리 기준과 무관하게 회귀로 취급).
-    - 5개 프로세스 측정값의 **중앙값과 최댓값을 함께 기록**하고, **중앙값 ≤ 30MB이며 개별
-      측정값 중 어느 것도 명시적 단회 상한(예: 60MB)을 넘지 않아야** 합격(NFR-1 상한 충족).
+    - 5개 프로세스 측정값의 **중앙값과 최댓값을 함께 기록**한다. 합격 기준은 시험 결과를 본
+      뒤 정하지 않고 사전에 다음으로 고정한다(리뷰17 m-2 — 이전엔 "예: 60MB"로 예시일
+      뿐이라 사후 해석 여지가 있었음): **중앙값 ≤ 30MB, 그리고 5개 중 어느 측정값도
+      60MB를 넘지 않아야** 합격(NFR-1 상한 충족). 두 수치 모두 예시가 아니라 확정 게이트다.
   - 가능하면 LanceDB의 query plan/스토리지 read 통계도 함께 기록해 컬럼 프루닝을 직접
     근거로 남긴다(보조 근거, 합격 판정의 필수 조건은 아님).
 
@@ -390,3 +401,8 @@ meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_stat
   반환값 계약 변경을 컴포넌트 표에 반영(M-1)·unsupported 판정을 API 메서드 존재
   여부만으로 좁게 확인하도록 capability probe 도입(M-3)·성능 시험의 DB 격리(프로세스별
   seed DB 복제) 명시(m-1) — 전 라운드 Blocker/Major 전건 처리, 미종결 0건 유지
+- reviews/REVIEW-20260724-...-projectio-17.md (APPROVE_WITH_CHANGES — 최초로 Blocker/Major
+  없이 Minor만 도착) — hard_exit 콜백 계약을 `HardExit = Callable[[int], NoReturn]` 타입
+  별칭으로 명시(m-1)·성능 수용 기준을 "예시" 문구 없이 중앙값 ≤30MB·개별 ≤60MB로 확정하고
+  Windows 릴리스 시험에서 `PeakWorkingSetSize` 병행 측정을 필수로 승격(m-2). 이 라운드로
+  Blocker/Major/Minor 전건 처리 완료, Accepted 재확인

@@ -8,11 +8,30 @@ COM Open 등에 블로킹돼 취소 플래그를 못 보면 정상 종료가 안
 
 worker는 QThread를 덕타이핑(cancel/isRunning/wait/terminate)하고, 최종 하드
 종료는 hard_exit로 주입해 테스트에서 프로세스를 실제로 죽이지 않고 검증한다.
+
+**hard_exit 계약(`Callable[[int], NoReturn]`, 설계 리뷰 17차 m-1)**: quit과
+hard_exit가 프로세스 수명 동안 "정확히 하나만" 실행된다는 보장은, `stop_worker()`가
+호출한 hard_exit가 **절대 반환하지 않는다**는 전제에 의존한다(반환하면 그 뒤 이어지는
+`finalize_shutdown()`이 다시 판정해 두 번째 hard_exit 또는 quit이 관측될 수 있음).
+운영 기본값 `_default_hard_exit`(`os._exit`)는 이 계약을 만족한다. 테스트 더블을
+주입할 때도 리스트에 `append`만 하는 것은 **비복귀를 모사하지 않는다** — 실제로는
+호출 후 반환하므로, `stop_worker()`가 hard_exit를 호출한 뒤에도 계속 실행돼 그
+반환값(`True`)이 `_shutdown()`에서 `finalize_shutdown(force_hard_exit=True)`로
+이어져 두 번째 판정이 다시 hard_exit를 호출하는 정상적인 흐름과 실제 비복귀 상황을
+테스트가 구분하지 못한다. 이는 **의도된 완화**다 — 테스트가 매번 `SystemExit`을
+던지도록 요구하면 각 테스트가 이를 잡아야 해 번거롭고, 이 모듈의 반환값 기반 설계
+(`stop_worker()`가 `bool`을 반환해 호출부가 명시적으로 `force_hard_exit`를 전파)
+자체가 "hard_exit가 반환하더라도 다음 판정이 다시 보수적으로 hard_exit로 수렴한다"는
+방어선을 이미 갖추고 있어, 비복귀 모사 없이도 안전하다.
 """
 import logging
 import os
+from typing import Callable, NoReturn
 
 logger = logging.getLogger(__name__)
+
+# hard_exit 콜백의 계약 — 절대 반환하지 않아야 한다(모듈 docstring 참조).
+HardExit = Callable[[int], NoReturn]
 
 # 취소 플래그 확인 후 정상 종료를 기다리는 시간(현재 처리 중인 파일 완료 여유)
 _WAIT_GRACEFUL_MS = 8000
@@ -94,7 +113,7 @@ def clear_dirty_shutdown(marker_path=None) -> None:
     t.join(_CLEAR_DIRTY_JOIN_TIMEOUT_SEC)
 
 
-def _default_hard_exit(code: int = 0) -> None:
+def _default_hard_exit(code: int = 0) -> NoReturn:
     """프로세스를 무조건·즉시 종료한다(마지막 수단 — 어떤 정리 코드도 먼저 실행하지 않음).
 
     이전에는 os._exit() 전에 logging.shutdown()으로 로그를 flush했지만, 이는 하드
@@ -109,7 +128,7 @@ def _default_hard_exit(code: int = 0) -> None:
     os._exit(code)
 
 
-def stop_worker(worker, hard_exit=_default_hard_exit) -> bool:
+def stop_worker(worker, hard_exit: HardExit = _default_hard_exit) -> bool:
     """워커를 정상 종료 → 실패 시 강제 종료 → 그래도 실패 시 프로세스 하드 종료.
 
     worker: cancel()/isRunning()/wait(ms)->bool/terminate() 를 갖는 객체(또는 None).
@@ -154,7 +173,7 @@ def stop_worker(worker, hard_exit=_default_hard_exit) -> bool:
     return True
 
 
-def finalize_shutdown(worker, quit_fn, hard_exit=_default_hard_exit, force_hard_exit: bool = False) -> None:
+def finalize_shutdown(worker, quit_fn, hard_exit: HardExit = _default_hard_exit, force_hard_exit: bool = False) -> None:
     """종료 최종 판정 — quit_fn(워커 비실행 확인) 또는 hard_exit(실행 중·판정 불가·강제중단됨) 중 정확히 하나.
 
     _shutdown()의 앞 단계(scheduler.stop/tray.hide/stop_worker)가 예외로 이탈하더라도 항상
