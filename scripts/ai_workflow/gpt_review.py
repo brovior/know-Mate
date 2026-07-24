@@ -1,4 +1,4 @@
-# vendored from ai-dev-workflow v0.1.4 — scripts/gpt_review.py
+# vendored from ai-dev-workflow v0.1.5 — scripts/gpt_review.py
 # 직접 수정 금지: 개선은 ai-dev-workflow 정본에 하고 init_project.py --update로 동기화한다.
 """GPT 독립 아키텍처 리뷰 브릿지 (채널 A/B 공용 실행체, 프로젝트 무관).
 
