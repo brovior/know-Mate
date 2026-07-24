@@ -2,7 +2,7 @@
 
 | 상태 | 날짜 | 결정자 | 리뷰 |
 |---|---|---|---|
-| Proposed | 2026-07-24 | Claude (Chief Architect) | reviews/REVIEW-20260724-adr-0001-explicit-quit-for-tray-app-adr-0002-purge-projectio-*.md (1~5차, 전건 종결) |
+| Accepted | 2026-07-24 | Claude (Chief Architect) | reviews/REVIEW-20260724-adr-0001-explicit-quit-for-tray-app-adr-0002-purge-projectio-*.md (1~17차, Blocker/Major/Minor 전건 처리·구현 반영. 17차 APPROVE_WITH_CHANGES(hard_exit NoReturn 계약 명시·성능 기준 수치 확정)로 최종 승인 근거 명시) |
 
 ## 맥락 (Context)
 - `_purge_removed_folders`(watch_folders에서 제거된 폴더의 청크를 DB에서 삭제)는 매 인덱싱
@@ -36,9 +36,22 @@
 취급(억제 해제). 메타 부재·타입/범위 이상은 부재와 동일 취급(스킵 없이 실행). purge 성공 후 메타
 저장 실패의 재실행은 삭제(file_path 기준)·optimize의 멱등성으로 안전. ⑤ op_sig는 스키마 버전을 포함한 canonical JSON(sort_keys·고정
 separator·UTF-8)의 SHA-256이며, 경로는 서명·소속판정 공용 정규화 함수 1개의 결과만 사용.
-⑥ projection 조회는 Arrow 컬럼 직접 순회(pandas 변환 생략). 배포 고정 lancedb 버전에서 공개
-projection API와 컬럼 pushdown을 구현 착수 시 검증하는 것이 **채택 전제조건**이며, 미지원이면
-이 변경을 배포하지 않는다(호환 전체-로드 모드를 두지 않음).
+⑥ projection 조회는 **`table.search().select(["file_path"]).to_arrow()`**로 확정(Arrow 직접
+순회, pandas 변환 생략). lancedb 0.34.0에서 실측 검증됨(결과 스키마에 `file_path`만 실림, 전체
+로드 대비 약 6배 빠름, 숨은 기본 limit 없음 — 상세는 architecture.md § 핵심 결정과 트레이드오프).
+검토했던 `table.to_lance().to_table(columns=[...])`는 별도 `pylance` 설치가 필요해 기각. 미지원
+lancedb 버전에서는 `table.search`/`search().select` **메서드 자체가 없다**(재시도로 복구되지 않는
+**영구 장애**, 배포 의존성 비호환). 판정은 `getattr`+`callable`로 메서드 존재 여부만 좁게
+확인한다(리뷰16 M-3) — `select(...).to_arrow()` **호출 도중** 발생하는 예외(AttributeError
+포함)까지 하나의 넓은 try로 잡으면, API는 있지만 다른 원인(내부 결함·테스트 더블 오류 등)으로
+난 예외까지 영구 억제로 오분류해 capability_sig가 바뀔 때까지 무기한 억제되는 위험이 있었다.
+메서드 부재로 확인된 경우만 `"unsupported"`로 분류돼 장기 억제되고(30분 백오프 반복 없음) 1회
+UI 알림으로 업데이트를 안내한다(리뷰11 M-2로 "failed"와 분리; 호환 전체-로드 모드를 두지 않는
+원칙은 유지 — 조용한 폴백 금지). 억제 해제 판정은 대량삭제 차단(`op_sig` 기준)과 달리
+**`compute_capability_sig()`(lancedb 버전 + 앱 버전 + projection 호출방식 버전, 리뷰15 M-1로
+확장)** 기준이다(리뷰14 M-1) — unsupported는 watch_folders 구성이 아니라 실행 환경의 문제이므로,
+op_sig로 억제하면 사용자가 안내대로 앱을 업데이트해도 폴더 구성이 그대로면 억제가 절대 풀리지
+않는 결함이 있었다.
 
 ## 검토한 대안 (Alternatives)
 | 대안 | 장점 | 단점 | 기각 사유 |
@@ -51,8 +64,14 @@ projection API와 컬럼 pushdown을 구현 착수 시 검증하는 것이 **채
 ## 결과 (Consequences)
 - 좋아지는 것: 유휴 방치 중(변경 0건) purge의 DB 조회가 0회가 되고, 조회가 필요한 사이클도
   메모리 사용이 인덱스 크기(벡터)와 무관해진다. RSS 눌러앉음의 주요 원인 제거.
-- 감수하는 것: 외부 요인으로 DB에만 남은 고아 경로의 복구가 "구성 변경 또는 파일 변경이 있는
-  사이클"로 지연될 수 있다(불일치 발생 원인 자체가 대개 그런 사이클이므로 실질 지연은 제한적
-  — 리뷰 검증 요청). projection API는 설치된 lancedb 버전에서 동작 확인 후 확정해야 한다.
+- 감수하는 것: 외부 요인으로 DB에만 남은 고아 경로의 복구가 지연될 수 있다 — **구성·파일
+  변경이 있는 사이클에서는 즉시** 실행되고, **변경이 전혀 없어도 최대 24시간(강제
+  reconciliation 주기, config화)마다** 1회 강제 실행된다(리뷰10 m-1로 architecture.md/A-0002와
+  정합화 — 24h 상한이 있어 무기한 방치는 아니다). **단, `"unsupported"`(projection API 비호환)는
+  이 24h 예외다**(리뷰14 M-1) — 시간이 아니라 `compute_capability_sig()` 변화(앱/lancedb 업데이트)로만
+  재검증하며, 24h가 지나도 환경이 그대로면 재시도하지 않는다(재시도해도 동일하게 실패할
+  영구 장애이므로 무의미한 재시도 자체가 낭비). projection API는 lancedb 0.34.0에서 실측
+  검증 완료(`table.search().select(["file_path"]).to_arrow()`, 상세는 architecture.md).
 - 후속 조치: 스킵 조건 단위 테스트(서명 비교·스파이), projection 결과 컬럼 검증 테스트,
-  watch_folder 제거 회귀 테스트 유지, 사내 유휴 1시간 RSS 실측(전후 비교).
+  watch_folder 제거 회귀 테스트 유지, 사내 유휴 1시간 RSS 실측(전후 비교), `max_delete_ratio`
+  fail-closed 검증·dirty-shutdown 마커 구현 완료(리뷰10 B-1/M-1).

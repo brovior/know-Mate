@@ -14,6 +14,16 @@ from knowmate.collector.cleanup import CleanupManager, CleanupReport
 _HAS_PYQT6 = bool(importlib.util.find_spec("PyQt6"))
 
 
+def _wait_until(predicate, timeout: float = 2.0, interval: float = 0.02) -> bool:
+    """predicate()가 True가 될 때까지 짧게 폴링한다(비동기 daemon 스레드 결과 확인용)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
 # ============================================================
 # TestState
 # ============================================================
@@ -290,7 +300,7 @@ def _make_worker(tmp_path: Path, watch_folder: str):
     extractor = FakeReader()
     config = _make_config(watch_folder)
     state_file = tmp_path / "state.json"
-    return CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file), indexer, state_file
+    return CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json"), indexer, state_file
 
 
 class TestCollectorWorker:
@@ -327,7 +337,7 @@ class TestCollectorWorker:
         config = _make_config(str(folder))
         state_file = tmp_path / "state.json"
 
-        worker = CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file)
+        worker = CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json")
         worker.run()
 
         from knowmate.collector.state import load_state
@@ -339,7 +349,7 @@ class TestCollectorWorker:
         f.write_bytes(b"modified content - different from original")
 
         # 같은 indexer 재사용 (DB 재생성 충돌 방지)
-        worker2 = CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file)
+        worker2 = CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json")
         worker2.run()
 
         state2 = load_state(state_file)
@@ -374,7 +384,7 @@ class TestCollectorWorker:
             "chunking": {"chunk_size": 400, "overlap": 80},
         }
         state_file = tmp_path / "state.json"
-        worker = CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file)
+        worker = CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json")
         worker.run()
 
         from knowmate.collector.state import load_state
@@ -384,7 +394,7 @@ class TestCollectorWorker:
         del_path = str(files[0])
         files[0].unlink()
 
-        worker2 = CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file)
+        worker2 = CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json")
         worker2.run()
 
         # orphan 파일의 청크가 soft delete 마킹되었는지 확인
@@ -446,7 +456,7 @@ class TestCollectorWorker:
         indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
         config = _make_config(str(folder))
         state_file = tmp_path / "state.json"
-        worker = CollectorWorker(config=config, indexer=indexer, extractor=FailingExtractor(), state_file=state_file)
+        worker = CollectorWorker(config=config, indexer=indexer, extractor=FailingExtractor(), state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json")
 
         finished_msgs = []
         worker.finished.connect(finished_msgs.append)
@@ -590,6 +600,7 @@ class TestQueuePriority:
         worker = CollectorWorker(
             config=_make_config(str(folder)), indexer=indexer,
             extractor=FakeReader(), state_file=state_file,
+            purge_meta_file=tmp_path / "purge_meta.json",
         )
         worker.run()
 
@@ -651,6 +662,7 @@ class TestDrmIdleSkip:
         indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
         worker = CollectorWorker(
             config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
+            purge_meta_file=tmp_path / "purge_meta.json",
             get_idle_seconds=lambda: 200.0,  # 임계(100) 초과 상태를 실시간으로 보고
         )
         worker.run()
@@ -679,6 +691,7 @@ class TestDrmIdleSkip:
         indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
         worker = CollectorWorker(
             config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
+            purge_meta_file=tmp_path / "purge_meta.json",
             get_idle_seconds=lambda: 5.0,  # 방금 활동함 → 스킵 안 함
         )
         worker.run()
@@ -723,6 +736,7 @@ class TestDrmIdleSkip:
 
         worker = CollectorWorker(
             config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
+            purge_meta_file=tmp_path / "purge_meta.json",
             get_idle_seconds=_idle,
         )
         worker.run()
@@ -754,6 +768,7 @@ class TestDrmIdleSkip:
         indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
         worker = CollectorWorker(
             config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
+            purge_meta_file=tmp_path / "purge_meta.json",
             get_idle_seconds=lambda: 99999.0,  # 아주 긴 유휴
         )
         worker.run()
@@ -881,6 +896,230 @@ class TestPurgeRemovedFolders:
         # UI 알림 발행됨
         assert len(alerts) == 1
         assert "대량 삭제" in alerts[0]
+
+    def test_projection_api_missing_returns_unsupported(self, tmp_path: Path):
+        """table.search()의 반환값에 select 메서드 자체가 없는(lancedb 버전 비호환) 경우
+        "failed"(일시적 장애)가 아니라 "unsupported"(영구 장애)로 구분된다(설계 리뷰
+        11차 M-2) — 재시도로 복구되지 않으므로 30분 백오프를 반복하지 않고 장기
+        억제해야 한다. 판정은 **메서드 존재 여부만**(getattr/callable) 좁게 확인한다
+        (설계 리뷰 16차 M-3) — select가 존재하지만 호출 중 예외를 던지는 경우는
+        아래 test_select_raises_attribute_error_is_treated_as_transient_failure 참조."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+
+        class _NoSelectQueryBuilder:
+            pass  # select 메서드 자체가 없음(구버전 lancedb 시뮬레이션)
+
+        class _TableWithoutSelect:
+            def search(self):
+                return _NoSelectQueryBuilder()
+
+        worker = CollectorWorker(
+            config=_make_config(str(folder)), indexer=indexer,
+            extractor=None, state_file=tmp_path / "state.json",
+        )
+        worker._indexer._table = _TableWithoutSelect()  # projection 미지원 시뮬레이션(table은 읽기전용 프로퍼티)
+
+        result = worker._purge_removed_folders([str(folder)], {}, dry_run=False, max_delete_ratio=0.30)
+        assert result == "unsupported"
+
+    def test_select_raises_attribute_error_is_treated_as_transient_failure(self, tmp_path: Path):
+        """리뷰16 M-3: select 메서드 자체는 존재하는데 호출 도중 AttributeError(또는 다른
+        예외)가 나면, API 부재가 아니라 내부 결함일 수 있으므로 "unsupported"(영구 억제)가
+        아니라 "failed"(일시적, 30분 백오프 후 재시도)로 분류해야 한다 — 넓은 try로
+        호출 체인 전체를 감싸면 이런 경우까지 capability_sig가 바뀔 때까지 무기한
+        억제되는 위험이 있었다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+
+        class _QueryBuilderThatRaises:
+            def select(self, *a, **kw):
+                raise AttributeError("select는 있지만 내부 결함으로 실패(시뮬레이션)")
+
+        class _TableWithBrokenSelect:
+            def search(self):
+                return _QueryBuilderThatRaises()
+
+        worker = CollectorWorker(
+            config=_make_config(str(folder)), indexer=indexer,
+            extractor=None, state_file=tmp_path / "state.json",
+        )
+        worker._indexer._table = _TableWithBrokenSelect()
+
+        result = worker._purge_removed_folders([str(folder)], {}, dry_run=False, max_delete_ratio=0.30)
+        assert result == "failed"
+
+
+# ============================================================
+# TestPurgeMetaIntegration — CollectorWorker + purge_meta 스킵/강제 reconciliation 통합
+# ============================================================
+
+class TestPurgeMetaIntegration:
+    """유휴 방치 중(변경 0건) purge DB 조회가 실제로 스킵되는지, 구성 변경 시
+    즉시 재실행되는지를 full-cycle(run())로 검증한다(설계 A-0002 AC-2)."""
+
+    def _make_worker_with_meta(self, tmp_path: Path, indexer, watch_folder: str, meta_file: Path):
+        from knowmate.secure.fake_reader import FakeReader
+        from knowmate.collector.scheduler import CollectorWorker
+
+        config = _make_config(watch_folder)
+        state_file = tmp_path / "state.json"
+        return CollectorWorker(
+            config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
+            purge_meta_file=meta_file,
+        )
+
+    def test_first_cycle_runs_purge_no_prior_meta(self, tmp_path: Path):
+        """메타가 없는 첫 사이클은 purge를 실행하고(스킵하지 않고) 메타를 남긴다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from unittest.mock import patch as _patch
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        (folder / "doc.txt").write_bytes(b"hello")
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        meta_file = tmp_path / "meta.json"
+        worker = self._make_worker_with_meta(tmp_path, indexer, str(folder), meta_file)
+
+        with _patch.object(worker, "_purge_removed_folders", wraps=worker._purge_removed_folders) as spy:
+            worker.run()
+        assert spy.call_count == 1
+        assert meta_file.exists()
+
+    def test_second_cycle_skips_purge_when_unchanged_and_zero_processed(self, tmp_path: Path):
+        """구성 불변 + 두 번째 사이클에 처리할 신규/변경 파일이 없으면 purge DB 조회가
+        스킵된다(AC-2)."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from unittest.mock import patch as _patch
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        (folder / "doc.txt").write_bytes(b"hello")
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        meta_file = tmp_path / "meta.json"
+
+        worker1 = self._make_worker_with_meta(tmp_path, indexer, str(folder), meta_file)
+        worker1.run()  # 1차: 신규 파일 1건 처리 + purge 실행 → 메타 기록
+
+        worker2 = self._make_worker_with_meta(tmp_path, indexer, str(folder), meta_file)
+        with _patch.object(worker2, "_purge_removed_folders", wraps=worker2._purge_removed_folders) as spy:
+            worker2.run()  # 2차: 변경 파일 없음(처리 0건) + 구성 동일 → purge 스킵
+        assert spy.call_count == 0
+
+    def test_purge_runs_again_when_watch_folders_change(self, tmp_path: Path):
+        """watch_folders 구성이 바뀌면(op_sig 변경) 처리 0건이어도 purge가 즉시 재실행된다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from unittest.mock import patch as _patch
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        (folder / "doc.txt").write_bytes(b"hello")
+        other_folder = tmp_path / "other"
+        other_folder.mkdir()
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        meta_file = tmp_path / "meta.json"
+
+        worker1 = self._make_worker_with_meta(tmp_path, indexer, str(folder), meta_file)
+        worker1.run()
+
+        # watch_folders를 다른 폴더로 변경 (op_sig 변경)
+        worker2 = self._make_worker_with_meta(tmp_path, indexer, str(other_folder), meta_file)
+        with _patch.object(worker2, "_purge_removed_folders", wraps=worker2._purge_removed_folders) as spy:
+            worker2.run()
+        assert spy.call_count == 1
+
+    def test_meta_persists_across_worker_instances(self, tmp_path: Path):
+        """sidecar 파일이 원자 저장되어 다음 워커 인스턴스(프로세스 재시작 시뮬레이션)가
+        읽을 수 있다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector import purge_meta
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        (folder / "doc.txt").write_bytes(b"hello")
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        meta_file = tmp_path / "meta.json"
+
+        worker1 = self._make_worker_with_meta(tmp_path, indexer, str(folder), meta_file)
+        worker1.run()
+
+        loaded = purge_meta.load_purge_meta(meta_file)
+        assert loaded.reconciled_sig is not None
+        assert loaded.last_purge_ts is not None
+
+
+class TestMaxDeleteRatioFailClosed:
+    """config.yaml은 사용자가 직접 편집 가능하므로 max_delete_ratio에 NaN·범위 밖 값이
+    들어와도 대량삭제 차단기가 우회되지 않아야 한다(설계 리뷰 10차 B-1) — 삭제 안전장치는
+    fail-closed(무효 값 → 사실상 전체 차단)여야지, 조용히 기본값으로 폴백해 정상처럼 동작하면
+    안 된다."""
+
+    def test_nan_max_delete_ratio_blocks_deletion_and_alerts(self, tmp_path: Path):
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.secure.fake_reader import FakeReader
+        from knowmate.collector.scheduler import CollectorWorker
+
+        stale_folder = tmp_path / "stale_docs"
+        stale_folder.mkdir()
+        kept_folder = tmp_path / "kept_docs"
+        kept_folder.mkdir()
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+
+        f = stale_folder / "doc.docx"
+        f.write_bytes(b"content")
+        chunk_ids = indexer.index_file(path=str(f), text="본문", mtime=f.stat().st_mtime, scope="local")
+
+        # kept_docs만 watch_folders에 남기고(stale_docs는 제거됨) dry_run=False +
+        # max_delete_ratio=NaN — config.yaml에서 사용자가 실수로 넣을 수 있는 값을 재현.
+        config = {
+            "collector": {"watch_folders": [str(kept_folder)], "idle_seconds": 60},
+            "cleanup": {"dry_run": False, "max_delete_ratio": float("nan")},
+            "chunking": {"chunk_size": 400, "overlap": 80},
+        }
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=FakeReader(),
+            state_file=tmp_path / "state.json", purge_meta_file=tmp_path / "purge_meta.json",
+        )
+        alerts = []
+        worker.indexing_needed.connect(alerts.append)
+
+        worker.run()
+
+        # fail-closed: 삭제되지 않고 그대로 남아 있어야 함
+        df = indexer.table.to_arrow().to_pandas()
+        active = df[~df["is_deleted"]]
+        assert str(f) in active["file_path"].values
+        # 설정 이상 알림이 발행됨
+        assert any("max_delete_ratio" in a for a in alerts)
 
 
 # ============================================================
@@ -1107,6 +1346,129 @@ class TestSingleInstance:
 # TestStopWorker — 종료 시 워커 정리 에스컬레이션 (PyQt6 무관)
 # ============================================================
 
+class TestDefaultHardExit:
+    """하드 종료 경로가 logging.shutdown()을 기다리지 않는지 검증한다(설계 리뷰 9차 B-1).
+
+    QThread.terminate()가 로깅 핸들러 락을 쥔 채로 스레드를 강제 중단시켰다면
+    logging.shutdown()이 그 락을 영원히 기다려, 최후 안전망이어야 할 하드 종료 자체가
+    멈추는 모순이 생긴다. 실제 os._exit는 프로세스를 죽이므로 pytest 안에서 직접
+    호출할 수는 없어, os._exit와 logging.shutdown을 각각 스파이로 치환해 호출 여부·
+    순서만 검증한다.
+    """
+
+    def test_does_not_call_logging_shutdown(self, monkeypatch):
+        import knowmate.app.lifecycle as lifecycle
+
+        shutdown_calls = []
+        exit_calls = []
+        monkeypatch.setattr(lifecycle.logging, "shutdown", lambda: shutdown_calls.append(1))
+        monkeypatch.setattr(lifecycle.os, "_exit", lambda code: exit_calls.append(code))
+
+        lifecycle._default_hard_exit(0)
+
+        assert exit_calls == [0]
+        assert shutdown_calls == []  # logging.shutdown()을 기다리지 않는다
+
+
+class TestDirtyShutdownMarker:
+    """강제 종료 사실을 저비용으로 기록·확인하는 표식(설계 리뷰 10차 M-1 → 11차 B-1로
+    구현 방식 수정).
+
+    LanceDB 쓰기 도중 강제 종료됐을 가능성을 자동으로 감지·복구하지는 않지만(검증
+    불가능한 추측성 로직은 미구현 — docs/DESIGN.md 참조), "강제 종료가 있었다"는
+    사실만은 사용자에게 알릴 수 있게 기록한다. 표식은 **시작 시 미리** 남기고
+    **정상 quit에서만** 지운다 — hard-exit 경로는 파일 I/O를 전혀 거치지 않아야
+    "하드 종료는 무조건·즉시" 불변식이 깨지지 않는다(리뷰11 B-1).
+    """
+
+    def test_first_run_not_dirty_but_marks_for_this_run(self, tmp_path: Path):
+        """표식이 없던 상태(첫 실행) → False 반환하지만, 이번 실행을 위한 표식은 남긴다."""
+        from knowmate.app.lifecycle import check_and_remark_dirty_shutdown
+
+        marker = tmp_path / "dirty_shutdown.flag"
+        assert not marker.exists()
+        assert check_and_remark_dirty_shutdown(marker) is False
+        assert marker.exists()  # 이번 실행 보호용 표식은 기록됨
+
+    def test_stale_marker_reports_dirty_and_rewrites(self, tmp_path: Path):
+        """이전 실행이 표식을 못 지우고 끝났다면(강제 종료) True를 반환하고, 이번
+        실행을 위해 다시 기록한다."""
+        from knowmate.app.lifecycle import check_and_remark_dirty_shutdown
+
+        marker = tmp_path / "dirty_shutdown.flag"
+        marker.write_text("1", encoding="utf-8")
+        assert check_and_remark_dirty_shutdown(marker) is True
+        assert marker.exists()  # 확인 후에도 이번 실행 보호용으로 다시 기록됨
+
+    def test_clear_removes_marker(self, tmp_path: Path):
+        """정상 quit 확정 시 clear_dirty_shutdown이 표식을 지운다(비동기 daemon 스레드,
+        설계 리뷰 12차 B-1 — 짧은 폴링으로 최종 결과만 확인)."""
+        from knowmate.app.lifecycle import check_and_remark_dirty_shutdown, clear_dirty_shutdown
+
+        marker = tmp_path / "dirty_shutdown.flag"
+        check_and_remark_dirty_shutdown(marker)  # 시작 시 기록
+        assert marker.exists()
+        clear_dirty_shutdown(marker)  # 정상 종료 시 제거 요청(즉시 반환)
+        assert _wait_until(lambda: not marker.exists()), "marker not removed in time"
+
+    def test_clear_returns_quickly_when_delete_is_fast(self, tmp_path: Path):
+        """정상적인(빠른) 삭제라면 join 상한(1초, 리뷰14 M-2)을 기다리지 않고
+        곧바로 반환한다."""
+        import time
+        from knowmate.app.lifecycle import check_and_remark_dirty_shutdown, clear_dirty_shutdown
+
+        marker = tmp_path / "dirty_shutdown.flag"
+        check_and_remark_dirty_shutdown(marker)
+
+        start = time.monotonic()
+        clear_dirty_shutdown(marker)
+        elapsed = time.monotonic() - start
+        assert elapsed < 0.5, f"clear_dirty_shutdown blocked for {elapsed}s"
+
+    def test_clear_bounded_by_join_timeout_when_delete_hangs(self):
+        """리뷰14 M-2: 삭제가 daemon 스레드에만 맡겨져 대기 없이 반환하면, 호출 직후
+        인터프리터가 곧바로 종료될 때 스레드가 완료 전에 잘려 정상 종료에서도 삭제가
+        보장되지 않는다는 지적을 받아, 최대 `_CLEAR_DIRTY_JOIN_TIMEOUT_SEC`(1초) 동안은
+        join하도록 수정했다 — 삭제가 오래 걸려도 그 상한을 크게 넘겨 블록되지는
+        않음(무기한 대기가 아님)을 확인한다."""
+        import time
+        from knowmate.app import lifecycle
+
+        class _SlowPath:
+            def unlink(self, missing_ok=True):
+                time.sleep(5.0)
+
+        start = time.monotonic()
+        lifecycle.clear_dirty_shutdown(_SlowPath())
+        elapsed = time.monotonic() - start
+        assert lifecycle._CLEAR_DIRTY_JOIN_TIMEOUT_SEC <= elapsed < 3.0, (
+            f"join 상한 근처에서 반환해야 하는데 {elapsed}s 걸림"
+        )
+
+    def test_clear_missing_marker_is_noop(self, tmp_path: Path):
+        """표식이 없는 상태에서 clear를 호출해도 예외가 없다."""
+        from knowmate.app.lifecycle import clear_dirty_shutdown
+        clear_dirty_shutdown(tmp_path / "no_such_marker.flag")
+
+    def test_full_cycle_dirty_then_clean(self, tmp_path: Path):
+        """실행1: 시작(마크) → 강제종료(표식 안 지움). 실행2: 시작 시 dirty=True 확인
+        → 정상 종료로 clear → 실행3: 시작 시 dirty=False."""
+        from knowmate.app.lifecycle import check_and_remark_dirty_shutdown, clear_dirty_shutdown
+        marker = tmp_path / "dirty_shutdown.flag"
+
+        # 실행1 시작 (첫 실행이라 dirty=False), 강제 종료라고 가정 — clear 호출 안 함
+        assert check_and_remark_dirty_shutdown(marker) is False
+
+        # 실행2 시작 — 실행1이 표식을 못 지웠으므로 dirty=True
+        assert check_and_remark_dirty_shutdown(marker) is True
+        # 실행2는 정상 종료
+        clear_dirty_shutdown(marker)
+        assert _wait_until(lambda: not marker.exists()), "marker not removed in time"
+
+        # 실행3 시작 — 실행2가 정상 종료했으므로 dirty=False
+        assert check_and_remark_dirty_shutdown(marker) is False
+
+
 class TestStopWorker:
     """정상 종료 → 강제 종료 → 하드 종료 단계적 강제. 워커가 COM에 멈춰도
     트레이 [종료]가 프로세스를 반드시 끝내도록 보장하는 로직."""
@@ -1131,41 +1493,143 @@ class TestStopWorker:
             self.terminated = True
 
     def test_graceful_stop_no_terminate_no_hardexit(self):
-        """첫 wait에 정상 종료되면 terminate·하드종료 없이 끝난다."""
+        """첫 wait에 정상 종료되면 terminate·하드종료 없이 끝나고 False(강제 아님)를 반환한다."""
         from knowmate.app.lifecycle import stop_worker
         w = self._FakeWorker(running=True, wait_results=[True])
         hard = []
-        stop_worker(w, hard_exit=lambda c: hard.append(c))
+        result = stop_worker(w, hard_exit=lambda c: hard.append(c))
         assert w.cancelled and not w.terminated and hard == []
+        assert result is False
 
     def test_terminate_when_graceful_times_out(self):
-        """정상 종료 실패 → terminate 후 성공하면 하드 종료는 안 한다."""
+        """정상 종료 실패 → terminate 후 성공하면 하드 종료는 안 하지만, terminate()가
+        쓰였으므로 True(강제 중단됨)를 반환한다(설계 리뷰 15차 B-1 — 호출부가 이 값을
+        finalize_shutdown(force_hard_exit=True)로 넘겨 quit 대신 hard_exit로 수렴시켜야
+        한다. terminate()로 멈춘 스레드는 임의 지점에서 강제 중단된 것이라 락을 쥔 채
+        죽었을 수 있어 "정상 종료"로 취급할 수 없다)."""
         from knowmate.app.lifecycle import stop_worker
         w = self._FakeWorker(running=True, wait_results=[False, True])
         hard = []
-        stop_worker(w, hard_exit=lambda c: hard.append(c))
+        result = stop_worker(w, hard_exit=lambda c: hard.append(c))
         assert w.terminated and hard == []
+        assert result is True
 
     def test_hard_exit_when_terminate_also_fails(self):
-        """정상·강제 모두 실패하면 프로세스 하드 종료(0)를 호출한다."""
+        """정상·강제 모두 실패하면 프로세스 하드 종료(0)를 호출하고 True를 반환한다."""
         from knowmate.app.lifecycle import stop_worker
         w = self._FakeWorker(running=True, wait_results=[False, False])
         hard = []
-        stop_worker(w, hard_exit=lambda c: hard.append(c))
+        result = stop_worker(w, hard_exit=lambda c: hard.append(c))
         assert w.terminated and hard == [0]
+        assert result is True
 
     def test_noop_when_not_running(self):
-        """이미 멈춘 워커는 아무것도 하지 않는다."""
+        """이미 멈춘 워커는 아무것도 하지 않고 False를 반환한다."""
         from knowmate.app.lifecycle import stop_worker
         w = self._FakeWorker(running=False)
         hard = []
-        stop_worker(w, hard_exit=lambda c: hard.append(c))
+        result = stop_worker(w, hard_exit=lambda c: hard.append(c))
         assert not w.cancelled and hard == []
+        assert result is False
 
     def test_noop_when_none(self):
-        """worker가 None이어도 예외 없이 통과한다."""
+        """worker가 None이어도 예외 없이 통과하고 False를 반환한다."""
         from knowmate.app.lifecycle import stop_worker
-        stop_worker(None, hard_exit=lambda c: (_ for _ in ()).throw(AssertionError("호출되면 안 됨")))
+        result = stop_worker(None, hard_exit=lambda c: (_ for _ in ()).throw(AssertionError("호출되면 안 됨")))
+        assert result is False
+
+
+class TestFinalizeShutdown:
+    """종료 최종 판정 — 워커 비실행 확인 시 quit, 실행 중·판정 불가 시 hard_exit.
+    quit과 hard_exit는 정확히 하나만 호출되어야 한다(설계 A-0001/ADR-0001)."""
+
+    class _FakeWorker:
+        def __init__(self, running=False, raise_on_is_running=False):
+            self._running = running
+            self._raise = raise_on_is_running
+
+        def isRunning(self):
+            if self._raise:
+                raise RuntimeError("워커 상태 조회 실패")
+            return self._running
+
+    def test_quit_when_worker_none(self):
+        """worker가 None이면 quit만 호출된다."""
+        from knowmate.app.lifecycle import finalize_shutdown
+        quit_calls, hard_calls = [], []
+        finalize_shutdown(
+            None, quit_fn=lambda: quit_calls.append(1),
+            hard_exit=lambda c: hard_calls.append(c),
+        )
+        assert quit_calls == [1] and hard_calls == []
+
+    def test_quit_when_worker_confirmed_stopped(self):
+        """isRunning()이 False로 확인되면 quit만 호출된다."""
+        from knowmate.app.lifecycle import finalize_shutdown
+        w = self._FakeWorker(running=False)
+        quit_calls, hard_calls = [], []
+        finalize_shutdown(
+            w, quit_fn=lambda: quit_calls.append(1),
+            hard_exit=lambda c: hard_calls.append(c),
+        )
+        assert quit_calls == [1] and hard_calls == []
+
+    def test_hard_exit_when_worker_still_running(self):
+        """워커가 여전히 실행 중이면 hard_exit만 호출된다(quit 안 함)."""
+        from knowmate.app.lifecycle import finalize_shutdown
+        w = self._FakeWorker(running=True)
+        quit_calls, hard_calls = [], []
+        finalize_shutdown(
+            w, quit_fn=lambda: quit_calls.append(1),
+            hard_exit=lambda c: hard_calls.append(c),
+        )
+        assert hard_calls == [0] and quit_calls == []
+
+    def test_hard_exit_when_is_running_raises(self):
+        """isRunning() 조회 자체가 실패(판정 불가)하면 보수적으로 hard_exit만 호출된다
+        (하드 종료 경로는 파일 I/O가 전혀 없어야 함, 리뷰11 B-1)."""
+        from knowmate.app.lifecycle import finalize_shutdown
+        w = self._FakeWorker(raise_on_is_running=True)
+        quit_calls, hard_calls = [], []
+        finalize_shutdown(
+            w, quit_fn=lambda: quit_calls.append(1),
+            hard_exit=lambda c: hard_calls.append(c),
+        )
+        assert hard_calls == [0] and quit_calls == []
+
+    def test_force_hard_exit_overrides_confirmed_stopped(self):
+        """리뷰15 B-1: isRunning()이 False로 확인돼도 force_hard_exit=True(stop_worker가
+        terminate()를 사용했음을 의미)면 quit 대신 hard_exit로 수렴한다 — terminate()로
+        강제 중단된 스레드는 락을 쥔 채 죽었을 수 있어 "정상 종료"로 취급할 수 없다."""
+        from knowmate.app.lifecycle import finalize_shutdown
+        w = self._FakeWorker(running=False)
+        quit_calls, hard_calls = [], []
+        finalize_shutdown(
+            w, quit_fn=lambda: quit_calls.append(1),
+            hard_exit=lambda c: hard_calls.append(c),
+            force_hard_exit=True,
+        )
+        assert hard_calls == [0] and quit_calls == []
+
+    def test_force_hard_exit_false_allows_normal_quit(self):
+        """force_hard_exit=False(기본값, 기존 동작)면 워커 비실행 확인 시 여전히 quit된다."""
+        from knowmate.app.lifecycle import finalize_shutdown
+        w = self._FakeWorker(running=False)
+        quit_calls, hard_calls = [], []
+        finalize_shutdown(
+            w, quit_fn=lambda: quit_calls.append(1),
+            hard_exit=lambda c: hard_calls.append(c),
+            force_hard_exit=False,
+        )
+        assert quit_calls == [1] and hard_calls == []
+
+    def test_finalize_shutdown_never_clears_dirty_marker(self):
+        """리뷰13 M-1: finalize_shutdown은 표식 해제를 전혀 하지 않는다 — quit()은
+        종료를 요청할 뿐 완료를 보장하지 않으므로, 표식 해제는 app.exec() 정상 반환
+        후 main()의 정상 반환 경로에서만 수행한다."""
+        from knowmate.app.lifecycle import finalize_shutdown
+        import inspect
+        assert "clear_dirty" not in inspect.signature(finalize_shutdown).parameters
 
 
 # ============================================================

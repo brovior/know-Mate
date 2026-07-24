@@ -2,7 +2,7 @@
 
 | 상태 | 날짜 | 결정자 | 리뷰 |
 |---|---|---|---|
-| Proposed | 2026-07-24 | Claude (Chief Architect) | reviews/REVIEW-20260724-adr-0001-explicit-quit-for-tray-app-adr-0002-purge-projectio-*.md (1~5차, 전건 종결) |
+| Accepted | 2026-07-24 | Claude (Chief Architect) | reviews/REVIEW-20260724-adr-0001-explicit-quit-for-tray-app-adr-0002-purge-projectio-*.md (1~17차, Blocker/Major/Minor 전건 처리·구현 반영. 17차 APPROVE_WITH_CHANGES(hard_exit NoReturn 계약 명시·성능 기준 수치 확정)로 최종 승인 근거 명시) |
 
 ## 맥락 (Context)
 - 베타 실사용에서 트레이 [종료] 후 `AegisDesk.exe`가 항상 잔존한다. 트레이 아이콘은
@@ -19,12 +19,22 @@
 ## 결정 (Decision)
 `main()`에서 `app.setQuitOnLastWindowClosed(False)`를 설정하고, 모든 종료 경로가 수렴하는
 `MainWindow._shutdown()`의 마지막 단계에서 종료를 **반드시** 완수한다: 앞 단계(스케줄러 정지·
-트레이 정리·`stop_worker`)의 예외와 무관하게 마지막 판정에 도달하며, **워커 비실행이 확인되면**
-`QApplication.instance().quit()`, **워커가 여전히 실행 중이거나 실행 여부 판정이 불가하면**
-(isRunning 조회 예외 포함) 보수적으로 `hard_exit`(os._exit 래퍼)를 호출한다 — quit과 hard_exit는
-정확히 하나만 실행된다. 기존 `stop_worker` 에스컬레이션(정상→terminate→`os._exit`)은 그대로
-유지하며, `_shutdown()`의 이 최종 분기는 stop_worker가 예외로 이탈한 경우까지 커버하는 마지막
-안전망이다.
+트레이 정리·`stop_worker`)의 예외와 무관하게 마지막 판정에 도달하며, **워커 비실행이 확인되고
+`terminate()`가 쓰이지 않았으면** `QApplication.instance().quit()`, **워커가 여전히 실행 중이거나
+실행 여부 판정이 불가하거나 `terminate()`로 강제 중단됐으면**(isRunning 조회 예외 포함) 보수적으로
+`hard_exit`(os._exit 래퍼)를 호출한다 — quit과 hard_exit는 정확히 하나만 실행된다. `terminate()`
+사용 여부를 "정상 종료 확인"에서 제외한 이유는 리뷰15 B-1 — `QThread.terminate()`는 스레드를
+임의 지점에서 강제 중단하므로, 그 결과 `isRunning()`이 False가 되어도 로깅 핸들러 락·LanceDB
+파일 락 등을 쥔 채 죽었을 가능성을 배제할 수 없어 "정상 종료"로 볼 수 없다. `stop_worker()`가
+`terminate()` 사용 여부를 반환하고, `_shutdown()`이 이 값을 `finalize_shutdown(force_hard_exit=)`로
+전달한다. 기존 `stop_worker` 에스컬레이션(정상→terminate→`os._exit`) 구조는 유지하며,
+`_shutdown()`의 이 최종 분기는 stop_worker가 예외로 이탈한 경우까지 커버하는 마지막 안전망이다.
+"quit과 hard_exit는 정확히 하나만 실행된다"는 보장은 `hard_exit`가 **절대 반환하지 않는다**는
+전제(`HardExit = Callable[[int], NoReturn]`)에 의존한다(리뷰17 m-1) — 반환하면 `stop_worker()`
+안에서 호출한 hard_exit 뒤에도 실행이 이어져 `finalize_shutdown()`이 다시 판정하게 되므로,
+운영 기본값(`os._exit`)이 이 계약을 만족함을 타입 별칭으로 명시한다. `stop_worker()`의 `bool`
+반환값 기반 설계 자체가 "hard_exit가 반환하더라도 다음 판정이 다시 보수적으로 hard_exit로
+수렴"하는 방어선이라, 테스트 더블이 비복귀를 완전히 모사하지 않아도 안전하다고 판단했다.
 
 ## 검토한 대안 (Alternatives)
 | 대안 | 장점 | 단점 | 기각 사유 |
