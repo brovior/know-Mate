@@ -134,18 +134,27 @@ state 기반이라 무관 — 변경 없음.
 사이클 시작:
   snapshot = 정규화(watch_folders)   # normcase/normpath·구분자 통일·중복 제거·정렬(불변 스냅샷,
                                      # 서명 계산과 purge 판정이 동일 스냅샷 사용)
-  op_sig = SHA-256(UTF-8 직렬화(snapshot, dry_run, max_delete_ratio))
-                                     # 결과에 영향 주는 설정 포함 — dry_run 해제·차단율 변경 시 재실행 보장
+  op_sig = SHA-256(canonical JSON)   # {"v":1, "folders":[...], "dry_run":bool,
+                                     #  "max_delete_ratio":float} 를 sort_keys=True·고정
+                                     # separator·UTF-8로 직렬화(필드 경계 모호성 제거, 리뷰2 m-2)
 사이클 종료부:
-  if op_sig == meta["reconciled_sig"] and 처리 0건
-     and (now - meta["last_purge_ts"]) < 강제주기(기본 24h):
-      purge 스킵 (DB 조회 없음)                        # ★ 빠른 경로
+  elapsed = now - meta["last_purge_ts"]
+  if elapsed < 0: meta 비정상으로 간주 → 즉시 purge (벽시계 역행 방어, 리뷰2 m-1)
+  if op_sig == meta["reconciled_sig"] and 처리 0건 and elapsed < 강제주기(기본 24h)
+     and 백오프 미해당:
+      purge 스킵 (DB 조회 없음)                        # ★ 빠른 경로 — O(1)
   else:
-      file_paths = chunks 테이블에서 file_path 컬럼만 조회    # ★ projection
+      file_paths = chunks 테이블에서 file_path 컬럼만 projection 조회
+                   # Arrow 컬럼 직접 순회 — pandas 변환 생략(리뷰2 B-1 대안3).
+                   # projection 불가 시 조용한 전체 로드 금지: 최적화 비활성 경고 + purge를
+                   # 구성 변경 사이클로 한정(리뷰2 M-3)
       (이하 기존과 동일: 소속 판정 → 대량삭제 차단 → dry_run → 삭제 → optimize)
-      purge가 예외 없이 완료된 경우에만:
-          meta["reconciled_sig"] = op_sig; meta["last_purge_ts"] = now   # 원자 갱신
-      예외·대량삭제 차단으로 미완료면: meta 미갱신 → 다음 사이클 자동 재시도
+      성공 완료 시에만: meta["reconciled_sig"]=op_sig; meta["last_purge_ts"]=now  # 원자 갱신
+      실패·차단 시 (핫루프 방지, 리뷰2 M-2):
+          meta["last_attempt_ts"]=now; meta["failed_sig"]=op_sig (+사유)
+          - 일시적 예외: 재시도 백오프(기본 30분, config화) 적용 — 매분 전건 재조회 금지
+          - 대량삭제 차단: 동일 op_sig에 대해 자동 재시도 안 함(구성·차단율 변경으로 op_sig가
+            바뀌어야 재실행). 차단 사실은 기존 UI 알림(1회)로 노출
 
 meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_state.meta.json, tmp→replace
 원자 교체). 기존 state 스키마(경로→dict)와 소비자 코드를 일절 건드리지 않는다(마이그레이션 불필요).
@@ -155,6 +164,7 @@ meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_stat
   취소되지 않았음. 실패·연기가 있던 사이클은 스킵하지 않는다(보수적).
 - **강제 reconciliation**: 스킵이 계속되더라도 `last_purge_ts` 기준 24h(기본, config화) 경과 시
   0건이어도 purge를 1회 실행 — 외부 요인으로 생긴 state-DB 불일치가 무기한 방치되지 않는 상한.
+  이 사이클은 O(N)이되 경로 데이터만 다룬다(R-0002 NFR-1 개정 문언과 일치 — 리뷰2 B-1/M-1 반영).
 
 ### 핵심 결정과 트레이드오프
 - 결정: projection 방식은 `table.search().select(["file_path"]).limit(...)` 대신
@@ -169,8 +179,10 @@ meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_stat
 ### 실패 모드
 | 실패 | 감지 | 대응(격리/재시도/중단) |
 |---|---|---|
-| projection API가 해당 lancedb 버전에 없음 | 구현 시 즉시 확인 | 기존 `to_arrow().to_pandas()`로 폴백하되 컬럼 select 가능한 다른 API 채택 |
-| purge 도중 예외·대량삭제 차단 | purge 반환/예외 | meta(reconciled_sig) 미갱신 → 다음 사이클 자동 재시도(리뷰 B-2 반영) |
+| projection API가 해당 lancedb 버전에 없음 | 구현 단계에서 배포 고정 버전으로 확정·문서 기록 | **조용한 전체 로드 폴백 금지** — 최적화 비활성을 경고하고 purge를 구성 변경 사이클로 한정(리뷰2 M-3) |
+| purge 도중 일시적 예외 | purge 반환/예외 | reconciled_sig 미갱신 + **재시도 백오프**(기본 30분) — 매 사이클 전건 재조회 금지(리뷰2 M-2) |
+| 대량삭제 차단 지속 | 차단 판정 | 동일 op_sig 자동 재시도 안 함 — 구성·차단율 변경 시에만 재실행, UI 알림 1회(리뷰2 M-2) |
+| 시스템 시각 역행 | now < last_purge_ts | meta 비정상 간주 → 즉시 purge(리뷰2 m-1) |
 | 스킵 오판(purge 필요한데 스킵) | op_sig 비교 로직 테스트 | SHA-256 + 정규화 스냅샷(프로세스 간 안정, 리뷰 m-1 반영). 잔여 위험은 24h 강제 reconciliation이 상한 |
 | sidecar 메타 파일 손상/유실 | 로드 실패 | meta 없음 = "스킵 불가"로 간주(보수적) → 그 사이클 purge 실행 후 재생성 |
 | 장기 유휴로 스킵만 반복 | last_purge_ts 경과 | 24h 초과 시 0건이어도 강제 purge(리뷰 B-1 반영) |

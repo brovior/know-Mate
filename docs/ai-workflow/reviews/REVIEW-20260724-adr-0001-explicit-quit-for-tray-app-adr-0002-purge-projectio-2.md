@@ -81,3 +81,26 @@
 - 설치·배포된 정확한 LanceDB 버전과 해당 버전에서 공개적으로 지원되는 전건 column projection API, 그리고 실제 저장소 레벨 column pushdown 여부를 확인해야 한다.
 - `_purge_removed_folders`가 pandas DataFrame을 반드시 요구하는지, Arrow 배열 직접 처리나 고정 크기 배치 처리가 가능한지 확인이 필요하다.
 - 외부 도구 또는 향후 공용 DB 캐시 로직이 로컬 chunks DB를 변경할 수 있는지 확인해야 한다. 불가능한 불변식이라면 24시간 강제 reconciliation의 필요성과 복잡도를 재평가할 수 있다.
+
+---
+
+## 처리 기록 (Claude, 2026-07-24)
+
+| ID | 판단 | 사유 / 반영 커밋 |
+|---|---|---|
+| B-1 | 수용 | 24h 강제 purge와 NFR-1 문언 충돌 인정 → R-0002 NFR-1을 재정식화(스킵 사이클 O(1) / reconciliation 사이클은 O(N)이되 벡터·원문 미로드, 청크 10만 기준 수십 MB 상한 실측). Arrow 컬럼 직접 순회로 pandas 변환 제거(대안 3 채택) → 반영: PR #59 설계 보강 커밋 |
+| M-1 | 수용 | FR-3에 복구 지연 상한 24h 명시, AC-2에 "마지막 성공 purge 후 24h 미만" 조건 포함(대안 1). 요구 문언 변경은 본 설계 PR 머지 승인으로 갈음 → 반영: 동일 커밋 |
+| M-2 | 수용 | 실패·차단 핫루프 지적 타당 → last_attempt_ts·failed_sig 기록, 일시적 예외는 백오프(기본 30분), 대량삭제 차단은 동일 op_sig 자동 재시도 금지(구성 변경 시에만)+UI 알림 1회(대안 1+2). NFR-3·AC-4 신설 → 반영: 동일 커밋 |
+| M-3 | 수용 | 조용한 전체 로드 폴백 제거 — projection 불가 시 최적화 비활성 경고 + purge를 구성 변경 사이클로 한정. 배포 고정 lancedb 버전에서 API 확정을 ADR 채택 조건화. AC-1에 실스캔/메모리 검증 추가(대안 1+2+3) → 반영: 동일 커밋 |
+| m-1 | 수용 | now < last_purge_ts면 meta 비정상 간주 → 즉시 purge. 미래 timestamp 테스트 추가 → 반영: 동일 커밋 |
+| m-2 | 수용 | op_sig를 스키마 버전 포함 canonical JSON(sort_keys·고정 separator·UTF-8)의 SHA-256로 확정 → 반영: 동일 커밋 |
+| m-3 | 수용 | R-0001 AC에 시간 상한 구분: 유휴/일반 종료 3초 이내, 행오버 에스컬레이션 15초 이내(8+3+여유) → 반영: 동일 커밋 |
+
+**확인 필요 항목 답변**: ① 종료 경로 수렴·재진입 가드는 구현 시 `_really_quit` 플래그와 함께
+점검(코드상 종료 경로는 트레이 [종료]·close_action=quit 2개, 모두 closeEvent→_shutdown 수렴 확인됨).
+② lancedb 배포 버전·projection API·pushdown은 구현 착수 시 확정해 ADR에 기록(채택 조건).
+③ `_purge_removed_folders`는 경로 문자열 집합만 있으면 되므로 Arrow 직접 순회로 전환 가능(확인됨).
+④ 현 단계에서 로컬 chunks DB를 쓰는 주체는 본 앱뿐이나, 5b(공용 DB 로컬 캐시)에서 외부 복사가
+도입될 예정이라 24h reconciliation은 유지가 타당.
+
+**종결 판정**: Blocker 1건·Major 3건 모두 수용·반영 완료 → 재리뷰 통과 시 Reviewed 승격 가능.

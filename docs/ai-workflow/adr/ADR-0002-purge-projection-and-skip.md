@@ -22,10 +22,15 @@
 ② 스킵 조건: "**op_sig 불변 && 처리 0건 && 마지막 성공 purge 후 24h 미경과**"일 때만 purge를
 생략한다. op_sig는 사이클 시작 시 고정한 불변 스냅샷(normcase/normpath·중복 제거·정렬)에
 `dry_run`·`max_delete_ratio`를 더해 SHA-256으로 계산한다(프로세스 간 안정·설정 변경 시 재실행).
-③ op_sig·`last_purge_ts` 메타는 purge가 **예외 없이 완료된 경우에만** 갱신한다 — 실패·대량삭제
-차단 시 미갱신으로 다음 사이클 자동 재시도. ④ 메타는 `index_state.json`이 아닌 **sidecar 파일**
-(`index_state.meta.json`, tmp→replace 원자 교체)에 보관해 기존 state 스키마·소비자를 건드리지
-않는다. 메타 부재/손상 시 스킵하지 않는다(보수적).
+③ op_sig·`last_purge_ts` 메타는 purge가 **예외 없이 완료된 경우에만** 갱신한다. 실패·차단 시의
+재시도는 핫루프가 되지 않게 한다: 일시적 예외는 백오프(기본 30분) 후 재시도, 대량삭제 차단은 동일
+op_sig에 대해 자동 재시도하지 않고 구성·차단율 변경(op_sig 변경) 시에만 재실행. ④ 메타는
+`index_state.json`이 아닌 **sidecar 파일**(`index_state.meta.json`, tmp→replace 원자 교체)에
+보관해 기존 state 스키마·소비자를 건드리지 않는다. 메타 부재/손상/시각 역행(now<last_purge_ts)
+시 스킵하지 않는다(보수적). ⑤ op_sig는 스키마 버전을 포함한 canonical JSON(sort_keys·고정
+separator·UTF-8)의 SHA-256. ⑥ projection 조회는 Arrow 컬럼 직접 순회(pandas 변환 생략)하며,
+projection API가 배포 lancedb 버전에서 불가하면 **조용한 전체 로드로 폴백하지 않고** 최적화
+비활성을 경고한다(구현 전 API 확정이 채택 조건).
 
 ## 검토한 대안 (Alternatives)
 | 대안 | 장점 | 단점 | 기각 사유 |
