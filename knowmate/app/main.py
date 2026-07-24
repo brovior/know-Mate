@@ -42,13 +42,20 @@ logger = logging.getLogger(__name__)
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, dirty_shutdown_detected: bool = False) -> None:
+    def __init__(
+        self,
+        dirty_shutdown_detected: bool = False,
+        lancedb_version_warning: str | None = None,
+    ) -> None:
         """메인 윈도우를 초기화한다.
 
         dirty_shutdown_detected: 이전 실행이 강제 종료됐는지(main()이 시작 시
             check_and_remark_dirty_shutdown()으로 판정) — True면 트레이 초기화 후
             풍선 알림으로 재인덱싱을 권장한다(설계 리뷰 11차 M-1, 로그만으로는
             GUI 사용자가 놓치기 쉬움).
+        lancedb_version_warning: main()이 check_lancedb_version()으로 확인한 경고
+            문구(범위 안이면 None) — 있으면 트레이 초기화 후 풍선 알림으로 표시한다
+            (설계 리뷰 19차 M-2, 로그만으로는 놓치기 쉬움).
         """
         super().__init__()
         self.setWindowTitle("Aegis Desk")
@@ -83,6 +90,11 @@ class MainWindow(QMainWindow):
                 "폴더를 제거 후 재추가해 재인덱싱하는 것을 권장합니다.",
                 QSystemTrayIcon.MessageIcon.Warning,
                 8000,
+            )
+        if lancedb_version_warning and self._tray is not None:
+            self._tray.showMessage(
+                "Aegis Desk", lancedb_version_warning,
+                QSystemTrayIcon.MessageIcon.Warning, 8000,
             )
 
         _inject_qwebchannel_js(self._view)
@@ -390,6 +402,16 @@ def main() -> None:
 
     logger.info("Aegis Desk %s 시작 (platform=%s)", __version__, sys.platform)
 
+    # 배포 빌드에 번들된 lancedb가 실측 검증 범위(requirements.txt) 안인지 확인한다
+    # (설계 리뷰 19차 M-2) — 포터블 빌드라 사용자가 버전을 바꿀 수 없으므로, 이 검사는
+    # 런타임 방어가 아니라 빌드 실수를 조기에 드러내는 진단 신호다. 범위 밖이어도
+    # 앱은 계속 실행한다(강제 종료할 만큼 확실한 장애가 아님 — 실제 비호환은 purge의
+    # "unsupported" 판정이 별도로 처리).
+    from knowmate.lancedb_compat import check_lancedb_version
+    lancedb_version_warning = check_lancedb_version()
+    if lancedb_version_warning:
+        logger.error(lancedb_version_warning)
+
     os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
     _set_windows_app_id("AegisDesk.App")
     app = QApplication(sys.argv)
@@ -426,7 +448,10 @@ def main() -> None:
             "폴더를 제거 후 재추가해 재인덱싱하는 것을 권장합니다."
         )
 
-    win = MainWindow(dirty_shutdown_detected=dirty_shutdown_detected)
+    win = MainWindow(
+        dirty_shutdown_detected=dirty_shutdown_detected,
+        lancedb_version_warning=lancedb_version_warning,
+    )
     single_instance_server = SingleInstanceServer(parent=win)
     single_instance_server.show_requested.connect(win._show_from_tray)
 
