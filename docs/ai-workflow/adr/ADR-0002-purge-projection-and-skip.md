@@ -2,7 +2,7 @@
 
 | 상태 | 날짜 | 결정자 | 리뷰 |
 |---|---|---|---|
-| Proposed | 2026-07-24 | Claude (Chief Architect) | 미검증 |
+| Proposed | 2026-07-24 | Claude (Chief Architect) | reviews/REVIEW-20260724-adr-0001-explicit-quit-for-tray-app-adr-0002-purge-projectio-*.md (1~5차, 전건 종결) |
 
 ## 맥락 (Context)
 - `_purge_removed_folders`(watch_folders에서 제거된 폴더의 청크를 DB에서 삭제)는 매 인덱싱

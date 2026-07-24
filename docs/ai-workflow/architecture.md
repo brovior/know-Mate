@@ -45,7 +45,7 @@
 
 <!-- 여기부터 실제 설계 블록을 추가한다. -->
 
-## A-0001: 트레이 상주 앱 종료 모델 — 명시적 quit  (상태: Draft / 대응 요구: R-0001)
+## A-0001: 트레이 상주 앱 종료 모델 — 명시적 quit  (상태: Reviewed / 대응 요구: R-0001)
 
 ### 개요
 현재 앱은 이벤트 루프 종료를 Qt의 암묵 규칙 `quitOnLastWindowClosed`(기본 True)에만 의존하고,
@@ -95,9 +95,10 @@ X (close_action=tray) → event.ignore() + hide()               # 종료 아님(
 처리한다(무결성 완주보다 "종료는 반드시 된다"를 우선 — R-0001 FR-1이 최상위):
 - `scheduler.stop()` 실패 → 계속 진행. quit()으로 이벤트 루프가 끝나면 Qt 타이머는 더 이상
   발화하지 않으므로 신규 사이클 차단은 결과적으로 성립.
-- `stop_worker()` 자체가 예외 → 계속 진행해 quit() 호출하되, **워커 스레드가 여전히 실행 중이면
-  hard_exit(os._exit) 경로로 전환**(quit만으로는 QThread 잔존 가능). 이 판정을 `_shutdown()`
-  마지막에 추가: `worker.isRunning()`이면 quit 대신 hard_exit.
+- `stop_worker()` 자체가 예외 → 계속 진행해 `_shutdown()` 마지막 판정으로: `worker.isRunning()`이
+  False로 **확인되면** quit, **True이거나 조회 자체가 예외면(판정 불가)** 보수적으로
+  hard_exit(quit만으로는 QThread 잔존 가능 — 리뷰5 M-2, "실행 중 또는 판정 불가 → hard_exit").
+  quit/hard_exit는 정확히 하나만 호출된다(ADR-0001 결정과 일치 — 리뷰5 M-1로 ADR 갱신).
 - terminate/`os._exit` 강제 경로에서는 계약 2·3(그 사이클의 state 저장·COM 정리)이 생략될 수
   있다 — 미저장 state는 다음 사이클 재인덱싱으로 자가 복구(감수하는 트레이드오프). 또한 8초
   graceful 대기는 "정상적으로 오래 걸리는 추출"에도 만료될 수 있음을 인정한다 — 이 경우에도 종료
@@ -127,13 +128,17 @@ daemon 사실이 성립하는 한 불필요 — 미도입).
 - 사외 통합(가능 시): `QT_QPA_PLATFORM=offscreen`으로 QApplication을 띄워 창 숨김/표시/
   `close_action=quit` 세 분기에서 이벤트 루프가 실제 종료되는지 통합 테스트(리뷰 m-2 반영).
   offscreen 불가 환경이면 closeEvent 분기 단위 테스트 + 아래 실기 3경로를 릴리스 체크리스트로 고정.
-- 사내 실기: ① 창 숨김 상태 [종료] ② 창 표시 상태 [종료] ③ `close_action=quit` X 클릭 —
-  세 경로 모두 작업관리자에서 프로세스 소멸 확인. ④ 인덱싱 중 [종료] — 기존 에스컬레이션 동작 확인.
+- 사내 실기(리뷰5 m-3 — AC 시간 상한과 직접 연결): ① 창 숨김 상태 [종료] ② 창 표시 상태 [종료]
+  ③ `close_action=quit` X 클릭 — 세 경로 모두 종료 명령 시점부터 프로세스 소멸까지 elapsed를 측정해
+  **3초 이내**(AC-1·AC-2) 판정. ④ 인덱싱 행오버 중 [종료] — 에스컬레이션 경유 **15초 이내**(AC-3)
+  판정. 릴리스 체크리스트에 측정 방법과 함께 고정.
 
 ### 리뷰 이력
-- (설계 PR 리뷰 대기)
+- reviews/REVIEW-20260724-...-projectio{,-2,-3,-4,-5}.md (GPT 채널 B, 5회) → 1~4차 REQUEST_CHANGES
+  전건 처리(수용 위주, 일부 근거 기각), 5차 APPROVE_WITH_CHANGES 전건 수용 → Blocker/Major 미종결
+  0건, Reviewed 승격 (2026-07-24)
 
-## A-0002: purge 조회 경량화 — 컬럼 projection + 조건부 스킵  (상태: Draft / 대응 요구: R-0002)
+## A-0002: purge 조회 경량화 — 컬럼 projection + 조건부 스킵  (상태: Reviewed / 대응 요구: R-0002)
 
 ### 개요
 `_purge_removed_folders`는 "watch_folders에서 제거된 폴더의 청크를 DB에서 삭제"하는 정리
@@ -184,6 +189,10 @@ state 기반이라 무관 — 변경 없음.
       (이하 기존과 동일: 소속 판정 → 대량삭제 차단 → dry_run → 삭제 → optimize)
       성공 완료: meta["reconciled_sig"]=op_sig; meta["last_purge_ts"]=now;
                  failed_sig·blocked_sig·next_retry_ts 해제                # 원자 갱신
+                 # 커밋 규칙(리뷰5 m-1): 성공 메타는 sidecar replace **성공 후에만** 메모리
+                 # committed 상태로 승격 — 저장 실패 시 메모리에도 반영하지 않아 같은 프로세스의
+                 # 다음 사이클이 스킵하지 않고 재실행(멱등이라 안전). 실패·차단 상태만 저장과
+                 # 무관하게 메모리 즉시 반영(억제는 보수적으로 유지, 스킵은 보수적으로 해제)
       일시적 예외: meta["failed_sig"]=op_sig; meta["next_retry_ts"]=now+백오프;
                  **meta["reconciled_sig"] 해제**   # 실패한 op_sig의 성공 스킵 자격 무효화 —
                  # 백오프 만료 후 이전 성공 메타가 3)을 참으로 만들어 재시도를 24h까지
@@ -235,6 +244,11 @@ meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_stat
   불변임을 검증.
 - 사내 실측: 유휴 방치 1시간 동안 작업관리자 RSS 추이 — 수정 전(우상향 눌러앉음) 대비 평탄화 확인.
   lancedb 실환경에서 projection API의 컬럼 미로드(pushdown) 실측(리뷰 '확인 필요' 반영).
+- 성능 수용(리뷰5 m-2): 대표 길이 file_path 10만 건 테스트 DB에서 강제 reconciliation 1회 실행 →
+  전후 peak RSS(또는 Arrow memory pool 최대치) 비교로 "baseline 대비 추가 할당 수십 MB 이내"
+  (NFR-1 상한) 판정 — RSS 추이 관찰과 별도로 1회 peak를 직접 측정.
 
 ### 리뷰 이력
-- (설계 PR 리뷰 대기)
+- reviews/REVIEW-20260724-...-projectio{,-2,-3,-4,-5}.md (GPT 채널 B, 5회) → 1~4차 REQUEST_CHANGES
+  전건 처리(수용 위주, 일부 근거 기각), 5차 APPROVE_WITH_CHANGES 전건 수용 → Blocker/Major 미종결
+  0건, Reviewed 승격 (2026-07-24)
