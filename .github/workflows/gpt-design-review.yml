@@ -1,0 +1,125 @@
+# vendored from ai-dev-workflow v0.1.4 — templates/gpt-design-review.yml
+# 직접 수정 금지: 개선은 ai-dev-workflow 정본에 하고 init_project.py --update로 동기화한다.
+# 채널 B — GPT 독립 설계 리뷰 (비동기, 모바일/웹 세션의 주 채널)
+#
+# 설계 PR이 docs/ai-workflow/**.md 를 바꾸면, GitHub 러너(클라우드 컨테이너의
+# 네트워크 정책과 무관)에서 scripts/ai_workflow/gpt_review.py 를 실행해 리뷰를
+# ① PR 코멘트로 게시하고 ② docs/ai-workflow/reviews/ 에 커밋한다.
+#
+# 가드:
+#  - repo Secret OPENAI_API_KEY 미등록 → 조용히 skip (무해)
+#  - fork PR → skip (secret 미노출·푸시 권한 없음)
+#  - reviews/** 변경은 트리거 제외 → 리뷰 커밋이 재트리거하는 루프 없음
+# 정본: ai-dev-workflow (vendored — 직접 수정 금지, init_project.py --update로 동기화)
+
+name: GPT Design Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "docs/ai-workflow/**.md"
+      - "!docs/ai-workflow/reviews/**"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: gpt-design-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # fork PR 차단(secret·push 권한 없음) + 봇 자신의 커밋으로는 돌지 않음
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Secret 게이트 (미등록이면 무해 skip)
+        id: gate
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -z "$OPENAI_API_KEY" ]; then
+            echo "has_key=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::OPENAI_API_KEY secret 미등록 — GPT 리뷰를 건너뜀"
+          else
+            echo "has_key=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout (PR head, 전체 이력)
+        if: steps.gate.outputs.has_key == 'true'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+
+      - name: 변경된 설계 문서 수집
+        if: steps.gate.outputs.has_key == 'true'
+        id: changed
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          FILES=$(git diff --name-only --diff-filter=ACMR "$BASE_SHA" "$HEAD_SHA" \
+            -- 'docs/ai-workflow/*.md' 'docs/ai-workflow/adr/*.md' \
+            | grep -v -E '^docs/ai-workflow/(reviews|prompts)/' || true)
+          if [ -z "$FILES" ]; then
+            echo "any=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::리뷰 대상 설계 문서 변경 없음 — skip"
+          else
+            echo "any=true" >> "$GITHUB_OUTPUT"
+            echo "files=$(echo "$FILES" | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
+            echo "리뷰 대상: $FILES"
+          fi
+
+      - name: Python 준비
+        if: steps.gate.outputs.has_key == 'true' && steps.changed.outputs.any == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: GPT 리뷰 실행
+        if: steps.gate.outputs.has_key == 'true' && steps.changed.outputs.any == 'true'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          GPT_REVIEW_MODEL: ${{ vars.GPT_REVIEW_MODEL }}
+        run: |
+          pip install --quiet openai
+          # vars.GPT_REVIEW_MODEL 미설정이면 빈 값 → 스크립트 기본값 사용
+          [ -z "$GPT_REVIEW_MODEL" ] && unset GPT_REVIEW_MODEL
+          # 배경 문서는 docs/ai-workflow/context-manifest.txt(프로젝트 선언)가 자동 동봉 —
+          # 여기서 파일명을 하드코딩하지 않는다.
+          python scripts/ai_workflow/gpt_review.py ${{ steps.changed.outputs.files }} \
+            --channel "B(action)"
+
+      - name: 리뷰를 PR 브랜치에 커밋
+        if: steps.gate.outputs.has_key == 'true' && steps.changed.outputs.any == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/ai-workflow/reviews/
+          if git diff --cached --quiet; then
+            echo "커밋할 리뷰 없음"
+          else
+            git commit -m "review(gpt): 설계 독립 리뷰 자동 게시 (channel B)"
+            git push origin "HEAD:${{ github.event.pull_request.head.ref }}"
+          fi
+
+      - name: 리뷰를 PR 코멘트로 게시
+        if: steps.gate.outputs.has_key == 'true' && steps.changed.outputs.any == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          LATEST=$(ls -t docs/ai-workflow/reviews/REVIEW-*.md | head -1)
+          {
+            echo "## 🔍 GPT 독립 설계 리뷰 (자동, 채널 B)"
+            echo ""
+            cat "$LATEST"
+            echo ""
+            echo "---"
+            echo "_자동 생성: GPT Design Review Action (ai-dev-workflow) — 판단·확정 권한은 Chief Architect(Claude)에게 있음._"
+          } > /tmp/comment.md
+          gh pr comment "${{ github.event.pull_request.number }}" --body-file /tmp/comment.md

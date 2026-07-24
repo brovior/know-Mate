@@ -1,0 +1,13 @@
+# 프로젝트별 외부 반출 금지 패턴 (gpt_review.py 보안 가드 확장)
+# 한 줄당 fnmatch 패턴 하나. 공통 기본(.env*, *.pem, *.key, *secret* 등)은 브릿지에 내장.
+# git 추적 + 비-gitignore 검사는 항상 별도 강제 — 이 파일은 추가 벨트다.
+#
+# know-Mate(RAG 데스크톱 앱) 사용자 지식·상태 데이터 반출 금지:
+km.key
+*.key
+index_state.json
+threads.json
+*.lance
+*.ldb
+test_docs/*
+debug.log
