@@ -102,7 +102,9 @@ X (close_action=tray) → event.ignore() + hide()               # 종료 아님(
   hard_exit(quit만으로는 QThread 잔존 가능 — 리뷰5 M-2, "실행 중 또는 판정 불가 → hard_exit").
   quit/hard_exit는 정확히 하나만 호출된다(ADR-0001 결정과 일치 — 리뷰5 M-1로 ADR 갱신).
 - terminate/`os._exit` 강제 경로에서는 계약 2·3(그 사이클의 state 저장·COM 정리)이 생략될 수
-  있다 — 미저장 state는 다음 사이클 재인덱싱으로 자가 복구(감수하는 트레이드오프). 또한 8초
+  있다 — **최소한** 그 사이클의 state 갱신이 유실되며(다음 사이클 재인덱싱으로 자가 복구),
+  LanceDB 쓰기 도중이었다면 영향 범위는 LanceDB의 커밋 원자성에 의존한다(구현 단계에서 버전·API
+  근거 확인, 리뷰7 m-1 — 재시작 후 DB open·재인덱싱 복구 테스트 포함). 또한 8초
   graceful 대기는 "정상적으로 오래 걸리는 추출"에도 만료될 수 있음을 인정한다 — 이 경우에도 종료
   우선 원칙은 동일하며, 잃는 것은 그 사이클의 state 갱신뿐(자가 복구됨).
 
@@ -131,10 +133,11 @@ daemon 사실이 성립하는 한 불필요 — 미도입).
 - 사외 통합(가능 시): `QT_QPA_PLATFORM=offscreen`으로 QApplication을 띄워 창 숨김/표시/
   `close_action=quit` 세 분기에서 이벤트 루프가 실제 종료되는지 통합 테스트(리뷰 m-2 반영).
   offscreen 불가 환경이면 closeEvent 분기 단위 테스트 + 아래 실기 3경로를 릴리스 체크리스트로 고정.
-- 사내 실기(리뷰5 m-3 — AC 시간 상한과 직접 연결): ① 창 숨김 상태 [종료] ② 창 표시 상태 [종료]
-  ③ `close_action=quit` X 클릭 — 세 경로 모두 종료 명령 시점부터 프로세스 소멸까지 elapsed를 측정해
-  **3초 이내**(AC-1·AC-2) 판정. ④ 인덱싱 행오버 중 [종료] — 에스컬레이션 경유 **15초 이내**(AC-3)
-  판정. 릴리스 체크리스트에 측정 방법과 함께 고정.
+- 사내 실기(리뷰5 m-3·리뷰7 M-2 — 경로(창 상태)와 워커 상태를 분리한 매트릭스): ① 창 숨김 ②
+  창 표시 ③ `close_action=quit` 세 경로를 **워커 미실행 상태**에서 실행해 **3초 이내**(AC-1·AC-2)
+  판정. ④ **정상 인덱싱 실행 중** [종료] — graceful 취소 대기 포함 **12초 이내**(AC-3a).
+  ⑤ **행오버 중** [종료] — 에스컬레이션 경유 **15초 이내**(AC-3b). elapsed는 종료 명령 시점부터
+  프로세스 소멸까지 측정, 릴리스 체크리스트에 고정.
 
 ### 리뷰 이력
 - reviews/REVIEW-20260724-...-projectio{,-2,-3,-4,-5}.md (GPT 채널 B, 5회) → 1~4차 REQUEST_CHANGES
@@ -156,7 +159,7 @@ state 기반이라 무관 — 변경 없음.
 |---|---|---|
 | `_purge_removed_folders` | `file_path`만 projection 조회, 삭제 판단·실행(기존 안전장치 유지), 성공 완료 여부 반환 | `knowmate/collector/scheduler.py` |
 | `_run_cycle` | 사이클 시작 시 불변 스냅샷·op_sig 계산, 스킵 판정(서명·0건·24h), 성공 시에만 meta 갱신 | `knowmate/collector/scheduler.py` |
-| purge 메타 sidecar | `reconciled_sig`·`last_purge_ts` 보관(tmp→replace 원자 교체). 기존 state 스키마 불변 | `index_state.meta.json` (신규) |
+| purge 메타 sidecar | 전체 필드 보관(tmp→replace 원자 교체): `reconciled_sig`(성공 서명)·`last_purge_ts`(성공 시각)·`failed_sig`+`next_retry_ts`(일시 실패 백오프)·`blocked_sig`(대량삭제 차단) + 스키마 버전. 필드별 유효성 규칙은 데이터 흐름 참조. 기존 state 스키마 불변 | `index_state.meta.json` (신규) |
 
 ### 데이터 흐름
 ```
@@ -233,7 +236,8 @@ meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_stat
 | projection API가 배포 고정 lancedb 버전에 없음 | **구현 착수 시 검증(채택 전제조건)** | 미지원이면 이 변경을 배포하지 않는다(호환 전체-로드 모드 없음 — 요구와 모순되는 폴백 자체를 두지 않음, 리뷰3 M-2). requirements.txt에 검증된 버전 고정 |
 | purge 도중 일시적 예외 | purge 반환/예외 | failed_sig+next_retry_ts 기록, 백오프(기본 30분) 중 **DB 조회 없이 return**(판정 1·2가 성공 스킵보다 선행 — 리뷰3 B-1) |
 | 대량삭제 차단 지속 | 차단 판정 | blocked_sig 기록 — 동일 op_sig 자동 재시도 안 함, 구성·차단율 변경 시에만 재실행, UI 알림 1회. 이 상태의 미복구는 FR-3 예외로 요구에 명문화(리뷰3 B-2) |
-| 시스템 시각 역행·미래 시각 필드 | now < last_purge_ts 또는 미래 next_retry_ts | 해당 억제·스킵 무시 → purge 실행(보수적, 리뷰3 m-2 포함) |
+| last_purge_ts가 미래값 | now < last_purge_ts | 성공 스킵 무효 → purge 실행(모든 미래값 무효) |
+| next_retry_ts가 유효 범위 밖(> now+설정백오프) | 로드 시 범위 검증 | 손상 취급 → 백오프 억제 해제(유효 범위 내 미래값은 **정상 억제** — 리뷰7 M-1로 문언 통일) |
 | sidecar 의미적 손상(타입·범위 이상) | 로드 시 필드별 검증 | 메타 부재와 동일 취급 → 스킵 없이 purge 후 재생성(리뷰3 m-2) |
 | purge 성공 후 meta 저장 실패 | 다음 사이클 재실행 | 안전 — 삭제(file_path 기준)·optimize는 멱등(재실행해도 결과 동일). 문서화+테스트(리뷰3 m-2) |
 | 스킵 오판(purge 필요한데 스킵) | op_sig 비교 로직 테스트 | SHA-256 + 정규화 스냅샷(프로세스 간 안정, 리뷰 m-1 반영). 잔여 위험은 24h 강제 reconciliation이 상한 |
@@ -242,8 +246,9 @@ meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_stat
 
 ### 검증 계획
 - 사외: ① projection 결과에 vector/text 부재 검증 ② 스킵 조건 단위 테스트(서명 동일+0건+24h 미경과
-  → 조회 스파이 미호출 / 서명·dry_run·차단율 변경 또는 24h 경과 → 호출) ③ purge 예외·대량삭제 차단
-  시 meta 미갱신 → 다음 사이클 재실행 검증 ④ meta 파일 부재/손상 시 purge 실행(보수적 폴백) ⑤
+  → 조회 스파이 미호출 / 서명·dry_run·차단율 변경 또는 24h 경과 → 호출) ③-a 일시적 예외 후
+  백오프 동안 조회 없음·만료 후 1회 재시도 검증, ③-b 차단 후 동일 op_sig 조회 없음·op_sig 변경
+  시 재실행 검증(성공 메타만 미갱신, 실패·차단 메타는 갱신됨 — 리뷰7 M-1) ④ meta 파일 부재/손상 시 purge 실행(보수적 폴백) ⑤
   watch_folder 제거 시나리오 회귀(기존 테스트 유지 통과) ⑥ op_sig가 경로 대소문자·구분자 차이에
   불변임을 검증.
 - 사내 실측: 유휴 방치 1시간 동안 작업관리자 RSS 추이 — 수정 전(우상향 눌러앉음) 대비 평탄화 확인.
