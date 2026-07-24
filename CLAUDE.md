@@ -140,8 +140,12 @@ scripts/          diag_search.py · inspect_index.py · test_shared_db.py(5b 사
 - UI 작업 시 `UI_SPEC.md` · `mockup.html` 먼저 읽고, 스펙과 다른 판단 필요 시 먼저 묻는다.
 - 로그 레벨: DEBUG(흐름 추적) / INFO(정상 결과) / WARNING(복구 가능) / ERROR(즉시 확인).
 
-<!-- ai-dev-workflow:review-recipe (init_project.py가 자동 주입 — 이 블록은 직접 수정하지 말 것) -->
+<!-- ai-dev-workflow:review-recipe (init_project.py가 자동 주입·갱신 — 이 블록은 직접 수정하지 말 것) -->
 ## 설계 리뷰 요청 처리 (ai-dev-workflow)
+
+> ⚠️ **모델 규칙 (필수)**: 이 설계·리뷰 워크플로(Chief Architect 판단)는 **반드시 Opus 이상 모델**로
+> 수행한다. **현재 세션이 Sonnet 이하이면, 리뷰·설계 작업을 시작하기 전에 사용자에게 "Opus 이상으로
+> 모델을 변경해 달라"고 먼저 요청**하고, 변경 전까지 진행하지 않는다. (설계 확정 후의 코딩·구현은 Sonnet도 허용.)
 
 사용자가 "설계 리뷰" / "GPT 리뷰" / "리뷰 받아줘" 등을 요청하면 — **네가 직접 리뷰하지 말고** 아래대로 한다:
 
