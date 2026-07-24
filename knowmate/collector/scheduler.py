@@ -292,7 +292,29 @@ class CollectorWorker(QThread):
 
         watch_folders = collector_cfg.get("watch_folders", [])
         dry_run = cleanup_cfg.get("dry_run", True)
-        max_delete_ratio = float(cleanup_cfg.get("max_delete_ratio", 0.30))
+
+        # 삭제 안전장치(대량삭제 차단기)에 쓰이는 값이라 fail-closed로 검증한다 —
+        # config.yaml은 사용자가 직접 편집 가능하고, YAML의 `.nan`이 그대로 들어오면
+        # `ratio > max_delete_ratio` 비교가 항상 거짓이 되어 차단기가 무력화된다
+        # (설계 리뷰 10차 B-1). 무효 값은 조용히 기본값(0.30 — 정상 동작 허용)으로
+        # 폴백하지 않고, 사실상 모든 삭제를 막는 0.0으로 대체 + 알림해 안전 쪽으로 fail한다.
+        from knowmate.collector import purge_meta
+        raw_max_delete_ratio = cleanup_cfg.get("max_delete_ratio", 0.30)
+        if purge_meta.is_valid_ratio(raw_max_delete_ratio):
+            max_delete_ratio = float(raw_max_delete_ratio)
+        else:
+            logger.error(
+                "[purge] max_delete_ratio 설정값이 비정상(%r) — fail-closed로 0.0(사실상 전체 "
+                "삭제 차단) 적용. config.yaml의 collector.cleanup.max_delete_ratio를 0~1 사이 "
+                "값으로 수정하세요.",
+                raw_max_delete_ratio,
+            )
+            self.indexing_needed.emit(
+                "max_delete_ratio 설정값이 비정상적입니다 — 안전을 위해 이번 사이클은 "
+                "삭제를 차단합니다. 설정을 확인하세요."
+            )
+            max_delete_ratio = 0.0
+
         chunk_size = int(chunk_cfg.get("chunk_size", 400))
         overlap = int(chunk_cfg.get("overlap", 80))
         max_file_size_mb = float(chunk_cfg.get("max_file_size_mb", 30.0))
@@ -321,11 +343,17 @@ class CollectorWorker(QThread):
         # docs/ai-workflow/architecture.md § A-0002. op_sig는 이번 사이클의 watch_folders
         # 구성·dry_run·max_delete_ratio로 결정되며, 변경 0건 + 동일 op_sig + 마지막 성공
         # purge 후 강제주기 미경과면 DB 조회 없이 스킵한다(유휴 방치 중 매분 전체 로드 방지).
-        from knowmate.collector import purge_meta
-        purge_force_reconcile_sec = float(
-            collector_cfg.get("purge_force_reconcile_sec", purge_meta.DEFAULT_FORCE_RECONCILE_SEC)
+        # 삭제 안전장치가 아니므로(언제 실행할지만 좌우) 무효 값은 기본값으로 폴백(fail-open).
+        raw_force_reconcile = collector_cfg.get("purge_force_reconcile_sec", purge_meta.DEFAULT_FORCE_RECONCILE_SEC)
+        purge_force_reconcile_sec = (
+            float(raw_force_reconcile)
+            if purge_meta.is_valid_positive_seconds(raw_force_reconcile)
+            else purge_meta.DEFAULT_FORCE_RECONCILE_SEC
         )
-        purge_backoff_sec = float(collector_cfg.get("purge_backoff_sec", purge_meta.DEFAULT_BACKOFF_SEC))
+        raw_backoff = collector_cfg.get("purge_backoff_sec", purge_meta.DEFAULT_BACKOFF_SEC)
+        purge_backoff_sec = (
+            float(raw_backoff) if purge_meta.is_valid_positive_seconds(raw_backoff) else purge_meta.DEFAULT_BACKOFF_SEC
+        )
         normalized_watch_folders = purge_meta.normalize_folders(watch_folders)
         purge_op_sig = purge_meta.compute_op_sig(normalized_watch_folders, dry_run, max_delete_ratio)
 

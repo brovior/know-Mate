@@ -20,6 +20,47 @@ _WAIT_GRACEFUL_MS = 8000
 _WAIT_AFTER_TERMINATE_MS = 3000
 
 
+_DIRTY_MARKER_NAME = "dirty_shutdown.flag"
+
+
+def _default_mark_dirty_shutdown() -> None:
+    """강제 종료 직전에 표식 파일을 남긴다(설계 리뷰 10차 M-1).
+
+    LanceDB add/delete/optimize가 진행 중일 수 있는 상태에서 워커 스레드를
+    강제 종료하거나 프로세스를 하드 종료하면, 그 쓰기의 커밋 원자성은 배포
+    lancedb 버전에 따라 미확정이다(추측성 자동 손상 감지·복구는 검증 불가능한
+    상태에서 넣는 게 더 위험하다고 판단해 미구현 — docs/DESIGN.md § 종료 확실화
+    참조). 대신 "강제 종료가 있었다"는 사실 자체는 저비용으로 기록해, 다음 실행
+    시작 시 사용자에게 재인덱싱을 권장할 근거로 삼는다(check_and_clear_dirty_shutdown).
+    표식 기록 자체의 실패(디스크 오류 등)는 종료를 막지 않도록 무시한다.
+    """
+    try:
+        from knowmate.config import get_data_dir
+        marker = get_data_dir() / _DIRTY_MARKER_NAME
+        marker.write_text("1", encoding="utf-8")
+    except OSError as exc:
+        logger.debug("강제 종료 표식 기록 실패(무시): %s", exc)
+
+
+def check_and_clear_dirty_shutdown(marker_path=None) -> bool:
+    """이전 실행이 강제 종료됐는지 확인하고 표식을 지운다(read-then-clear — 다음
+    시작 시 1회만 보고). 반환: 이전 실행에 강제 종료 표식이 있었으면 True.
+
+    marker_path: 표식 파일 경로(테스트 주입용, 기본은 %APPDATA%/AegisDesk/dirty_shutdown.flag).
+    """
+    try:
+        if marker_path is None:
+            from knowmate.config import get_data_dir
+            marker_path = get_data_dir() / _DIRTY_MARKER_NAME
+        existed = marker_path.exists()
+        if existed:
+            marker_path.unlink(missing_ok=True)
+        return existed
+    except OSError as exc:
+        logger.debug("강제 종료 표식 확인 실패(무시): %s", exc)
+        return False
+
+
 def _default_hard_exit(code: int = 0) -> None:
     """프로세스를 무조건·즉시 종료한다(마지막 수단 — 어떤 정리 코드도 먼저 실행하지 않음).
 
@@ -35,11 +76,12 @@ def _default_hard_exit(code: int = 0) -> None:
     os._exit(code)
 
 
-def stop_worker(worker, hard_exit=_default_hard_exit) -> None:
+def stop_worker(worker, hard_exit=_default_hard_exit, mark_dirty=_default_mark_dirty_shutdown) -> None:
     """워커를 정상 종료 → 실패 시 강제 종료 → 그래도 실패 시 프로세스 하드 종료.
 
     worker: cancel()/isRunning()/wait(ms)->bool/terminate() 를 갖는 객체(또는 None).
     hard_exit: 최종 프로세스 종료 콜백(기본 os._exit 래퍼, 테스트 주입용).
+    mark_dirty: 하드 종료 직전에 호출할 강제 종료 표식 콜백(테스트 주입용, 설계 리뷰 10차 M-1).
     """
     if worker is None or not worker.isRunning():
         return
@@ -57,10 +99,13 @@ def stop_worker(worker, hard_exit=_default_hard_exit) -> None:
 
     # 강제 종료 후에도 잔존 → 프로세스 하드 종료(사용자가 의도한 종료이므로 0)
     logger.error("워커 스레드가 강제 종료 후에도 잔존 — 프로세스 하드 종료(os._exit)")
+    mark_dirty()
     hard_exit(0)
 
 
-def finalize_shutdown(worker, quit_fn, hard_exit=_default_hard_exit) -> None:
+def finalize_shutdown(
+    worker, quit_fn, hard_exit=_default_hard_exit, mark_dirty=_default_mark_dirty_shutdown
+) -> None:
     """종료 최종 판정 — quit_fn(워커 비실행 확인) 또는 hard_exit(실행 중·판정 불가) 중 정확히 하나.
 
     _shutdown()의 앞 단계(scheduler.stop/tray.hide/stop_worker)가 예외로 이탈하더라도 항상
@@ -71,16 +116,19 @@ def finalize_shutdown(worker, quit_fn, hard_exit=_default_hard_exit) -> None:
     worker: cancel()/isRunning()/wait(ms)->bool/terminate() 를 갖는 객체(또는 None).
     quit_fn: () -> None, 워커 비실행이 확인됐을 때 호출할 정상 종료 콜백(QApplication.quit 등).
     hard_exit: 최종 프로세스 종료 콜백(기본 os._exit 래퍼, 테스트 주입용).
+    mark_dirty: 하드 종료 직전에 호출할 강제 종료 표식 콜백(테스트 주입용, 설계 리뷰 10차 M-1).
     """
     try:
         is_running = worker is not None and worker.isRunning()
     except Exception as exc:
         logger.warning("워커 실행 상태 조회 실패(판정 불가) — 보수적으로 하드 종료: %s", exc)
+        mark_dirty()
         hard_exit(0)
         return
 
     if is_running:
         logger.error("최종 판정 시점에도 워커가 실행 중 — 프로세스 하드 종료(os._exit)")
+        mark_dirty()
         hard_exit(0)
         return
 

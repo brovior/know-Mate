@@ -343,12 +343,20 @@ hard_exit 주입) 사외 단위 테스트가 가능하다.
 방어). `finalize_shutdown`도 `stop_worker`와 동형으로 PyQt6 비의존 분리 — `quit_fn`/`hard_exit`
 주입으로 사외 단위 테스트 가능(`knowmate/tests/test_phase3.py::TestFinalizeShutdown`).
 
+**강제 종료 표식 (dirty-shutdown marker, 설계 리뷰 10차 M-1)**: 자동 손상 감지·복구는 여전히
+보류하지만(아래), "강제 종료가 있었다"는 사실 자체는 저비용으로 남긴다. `stop_worker`/
+`finalize_shutdown`이 `hard_exit`를 호출하기 **직전**에 `lifecycle.mark_dirty_shutdown()`이
+`%APPDATA%/AegisDesk/dirty_shutdown.flag`를 기록하고(실패해도 종료를 막지 않음), 다음 앱 시작
+시 `main()`이 `check_and_clear_dirty_shutdown()`으로 그 표식을 확인·삭제(read-then-clear, 1회만
+보고)하며 존재하면 WARNING 로그로 재인덱싱을 권장한다. 정상 quit 경로에서는 표식을 남기지 않는다.
+
 **남은 한계(후속 과제, 설계 리뷰 8차 M-1 — 보류)**: `QThread.terminate()`/`os._exit()`가 LanceDB
 쓰기(add/delete/optimize) 도중 발생했을 때의 커밋 원자성은 실제 손상 시나리오를 재현·검증할 수
 없는 상태에서 추측성 자동 복구(격리·재구축) 로직을 넣는 게 오히려 위험하다고 판단해 지금은 넣지
 않았다. 인덱스는 원본 문서에서 **언제든 재생성 가능한 파생 데이터**이므로, 최악의 경우 "인덱스
 폴더 삭제 후 재인덱싱"이 항상 유효한 완전 복구 경로다 — 실제 장애 사례가 쌓이면 자동 감지·격리를
-근거 있게 설계한다.
+근거 있게 설계한다. 위 dirty-shutdown 표식은 "언제 그 복구가 필요할지"에 대한 최소한의 신호일
+뿐, 자동 격리·재구축은 여전히 하지 않는다.
 
 ## COM 행오버 워치독 (`collector/com_watchdog.py` + `secure/office_guard.py`)
 

@@ -4,6 +4,8 @@
 """
 from pathlib import Path
 
+import pytest
+
 from knowmate.collector import purge_meta
 from knowmate.collector.purge_meta import PurgeMeta
 
@@ -252,3 +254,74 @@ class TestPurgeMetaPersistence:
         f.write_text("[1, 2, 3]", encoding="utf-8")
         meta = purge_meta.load_purge_meta(f)
         assert meta == PurgeMeta()
+
+
+# ============================================================
+# is_valid_ratio / is_valid_positive_seconds — fail-closed 검증 (설계 리뷰 10차 B-1)
+# ============================================================
+
+class TestIsValidRatio:
+    """max_delete_ratio는 삭제 안전장치에 쓰이므로 fail-closed 검증 대상이다.
+    사용자가 config.yaml을 직접 편집할 수 있어 NaN·Infinity·범위 밖 값이 들어올 수 있다."""
+
+    def test_normal_values_valid(self):
+        assert purge_meta.is_valid_ratio(0.0)
+        assert purge_meta.is_valid_ratio(0.3)
+        assert purge_meta.is_valid_ratio(1.0)
+        assert purge_meta.is_valid_ratio(1)  # int도 허용
+
+    def test_nan_invalid(self):
+        assert not purge_meta.is_valid_ratio(float("nan"))
+
+    def test_infinity_invalid(self):
+        assert not purge_meta.is_valid_ratio(float("inf"))
+        assert not purge_meta.is_valid_ratio(float("-inf"))
+
+    def test_negative_invalid(self):
+        assert not purge_meta.is_valid_ratio(-0.1)
+
+    def test_greater_than_one_invalid(self):
+        assert not purge_meta.is_valid_ratio(1.1)
+
+    def test_non_numeric_invalid(self):
+        assert not purge_meta.is_valid_ratio("0.3")
+        assert not purge_meta.is_valid_ratio(None)
+
+    def test_bool_invalid(self):
+        """bool은 int의 서브클래스라 isinstance(True, int)가 참이지만, 설정값으로는
+        의미 없는 타입이므로 명시적으로 배제한다."""
+        assert not purge_meta.is_valid_ratio(True)
+        assert not purge_meta.is_valid_ratio(False)
+
+
+class TestIsValidPositiveSeconds:
+    def test_normal_values_valid(self):
+        assert purge_meta.is_valid_positive_seconds(1.0)
+        assert purge_meta.is_valid_positive_seconds(86400)
+
+    def test_zero_invalid(self):
+        assert not purge_meta.is_valid_positive_seconds(0)
+
+    def test_negative_invalid(self):
+        assert not purge_meta.is_valid_positive_seconds(-1.0)
+
+    def test_nan_invalid(self):
+        assert not purge_meta.is_valid_positive_seconds(float("nan"))
+
+    def test_infinity_invalid(self):
+        assert not purge_meta.is_valid_positive_seconds(float("inf"))
+
+    def test_non_numeric_invalid(self):
+        assert not purge_meta.is_valid_positive_seconds("86400")
+
+
+class TestComputeOpSigRejectsNonFinite:
+    def test_nan_max_delete_ratio_raises(self):
+        """compute_op_sig는 allow_nan=False로 직렬화한다 — 호출부가 is_valid_ratio로
+        미리 걸러야 하며, 걸러지지 않은 NaN이 들어오면 조용히 넘어가지 않고 즉시 실패한다."""
+        with pytest.raises(ValueError):
+            purge_meta.compute_op_sig(["/a"], False, float("nan"))
+
+    def test_infinity_max_delete_ratio_raises(self):
+        with pytest.raises(ValueError):
+            purge_meta.compute_op_sig(["/a"], False, float("inf"))

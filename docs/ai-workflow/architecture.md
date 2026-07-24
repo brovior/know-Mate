@@ -129,7 +129,7 @@ daemon 사실이 성립하는 한 불필요 — 미도입).
 | 새 종료 경로 추가 시 `_shutdown()` 미경유 | 코드 리뷰 규칙 | `_quit_app`/`closeEvent` 외 종료 경로 금지 문서화 |
 | `_shutdown()` 중복 진입(근접한 이중 종료 요청) | `_shutdown_done` 플래그 | 멱등 가드 — 두 번째 진입은 즉시 반환. "정확히 하나"는 **프로세스 수명 기준**이며 중복 호출 테스트로 고정(리뷰6 m-1) |
 | 하드 종료 직전 `logging.shutdown()`이 로깅 핸들러 락 대기로 영구 블록 | 코드 검토 | `_default_hard_exit`는 `logging.shutdown()`을 호출하지 않고 즉시 `os._exit()`만 실행(리뷰9 B-1) — 로그 유실을 감수하고 종료 확실성을 우선 |
-| LanceDB 쓰기(add/delete/optimize) 도중 강제 종료 시 손상 범위 미확정 | 실제 손상 재현 불가(구현 단계 한계) | 자동 감지·복구는 추측성 위험 판단으로 미구현. "인덱스는 재생성 가능한 파생 데이터"라 최악의 경우 인덱스 폴더 삭제 후 재인덱싱이 항상 유효한 복구 경로 — 후속 과제화(리뷰8 M-1, 리뷰9 M-2) |
+| LanceDB 쓰기(add/delete/optimize) 도중 강제 종료 시 손상 범위 미확정 | **`lifecycle.check_and_clear_dirty_shutdown()`** — `hard_exit` 직전 `mark_dirty()`로 남긴 표식을 다음 시작 시 확인(read-then-clear) | 자동 감지·복구는 여전히 추측성 위험 판단으로 미구현이나(후속 과제, 리뷰8 M-1), **강제 종료가 있었다는 사실만은 저비용으로 기록** — 다음 시작 시 WARNING 로그로 "검색 결과가 이상하면 재인덱싱 권장" 안내(리뷰10 M-1, 8·9차보다 범위가 좁은 감지 전용 장치라 채택). 자동 격리·재구축은 하지 않는다 — "인덱스는 재생성 가능한 파생 데이터"라 사용자가 폴더 재추가로 직접 재인덱싱 가능 |
 
 ### 검증 계획
 - 사외 단위: `_shutdown()`이 각 단계(스케줄러 stop → stop_worker → quit) **순서대로** 호출하고,
@@ -137,6 +137,12 @@ daemon 사실이 성립하는 한 불필요 — 미도입).
 - 사외 단위(예외 매개변수화, 리뷰4 m-2): scheduler.stop / tray.hide / stop_worker / isRunning
   조회가 **각각** 예외를 던지는 케이스에서 후속 단계가 계속 실행되고 최종적으로 quit(워커 미실행)
   또는 hard_exit(워커 잔존)가 **정확히 하나만** 호출됨을 검증. 보조 스레드 daemon 속성 테스트 유지.
+- 사외 단위(리뷰9 B-1): `_default_hard_exit`가 `logging.shutdown()`을 호출하지 않고 즉시
+  `os._exit()`만 부르는지 스파이로 검증.
+- 사외 단위(리뷰10 M-1): `stop_worker`/`finalize_shutdown`의 모든 hard_exit 분기에서
+  `mark_dirty()`가 `hard_exit()`보다 먼저 호출되는지(순서 포함), quit 경로에서는 `mark_dirty`가
+  호출되지 않는지 검증. `check_and_clear_dirty_shutdown`의 read-then-clear 왕복(표식 있음/없음)
+  단위 테스트.
 - 사외 통합(가능 시): `QT_QPA_PLATFORM=offscreen`으로 QApplication을 띄워 창 숨김/표시/
   `close_action=quit` 세 분기에서 이벤트 루프가 실제 종료되는지 통합 테스트(리뷰 m-2 반영).
   offscreen 불가 환경이면 closeEvent 분기 단위 테스트 + 아래 실기 3경로를 릴리스 체크리스트로 고정.
@@ -251,7 +257,9 @@ meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_stat
 | last_purge_ts가 미래값 | now < last_purge_ts | 성공 스킵 무효 → purge 실행(모든 미래값 무효) |
 | next_retry_ts가 유효 범위 밖(> now+설정백오프) | 로드 시 범위 검증 | 손상 취급 → 백오프 억제 해제(유효 범위 내 미래값은 **정상 억제** — 리뷰7 M-1로 문언 통일) |
 | sidecar 의미적 손상(타입·범위 이상) | 로드 시 필드별 검증 | 메타 부재와 동일 취급 → 스킵 없이 purge 후 재생성(리뷰3 m-2) |
-| purge 성공 후 meta 저장 실패 | 다음 사이클 재실행 | 안전 — 삭제(file_path 기준)·optimize는 멱등(재실행해도 결과 동일). 문서화+테스트(리뷰3 m-2) |
+| purge 성공 후 meta 저장 실패 | sidecar replace 실패 로그 | **현재 프로세스는 성공 메타를 메모리 캐시로 즉시 반영해 정상 스킵을 지속**(매 사이클 재조회 방지) — 다음 사이클 재실행이 아니라 **재시작 후** sidecar가 구버전임을 보고 재실행된다(리뷰6 m-2로 확정, 리뷰10 m-2로 표 문언 통일). 삭제(file_path 기준)·optimize는 멱등이라 재실행돼도 안전 |
+| 대량삭제 차단율(`max_delete_ratio`)이 비정상 값(NaN·범위 밖) | `purge_meta.is_valid_ratio` 검증 | fail-closed — 0.0(사실상 전체 삭제 차단)으로 대체 + ERROR 로그 + UI 알림. 조용히 기본값(0.30)으로 폴백하지 않는다(리뷰10 B-1) |
+| `purge_force_reconcile_sec`/`purge_backoff_sec`이 비정상 값 | `purge_meta.is_valid_positive_seconds` 검증 | fail-open — 삭제 안전장치가 아니므로 안전한 기본값(24h/30분)으로 폴백 + 로그(리뷰10 B-1과 동일 근거로 도입, 심각도는 낮음) |
 | 스킵 오판(purge 필요한데 스킵) | op_sig 비교 로직 테스트 | SHA-256 + 정규화 스냅샷(프로세스 간 안정, 리뷰 m-1 반영). 잔여 위험은 24h 강제 reconciliation이 상한 |
 | sidecar 메타 파일 손상/유실 | 로드 실패 | meta 없음 = "스킵 불가"로 간주(보수적) → 그 사이클 purge 실행 후 재생성 |
 | 장기 유휴로 스킵만 반복 | last_purge_ts 경과 | 24h 초과 시 0건이어도 강제 purge(리뷰 B-1 반영) |
@@ -262,7 +270,10 @@ meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_stat
   백오프 동안 조회 없음·만료 후 1회 재시도 검증, ③-b 차단 후 동일 op_sig 조회 없음·op_sig 변경
   시 재실행 검증(성공 메타만 미갱신, 실패·차단 메타는 갱신됨 — 리뷰7 M-1) ④ meta 파일 부재/손상 시 purge 실행(보수적 폴백) ⑤
   watch_folder 제거 시나리오 회귀(기존 테스트 유지 통과) ⑥ op_sig가 경로 대소문자·구분자 차이에
-  불변임을 검증.
+  불변임을 검증 ⑦(리뷰10 B-1) `is_valid_ratio`/`is_valid_positive_seconds`에 NaN·Infinity·
+  음수·범위 초과·bool·비숫자 케이스, `compute_op_sig`에 NaN/Infinity를 넣으면 `ValueError`인지,
+  `max_delete_ratio=NaN`인 config로 전체 사이클을 실행했을 때 삭제가 전혀 일어나지 않고
+  `indexing_needed` 알림이 발행되는지(fail-closed) 통합 검증.
 - 사내 실측: 유휴 방치 1시간 동안 작업관리자 RSS 추이 — 수정 전(우상향 눌러앉음) 대비 평탄화 확인.
   lancedb 실환경에서 projection API의 컬럼 미로드(pushdown) 실측(리뷰 '확인 필요' 반영).
 - 성능 수용(리뷰5 m-2): 대표 길이 file_path 10만 건 테스트 DB에서 강제 reconciliation 1회 실행 →

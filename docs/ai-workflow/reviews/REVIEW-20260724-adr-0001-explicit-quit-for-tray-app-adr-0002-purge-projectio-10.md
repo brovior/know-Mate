@@ -50,3 +50,20 @@
 - 소스 코드가 제공되지 않아 `max_delete_ratio`, 강제주기, 백오프 값에 대한 기존 공통 설정 검증과 `json.dumps(..., allow_nan=False)` 적용 여부는 확인할 수 없다.
 - R-0001·R-0002 요구사항 원문이 제공되지 않아 대량삭제 안전장치의 명시적 불변식과 강제 종료 후 복구에 대한 수용 기준은 확인이 필요하다.
 - `hard_exit` 주입 함수가 반환하지 않는 `NoReturn` 계약인지 확인이 필요하다. 테스트 대역이 반환할 수 있다면 `stop_worker`에서 hard-exit 호출 후 최종 판정까지 이어져 “정확히 하나” 계약을 깨는 테스트상 모호성이 생길 수 있다.
+
+---
+
+## 처리 기록 (Claude, 2026-07-24)
+
+| ID | 판단 | 사유 / 반영 커밋 |
+|---|---|---|
+| B-1 | 수용 | 실제 안전 결함 확인 — `max_delete_ratio`(대량삭제 차단 안전장치)에 검증이 없어 YAML `.nan` 등이 차단기를 무력화할 수 있었음. `purge_meta.is_valid_ratio`(0~1 유한 실수)로 fail-closed 검증 추가 — 무효 시 0.0(사실상 전체 삭제 차단)으로 대체 + ERROR 로그 + UI 알림(대안 1 채택, 조용한 기본값 폴백 금지). `purge_force_reconcile_sec`/`purge_backoff_sec`은 삭제 안전장치가 아니므로 `is_valid_positive_seconds`로 fail-open 검증(기본값 폴백). `compute_op_sig`에 `allow_nan=False` 추가(2중 방어). 회귀 테스트 다수 추가 → 반영: 구현 PR #60 후속 커밋 |
+| M-1 | 수용(축소 채택) | "언제 복구해야 하는지 판별 경로 없음" 지적 타당. 다만 8·9차에서 거절한 "자동 손상 감지·격리·재구축"과는 범위가 다른, 저비용·검증 가능한 **감지 전용** 제안이라 채택: `hard_exit` 직전 `mark_dirty_shutdown()`으로 표식 기록(실패 무시) → 다음 시작 시 `check_and_clear_dirty_shutdown()`(read-then-clear)으로 확인해 WARNING 로그 1줄. 자동 격리·재구축·DB 무결성 검사는 여전히 미구현(DESIGN.md에 명시) — 검증 불가능한 추측성 로직이라는 8차 판단은 유지 |
+| m-1 | 수용 | ADR-0002 Consequences의 "구성/파일 변경 사이클로만 지연" 서술에 "변경 없어도 24h 강제 reconciliation" 추가해 A-0002/architecture.md와 정합화 |
+| m-2 | 수용 | 실패 모드 표의 "다음 사이클 재실행"을 "현재 프로세스는 메모리 캐시로 정상 스킵 지속, 재시작 후에만 재실행"으로 정정(리뷰6에서 확정한 정책과 통일) |
+
+**확인 필요 항목 답변**: `hard_exit` NoReturn 계약 우려 — `stop_worker`/`finalize_shutdown`은 각
+hard_exit 호출 직후 명시적 `return`문이 있어(테스트 대역이 실제로 반환하더라도) 그 뒤 코드가
+실행되지 않도록 이미 구조적으로 보장돼 있음(추가 수정 불필요, 기존 코드 확인).
+
+**종결 판정**: Blocker 1건·Major 1건(축소 채택)·Minor 2건 전건 수용·반영. 신규 미해결 항목 없음.

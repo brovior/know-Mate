@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
 import time
 from dataclasses import dataclass, asdict
@@ -28,6 +29,25 @@ DEFAULT_FORCE_RECONCILE_SEC = 24 * 3600
 # 일시적 실패 후 재시도까지 대기하는 시간(초) — 실패가 지속돼도 매 사이클(60초) 전건
 # 재조회하지 않도록 한다.
 DEFAULT_BACKOFF_SEC = 30 * 60
+
+
+def is_valid_ratio(value) -> bool:
+    """0~1 범위의 유한한 실수인지 확인한다(config.yaml은 사용자가 직접 편집 가능하므로
+    `max_delete_ratio`처럼 삭제 안전장치에 쓰이는 값은 fail-closed로 검증해야 한다 —
+    설계 리뷰 10차 B-1. YAML의 `.nan`이 그대로 들어오면 `ratio > max_delete_ratio`
+    비교가 항상 거짓이 되어 대량삭제 차단기를 무력화할 수 있다)."""
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and 0.0 <= value <= 1.0
+    )
+
+
+def is_valid_positive_seconds(value) -> bool:
+    """유한하고 0보다 큰 실수인지 확인한다(강제 reconciliation 주기·백오프 값 검증용).
+    삭제 안전장치는 아니므로 무효 시 안전한 기본값으로 폴백(fail-open)하면 된다."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0
 
 
 def _normalize_path_str(s: str) -> str:
@@ -72,6 +92,10 @@ def compute_op_sig(normalized_folders: list[str], dry_run: bool, max_delete_rati
 
     스키마 버전을 포함한 고정 필드 + sort_keys + 고정 separator + UTF-8 직렬화로,
     단순 문자열 결합의 필드 경계 모호성을 없애고 프로세스 재시작에도 안정적이다.
+    `allow_nan=False`로 직렬화한다 — 호출부가 `max_delete_ratio`를 `is_valid_ratio`로
+    미리 검증해야 하며(설계 리뷰 10차 B-1), 검증을 건너뛴 NaN/Infinity가 여기까지
+    들어오면 (표준 JSON이 아닌 리터럴 NaN을 허용하는) 조용한 직렬화 대신 즉시
+    예외로 드러낸다.
     """
     payload = {
         "v": SCHEMA_VERSION,
@@ -79,7 +103,9 @@ def compute_op_sig(normalized_folders: list[str], dry_run: bool, max_delete_rati
         "dry_run": bool(dry_run),
         "max_delete_ratio": float(max_delete_ratio),
     }
-    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False
+    )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 

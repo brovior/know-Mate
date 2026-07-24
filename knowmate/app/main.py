@@ -369,6 +369,17 @@ def main() -> None:
 
     logger.info("Aegis Desk %s 시작 (platform=%s)", __version__, sys.platform)
 
+    # 이전 실행이 강제 종료(하드 종료)됐다면 표식이 남아있다 — LanceDB 쓰기 도중이었을
+    # 가능성을 배제할 수 없으므로(커밋 원자성 미검증, 설계 리뷰 10차 M-1) 자동 복구는
+    # 하지 않되, 진단에 쓸 수 있게 경고만 남긴다. read-then-clear라 다음 시작 때는
+    # 다시 뜨지 않는다.
+    from knowmate.app.lifecycle import check_and_clear_dirty_shutdown
+    if check_and_clear_dirty_shutdown():
+        logger.warning(
+            "이전 실행이 강제 종료됐습니다 — 검색 결과가 이상하면 설정 패널에서 해당 "
+            "폴더를 제거 후 재추가해 재인덱싱하는 것을 권장합니다."
+        )
+
     os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
     _set_windows_app_id("AegisDesk.App")
     app = QApplication(sys.argv)
