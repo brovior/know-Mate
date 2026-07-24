@@ -170,6 +170,27 @@ class TestDecide:
         d = purge_meta.decide(meta, "sig-a", processed_count=0, now=1000.0, backoff_sec=1800)
         assert d.should_run  # 손상 취급 → 억제 해제
 
+    def test_unsupported_blocked_suppressed_when_capability_sig_matches(self):
+        """리뷰14 M-1: unsupported 억제는 op_sig가 아니라 capability_sig로 판정한다 —
+        watch_folders(op_sig)가 바뀌어도 환경(capability_sig)이 그대로면 계속 억제된다."""
+        meta = PurgeMeta(blocked_sig="sig-a", blocked_reason="unsupported", blocked_capability_sig="0.1.0")
+        d = purge_meta.decide(meta, "sig-b", processed_count=0, now=1000.0, capability_sig="0.1.0")
+        assert not d.should_run and d.reason == "blocked"
+
+    def test_unsupported_blocked_released_when_capability_sig_changes(self):
+        """리뷰14 M-1: 앱/lancedb 업데이트로 capability_sig가 바뀌면 op_sig(폴더 구성)가
+        그대로여도 unsupported 억제가 해제되어 재검증된다 — 이전에는 op_sig 기준이라
+        폴더 구성이 그대로면 업데이트 안내가 실제로는 억제를 풀지 못하는 결함이 있었다."""
+        meta = PurgeMeta(blocked_sig="sig-a", blocked_reason="unsupported", blocked_capability_sig="0.1.0")
+        d = purge_meta.decide(meta, "sig-a", processed_count=0, now=1000.0, capability_sig="0.2.0")
+        assert d.should_run
+
+    def test_unsupported_blocked_released_when_capability_sig_unknown(self):
+        """호출부가 capability_sig를 넘기지 않으면(None) 안전한 방향(재시도)으로 폴백한다."""
+        meta = PurgeMeta(blocked_sig="sig-a", blocked_reason="unsupported", blocked_capability_sig="0.1.0")
+        d = purge_meta.decide(meta, "sig-a", processed_count=0, now=1000.0)
+        assert d.should_run
+
 
 # ============================================================
 # on_success / on_transient_failure / on_blocked — 전이별 필드 완전성
@@ -214,6 +235,27 @@ class TestMetaTransitions:
         assert out.blocked_sig == "sig-a"
         assert out.blocked_reason == "unsupported"
 
+    def test_on_blocked_records_capability_sig(self):
+        """리뷰14 M-1: reason="unsupported"와 함께 capability_sig를 넘기면 기록돼
+        decide()가 이후 억제 해제를 op_sig가 아닌 이 값 기준으로 판정할 수 있다."""
+        meta = PurgeMeta()
+        out = purge_meta.on_blocked(meta, "sig-a", reason="unsupported", capability_sig="0.1.0")
+        assert out.blocked_capability_sig == "0.1.0"
+
+    def test_on_blocked_mass_delete_leaves_capability_sig_none(self):
+        meta = PurgeMeta()
+        out = purge_meta.on_blocked(meta, "sig-a")
+        assert out.blocked_capability_sig is None
+
+
+class TestComputeCapabilitySig:
+    def test_returns_nonempty_string(self):
+        """실제 lancedb가 설치돼 있으면 버전 문자열을, 없거나 조회 실패 시 "unknown"을
+        반환한다 — 어느 경우든 빈 문자열이나 None은 아니다(decide()가 문자열 비교로만
+        판정하므로 타입 안정성이 중요)."""
+        sig = purge_meta.compute_capability_sig()
+        assert isinstance(sig, str) and sig != ""
+
 
 # ============================================================
 # load_purge_meta / save_purge_meta — sidecar 원자 저장·보수적 검증
@@ -240,6 +282,16 @@ class TestPurgeMetaPersistence:
         loaded = purge_meta.load_purge_meta(f)
         assert loaded == original
         assert loaded.blocked_reason == "unsupported"
+
+    def test_roundtrip_blocked_capability_sig(self, tmp_path: Path):
+        """리뷰14 M-1: blocked_capability_sig도 sidecar에 저장·복원돼야 재시작 후
+        capability_sig 기준 억제 해제 판정이 유지된다."""
+        f = tmp_path / "meta.json"
+        original = PurgeMeta(blocked_sig="sig-a", blocked_reason="unsupported", blocked_capability_sig="0.1.0")
+        assert purge_meta.save_purge_meta(f, original)
+        loaded = purge_meta.load_purge_meta(f)
+        assert loaded == original
+        assert loaded.blocked_capability_sig == "0.1.0"
 
     def test_atomic_save_uses_tmp_then_replace(self, tmp_path: Path):
         f = tmp_path / "meta.json"

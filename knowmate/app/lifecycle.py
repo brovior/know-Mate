@@ -53,21 +53,26 @@ def check_and_remark_dirty_shutdown(marker_path=None) -> bool:
         return False
 
 
+_CLEAR_DIRTY_JOIN_TIMEOUT_SEC = 1.0
+
+
 def clear_dirty_shutdown(marker_path=None) -> None:
-    """`app.exec()`가 정상 반환한 뒤(main()의 정상 반환 경로)에만 호출해 표식을 지운다 —
-    **호출 즉시 반환**한다(결과를 기다리지 않음, 설계 리뷰 12차 B-1). quit() 요청 시점이
-    아니라 이벤트 루프가 실제로 반환을 완료한 뒤에 호출해야 한다 — quit()은 종료를
-    "요청"할 뿐 완료를 보장하지 않으므로, 요청 시점에 지우면 그 사이 크래시가 나도
-    다음 시작 때 강제 종료를 탐지하지 못한다(설계 리뷰 13차 M-1).
+    """`app.exec()`가 정상 반환한 뒤(main()의 정상 반환 경로)에만 호출해 표식을 지운다.
+    quit() 요청 시점이 아니라 이벤트 루프가 실제로 반환을 완료한 뒤에 호출해야 한다 —
+    quit()은 종료를 "요청"할 뿐 완료를 보장하지 않으므로, 요청 시점에 지우면 그 사이
+    크래시가 나도 다음 시작 때 강제 종료를 탐지하지 못한다(설계 리뷰 13차 M-1).
 
     hard-exit 경로에서는 절대 호출하지 않는다 — 그래야 표식이 "정상 종료 못 함"의
-    증거로 남는다. 삭제 자체는 별도 daemon 스레드에서 시도한다: `%APPDATA%`가
-    네트워크로 리다이렉트된 로밍 프로필이거나 백신이 파일 삭제를 지연시키면
-    `unlink()`가 동기 호출로는 오래 걸리거나 멈출 수 있는데, 이 함수를 호출하는
-    `finalize_shutdown`의 quit 경로가 그 때문에 `quit_fn()` 호출을 못 하게 되면
-    "종료는 반드시 된다"는 최상위 불변식이 다시 깨진다. 삭제가 실패·지연되면
-    다음 시작 때 표식이 남아있어 오탐(강제 종료 아니었는데 경고) 위험은 있지만,
-    이는 진단 정보의 정확도 저하일 뿐이라 종료 보장보다 우선순위가 낮다.
+    증거로 남는다. 삭제 자체는 별도 daemon 스레드에서 수행하고 **최대
+    `_CLEAR_DIRTY_JOIN_TIMEOUT_SEC`초만 대기**한다(best-effort, 설계 리뷰 14차 M-2) —
+    `%APPDATA%`가 네트워크로 리다이렉트된 로밍 프로필이거나 백신이 파일 삭제를
+    지연시키면 `unlink()`가 오래 걸리거나 멈출 수 있는데, 무기한 daemon 스레드에만
+    맡기면 이 함수 호출 직후 인터프리터가 곧바로 종료돼(main()의 마지막 단계) 스레드가
+    실행되기도 전에 잘릴 수 있다(리뷰13 B-1 수정 이후 리뷰14 M-2가 지적). 반대로
+    무기한 동기 대기는 종료 자체를 지연시킬 수 있으므로, 짧은 상한을 두고 그 안에
+    끝나지 않으면 종료를 계속한다 — 표식이 남으면 다음 시작 때 오탐(강제 종료 아니었는데
+    경고) 위험은 있지만, 이는 진단 정보의 정확도 저하일 뿐이라 종료 지연보다 우선순위가
+    낮다.
     """
     def _do_clear(path) -> None:
         try:
@@ -84,7 +89,9 @@ def clear_dirty_shutdown(marker_path=None) -> None:
             return
 
     import threading
-    threading.Thread(target=_do_clear, args=(marker_path,), daemon=True, name="clear-dirty-marker").start()
+    t = threading.Thread(target=_do_clear, args=(marker_path,), daemon=True, name="clear-dirty-marker")
+    t.start()
+    t.join(_CLEAR_DIRTY_JOIN_TIMEOUT_SEC)
 
 
 def _default_hard_exit(code: int = 0) -> None:

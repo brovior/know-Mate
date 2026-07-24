@@ -50,6 +50,23 @@ def is_valid_positive_seconds(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value) and value > 0
 
 
+def compute_capability_sig() -> str:
+    """projection API 가용성에 영향을 주는 배포 환경 지문(lancedb 버전).
+
+    `op_sig`(폴더·설정 기반)와 달리 `"unsupported"` 억제 해제는 **watch_folders가
+    아니라 앱/의존성 업데이트에 반응**해야 한다(설계 리뷰 14차 M-1) — projection API
+    미지원은 폴더 구성과 무관한 환경 문제이므로, op_sig가 그대로여도 lancedb 버전이
+    바뀌면(사용자가 안내대로 앱을 업데이트하면) 억제를 해제하고 재검증해야 한다.
+    lancedb import 실패 등 조회 자체가 안 되는 극단적 상황은 "unknown"으로 취급해
+    안전하게(억제 미해제 방향이 아니라 재시도 방향으로) 폴백한다.
+    """
+    try:
+        import lancedb
+        return str(getattr(lancedb, "__version__", "unknown"))
+    except Exception:
+        return "unknown"
+
+
 def _normalize_path_str(s: str) -> str:
     """단일 경로 문자열에 정규화 규칙을 적용한다(절대경로화·normpath·normcase·구분자
     통일·후행 구분자 제거). 루트(watch_folders)와 비교 대상(DB의 file_path) 양쪽에
@@ -126,6 +143,10 @@ class PurgeMeta:
     next_retry_ts: float | None = None
     blocked_sig: str | None = None
     blocked_reason: str | None = None
+    # blocked_reason == "unsupported"일 때만 쓰인다(설계 리뷰 14차 M-1) — 억제 당시의
+    # lancedb 버전 지문. decide()가 이 값을 op_sig가 아니라 compute_capability_sig()의
+    # 최신 값과 비교해, watch_folders 변경 없이도 앱 업데이트만으로 억제를 해제한다.
+    blocked_capability_sig: str | None = None
 
 
 def _is_valid_number(v) -> bool:
@@ -158,12 +179,14 @@ def load_purge_meta(meta_file: Path) -> PurgeMeta:
     failed_sig = data.get("failed_sig")
     blocked_sig = data.get("blocked_sig")
     blocked_reason = data.get("blocked_reason")
+    blocked_capability_sig = data.get("blocked_capability_sig")
     last_purge_ts = data.get("last_purge_ts")
     next_retry_ts = data.get("next_retry_ts")
 
     for name, val in (
         ("reconciled_sig", reconciled_sig), ("failed_sig", failed_sig),
         ("blocked_sig", blocked_sig), ("blocked_reason", blocked_reason),
+        ("blocked_capability_sig", blocked_capability_sig),
     ):
         if val is not None and not isinstance(val, str):
             logger.warning("[purge] 메타 필드 타입 이상(%s), 무시: %r", name, val)
@@ -181,6 +204,7 @@ def load_purge_meta(meta_file: Path) -> PurgeMeta:
         next_retry_ts=next_retry_ts,
         blocked_sig=blocked_sig,
         blocked_reason=blocked_reason,
+        blocked_capability_sig=blocked_capability_sig,
     )
 
 
@@ -220,14 +244,25 @@ def decide(
     now: float,
     force_reconcile_sec: float = DEFAULT_FORCE_RECONCILE_SEC,
     backoff_sec: float = DEFAULT_BACKOFF_SEC,
+    capability_sig: str | None = None,
 ) -> PurgeDecision:
     """이번 사이클에 purge를 실행해야 하는지 판정한다.
 
     판정 순서(차단 → 백오프 → 성공 스킵 → 실행)를 항상 지킨다 — 이 순서가 아니면
     실패 직후 reconciled_sig 불일치로 백오프 조건에 도달하지 못해 매 사이클 전건
     재조회하는 결함이 생긴다.
+
+    capability_sig: `blocked_reason == "unsupported"`인 억제를 해제할지 판정하는 데만
+    쓴다(설계 리뷰 14차 M-1). unsupported는 watch_folders 구성과 무관한 환경 문제라
+    op_sig가 아니라 이 지문으로 판정한다 — 값이 억제 당시와 다르면(앱/lancedb
+    업데이트) 억제를 해제하고 재검증한다. 호출부가 넘기지 않으면(None) 안전한 방향
+    (억제 해제·재시도)으로 폴백한다.
     """
-    if meta.blocked_sig == op_sig:
+    if meta.blocked_sig is not None and meta.blocked_reason == "unsupported":
+        if capability_sig is not None and meta.blocked_capability_sig == capability_sig:
+            return PurgeDecision(False, "blocked")
+        # capability_sig 불명 또는 변경됨 → 억제 해제, 아래 판정으로 진행
+    elif meta.blocked_sig == op_sig:
         return PurgeDecision(False, "blocked")
 
     if meta.failed_sig == op_sig and meta.next_retry_ts is not None:
@@ -262,13 +297,19 @@ def on_transient_failure(meta: PurgeMeta, op_sig: str, now: float, backoff_sec: 
     )
 
 
-def on_blocked(meta: PurgeMeta, op_sig: str, reason: str = "mass_delete") -> PurgeMeta:
+def on_blocked(
+    meta: PurgeMeta, op_sig: str, reason: str = "mass_delete", capability_sig: str | None = None,
+) -> PurgeMeta:
     """차단 후 메타 — 동일 op_sig에서는 자동 재시도하지 않도록 차단 서명만 남기고,
     이전 성공·실패 상태는 함께 해제한다(오래된 억제가 다시 유효해지는 것 방지).
 
     reason: "mass_delete"(대량삭제 안전장치) | "unsupported"(projection API 비호환) —
-    재시작 후 표시할 알림 문구를 구분하는 데만 쓰인다(설계 리뷰 12차 m-1)."""
+    재시작 후 표시할 알림 문구를 구분하는 데만 쓰인다(설계 리뷰 12차 m-1).
+    capability_sig: reason="unsupported"일 때만 의미 있다 — compute_capability_sig()의
+    현재 값을 기록해, decide()가 이후 앱/lancedb 업데이트로 값이 바뀌면 op_sig와
+    무관하게 억제를 해제하도록 한다(설계 리뷰 14차 M-1)."""
     return PurgeMeta(
         reconciled_sig=None, last_purge_ts=meta.last_purge_ts, failed_sig=None,
         next_retry_ts=None, blocked_sig=op_sig, blocked_reason=reason,
+        blocked_capability_sig=capability_sig,
     )

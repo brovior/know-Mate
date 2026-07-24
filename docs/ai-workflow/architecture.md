@@ -132,6 +132,7 @@ daemon 사실이 성립하는 한 불필요 — 미도입).
 | LanceDB 쓰기(add/delete/optimize) 도중 강제 종료 시 손상 범위 미확정 | **`lifecycle.check_and_remark_dirty_shutdown()`** — 앱 **시작 시**, 단일 인스턴스 소유권을 획득한 프로세스에서만(리뷰12 M-1) 표식을 확인·재기록(read-then-remark). `app.exec()`가 정상 반환한 뒤 `main()`의 정상 반환 경로에서만(리뷰13 M-1) `clear_dirty_shutdown()`으로 지운다 | 자동 감지·복구는 여전히 추측성 위험 판단으로 미구현이나(후속 과제, 리뷰8 M-1), **강제 종료가 있었다는 사실만은 저비용으로 기록** — 다음 시작 시 WARNING 로그 + 트레이 풍선 알림(리뷰11 M-1 — 로그만으로는 GUI 사용자가 놓치기 쉬움)으로 "검색 결과가 이상하면 재인덱싱 권장" 안내. 자동 격리·재구축은 하지 않는다 — "인덱스는 재생성 가능한 파생 데이터"라 사용자가 폴더 재추가로 직접 재인덱싱 가능 |
 | **(리뷰11 B-1)** 표식 기록이 hard-exit 직전 동기 파일 I/O였다면, 그 I/O 자체가 블록(백신·네트워크 드라이브 등)될 때 최후 안전망인 하드 종료가 멈출 수 있음 | 코드 검토 | 표식 기록 위치를 **hard-exit 직전 → 앱 시작 시**로 이동. hard-exit 경로(`stop_worker`/`finalize_shutdown`의 hard_exit 분기)는 이제 파일 I/O를 전혀 거치지 않고 `hard_exit()`만 호출한다 — 9차 B-1로 확립한 "하드 종료는 무조건·즉시" 불변식과 재정합 |
 | **(리뷰12 B-1)** `clear_dirty_shutdown()`의 동기 `unlink()`가 블록되면 정상 quit 경로도 지연될 수 있음 | 코드 검토 | 삭제를 daemon 스레드에 위임하고 즉시 반환(결과를 기다리지 않음) — 삭제 실패·지연은 다음 시작 시 오탐(false positive) 위험만 있고, 그 편이 종료 지연보다 우선순위가 낮다 |
+| **(리뷰14 M-2)** daemon 스레드에 삭제를 맡기고 대기 없이 반환하면, 호출 직후 인터프리터가 곧바로 종료돼(`main()`의 마지막 단계) 스레드가 실행되기 전/`unlink()` 완료 전에 잘려 정상 종료에서도 삭제가 보장되지 않음 | 코드 검토 | daemon 스레드 시작 후 **최대 1초(`_CLEAR_DIRTY_JOIN_TIMEOUT_SEC`)만 `join()`**(best-effort 상한). 이 위치(리뷰13 M-1로 `app.exec()` 정상 반환 후로 이동됨)는 이벤트 루프가 이미 끝난 뒤라, 짧은 상한 대기가 "종료는 반드시 된다" 불변식을 재위협하지 않는다 — 1초를 넘겨도 종료를 계속한다 |
 | **(리뷰13 M-1)** `quit_fn()`(QApplication.quit) 호출은 이벤트 루프 종료를 "요청"할 뿐 완료를 보장하지 않는데, `finalize_shutdown()`이 그 직전에 표식을 지우면 요청~실제 반환 사이 크래시 시 다음 시작에서 강제 종료를 탐지 못하는 false negative가 생김 | 코드 검토 | `finalize_shutdown()`에서 `clear_dirty()` 호출을 완전히 제거. 표식 해제는 `main()`에서 `app.exec()`가 **정상 반환한 뒤**로 이동 — hard-exit 경로는 `os._exit()`로 `app.exec()`에 절대 반환하지 않으므로 "app.exec() 반환 = 정상 quit 확정"이 성립해, 이 위치가 표식 해제의 유일하게 안전한 시점이다 |
 | **(리뷰12 M-1)** 보조 인스턴스가 단일 인스턴스 판정 전에 표식을 건드리면 실행 중인 주 인스턴스의 표식을 오염시켜 오탐/누락 유발 | 코드 검토 | 시작 흐름을 `QApplication 생성 → 단일 인스턴스 획득/기존 인스턴스 통지(실패 시 즉시 return) → 소유권 획득 성공 시에만 표식 확인·재기록 → MainWindow 생성 → app.exec()`로 고정. 기존 인스턴스를 발견한 보조 프로세스는 표식 API를 전혀 호출하지 않고 `return`으로 조기 종료한다 |
 
@@ -166,6 +167,16 @@ daemon 사실이 성립하는 한 불필요 — 미도입).
   REQUEST_CHANGES 전건 처리(수용 위주, 일부 근거 기각), 5·6차 APPROVE_WITH_CHANGES 전건 수용,
   8차(PR #59 머지 후 도착) M-1 보류(후속 과제화)·나머지 수용 → Blocker/Major 미종결 0건,
   구현 완료 후 Accepted 승격 (2026-07-24)
+- reviews/REVIEW-20260724-...-projectio-{9,10,11,12,13,14}.md (PR #60 구현 반영 중 재트리거,
+  6회, 전건 REQUEST_CHANGES) — 9차 hard-exit logging.shutdown 제거(B-1), 10차
+  max_delete_ratio fail-closed 검증·dirty-shutdown 마커 최초 도입(B-1/M-1), 11차 마커
+  기록 위치를 hard-exit 직전에서 앱 시작 시로 재설계(B-1)·purge unsupported 분류(M-2),
+  12차 마커 삭제 daemon 비동기화(B-1)·단일 인스턴스 확정 후로 마커 처리 순서 이동(M-1)·
+  blocked_reason 필드 도입(m-1), 13차 마커 해제 시점을 app.exec() 정상 반환 후로 재이동
+  (M-1)·성능 수용 절차를 독립 프로세스 psutil 샘플링으로 재작성(M-3), 14차 unsupported
+  억제를 op_sig가 아닌 capability_sig(lancedb 버전) 기준으로 재설계(M-1)·마커 삭제
+  daemon에 짧은 join 상한 추가(M-2)·성능 수용 절차의 warm-up 범위를 DB open까지로
+  제한(M-3) — 전 라운드 Blocker/Major 전건 처리, 미종결 0건 유지
 
 ## A-0002: purge 조회 경량화 — 컬럼 projection + 조건부 스킵  (상태: Accepted / 대응 요구: R-0002)
 
@@ -260,7 +271,7 @@ meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_stat
 ### 실패 모드
 | 실패 | 감지 | 대응(격리/재시도/중단) |
 |---|---|---|
-| projection API가 배포 고정 lancedb 버전에 없음 | `table.search().select([...])` 호출이 `AttributeError` | **"unsupported"로 분류**(리뷰11 M-2) — 재시도로 복구되지 않는 영구 장애이므로 일시적 DB I/O 실패("failed", 30분 백오프)와 구분한다. `on_blocked`와 동일하게 동일 op_sig에서 장기 억제(반복 재시도 없음) + 1회 UI 알림("앱 업데이트 필요"). 호환 전체-로드 모드 없음 — 요구와 모순되는 폴백 자체를 두지 않음(리뷰3 M-2). lancedb 0.34.0에서 실측 검증 완료(위 핵심 결정 참조) |
+| projection API가 배포 고정 lancedb 버전에 없음 | `table.search().select([...])` 호출이 `AttributeError` | **"unsupported"로 분류**(리뷰11 M-2) — 재시도로 복구되지 않는 영구 장애이므로 일시적 DB I/O 실패("failed", 30분 백오프)와 구분한다. `on_blocked`와 동일한 형태로 장기 억제(반복 재시도 없음) + 1회 UI 알림("앱 업데이트 필요")하되, 억제 해제 판정은 **op_sig가 아니라 `compute_capability_sig()`(lancedb 버전 지문)**로 한다(리뷰14 M-1 — unsupported는 watch_folders 구성과 무관한 환경 문제라, op_sig 기준이면 폴더 구성이 그대로일 때 앱 업데이트 안내가 실제로는 억제를 풀지 못하는 결함이 있었다). 즉 **unsupported는 24시간 강제 reconciliation 예외** — 시간이 아니라 capability_sig 변화(앱/lancedb 업데이트)로만 재검증한다. 호환 전체-로드 모드 없음 — 요구와 모순되는 폴백 자체를 두지 않음(리뷰3 M-2). lancedb 0.34.0에서 실측 검증 완료(위 핵심 결정 참조) |
 | purge 도중 일시적 예외 | purge 반환/예외 | failed_sig+next_retry_ts 기록, 백오프(기본 30분) 중 **DB 조회 없이 return**(판정 1·2가 성공 스킵보다 선행 — 리뷰3 B-1) |
 | 대량삭제 차단 지속 | 차단 판정 | blocked_sig 기록 — 동일 op_sig 자동 재시도 안 함, 구성·차단율 변경 시에만 재실행, UI 알림 1회. 이 상태의 미복구는 FR-3 예외로 요구에 명문화(리뷰3 B-2) |
 | last_purge_ts가 미래값 | now < last_purge_ts | 성공 스킵 무효 → purge 실행(모든 미래값 무효) |
@@ -285,21 +296,26 @@ meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_stat
   `indexing_needed` 알림이 발행되는지(fail-closed) 통합 검증.
 - 사내 실측: 유휴 방치 1시간 동안 작업관리자 RSS 추이 — 수정 전(우상향 눌러앉음) 대비 평탄화 확인.
   lancedb 실환경에서 projection API의 컬럼 미로드(pushdown) 실측(리뷰 '확인 필요' 반영).
-- **성능 수용 — 필수(리뷰5 m-2, 리뷰11 m-1로 승격, 리뷰12 m-2 → 리뷰13 M-3/m-1로 절차 재정정)**:
-  결과 스키마에 벡터/원문이 없다는 사실과 약 6배 속도 향상은 강한 정황이지만, projection이
-  저장소 스캔 단계에서 실제로 컬럼을 건너뛴다는 직접 증거는 아니다(리뷰11 m-1 지적) — 배포
-  전 아래 절차로 **필수** 확보한다. (리뷰12 m-2가 제시한 "동일 프로세스에서 `ru_maxrss` 5회
-  반복 차분" 방식은 `ru_maxrss`가 프로세스 수명 **누적** peak라 첫 회 이후 차분이 구조적으로
-  0에 수렴해 거짓 합격할 수 있음이 리뷰13 M-3에서 지적돼 폐기한다.)
+- **성능 수용 — 필수(리뷰5 m-2, 리뷰11 m-1로 승격, 리뷰12 m-2 → 리뷰13 M-3/m-1 → 리뷰14 M-3로
+  절차 재정정)**: 결과 스키마에 벡터/원문이 없다는 사실과 약 6배 속도 향상은 강한 정황이지만,
+  projection이 저장소 스캔 단계에서 실제로 컬럼을 건너뛴다는 직접 증거는 아니다(리뷰11 m-1
+  지적) — 배포 전 아래 절차로 **필수** 확보한다. (리뷰12 m-2가 제시한 "동일 프로세스에서
+  `ru_maxrss` 5회 반복 차분" 방식은 `ru_maxrss`가 프로세스 수명 **누적** peak라 첫 회 이후
+  차분이 구조적으로 0에 수렴해 거짓 합격할 수 있음이 리뷰13 M-3에서 지적돼 폐기했다.)
   - 테스트 DB: 10만 행, file_path는 사내 실사용 경로 분포를 대표하는 길이(30~200자 구간에서
     표본화)로 생성. 제거 대상 경로를 테이블의 앞·중간·끝 위치에 각각 배치해 반환 행 수와
     삭제 후보 분류의 완전성도 함께 확인한다(리뷰13 m-1).
   - 측정: **5개의 독립 프로세스**에서 각각 1회씩 실행한다(동일 프로세스 반복이 아님 — 리뷰13
-    M-3). 각 프로세스는 시작 후 안정화(테스트 DB open + 쿼리 1회 warm-up)한 뒤의 baseline
-    RSS를 기록하고, 강제 reconciliation(프로젝션 쿼리 전체 스캔 + Arrow 순회 + 삭제 대상
-    구성 + `optimize()`까지 포함한 end-to-end)을 실행하는 동안 짧은 간격(예: 50ms)으로 RSS를
-    샘플링해 `max(sampled_rss) - baseline_rss`를 그 프로세스의 추가 할당량으로 기록한다. RSS
-    측정은 `psutil.Process().memory_info().rss`(Windows 포함 크로스플랫폼) 사용.
+    M-3). 각 프로세스의 warm-up은 **DB open과 스키마/행 수 조회(`count_rows()` 등)로만
+    한정**하고 baseline RSS를 기록한다 — measurement 대상인 `file_path` projection 쿼리·Arrow
+    순회는 warm-up에 절대 포함하지 않는다(리뷰14 M-3: 측정 대상과 동일한 전체 쿼리를
+    warm-up에서 먼저 실행하면 CPython/pyarrow가 해제 후에도 OS에 반환하지 않는 메모리가
+    baseline에 흡수돼, 이후 "max - baseline" 차분이 실제 첫 purge 비용을 과소평가하는
+    거짓 합격을 만든다). baseline 확정 후 강제 reconciliation(프로젝션 쿼리 전체 스캔 + Arrow
+    순회 + 삭제 대상 구성 + `optimize()`까지 포함한 end-to-end, **프로세스 최초 1회**)을
+    실행하는 동안 짧은 간격(예: 50ms)으로 RSS를 샘플링해 `max(sampled_rss) - baseline_rss`를
+    그 프로세스의 추가 할당량으로 기록한다. RSS 측정은
+    `psutil.Process().memory_info().rss`(Windows 포함 크로스플랫폼) 사용.
     - 결과 검증: projection 반환 행 수가 실제 테이블 행 수와 일치하고, 앞·중간·끝에 배치한
       제거 대상 경로가 모두 삭제 후보로 분류되는지 확인(리뷰13 m-1 — 불일치 시 그 자체로
       불합격, 메모리 기준과 무관하게 회귀로 취급).
@@ -313,3 +329,13 @@ meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_stat
   REQUEST_CHANGES 전건 처리(수용 위주, 일부 근거 기각), 5·6차 APPROVE_WITH_CHANGES 전건 수용,
   8차(PR #59 머지 후 도착) M-1 보류(후속 과제화)·나머지 수용 → Blocker/Major 미종결 0건,
   구현 완료 후 Accepted 승격 (2026-07-24)
+- reviews/REVIEW-20260724-...-projectio-{9,10,11,12,13,14}.md (PR #60 구현 반영 중 재트리거,
+  6회, 전건 REQUEST_CHANGES) — 9차 hard-exit logging.shutdown 제거(B-1), 10차
+  max_delete_ratio fail-closed 검증·dirty-shutdown 마커 최초 도입(B-1/M-1), 11차 마커
+  기록 위치를 hard-exit 직전에서 앱 시작 시로 재설계(B-1)·purge unsupported 분류(M-2),
+  12차 마커 삭제 daemon 비동기화(B-1)·단일 인스턴스 확정 후로 마커 처리 순서 이동(M-1)·
+  blocked_reason 필드 도입(m-1), 13차 마커 해제 시점을 app.exec() 정상 반환 후로 재이동
+  (M-1)·성능 수용 절차를 독립 프로세스 psutil 샘플링으로 재작성(M-3), 14차 unsupported
+  억제를 op_sig가 아닌 capability_sig(lancedb 버전) 기준으로 재설계(M-1)·마커 삭제
+  daemon에 짧은 join 상한 추가(M-2)·성능 수용 절차의 warm-up 범위를 DB open까지로
+  제한(M-3) — 전 라운드 Blocker/Major 전건 처리, 미종결 0건 유지

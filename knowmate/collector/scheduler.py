@@ -575,12 +575,14 @@ class CollectorWorker(QThread):
         # 판정 순서는 차단 → 백오프 → 성공 스킵 → 실행 순으로 고정(purge_meta.decide) —
         # 실패 직후 성공 서명을 해제하지 않으면 백오프가 성공 스킵에 가려 무력화된다.
         purge_meta_now = time.time()
+        purge_capability_sig = purge_meta.compute_capability_sig()
         purge_meta_state = self._purge_meta_cache
         if purge_meta_state is None:
             purge_meta_state = purge_meta.load_purge_meta(self._purge_meta_file)
         decision = purge_meta.decide(
             purge_meta_state, purge_op_sig, done, purge_meta_now,
             force_reconcile_sec=purge_force_reconcile_sec, backoff_sec=purge_backoff_sec,
+            capability_sig=purge_capability_sig,
         )
         if not decision.should_run:
             logger.debug("[purge] 스킵(%s)", decision.reason)
@@ -594,15 +596,19 @@ class CollectorWorker(QThread):
                 purge_meta_state = purge_meta.on_blocked(purge_meta_state, purge_op_sig, reason="mass_delete")
             elif result == "unsupported":
                 # 영구 장애(API 비호환) — 30분 백오프로 반복 재시도해도 복구되지 않으므로
-                # on_blocked와 동일하게 동일 op_sig에서는 장기 억제한다(구성 변경 또는
-                # 앱 업데이트로 op_sig가 바뀌어야 재시도). 1회만 알림. reason="unsupported"로
-                # 대량삭제 차단과 구분해 sidecar에 기록한다(설계 리뷰 12차 m-1).
-                if purge_meta_state.blocked_sig != purge_op_sig:
+                # 장기 억제하되, watch_folders가 아니라 lancedb 버전 지문(capability_sig)으로
+                # 판정한다(설계 리뷰 14차 M-1) — op_sig로 억제하면 사용자가 안내대로 앱을
+                # 업데이트해도 폴더 구성이 그대로면 억제가 절대 풀리지 않는 결함이 있었다.
+                # 알림도 동일하게 capability_sig 변화 기준 1회로 제한한다.
+                if purge_meta_state.blocked_capability_sig != purge_capability_sig:
                     self.indexing_needed.emit(
                         "제거된 폴더 정리 기능이 이 배포 환경과 호환되지 않습니다. "
                         "앱을 최신 버전으로 업데이트하세요."
                     )
-                purge_meta_state = purge_meta.on_blocked(purge_meta_state, purge_op_sig, reason="unsupported")
+                purge_meta_state = purge_meta.on_blocked(
+                    purge_meta_state, purge_op_sig, reason="unsupported",
+                    capability_sig=purge_capability_sig,
+                )
             else:  # "failed"
                 purge_meta_state = purge_meta.on_transient_failure(
                     purge_meta_state, purge_op_sig, purge_meta_now, backoff_sec=purge_backoff_sec,

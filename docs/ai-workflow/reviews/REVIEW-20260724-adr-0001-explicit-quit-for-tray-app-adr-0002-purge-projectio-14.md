@@ -61,3 +61,14 @@
 - 소스 코드가 제공되지 않아 `_shutdown_done` 설정 시점, 각 단계의 독립 예외 처리, `quit()`/`hard_exit` 상호배타성, sidecar 메모리 캐시 전이, projection 결과 전건 반환 등 “구현 완료” 주장은 확인할 수 없다.
 - `unsupported`가 실제 코드에서 `blocked_sig`를 재사용하는지 별도 필드를 사용하는지, 그리고 앱/LanceDB 업데이트 시 해당 상태를 초기화하는 별도 로직이 있는지 확인이 필요하다.
 - 메모리 측정 절차의 “쿼리 1회 warm-up”이 전체 projection 쿼리인지 단순 연결·메타데이터 쿼리인지 확인이 필요하다. 전체 projection이 아니라면 M-3의 범위는 측정 절차 문언 명확화로 축소할 수 있다.
+
+## 처리 기록 (중립 검토)
+
+| ID | 판단 | 사유/반영 |
+|---|---|---|
+| M-1 | 수용 | unsupported 억제 해제 판정을 op_sig에서 `compute_capability_sig()`(lancedb 버전 지문)로 전환. `PurgeMeta.blocked_capability_sig` 필드 추가, `on_blocked(..., capability_sig=)`로 기록, `decide(..., capability_sig=)`가 `blocked_reason == "unsupported"`일 때만 이 값으로 판정(불명/변경 시 억제 해제 → 안전한 방향). `scheduler.py`가 매 사이클 `purge_meta.compute_capability_sig()`를 계산해 `decide`/`on_blocked`/알림 1회 판정에 일관되게 사용하도록 배선. 리뷰가 제시한 대안 3("AttributeError 전체를 미지원으로 간주하지 않고 정확한 API 호출 지점에서만 변환")은 이미 구현대로였음(`table.search().select()` 호출부에서만 `AttributeError`를 잡음) — 별도 조치 불필요. `knowmate/collector/purge_meta.py`, `knowmate/collector/scheduler.py`. |
+| M-2 | 수용 | daemon 스레드 삭제에 최대 1초(`_CLEAR_DIRTY_JOIN_TIMEOUT_SEC`) `join()` 추가 — 리뷰13 M-1로 호출 위치가 `app.exec()` 정상 반환 후로 이미 이동했으므로(이벤트 루프가 끝난 뒤), 짧은 상한 대기가 "종료는 반드시 된다" 불변식을 재위협하지 않는다고 판단해 리뷰가 제시한 대안 1(짧은 제한시간 join)을 채택. helper 프로세스 위임(대안 2)은 이 앱 규모에 과한 운영 복잡도라 기각. `knowmate/app/lifecycle.py`. |
+| M-3 | 수용 | 성능 수용 절차의 warm-up 범위를 "DB open + count_rows() 등 메타데이터 조회"로 명시적으로 제한하고, 측정 대상인 전체 projection 쿼리는 baseline 확정 후 프로세스 최초 1회로만 실행하도록 `architecture.md`를 재작성 — 지적대로 동일 쿼리를 warm-up에서 먼저 돌리면 pyarrow의 미반환 힙이 baseline에 흡수돼 거짓 합격 가능성이 있었음을 인정. |
+| m-1 | 수용 | ADR 헤더(1~14차)와 architecture.md 리뷰 이력을 9~14차까지 갱신, 각 라운드 핵심 반영 사항을 요약해 최종 승인 근거 추적성을 회복. |
+
+**종결 판정**: M-1·M-2·M-3(Major 3건) 모두 실질적 결함으로 확인돼 수정 반영. m-1도 수용. Blocker/Major 잔존 0건.

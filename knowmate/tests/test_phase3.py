@@ -1376,9 +1376,9 @@ class TestDirtyShutdownMarker:
         clear_dirty_shutdown(marker)  # 정상 종료 시 제거 요청(즉시 반환)
         assert _wait_until(lambda: not marker.exists()), "marker not removed in time"
 
-    def test_clear_returns_immediately_without_waiting(self, tmp_path: Path):
-        """리뷰12 B-1: clear_dirty_shutdown은 삭제 완료를 기다리지 않고 즉시 반환해야
-        한다 — quit_fn() 호출을 지연시키면 "종료는 반드시 된다" 불변식이 깨진다."""
+    def test_clear_returns_quickly_when_delete_is_fast(self, tmp_path: Path):
+        """정상적인(빠른) 삭제라면 join 상한(1초, 리뷰14 M-2)을 기다리지 않고
+        곧바로 반환한다."""
         import time
         from knowmate.app.lifecycle import check_and_remark_dirty_shutdown, clear_dirty_shutdown
 
@@ -1389,6 +1389,26 @@ class TestDirtyShutdownMarker:
         clear_dirty_shutdown(marker)
         elapsed = time.monotonic() - start
         assert elapsed < 0.5, f"clear_dirty_shutdown blocked for {elapsed}s"
+
+    def test_clear_bounded_by_join_timeout_when_delete_hangs(self):
+        """리뷰14 M-2: 삭제가 daemon 스레드에만 맡겨져 대기 없이 반환하면, 호출 직후
+        인터프리터가 곧바로 종료될 때 스레드가 완료 전에 잘려 정상 종료에서도 삭제가
+        보장되지 않는다는 지적을 받아, 최대 `_CLEAR_DIRTY_JOIN_TIMEOUT_SEC`(1초) 동안은
+        join하도록 수정했다 — 삭제가 오래 걸려도 그 상한을 크게 넘겨 블록되지는
+        않음(무기한 대기가 아님)을 확인한다."""
+        import time
+        from knowmate.app import lifecycle
+
+        class _SlowPath:
+            def unlink(self, missing_ok=True):
+                time.sleep(5.0)
+
+        start = time.monotonic()
+        lifecycle.clear_dirty_shutdown(_SlowPath())
+        elapsed = time.monotonic() - start
+        assert lifecycle._CLEAR_DIRTY_JOIN_TIMEOUT_SEC <= elapsed < 3.0, (
+            f"join 상한 근처에서 반환해야 하는데 {elapsed}s 걸림"
+        )
 
     def test_clear_missing_marker_is_noop(self, tmp_path: Path):
         """표식이 없는 상태에서 clear를 호출해도 예외가 없다."""

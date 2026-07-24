@@ -2,7 +2,7 @@
 
 | 상태 | 날짜 | 결정자 | 리뷰 |
 |---|---|---|---|
-| Accepted | 2026-07-24 | Claude (Chief Architect) | reviews/REVIEW-20260724-adr-0001-explicit-quit-for-tray-app-adr-0002-purge-projectio-*.md (1~13차, Blocker/Major 전건 처리·구현 반영, 리뷰11 M-1 축소채택·리뷰12 marker 비동기화/단일인스턴스 순서 정정·리뷰13 marker 해제 위치를 app.exec() 정상 반환 후로 재이동 근거 명시) |
+| Accepted | 2026-07-24 | Claude (Chief Architect) | reviews/REVIEW-20260724-adr-0001-explicit-quit-for-tray-app-adr-0002-purge-projectio-*.md (1~14차, Blocker/Major 전건 처리·구현 반영, 리뷰11 M-1 축소채택·리뷰12 marker 비동기화/단일인스턴스 순서 정정·리뷰13 marker 해제 위치 재이동·리뷰14 unsupported capability_sig 재설계/marker join 상한 추가 근거 명시) |
 
 ## 맥락 (Context)
 - 베타 실사용에서 트레이 [종료] 후 `AegisDesk.exe`가 항상 잔존한다. 트레이 아이콘은
