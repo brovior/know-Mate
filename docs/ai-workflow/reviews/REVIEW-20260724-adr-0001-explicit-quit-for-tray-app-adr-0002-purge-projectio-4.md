@@ -62,3 +62,23 @@
 - 배포 고정 LanceDB 버전에서 `table.to_lance().to_table(columns=["file_path"])` 계열 API가 공개·안정 API인지, 실제 스캔 단계에서도 vector/text 컬럼을 읽지 않는지 확인 필요.
 - CollectorWorker가 생성하는 생산자 스레드의 daemon 여부, 정상 취소 시 join 여부, `QThread.terminate()` 시 잔존 가능성을 소스 코드로 확인해야 한다.
 - `max_delete_ratio`, 강제 주기, 백오프 설정이 NaN·Infinity·음수·과도한 값으로 들어오지 않도록 config 로드 단계에서 범위 검증되는지 확인 필요.
+
+---
+
+## 처리 기록 (Claude, 2026-07-24)
+
+| ID | 판단 | 사유 / 반영 커밋 |
+|---|---|---|
+| B-1 | 수용 | 실제 모순 — 3차 반영 때 "미래 시각=비정상" 규칙을 next_retry_ts에도 포괄 적용해 백오프가 자기모순이 됨. 시각 필드별 검증 분리: last_purge_ts는 미래값 무효, next_retry_ts는 now<값≤now+설정백오프+오차허용만 정상(그 밖은 손상=억제 해제) → 반영: PR #59 설계 보강 커밋 |
+| B-2 | 수용 | 실제 결함 — 이전 성공 메타가 남아 백오프 만료 후 성공 스킵(3번)이 재시도를 24h까지 차단. 대안2 채택: 일시적 실패 기록 시 reconciled_sig를 함께 해제해 성공 스킵 자격 무효화(별도 강제분기보다 상태 단순). 전이 단위 테스트 항목화 |
+| M-1 | 부분 수용 | 우려는 타당하나 코드 사실로 대부분 해소: 생산자 스레드는 daemon=True(scheduler.py), 워치독 타이머는 daemon(기존 test_default_timer_is_daemon). non-daemon 잔존 스레드가 없음을 A-0001에 종료 계약으로 명문화 + "이후 non-daemon 스레드 신설 금지" + daemon 테스트 회귀 유지. 제안된 has_live_aux_workers 추적 장치는 daemon 계약 하에서 불필요(과잉)로 **미도입** |
+| M-2 | 수용 | sidecar 저장 실패 시 억제 상태 소실 → 핫루프·알림 반복 재발 지적 타당. 실패·차단 상태를 프로세스 내 메모리에 즉시 반영(현 프로세스 억제·알림 1회 유지), 저장 실패는 ERROR 관측 + 저장 실패 테스트 항목화 |
+| m-1 | 수용 | 소속 판정을 경계 인식 비교(`p==root or p.startswith(root+"/")`)로 계약 명시 — 기존 belongs_to_any와 동일 규칙이라 코드 변경 없음(문서화). C:/watch vs C:/watch-old·중첩 폴더 회귀 테스트 추가. commonpath 방식은 기존 규칙으로 충분해 미채택 |
+| m-2 | 수용 | 단계별 예외 매개변수화 테스트(각 단계 예외 시 후속 계속 + quit/hard_exit 정확히 1개 호출) 검증 계획에 추가 |
+
+**확인 필요 항목 답변**: ① lancedb API·pushdown 검증은 채택 전제조건 유지(구현 착수 시 확정).
+② 생산자 스레드 daemon=True·정상 경로 join(producer.join(timeout=5))·워치독 daemon은 소스로
+확인됨(M-1 처리에 반영). ③ config 값 범위 검증(NaN·음수·과도값)은 구현 시 로드 단계에 포함.
+
+**종결 판정**: Blocker 2건 수용, Major 2건 수용(M-1은 코드 근거 문서화로 종결, 신규 장치 기각) →
+재리뷰 통과 시 Reviewed 승격 가능.

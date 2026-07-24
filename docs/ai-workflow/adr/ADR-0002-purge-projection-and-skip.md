@@ -22,15 +22,19 @@
 ② 스킵 조건: "**op_sig 불변 && 처리 0건 && 마지막 성공 purge 후 24h 미경과**"일 때만 purge를
 생략한다. op_sig는 사이클 시작 시 고정한 불변 스냅샷(normcase/normpath·중복 제거·정렬)에
 `dry_run`·`max_delete_ratio`를 더해 SHA-256으로 계산한다(프로세스 간 안정·설정 변경 시 재실행).
-③ op_sig·`last_purge_ts` 메타는 purge가 **예외 없이 완료된 경우에만** 갱신하고, 억제 판정은
-성공 스킵보다 **먼저** 수행한다(차단 → 백오프 → 성공 스킵 → 실행 순 — 실패 직후 서명 불일치로
-백오프가 무력화되는 결함 방지). 일시적 예외는 `failed_sig`+`next_retry_ts`(기본 30분 백오프),
-대량삭제 차단은 `blocked_sig`로 기록해 동일 op_sig에 대해 자동 재시도하지 않는다(구성·차단율
-변경 시에만 재실행 — 이 미복구는 R-0002 FR-3의 명문화된 예외). ④ 메타는 `index_state.json`이
-아닌 **sidecar 파일**(`index_state.meta.json`, tmp→replace 원자 교체)에 보관해 기존 state
-스키마·소비자를 건드리지 않는다. 메타 부재·의미적 손상(타입/범위 이상)·시각 역행·미래 시각
-필드는 해당 억제/스킵을 무시한다(보수적). purge 성공 후 메타 저장 실패의 재실행은 삭제(file_path
-기준)·optimize의 멱등성으로 안전. ⑤ op_sig는 스키마 버전을 포함한 canonical JSON(sort_keys·고정
+③ 메타 갱신·판정 규칙: 억제 판정을 성공 스킵보다 **먼저** 수행한다(차단 → 백오프 → 성공 스킵 →
+실행 순). 성공 완료 시에만 `reconciled_sig`·`last_purge_ts`를 갱신하고 실패·차단 표식을 해제한다.
+일시적 예외는 `failed_sig`+`next_retry_ts`(기본 30분 백오프)를 기록하며 **동시에
+`reconciled_sig`를 해제**한다 — 백오프 만료 후 이전 성공 메타가 성공 스킵을 성립시켜 재시도를
+24h까지 막는 결함 방지. 대량삭제 차단은 `blocked_sig`로 기록해 동일 op_sig에 대해 자동 재시도하지
+않는다(구성·차단율 변경 시에만 재실행 — 이 미복구는 R-0002 FR-3의 명문화된 예외). 실패·차단
+상태는 sidecar 저장 성공 여부와 무관하게 **프로세스 내 메모리에 즉시 반영**해 저장 실패 시에도
+현 프로세스의 억제·알림 1회가 유지된다. ④ 메타는 `index_state.json`이 아닌 **sidecar 파일**
+(`index_state.meta.json`, tmp→replace 원자 교체)에 보관해 기존 state 스키마·소비자를 건드리지
+않는다. 시각 필드 검증은 필드별로 다르다: `last_purge_ts`는 미래값이면 무효(스킵 불가),
+`next_retry_ts`는 `now < 값 ≤ now+설정백오프+오차허용`의 미래값이 **정상**이고 그 밖만 손상
+취급(억제 해제). 메타 부재·타입/범위 이상은 부재와 동일 취급(스킵 없이 실행). purge 성공 후 메타
+저장 실패의 재실행은 삭제(file_path 기준)·optimize의 멱등성으로 안전. ⑤ op_sig는 스키마 버전을 포함한 canonical JSON(sort_keys·고정
 separator·UTF-8)의 SHA-256이며, 경로는 서명·소속판정 공용 정규화 함수 1개의 결과만 사용.
 ⑥ projection 조회는 Arrow 컬럼 직접 순회(pandas 변환 생략). 배포 고정 lancedb 버전에서 공개
 projection API와 컬럼 pushdown을 구현 착수 시 검증하는 것이 **채택 전제조건**이며, 미지원이면

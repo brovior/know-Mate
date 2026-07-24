@@ -103,6 +103,14 @@ X (close_action=tray) → event.ignore() + hide()               # 종료 아님(
   graceful 대기는 "정상적으로 오래 걸리는 추출"에도 만료될 수 있음을 인정한다 — 이 경우에도 종료
   우선 원칙은 동일하며, 잃는 것은 그 사이클의 state 갱신뿐(자가 복구됨).
 
+**보조 실행 단위의 종료 계약 (리뷰4 M-1)**: 워커가 만드는 파이썬 스레드는 전부 **daemon**이다 —
+스캔 생산자 스레드는 `daemon=True`(scheduler.py `scan-producer`), 워치독 타이머는 daemon
+Timer(com_watchdog, 기존 `test_default_timer_is_daemon`로 고정). 따라서 QThread 종료 후 인터프리터
+종료를 막는 non-daemon 잔존 스레드는 존재하지 않으며, `_shutdown()`의 종료 판정은
+`worker.isRunning()`(QThread)만 보면 충분하다. **이후 non-daemon 스레드를 새로 만드는 것은 이
+계약 위반**이며, daemon 속성 테스트를 회귀로 유지한다(별도 has_live_aux_workers류 추적 장치는
+daemon 사실이 성립하는 한 불필요 — 미도입).
+
 ### 실패 모드
 | 실패 | 감지 | 대응(격리/재시도/중단) |
 |---|---|---|
@@ -113,6 +121,9 @@ X (close_action=tray) → event.ignore() + hide()               # 종료 아님(
 ### 검증 계획
 - 사외 단위: `_shutdown()`이 각 단계(스케줄러 stop → stop_worker → quit) **순서대로** 호출하고,
   quit이 stop_worker 반환 전에 불리지 않음을 주입 스파이로 검증(PyQt6 미의존 형태로 분리).
+- 사외 단위(예외 매개변수화, 리뷰4 m-2): scheduler.stop / tray.hide / stop_worker / isRunning
+  조회가 **각각** 예외를 던지는 케이스에서 후속 단계가 계속 실행되고 최종적으로 quit(워커 미실행)
+  또는 hard_exit(워커 잔존)가 **정확히 하나만** 호출됨을 검증. 보조 스레드 daemon 속성 테스트 유지.
 - 사외 통합(가능 시): `QT_QPA_PLATFORM=offscreen`으로 QApplication을 띄워 창 숨김/표시/
   `close_action=quit` 세 분기에서 이벤트 루프가 실제 종료되는지 통합 테스트(리뷰 m-2 반영).
   offscreen 불가 환경이면 closeEvent 분기 단위 테스트 + 아래 실기 3경로를 릴리스 체크리스트로 고정.
@@ -145,30 +156,43 @@ state 기반이라 무관 — 변경 없음.
   snapshot = normalize_folders(watch_folders)
       # 공용 함수 1개로 통일(리뷰3 m-1): 절대경로화(abspath) → normpath → normcase →
       # 구분자 '/' 통일 → 후행 구분자 제거 → 중복 제거 → 정렬. 환경변수 확장은 하지 않음
-      # (config에 리터럴 경로만 허용 — 기존 동작). UNC와 매핑 드라이브는 **문자열이 다르면
-      # 다른 실체로 취급**(파일시스템 해석 안 함 — 오판 시 결과는 불필요 purge 1회로 무해).
+      # (config에 리터럴 경로만 허용 — 기존 동작). UNC와 매핑 드라이브·junction은 **문자열이
+      # 다르면 다른 실체로 취급**(파일시스템 해석 안 함 — 오판 시 결과는 불필요 purge 1회로 무해).
       # 서명 계산과 purge 소속 판정 모두 이 함수의 결과만 사용(이원화 금지).
+      # 소속 판정은 **경계 인식 비교**: `p == root or p.startswith(root + "/")` — 구분자를
+      # 붙여 비교하므로 `C:/watch`가 `C:/watch-old/...`를 포함한다고 오판하지 않는다(기존
+      # _purge_removed_folders의 belongs_to_any와 동일 규칙, 리뷰4 m-1). 경계·드라이브 상이·
+      # 중첩 watch folder 케이스를 회귀 테스트로 고정.
   op_sig = SHA-256(canonical JSON)   # {"v":1, "folders":[...], "dry_run":bool,
                                      #  "max_delete_ratio":float} 를 sort_keys=True·고정
                                      # separator·UTF-8로 직렬화(필드 경계 모호성 제거, 리뷰2 m-2)
 사이클 종료부 — 판정 순서 고정(억제 판정이 성공 스킵보다 먼저, 리뷰3 B-1):
-  # 시각 필드(last_purge_ts·next_retry_ts)는 미래값이면 비정상 → 해당 억제 무시(보수적)
+  # 시각 필드 검증은 필드별로 다르다(리뷰4 B-1 — next_retry_ts는 정의상 미래값이 정상):
+  #  - last_purge_ts: 미래값(> now + 오차허용)이면 무효 → 성공 스킵 불가
+  #  - next_retry_ts: now < 값 <= now + 설정백오프 + 오차허용 범위만 유효.
+  #    그보다 먼 미래값은 손상으로 간주 → 백오프 무시(억제 해제)
   1) if meta["blocked_sig"] == op_sig:
          return (DB 조회 없음)      # 대량삭제 차단 상태 — 동일 설정으론 자동 재시도 안 함
-  2) if meta["failed_sig"] == op_sig and now < meta["next_retry_ts"]:
+  2) if meta["failed_sig"] == op_sig and next_retry_ts가 유효 범위 and now < next_retry_ts:
          return (DB 조회 없음)      # 일시적 실패 백오프(기본 30분, config화)
   3) if op_sig == meta["reconciled_sig"] and 처리 0건
         and 0 <= (now - meta["last_purge_ts"]) < 강제주기(기본 24h):
-         return (DB 조회 없음)      # ★ 정상 빠른 경로 — O(1). 시각 역행(elapsed<0)은 스킵 불가
+         return (DB 조회 없음)      # ★ 정상 빠른 경로 — O(1)
   4) purge 실행:
       file_paths = chunks 테이블에서 file_path 컬럼만 projection 조회
                    # Arrow 컬럼 직접 순회 — pandas 변환 생략
       (이하 기존과 동일: 소속 판정 → 대량삭제 차단 → dry_run → 삭제 → optimize)
       성공 완료: meta["reconciled_sig"]=op_sig; meta["last_purge_ts"]=now;
-                 failed_sig·blocked_sig 해제                              # 원자 갱신
-      일시적 예외: meta["failed_sig"]=op_sig; meta["next_retry_ts"]=now+백오프
+                 failed_sig·blocked_sig·next_retry_ts 해제                # 원자 갱신
+      일시적 예외: meta["failed_sig"]=op_sig; meta["next_retry_ts"]=now+백오프;
+                 **meta["reconciled_sig"] 해제**   # 실패한 op_sig의 성공 스킵 자격 무효화 —
+                 # 백오프 만료 후 이전 성공 메타가 3)을 참으로 만들어 재시도를 24h까지
+                 # 가로막는 결함 방지(리뷰4 B-2, 대안2 채택: 별도 강제분기보다 상태가 단순)
       대량삭제 차단: meta["blocked_sig"]=op_sig + 기존 UI 알림(1회) —
                  구성·차단율 변경으로 op_sig가 바뀌어야 재실행
+  # 실패·차단 상태는 sidecar 저장과 **무관하게 프로세스 내 메모리에 즉시 반영**(리뷰4 M-2) —
+  # sidecar 저장 실패(권한·디스크·백신 잠금)여도 현재 프로세스에서는 억제·알림 1회가 유지된다.
+  # 저장 실패는 ERROR 로그로 관측, 다음 메타 갱신 기회에 자연 재시도.
 
 meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_state.meta.json, tmp→replace
 원자 교체). 기존 state 스키마(경로→dict)와 소비자 코드를 일절 건드리지 않는다(마이그레이션 불필요).
