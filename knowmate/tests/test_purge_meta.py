@@ -204,6 +204,15 @@ class TestMetaTransitions:
         assert out.reconciled_sig is None
         assert out.failed_sig is None
         assert out.next_retry_ts is None
+        assert out.blocked_reason == "mass_delete"
+
+    def test_on_blocked_reason_unsupported(self):
+        """리뷰12 m-1: reason="unsupported"를 넘기면 blocked_reason에 그대로 반영돼
+        재시작 후 알림 문구를 대량삭제 차단과 구분할 수 있다."""
+        meta = PurgeMeta()
+        out = purge_meta.on_blocked(meta, "sig-a", reason="unsupported")
+        assert out.blocked_sig == "sig-a"
+        assert out.blocked_reason == "unsupported"
 
 
 # ============================================================
@@ -221,6 +230,16 @@ class TestPurgeMetaPersistence:
         assert purge_meta.save_purge_meta(f, original)
         loaded = purge_meta.load_purge_meta(f)
         assert loaded == original
+
+    def test_roundtrip_blocked_reason(self, tmp_path: Path):
+        """리뷰12 m-1: blocked_reason도 sidecar에 저장·복원돼야 재시작 후 알림 문구를
+        대량삭제 차단과 API 비호환으로 구분할 수 있다."""
+        f = tmp_path / "meta.json"
+        original = PurgeMeta(blocked_sig="sig-a", blocked_reason="unsupported")
+        assert purge_meta.save_purge_meta(f, original)
+        loaded = purge_meta.load_purge_meta(f)
+        assert loaded == original
+        assert loaded.blocked_reason == "unsupported"
 
     def test_atomic_save_uses_tmp_then_replace(self, tmp_path: Path):
         f = tmp_path / "meta.json"

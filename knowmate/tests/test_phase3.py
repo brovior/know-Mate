@@ -14,6 +14,16 @@ from knowmate.collector.cleanup import CleanupManager, CleanupReport
 _HAS_PYQT6 = bool(importlib.util.find_spec("PyQt6"))
 
 
+def _wait_until(predicate, timeout: float = 2.0, interval: float = 0.02) -> bool:
+    """predicate()가 True가 될 때까지 짧게 폴링한다(비동기 daemon 스레드 결과 확인용)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(interval)
+    return predicate()
+
+
 # ============================================================
 # TestState
 # ============================================================
@@ -1356,14 +1366,29 @@ class TestDirtyShutdownMarker:
         assert marker.exists()  # 확인 후에도 이번 실행 보호용으로 다시 기록됨
 
     def test_clear_removes_marker(self, tmp_path: Path):
-        """정상 quit 확정 시 clear_dirty_shutdown이 표식을 지운다."""
+        """정상 quit 확정 시 clear_dirty_shutdown이 표식을 지운다(비동기 daemon 스레드,
+        설계 리뷰 12차 B-1 — 짧은 폴링으로 최종 결과만 확인)."""
         from knowmate.app.lifecycle import check_and_remark_dirty_shutdown, clear_dirty_shutdown
 
         marker = tmp_path / "dirty_shutdown.flag"
         check_and_remark_dirty_shutdown(marker)  # 시작 시 기록
         assert marker.exists()
-        clear_dirty_shutdown(marker)  # 정상 종료 시 제거
-        assert not marker.exists()
+        clear_dirty_shutdown(marker)  # 정상 종료 시 제거 요청(즉시 반환)
+        assert _wait_until(lambda: not marker.exists()), "marker not removed in time"
+
+    def test_clear_returns_immediately_without_waiting(self, tmp_path: Path):
+        """리뷰12 B-1: clear_dirty_shutdown은 삭제 완료를 기다리지 않고 즉시 반환해야
+        한다 — quit_fn() 호출을 지연시키면 "종료는 반드시 된다" 불변식이 깨진다."""
+        import time
+        from knowmate.app.lifecycle import check_and_remark_dirty_shutdown, clear_dirty_shutdown
+
+        marker = tmp_path / "dirty_shutdown.flag"
+        check_and_remark_dirty_shutdown(marker)
+
+        start = time.monotonic()
+        clear_dirty_shutdown(marker)
+        elapsed = time.monotonic() - start
+        assert elapsed < 0.5, f"clear_dirty_shutdown blocked for {elapsed}s"
 
     def test_clear_missing_marker_is_noop(self, tmp_path: Path):
         """표식이 없는 상태에서 clear를 호출해도 예외가 없다."""
@@ -1383,6 +1408,7 @@ class TestDirtyShutdownMarker:
         assert check_and_remark_dirty_shutdown(marker) is True
         # 실행2는 정상 종료
         clear_dirty_shutdown(marker)
+        assert _wait_until(lambda: not marker.exists()), "marker not removed in time"
 
         # 실행3 시작 — 실행2가 정상 종료했으므로 dirty=False
         assert check_and_remark_dirty_shutdown(marker) is False

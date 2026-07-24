@@ -52,3 +52,14 @@
 - `check_and_remark_dirty_shutdown()`이 단일 인스턴스 획득 전후 중 언제 호출되고, 보조 인스턴스 종료 시 `clear_dirty_shutdown()`이 호출되는지 확인이 필요하다.
 - 배포 의존성에서 `lancedb==0.34.0` 또는 동등한 호환 범위가 실제로 고정되어 있는지 확인이 필요하다. 고정되지 않았다면 purge가 영구 억제되는 배포가 발생할 수 있다.
 - A-0002가 언급한 필수 10만 건 peak RSS 검증이 이미 완료됐는지, 아직 릴리스 게이트로 남아 있는지 확인이 필요하다.
+
+## 처리 기록 (중립 검토)
+
+| ID | 판단 | 사유/반영 |
+|---|---|---|
+| B-1 | 수용 | `clear_dirty_shutdown()`이 실제 `unlink()`를 daemon 스레드로 위임하고 즉시 반환하도록 재작성. `finalize_shutdown`의 정상 quit 분기가 marker I/O 완료를 기다리지 않으므로 "종료는 반드시 된다" 불변식이 marker 삭제 지연·실패에 영향받지 않는다. 워치독/타임아웃 방식(리뷰가 제시한 대안 1)은 스레드 강제 종료라는 새 실패 모드를 추가하는 과잉 설계라 판단, 리뷰가 제시한 대안 2(best-effort + 문서화)를 채택. `knowmate/app/lifecycle.py` `clear_dirty_shutdown`. |
+| M-1 | 수용 | `main()`에서 dirty-marker 확인/재기록을 `try_acquire_or_notify_existing()` 성공(=primary 확정) 이후로 이동. 보조 인스턴스는 marker API를 전혀 호출하지 않는다(단일 인스턴스 실패 시 `return`으로 조기 종료하므로 marker 코드에 도달하지 않음 — 별도 조건문 불필요). `knowmate/app/main.py` `main()`. |
+| m-1 | 수용 | `PurgeMeta`에 `blocked_reason: str | None`(값: `"mass_delete"` \| `"unsupported"`) 필드 추가. `on_blocked(meta, op_sig, reason="mass_delete")`로 시그니처 확장, `load_purge_meta`가 타입 검증 후 round-trip, `scheduler.py`의 두 호출부가 각각 `reason="mass_delete"`/`reason="unsupported"`를 명시. 별도 `unsupported_sig` 필드는 만들지 않음 — `decide()`의 판정 로직(동일 op_sig 재시도 억제)이 두 원인 모두 동일해 상태 필드를 분리할 실익이 없고, `blocked_reason`은 순수 표시용이라 리뷰가 제시한 최소안(대안 2)으로 충분. |
+| m-2 | 수용 | `architecture.md` 성능 수용 기준을 "10만 행, 대표 길이 분포(30~200자 표본화), warm-up 후 5회 반복, 회당 실행 직전/직후 peak RSS 차분, 중앙값 ≤ 30MB 합격"으로 구체화. 100만 행 추가 시험(리뷰 제안)은 베타 단계 필수 게이트로는 과함 — 10만 행 결과가 선형성 가정에 부합하면 추가 시험 없이도 배포 판단에 충분하다고 보아 범위에서 제외, 필요 시 후속 검증으로 남김. `docs/ai-workflow/architecture.md`. |
+
+**종결 판정**: B-1(Blocker)·M-1(Major) 모두 실질적 결함으로 확인돼 수정 반영. m-1·m-2도 수용해 문서·코드 정합성을 높임. Blocker/Major 잔존 0건.

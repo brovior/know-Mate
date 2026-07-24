@@ -111,13 +111,21 @@ def compute_op_sig(normalized_folders: list[str], dry_run: bool, max_delete_rati
 
 @dataclass
 class PurgeMeta:
-    """purge 판정에 쓰이는 상태. 필드 의미는 모듈 docstring·설계 문서 참조."""
+    """purge 판정에 쓰이는 상태. 필드 의미는 모듈 docstring·설계 문서 참조.
+
+    blocked_reason: blocked_sig가 왜 설정됐는지 구분한다(설계 리뷰 12차 m-1) —
+    "mass_delete"(대량삭제 차단 안전장치) | "unsupported"(projection API 비호환,
+    영구 장애). 두 원인 모두 decide()의 판정 로직(동일 op_sig에서 자동 재시도
+    안 함)은 동일해 별도 상태 필드를 추가하지 않고 재사용하되, 재시작 후 표시할
+    알림 문구를 구분하는 데 쓴다.
+    """
 
     reconciled_sig: str | None = None
     last_purge_ts: float | None = None
     failed_sig: str | None = None
     next_retry_ts: float | None = None
     blocked_sig: str | None = None
+    blocked_reason: str | None = None
 
 
 def _is_valid_number(v) -> bool:
@@ -149,10 +157,14 @@ def load_purge_meta(meta_file: Path) -> PurgeMeta:
     reconciled_sig = data.get("reconciled_sig")
     failed_sig = data.get("failed_sig")
     blocked_sig = data.get("blocked_sig")
+    blocked_reason = data.get("blocked_reason")
     last_purge_ts = data.get("last_purge_ts")
     next_retry_ts = data.get("next_retry_ts")
 
-    for name, val in (("reconciled_sig", reconciled_sig), ("failed_sig", failed_sig), ("blocked_sig", blocked_sig)):
+    for name, val in (
+        ("reconciled_sig", reconciled_sig), ("failed_sig", failed_sig),
+        ("blocked_sig", blocked_sig), ("blocked_reason", blocked_reason),
+    ):
         if val is not None and not isinstance(val, str):
             logger.warning("[purge] 메타 필드 타입 이상(%s), 무시: %r", name, val)
             return PurgeMeta()
@@ -168,6 +180,7 @@ def load_purge_meta(meta_file: Path) -> PurgeMeta:
         failed_sig=failed_sig,
         next_retry_ts=next_retry_ts,
         blocked_sig=blocked_sig,
+        blocked_reason=blocked_reason,
     )
 
 
@@ -249,7 +262,13 @@ def on_transient_failure(meta: PurgeMeta, op_sig: str, now: float, backoff_sec: 
     )
 
 
-def on_blocked(meta: PurgeMeta, op_sig: str) -> PurgeMeta:
-    """대량삭제 차단 후 메타 — 동일 op_sig에서는 자동 재시도하지 않도록 차단 서명만
-    남기고, 이전 성공·실패 상태는 함께 해제한다(오래된 억제가 다시 유효해지는 것 방지)."""
-    return PurgeMeta(reconciled_sig=None, last_purge_ts=meta.last_purge_ts, failed_sig=None, next_retry_ts=None, blocked_sig=op_sig)
+def on_blocked(meta: PurgeMeta, op_sig: str, reason: str = "mass_delete") -> PurgeMeta:
+    """차단 후 메타 — 동일 op_sig에서는 자동 재시도하지 않도록 차단 서명만 남기고,
+    이전 성공·실패 상태는 함께 해제한다(오래된 억제가 다시 유효해지는 것 방지).
+
+    reason: "mass_delete"(대량삭제 안전장치) | "unsupported"(projection API 비호환) —
+    재시작 후 표시할 알림 문구를 구분하는 데만 쓰인다(설계 리뷰 12차 m-1)."""
+    return PurgeMeta(
+        reconciled_sig=None, last_purge_ts=meta.last_purge_ts, failed_sig=None,
+        next_retry_ts=None, blocked_sig=op_sig, blocked_reason=reason,
+    )

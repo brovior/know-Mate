@@ -591,17 +591,18 @@ class CollectorWorker(QThread):
             if result == "success":
                 purge_meta_state = purge_meta.on_success(purge_meta_state, purge_op_sig, purge_meta_now)
             elif result == "blocked":
-                purge_meta_state = purge_meta.on_blocked(purge_meta_state, purge_op_sig)
+                purge_meta_state = purge_meta.on_blocked(purge_meta_state, purge_op_sig, reason="mass_delete")
             elif result == "unsupported":
                 # 영구 장애(API 비호환) — 30분 백오프로 반복 재시도해도 복구되지 않으므로
                 # on_blocked와 동일하게 동일 op_sig에서는 장기 억제한다(구성 변경 또는
-                # 앱 업데이트로 op_sig가 바뀌어야 재시도). 1회만 알림.
+                # 앱 업데이트로 op_sig가 바뀌어야 재시도). 1회만 알림. reason="unsupported"로
+                # 대량삭제 차단과 구분해 sidecar에 기록한다(설계 리뷰 12차 m-1).
                 if purge_meta_state.blocked_sig != purge_op_sig:
                     self.indexing_needed.emit(
                         "제거된 폴더 정리 기능이 이 배포 환경과 호환되지 않습니다. "
                         "앱을 최신 버전으로 업데이트하세요."
                     )
-                purge_meta_state = purge_meta.on_blocked(purge_meta_state, purge_op_sig)
+                purge_meta_state = purge_meta.on_blocked(purge_meta_state, purge_op_sig, reason="unsupported")
             else:  # "failed"
                 purge_meta_state = purge_meta.on_transient_failure(
                     purge_meta_state, purge_op_sig, purge_meta_now, backoff_sec=purge_backoff_sec,

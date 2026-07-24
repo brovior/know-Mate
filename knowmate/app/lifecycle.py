@@ -54,18 +54,34 @@ def check_and_remark_dirty_shutdown(marker_path=None) -> bool:
 
 
 def clear_dirty_shutdown(marker_path=None) -> None:
-    """정상 종료(quit)가 확정된 시점에 호출해 표식을 지운다.
+    """정상 종료(quit)가 확정된 시점에 호출해 표식을 지운다 — **호출 즉시 반환**한다
+    (결과를 기다리지 않음, 설계 리뷰 12차 B-1).
 
     hard-exit 경로에서는 절대 호출하지 않는다 — 그래야 표식이 "정상 종료 못 함"의
-    증거로 남는다. 실패(디스크 오류 등)는 무시한다.
+    증거로 남는다. 삭제 자체는 별도 daemon 스레드에서 시도한다: `%APPDATA%`가
+    네트워크로 리다이렉트된 로밍 프로필이거나 백신이 파일 삭제를 지연시키면
+    `unlink()`가 동기 호출로는 오래 걸리거나 멈출 수 있는데, 이 함수를 호출하는
+    `finalize_shutdown`의 quit 경로가 그 때문에 `quit_fn()` 호출을 못 하게 되면
+    "종료는 반드시 된다"는 최상위 불변식이 다시 깨진다. 삭제가 실패·지연되면
+    다음 시작 때 표식이 남아있어 오탐(강제 종료 아니었는데 경고) 위험은 있지만,
+    이는 진단 정보의 정확도 저하일 뿐이라 종료 보장보다 우선순위가 낮다.
     """
-    try:
-        if marker_path is None:
+    def _do_clear(path) -> None:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as exc:
+            logger.debug("강제 종료 표식 삭제 실패(무시): %s", exc)
+
+    if marker_path is None:
+        try:
             from knowmate.config import get_data_dir
             marker_path = get_data_dir() / _DIRTY_MARKER_NAME
-        marker_path.unlink(missing_ok=True)
-    except OSError as exc:
-        logger.debug("강제 종료 표식 삭제 실패(무시): %s", exc)
+        except OSError as exc:
+            logger.debug("강제 종료 표식 경로 확인 실패(무시): %s", exc)
+            return
+
+    import threading
+    threading.Thread(target=_do_clear, args=(marker_path,), daemon=True, name="clear-dirty-marker").start()
 
 
 def _default_hard_exit(code: int = 0) -> None:

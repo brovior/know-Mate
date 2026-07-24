@@ -384,19 +384,6 @@ def main() -> None:
 
     logger.info("Aegis Desk %s 시작 (platform=%s)", __version__, sys.platform)
 
-    # 이번 실행을 위한 강제 종료 표식을 지금 남긴다(정상 quit에서만 지워짐 — 설계
-    # 리뷰 11차 B-1). 반환값은 "직전 실행이 표식을 못 지우고 끝났는가" = 강제 종료
-    # 여부. LanceDB 쓰기 도중이었을 가능성을 배제할 수 없으므로(커밋 원자성 미검증,
-    # 리뷰10 M-1) 자동 복구는 하지 않되, 로그 + 트레이 알림(MainWindow 생성 후)으로
-    # 재인덱싱을 권장한다.
-    from knowmate.app.lifecycle import check_and_remark_dirty_shutdown
-    dirty_shutdown_detected = check_and_remark_dirty_shutdown()
-    if dirty_shutdown_detected:
-        logger.warning(
-            "이전 실행이 강제 종료됐습니다 — 검색 결과가 이상하면 설정 패널에서 해당 "
-            "폴더를 제거 후 재추가해 재인덱싱하는 것을 권장합니다."
-        )
-
     os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
     _set_windows_app_id("AegisDesk.App")
     app = QApplication(sys.argv)
@@ -417,6 +404,21 @@ def main() -> None:
     )
     if not try_acquire_or_notify_existing():
         return
+
+    # 단일 인스턴스로 확정된 뒤에만 강제 종료 표식을 다룬다(설계 리뷰 12차 M-1) —
+    # 그렇지 않으면 곧 조용히 종료할 보조 인스턴스가 주 인스턴스의 표식을 건드려
+    # false-positive(또는 놓친) 감지를 유발할 수 있다. 이번 실행을 위한 표식은
+    # 지금 남기고 정상 quit에서만 지워진다(11차 B-1). 반환값은 "직전 실행이
+    # 표식을 못 지우고 끝났는가" = 강제 종료 여부. LanceDB 쓰기 도중이었을 가능성을
+    # 배제할 수 없으므로(커밋 원자성 미검증, 10차 M-1) 자동 복구는 하지 않되, 로그 +
+    # 트레이 알림(MainWindow 생성 후)으로 재인덱싱을 권장한다.
+    from knowmate.app.lifecycle import check_and_remark_dirty_shutdown
+    dirty_shutdown_detected = check_and_remark_dirty_shutdown()
+    if dirty_shutdown_detected:
+        logger.warning(
+            "이전 실행이 강제 종료됐습니다 — 검색 결과가 이상하면 설정 패널에서 해당 "
+            "폴더를 제거 후 재추가해 재인덱싱하는 것을 권장합니다."
+        )
 
     win = MainWindow(dirty_shutdown_detected=dirty_shutdown_detected)
     single_instance_server = SingleInstanceServer(parent=win)
