@@ -54,8 +54,11 @@ def check_and_remark_dirty_shutdown(marker_path=None) -> bool:
 
 
 def clear_dirty_shutdown(marker_path=None) -> None:
-    """정상 종료(quit)가 확정된 시점에 호출해 표식을 지운다 — **호출 즉시 반환**한다
-    (결과를 기다리지 않음, 설계 리뷰 12차 B-1).
+    """`app.exec()`가 정상 반환한 뒤(main()의 정상 반환 경로)에만 호출해 표식을 지운다 —
+    **호출 즉시 반환**한다(결과를 기다리지 않음, 설계 리뷰 12차 B-1). quit() 요청 시점이
+    아니라 이벤트 루프가 실제로 반환을 완료한 뒤에 호출해야 한다 — quit()은 종료를
+    "요청"할 뿐 완료를 보장하지 않으므로, 요청 시점에 지우면 그 사이 크래시가 나도
+    다음 시작 때 강제 종료를 탐지하지 못한다(설계 리뷰 13차 M-1).
 
     hard-exit 경로에서는 절대 호출하지 않는다 — 그래야 표식이 "정상 종료 못 함"의
     증거로 남는다. 삭제 자체는 별도 daemon 스레드에서 시도한다: `%APPDATA%`가
@@ -129,7 +132,7 @@ def stop_worker(worker, hard_exit=_default_hard_exit) -> None:
     hard_exit(0)
 
 
-def finalize_shutdown(worker, quit_fn, hard_exit=_default_hard_exit, clear_dirty=clear_dirty_shutdown) -> None:
+def finalize_shutdown(worker, quit_fn, hard_exit=_default_hard_exit) -> None:
     """종료 최종 판정 — quit_fn(워커 비실행 확인) 또는 hard_exit(실행 중·판정 불가) 중 정확히 하나.
 
     _shutdown()의 앞 단계(scheduler.stop/tray.hide/stop_worker)가 예외로 이탈하더라도 항상
@@ -137,13 +140,18 @@ def finalize_shutdown(worker, quit_fn, hard_exit=_default_hard_exit, clear_dirty
     멈춘 상태이지만, stop_worker() 자체가 예외를 던졌거나 isRunning() 조회 자체가 실패하면
     "판정 불가" 상태이므로 quit()만으로는 QThread가 잔존할 수 있어 보수적으로 hard_exit한다.
 
+    강제 종료 표식(clear_dirty_shutdown) 해제는 **여기서 하지 않는다**(설계 리뷰 13차 M-1).
+    `quit_fn()`(QApplication.quit)은 이벤트 루프 종료를 "요청"할 뿐 프로세스의 정상 종료
+    완료를 보장하지 않는다 — 여기서 표식을 지운 뒤 이벤트 루프 반환 전에 네이티브
+    크래시가 나면 다음 시작 때 강제 종료를 탐지하지 못하는 false negative가 생긴다.
+    표식 해제는 `app.exec()`가 정상 반환한 뒤 `main()`의 정상 반환 경로에서만 수행한다
+    (hard_exit 경로는 os._exit()로 app.exec()에 절대 반환하지 않으므로, "app.exec() 반환
+    = 정상 quit 확정"이 성립한다).
+
     worker: cancel()/isRunning()/wait(ms)->bool/terminate() 를 갖는 객체(또는 None).
     quit_fn: () -> None, 워커 비실행이 확인됐을 때 호출할 정상 종료 콜백(QApplication.quit 등).
     hard_exit: 최종 프로세스 종료 콜백(기본 os._exit 래퍼, 테스트 주입용). **파일 I/O 없이**
-        즉시 실행되어야 하므로(리뷰11 B-1) 이 분기에서는 clear_dirty를 호출하지 않는다 —
-        강제 종료 표식은 시작 시 미리 기록돼 있고(check_and_remark_dirty_shutdown), 정상
-        quit 경로에서만 지워진다.
-    clear_dirty: 정상 quit이 확정됐을 때 호출할 강제 종료 표식 해제 콜백(테스트 주입용).
+        즉시 실행되어야 한다(리뷰11 B-1).
     """
     try:
         is_running = worker is not None and worker.isRunning()
@@ -157,5 +165,4 @@ def finalize_shutdown(worker, quit_fn, hard_exit=_default_hard_exit, clear_dirty
         hard_exit(0)
         return
 
-    clear_dirty()
     quit_fn()

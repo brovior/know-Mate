@@ -1495,7 +1495,7 @@ class TestFinalizeShutdown:
         quit_calls, hard_calls = [], []
         finalize_shutdown(
             None, quit_fn=lambda: quit_calls.append(1),
-            hard_exit=lambda c: hard_calls.append(c), clear_dirty=lambda: None,
+            hard_exit=lambda c: hard_calls.append(c),
         )
         assert quit_calls == [1] and hard_calls == []
 
@@ -1506,44 +1506,40 @@ class TestFinalizeShutdown:
         quit_calls, hard_calls = [], []
         finalize_shutdown(
             w, quit_fn=lambda: quit_calls.append(1),
-            hard_exit=lambda c: hard_calls.append(c), clear_dirty=lambda: None,
+            hard_exit=lambda c: hard_calls.append(c),
         )
         assert quit_calls == [1] and hard_calls == []
 
     def test_hard_exit_when_worker_still_running(self):
-        """워커가 여전히 실행 중이면 hard_exit만 호출된다(quit 안 함, clear_dirty도 안 함)."""
+        """워커가 여전히 실행 중이면 hard_exit만 호출된다(quit 안 함)."""
         from knowmate.app.lifecycle import finalize_shutdown
         w = self._FakeWorker(running=True)
-        quit_calls, hard_calls, clear_calls = [], [], []
+        quit_calls, hard_calls = [], []
         finalize_shutdown(
             w, quit_fn=lambda: quit_calls.append(1),
-            hard_exit=lambda c: hard_calls.append(c), clear_dirty=lambda: clear_calls.append(1),
+            hard_exit=lambda c: hard_calls.append(c),
         )
-        assert hard_calls == [0] and quit_calls == [] and clear_calls == []
+        assert hard_calls == [0] and quit_calls == []
 
     def test_hard_exit_when_is_running_raises(self):
         """isRunning() 조회 자체가 실패(판정 불가)하면 보수적으로 hard_exit만 호출된다
-        (clear_dirty도 호출되지 않음 — 하드 종료 경로는 파일 I/O가 전혀 없어야 함, 리뷰11 B-1)."""
+        (하드 종료 경로는 파일 I/O가 전혀 없어야 함, 리뷰11 B-1)."""
         from knowmate.app.lifecycle import finalize_shutdown
         w = self._FakeWorker(raise_on_is_running=True)
-        quit_calls, hard_calls, clear_calls = [], [], []
+        quit_calls, hard_calls = [], []
         finalize_shutdown(
             w, quit_fn=lambda: quit_calls.append(1),
-            hard_exit=lambda c: hard_calls.append(c), clear_dirty=lambda: clear_calls.append(1),
+            hard_exit=lambda c: hard_calls.append(c),
         )
-        assert hard_calls == [0] and quit_calls == [] and clear_calls == []
+        assert hard_calls == [0] and quit_calls == []
 
-    def test_clear_dirty_before_quit(self):
-        """정상 quit 경로에서는 clear_dirty가 quit보다 먼저 호출된다."""
+    def test_finalize_shutdown_never_clears_dirty_marker(self):
+        """리뷰13 M-1: finalize_shutdown은 표식 해제를 전혀 하지 않는다 — quit()은
+        종료를 요청할 뿐 완료를 보장하지 않으므로, 표식 해제는 app.exec() 정상 반환
+        후 main()의 정상 반환 경로에서만 수행한다."""
         from knowmate.app.lifecycle import finalize_shutdown
-        w = self._FakeWorker(running=False)
-        calls = []
-        finalize_shutdown(
-            w, quit_fn=lambda: calls.append(("quit",)),
-            hard_exit=lambda c: calls.append(("hard_exit", c)),
-            clear_dirty=lambda: calls.append(("clear_dirty",)),
-        )
-        assert calls == [("clear_dirty",), ("quit",)]
+        import inspect
+        assert "clear_dirty" not in inspect.signature(finalize_shutdown).parameters
 
 
 # ============================================================

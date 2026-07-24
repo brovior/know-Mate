@@ -425,7 +425,12 @@ def main() -> None:
     single_instance_server.show_requested.connect(win._show_from_tray)
 
     win.show()
-    sys.exit(app.exec())
+    exit_code = app.exec()
+    # app.exec()가 반환됐다 = 정상 quit이 확정됐다(하드 종료 경로는 os._exit()로
+    # 여기 절대 돌아오지 않는다) — 이 시점에만 강제 종료 표식을 지운다(설계 리뷰 13차 M-1).
+    from knowmate.app.lifecycle import clear_dirty_shutdown
+    clear_dirty_shutdown()
+    sys.exit(exit_code)
 
 
 if __name__ == "__main__":
