@@ -1,0 +1,13 @@
+# GPT 리뷰 배경 문서 목록 (context manifest) — know-Mate
+# 한 줄당 저장소 상대 경로 하나. 없는 파일은 경고 후 건너뜀.
+# 프레임워크는 이름을 하드코딩하지 않는다 — 이 목록이 know-Mate의 소개/명세 선언.
+#
+# 규칙·계약:
+CLAUDE.md
+# 프로젝트 한눈 소개:
+README.md
+# 아키텍처·설계:
+docs/RAG_ARCHITECTURE.md
+docs/DESIGN.md
+# UI 명세:
+UI_SPEC.md
