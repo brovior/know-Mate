@@ -79,6 +79,20 @@ X (close_action=tray) → event.ignore() + hide()               # 종료 아님(
   현재 종료 경로는 트레이 [종료]와 `close_action=quit` 둘뿐이며 둘 다 `closeEvent→_shutdown`으로
   수렴함을 코드로 확인.
 
+### 정상 종료 계약 (데이터 무결성 — R-0001 NFR-1의 보장 근거, 리뷰 M-1 반영)
+`quit()`은 `_shutdown()`의 **마지막** 단계이며 앞 단계들이 다음을 보장한 뒤에만 도달한다:
+1. **신규 작업 차단**: `scheduler.stop()`이 유휴 타이머·복귀 워처를 정지(`IdleScheduler.stop`) →
+   새 사이클 트리거 없음.
+2. **진행 중 작업의 state 저장**: `stop_worker`의 graceful 경로(`cancel()` + `wait(8s)`)는 워커가
+   현재 파일을 마친 뒤 취소 분기에서 `save_state()`를 호출하고 반환하는 것까지 기다린다
+   (`CollectorWorker._run_cycle`의 취소 분기·정상 완료 경로 모두 `save_state` 후 종료 — 기존 코드).
+   `save_state`는 tmp→replace **원자 교체**(기존 `test_atomic_save_uses_tmp_then_replace`로 보장).
+3. **COM 정리**: 워커 `run()`의 finally가 `quit_com_apps()`로 소유 Office를 정리(기존 코드).
+4. **로그 flush**: 정상 경로는 인터프리터 종료 시 `logging.shutdown()`(atexit), 하드 종료 경로는
+   `_default_hard_exit`가 명시적으로 `logging.shutdown()` 후 `os._exit`(기존 코드).
+- terminate/`os._exit` 강제 경로에서는 위 2·3이 생략될 수 있다 — 이는 "행오버로 이미 멈춘 워커"
+  한정이며, 그 사이클의 state 미저장은 다음 사이클 재인덱싱으로 자가 복구된다(감수하는 트레이드오프).
+
 ### 실패 모드
 | 실패 | 감지 | 대응(격리/재시도/중단) |
 |---|---|---|
@@ -87,7 +101,11 @@ X (close_action=tray) → event.ignore() + hide()               # 종료 아님(
 | 새 종료 경로 추가 시 `_shutdown()` 미경유 | 코드 리뷰 규칙 | `_quit_app`/`closeEvent` 외 종료 경로 금지 문서화 |
 
 ### 검증 계획
-- 사외: `_shutdown()`이 `quit` 콜백을 호출하는지 주입 스파이로 단위 테스트(PyQt6 미의존 형태로 분리).
+- 사외 단위: `_shutdown()`이 각 단계(스케줄러 stop → stop_worker → quit) **순서대로** 호출하고,
+  quit이 stop_worker 반환 전에 불리지 않음을 주입 스파이로 검증(PyQt6 미의존 형태로 분리).
+- 사외 통합(가능 시): `QT_QPA_PLATFORM=offscreen`으로 QApplication을 띄워 창 숨김/표시/
+  `close_action=quit` 세 분기에서 이벤트 루프가 실제 종료되는지 통합 테스트(리뷰 m-2 반영).
+  offscreen 불가 환경이면 closeEvent 분기 단위 테스트 + 아래 실기 3경로를 릴리스 체크리스트로 고정.
 - 사내 실기: ① 창 숨김 상태 [종료] ② 창 표시 상태 [종료] ③ `close_action=quit` X 클릭 —
   세 경로 모두 작업관리자에서 프로세스 소멸 확인. ④ 인덱싱 중 [종료] — 기존 에스컬레이션 동작 확인.
 
@@ -107,42 +125,64 @@ state 기반이라 무관 — 변경 없음.
 ### 컴포넌트와 책임
 | 컴포넌트 | 책임 | 위치(모듈/경로) |
 |---|---|---|
-| `_purge_removed_folders` | `file_path`만 projection 조회, 삭제 판단·실행(기존 안전장치 유지) | `knowmate/collector/scheduler.py` |
-| `_run_cycle` | 스킵 조건 판정(watch_folders 서명 비교 + 처리 0건) 후 purge 호출 여부 결정 | `knowmate/collector/scheduler.py` |
-| state 파일 | 직전 사이클의 watch_folders 서명(정렬·정규화된 목록 해시) 보관 | `index_state.json` 메타 키 |
+| `_purge_removed_folders` | `file_path`만 projection 조회, 삭제 판단·실행(기존 안전장치 유지), 성공 완료 여부 반환 | `knowmate/collector/scheduler.py` |
+| `_run_cycle` | 사이클 시작 시 불변 스냅샷·op_sig 계산, 스킵 판정(서명·0건·24h), 성공 시에만 meta 갱신 | `knowmate/collector/scheduler.py` |
+| purge 메타 sidecar | `reconciled_sig`·`last_purge_ts` 보관(tmp→replace 원자 교체). 기존 state 스키마 불변 | `index_state.meta.json` (신규) |
 
 ### 데이터 흐름
 ```
+사이클 시작:
+  snapshot = 정규화(watch_folders)   # normcase/normpath·구분자 통일·중복 제거·정렬(불변 스냅샷,
+                                     # 서명 계산과 purge 판정이 동일 스냅샷 사용)
+  op_sig = SHA-256(UTF-8 직렬화(snapshot, dry_run, max_delete_ratio))
+                                     # 결과에 영향 주는 설정 포함 — dry_run 해제·차단율 변경 시 재실행 보장
 사이클 종료부:
-  watch_sig = hash(정규화(watch_folders))
-  if watch_sig == state["_watch_sig"] and 처리 0건:
-      purge 스킵 (DB 조회 없음)                       # ★ 신규 빠른 경로
+  if op_sig == meta["reconciled_sig"] and 처리 0건
+     and (now - meta["last_purge_ts"]) < 강제주기(기본 24h):
+      purge 스킵 (DB 조회 없음)                        # ★ 빠른 경로
   else:
-      file_paths = chunks 테이블에서 file_path 컬럼만 조회   # ★ projection
+      file_paths = chunks 테이블에서 file_path 컬럼만 조회    # ★ projection
       (이하 기존과 동일: 소속 판정 → 대량삭제 차단 → dry_run → 삭제 → optimize)
-  state["_watch_sig"] = watch_sig
+      purge가 예외 없이 완료된 경우에만:
+          meta["reconciled_sig"] = op_sig; meta["last_purge_ts"] = now   # 원자 갱신
+      예외·대량삭제 차단으로 미완료면: meta 미갱신 → 다음 사이클 자동 재시도
+
+meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_state.meta.json, tmp→replace
+원자 교체). 기존 state 스키마(경로→dict)와 소비자 코드를 일절 건드리지 않는다(마이그레이션 불필요).
 ```
+
+- **처리 0건의 정의**: 이번 사이클에서 소비자 루프가 꺼낸 태스크(성공·실패·연기 포함)가 0건이고
+  취소되지 않았음. 실패·연기가 있던 사이클은 스킵하지 않는다(보수적).
+- **강제 reconciliation**: 스킵이 계속되더라도 `last_purge_ts` 기준 24h(기본, config화) 경과 시
+  0건이어도 purge를 1회 실행 — 외부 요인으로 생긴 state-DB 불일치가 무기한 방치되지 않는 상한.
 
 ### 핵심 결정과 트레이드오프
 - 결정: projection 방식은 `table.search().select(["file_path"]).limit(...)` 대신
   **`table.to_lance().to_table(columns=["file_path"])`** 계열(전건 조회에 limit 불필요·벡터 미로드)
   을 1순위로 검토하되, 설치된 lancedb 0.6+ API에서 동작 확인 후 확정 → 근거·대안은 ADR-0002
-- 결정: 스킵 조건은 "watch_folders 서명 불변 && 처리 0건" — 서명이 바뀐 사이클은 반드시 purge 실행
-- 트레이드오프: state-DB 불일치(외부 요인으로 DB에만 남은 고아 경로)의 복구가 "구성 변경 또는
-  파일 변경이 있는 사이클"로 지연된다. 불일치의 발생 원인 자체가 그런 사이클(삭제 실패 등)이므로
-  실질 지연은 제한적이라고 판단 — 리뷰 검증 요청 항목.
+- 결정: 스킵 조건은 "op_sig(구성+dry_run+차단율) 불변 && 처리 0건 && 24h 미경과". 서명은 purge가
+  **성공 완료된 경우에만** 갱신한다(실패·차단 시 미갱신 → 재시도 보존). → 근거는 ADR-0002
+- 결정: 메타는 sidecar 파일(index_state.meta.json) — 기존 state 스키마·소비자 무변경 (리뷰 M-2 반영)
+- 트레이드오프: 불일치 복구가 최대 24h(강제 주기)까지 지연될 수 있다 — 무기한 방치는 강제
+  reconciliation으로 차단(리뷰 B-1 반영). sidecar 파일이 1개 늘어난다.
 
 ### 실패 모드
 | 실패 | 감지 | 대응(격리/재시도/중단) |
 |---|---|---|
 | projection API가 해당 lancedb 버전에 없음 | 구현 시 즉시 확인 | 기존 `to_arrow().to_pandas()`로 폴백하되 컬럼 select 가능한 다른 API 채택 |
-| 스킵 오판(purge 필요한데 스킵) | watch_sig 비교 로직 테스트 | 서명에 정규화(구분자·대소문자) 포함, 의심 시 스킵 없이 실행하는 보수적 기본 |
-| state 메타 키(_watch_sig)와 파일 경로 키 충돌 | 키 네임스페이스(_접두) | 기존 로직이 경로 키만 순회하는지 확인 후 도입 |
+| purge 도중 예외·대량삭제 차단 | purge 반환/예외 | meta(reconciled_sig) 미갱신 → 다음 사이클 자동 재시도(리뷰 B-2 반영) |
+| 스킵 오판(purge 필요한데 스킵) | op_sig 비교 로직 테스트 | SHA-256 + 정규화 스냅샷(프로세스 간 안정, 리뷰 m-1 반영). 잔여 위험은 24h 강제 reconciliation이 상한 |
+| sidecar 메타 파일 손상/유실 | 로드 실패 | meta 없음 = "스킵 불가"로 간주(보수적) → 그 사이클 purge 실행 후 재생성 |
+| 장기 유휴로 스킵만 반복 | last_purge_ts 경과 | 24h 초과 시 0건이어도 강제 purge(리뷰 B-1 반영) |
 
 ### 검증 계획
-- 사외: ① projection 결과에 vector/text 부재 검증 ② 스킵 조건 단위 테스트(서명 동일+0건 → 조회
-  스파이 미호출 / 서명 변경 → 호출) ③ watch_folder 제거 시나리오 회귀(기존 테스트 유지 통과).
+- 사외: ① projection 결과에 vector/text 부재 검증 ② 스킵 조건 단위 테스트(서명 동일+0건+24h 미경과
+  → 조회 스파이 미호출 / 서명·dry_run·차단율 변경 또는 24h 경과 → 호출) ③ purge 예외·대량삭제 차단
+  시 meta 미갱신 → 다음 사이클 재실행 검증 ④ meta 파일 부재/손상 시 purge 실행(보수적 폴백) ⑤
+  watch_folder 제거 시나리오 회귀(기존 테스트 유지 통과) ⑥ op_sig가 경로 대소문자·구분자 차이에
+  불변임을 검증.
 - 사내 실측: 유휴 방치 1시간 동안 작업관리자 RSS 추이 — 수정 전(우상향 눌러앉음) 대비 평탄화 확인.
+  lancedb 실환경에서 projection API의 컬럼 미로드(pushdown) 실측(리뷰 '확인 필요' 반영).
 
 ### 리뷰 이력
 - (설계 PR 리뷰 대기)

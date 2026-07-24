@@ -62,3 +62,24 @@
 - 설치된 LanceDB 버전에서 `table.to_lance().to_table(columns=["file_path"])`가 공개·지원 API인지, 실제로 vector/text 컬럼을 읽지 않는 projection pushdown이 이루어지는지 실측이 필요하다.
 - “이번 사이클 처리 0건”이 성공한 신규·변경 파일만 의미하는지, 삭제·실패·연기·취소·orphan 처리도 포함하는지 정의가 필요하다.
 - `index_state.json`의 현재 저장이 원자적 교체 방식인지, 모든 state 소비자가 예약 메타 키를 안전하게 처리할 수 있는지 확인이 필요하다.
+
+---
+
+## 처리 기록 (Claude, 2026-07-24)
+
+| ID | 판단 | 사유 / 반영 커밋 |
+|---|---|---|
+| B-1 | 수용 | 스킵 지속 시 불일치 무기한 방치 지적 타당 → `last_purge_ts` 기준 24h 강제 reconciliation 추가(0건이어도 실행). 메타 부재/손상 시 스킵 안 함(보수적) → 반영: PR #59 설계 보강 커밋 (A-0002·ADR-0002) |
+| B-2 | 수용 | 무조건 서명 갱신은 재시도 경로 소멸 지적 타당 → 서명을 "성공적으로 reconcile된 op_sig"로 재정의, purge 예외 없이 완료 시에만 원자 갱신. `dry_run`·`max_delete_ratio`를 op_sig에 포함해 설정 변경 시 재실행 보장 → 반영: 동일 커밋 |
+| M-1 | 수용 | A-0001에 "정상 종료 계약" 신설 — 신규 작업 차단(scheduler.stop) → 진행 작업 state 저장(취소 분기 save_state, tmp→replace 원자 교체는 기존 테스트로 보장) → COM 정리(run finally) → 로그 flush → quit 순서와 기존 코드 근거를 명시. quit이 stop_worker 반환 전에 불리지 않음을 단위 테스트 항목화 → 반영: 동일 커밋 |
+| M-2 | 수용 | `index_state.json` 최상위 scalar 메타 키의 스키마 가정 위험 지적 타당 → **sidecar 파일**(`index_state.meta.json`, 원자 교체)로 변경. 기존 state 스키마·소비자 코드 무변경, 마이그레이션 불필요 → 반영: 동일 커밋 |
+| m-1 | 수용 | 서명 규칙 확정: 사이클 시작 시 불변 스냅샷(normcase/normpath·구분자 통일·중복 제거·정렬) + UTF-8 직렬화 + SHA-256(내장 hash() 미사용 — 프로세스 간 안정). 서명 계산과 purge 판정이 동일 스냅샷 사용 → 반영: 동일 커밋 |
+| m-2 | 수용(조건부) | `QT_QPA_PLATFORM=offscreen` 통합 테스트(숨김/표시/close_action=quit 3분기 이벤트 루프 종료)를 검증 계획에 추가. offscreen 불가 환경이면 closeEvent 분기 단위 테스트 + 실기 3경로를 릴리스 체크리스트로 고정 → 반영: 동일 커밋 |
+
+**확인 필요 항목 답변**: ① `_shutdown`은 단계별 독립 try/except 기존재(main.py), 재진입 가드는
+구현 시 `_really_quit` 플래그와 함께 점검. ② lancedb projection pushdown은 사내 실측 항목으로
+검증 계획에 명시. ③ "처리 0건" = 소비자 루프가 꺼낸 태스크(성공·실패·연기 포함) 0건 && 미취소로
+정의(A-0002). ④ `save_state`는 tmp→replace 원자 교체(기존 테스트 `test_atomic_save_uses_tmp_then_replace`).
+
+**종결 판정**: Blocker 2건·Major 2건 모두 수용·설계 반영 완료 → 재리뷰(Action 재트리거) 통과 시
+A-0001/A-0002 상태 Draft→Reviewed 승격 가능.

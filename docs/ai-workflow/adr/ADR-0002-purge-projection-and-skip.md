@@ -19,9 +19,13 @@
 
 ## 결정 (Decision)
 ① purge의 DB 조회를 `file_path` 단일 컬럼 projection으로 교체한다(벡터·원문 미로드).
-② "watch_folders 서명(정규화 목록의 해시)이 직전 사이클과 동일 && 이번 사이클 처리 0건"이면
-purge 조회 자체를 생략한다. 서명이 바뀐 사이클은 반드시 purge를 실행한다. 직전 서명은
-`index_state.json`의 메타 키(`_watch_sig` 등 경로와 충돌하지 않는 네임스페이스)에 보관한다.
+② 스킵 조건: "**op_sig 불변 && 처리 0건 && 마지막 성공 purge 후 24h 미경과**"일 때만 purge를
+생략한다. op_sig는 사이클 시작 시 고정한 불변 스냅샷(normcase/normpath·중복 제거·정렬)에
+`dry_run`·`max_delete_ratio`를 더해 SHA-256으로 계산한다(프로세스 간 안정·설정 변경 시 재실행).
+③ op_sig·`last_purge_ts` 메타는 purge가 **예외 없이 완료된 경우에만** 갱신한다 — 실패·대량삭제
+차단 시 미갱신으로 다음 사이클 자동 재시도. ④ 메타는 `index_state.json`이 아닌 **sidecar 파일**
+(`index_state.meta.json`, tmp→replace 원자 교체)에 보관해 기존 state 스키마·소비자를 건드리지
+않는다. 메타 부재/손상 시 스킵하지 않는다(보수적).
 
 ## 검토한 대안 (Alternatives)
 | 대안 | 장점 | 단점 | 기각 사유 |
