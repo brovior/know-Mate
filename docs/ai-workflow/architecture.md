@@ -90,8 +90,18 @@ X (close_action=tray) → event.ignore() + hide()               # 종료 아님(
 3. **COM 정리**: 워커 `run()`의 finally가 `quit_com_apps()`로 소유 Office를 정리(기존 코드).
 4. **로그 flush**: 정상 경로는 인터프리터 종료 시 `logging.shutdown()`(atexit), 하드 종료 경로는
    `_default_hard_exit`가 명시적으로 `logging.shutdown()` 후 `os._exit`(기존 코드).
-- terminate/`os._exit` 강제 경로에서는 위 2·3이 생략될 수 있다 — 이는 "행오버로 이미 멈춘 워커"
-  한정이며, 그 사이클의 state 미저장은 다음 사이클 재인덱싱으로 자가 복구된다(감수하는 트레이드오프).
+**단계별 실패 정책 (리뷰3 M-1 — "보장 후 quit"과 "예외 무관 quit"의 관계 명확화)**:
+위 계약은 **정상 경로**의 보장이고, 앞 단계가 실패한 경우는 데이터 무결성 예외로 다음과 같이
+처리한다(무결성 완주보다 "종료는 반드시 된다"를 우선 — R-0001 FR-1이 최상위):
+- `scheduler.stop()` 실패 → 계속 진행. quit()으로 이벤트 루프가 끝나면 Qt 타이머는 더 이상
+  발화하지 않으므로 신규 사이클 차단은 결과적으로 성립.
+- `stop_worker()` 자체가 예외 → 계속 진행해 quit() 호출하되, **워커 스레드가 여전히 실행 중이면
+  hard_exit(os._exit) 경로로 전환**(quit만으로는 QThread 잔존 가능). 이 판정을 `_shutdown()`
+  마지막에 추가: `worker.isRunning()`이면 quit 대신 hard_exit.
+- terminate/`os._exit` 강제 경로에서는 계약 2·3(그 사이클의 state 저장·COM 정리)이 생략될 수
+  있다 — 미저장 state는 다음 사이클 재인덱싱으로 자가 복구(감수하는 트레이드오프). 또한 8초
+  graceful 대기는 "정상적으로 오래 걸리는 추출"에도 만료될 수 있음을 인정한다 — 이 경우에도 종료
+  우선 원칙은 동일하며, 잃는 것은 그 사이클의 state 갱신뿐(자가 복구됨).
 
 ### 실패 모드
 | 실패 | 감지 | 대응(격리/재시도/중단) |
@@ -132,29 +142,33 @@ state 기반이라 무관 — 변경 없음.
 ### 데이터 흐름
 ```
 사이클 시작:
-  snapshot = 정규화(watch_folders)   # normcase/normpath·구분자 통일·중복 제거·정렬(불변 스냅샷,
-                                     # 서명 계산과 purge 판정이 동일 스냅샷 사용)
+  snapshot = normalize_folders(watch_folders)
+      # 공용 함수 1개로 통일(리뷰3 m-1): 절대경로화(abspath) → normpath → normcase →
+      # 구분자 '/' 통일 → 후행 구분자 제거 → 중복 제거 → 정렬. 환경변수 확장은 하지 않음
+      # (config에 리터럴 경로만 허용 — 기존 동작). UNC와 매핑 드라이브는 **문자열이 다르면
+      # 다른 실체로 취급**(파일시스템 해석 안 함 — 오판 시 결과는 불필요 purge 1회로 무해).
+      # 서명 계산과 purge 소속 판정 모두 이 함수의 결과만 사용(이원화 금지).
   op_sig = SHA-256(canonical JSON)   # {"v":1, "folders":[...], "dry_run":bool,
                                      #  "max_delete_ratio":float} 를 sort_keys=True·고정
                                      # separator·UTF-8로 직렬화(필드 경계 모호성 제거, 리뷰2 m-2)
-사이클 종료부:
-  elapsed = now - meta["last_purge_ts"]
-  if elapsed < 0: meta 비정상으로 간주 → 즉시 purge (벽시계 역행 방어, 리뷰2 m-1)
-  if op_sig == meta["reconciled_sig"] and 처리 0건 and elapsed < 강제주기(기본 24h)
-     and 백오프 미해당:
-      purge 스킵 (DB 조회 없음)                        # ★ 빠른 경로 — O(1)
-  else:
+사이클 종료부 — 판정 순서 고정(억제 판정이 성공 스킵보다 먼저, 리뷰3 B-1):
+  # 시각 필드(last_purge_ts·next_retry_ts)는 미래값이면 비정상 → 해당 억제 무시(보수적)
+  1) if meta["blocked_sig"] == op_sig:
+         return (DB 조회 없음)      # 대량삭제 차단 상태 — 동일 설정으론 자동 재시도 안 함
+  2) if meta["failed_sig"] == op_sig and now < meta["next_retry_ts"]:
+         return (DB 조회 없음)      # 일시적 실패 백오프(기본 30분, config화)
+  3) if op_sig == meta["reconciled_sig"] and 처리 0건
+        and 0 <= (now - meta["last_purge_ts"]) < 강제주기(기본 24h):
+         return (DB 조회 없음)      # ★ 정상 빠른 경로 — O(1). 시각 역행(elapsed<0)은 스킵 불가
+  4) purge 실행:
       file_paths = chunks 테이블에서 file_path 컬럼만 projection 조회
-                   # Arrow 컬럼 직접 순회 — pandas 변환 생략(리뷰2 B-1 대안3).
-                   # projection 불가 시 조용한 전체 로드 금지: 최적화 비활성 경고 + purge를
-                   # 구성 변경 사이클로 한정(리뷰2 M-3)
+                   # Arrow 컬럼 직접 순회 — pandas 변환 생략
       (이하 기존과 동일: 소속 판정 → 대량삭제 차단 → dry_run → 삭제 → optimize)
-      성공 완료 시에만: meta["reconciled_sig"]=op_sig; meta["last_purge_ts"]=now  # 원자 갱신
-      실패·차단 시 (핫루프 방지, 리뷰2 M-2):
-          meta["last_attempt_ts"]=now; meta["failed_sig"]=op_sig (+사유)
-          - 일시적 예외: 재시도 백오프(기본 30분, config화) 적용 — 매분 전건 재조회 금지
-          - 대량삭제 차단: 동일 op_sig에 대해 자동 재시도 안 함(구성·차단율 변경으로 op_sig가
-            바뀌어야 재실행). 차단 사실은 기존 UI 알림(1회)로 노출
+      성공 완료: meta["reconciled_sig"]=op_sig; meta["last_purge_ts"]=now;
+                 failed_sig·blocked_sig 해제                              # 원자 갱신
+      일시적 예외: meta["failed_sig"]=op_sig; meta["next_retry_ts"]=now+백오프
+      대량삭제 차단: meta["blocked_sig"]=op_sig + 기존 UI 알림(1회) —
+                 구성·차단율 변경으로 op_sig가 바뀌어야 재실행
 
 meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_state.meta.json, tmp→replace
 원자 교체). 기존 state 스키마(경로→dict)와 소비자 코드를 일절 건드리지 않는다(마이그레이션 불필요).
@@ -179,10 +193,12 @@ meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_stat
 ### 실패 모드
 | 실패 | 감지 | 대응(격리/재시도/중단) |
 |---|---|---|
-| projection API가 해당 lancedb 버전에 없음 | 구현 단계에서 배포 고정 버전으로 확정·문서 기록 | **조용한 전체 로드 폴백 금지** — 최적화 비활성을 경고하고 purge를 구성 변경 사이클로 한정(리뷰2 M-3) |
-| purge 도중 일시적 예외 | purge 반환/예외 | reconciled_sig 미갱신 + **재시도 백오프**(기본 30분) — 매 사이클 전건 재조회 금지(리뷰2 M-2) |
-| 대량삭제 차단 지속 | 차단 판정 | 동일 op_sig 자동 재시도 안 함 — 구성·차단율 변경 시에만 재실행, UI 알림 1회(리뷰2 M-2) |
-| 시스템 시각 역행 | now < last_purge_ts | meta 비정상 간주 → 즉시 purge(리뷰2 m-1) |
+| projection API가 배포 고정 lancedb 버전에 없음 | **구현 착수 시 검증(채택 전제조건)** | 미지원이면 이 변경을 배포하지 않는다(호환 전체-로드 모드 없음 — 요구와 모순되는 폴백 자체를 두지 않음, 리뷰3 M-2). requirements.txt에 검증된 버전 고정 |
+| purge 도중 일시적 예외 | purge 반환/예외 | failed_sig+next_retry_ts 기록, 백오프(기본 30분) 중 **DB 조회 없이 return**(판정 1·2가 성공 스킵보다 선행 — 리뷰3 B-1) |
+| 대량삭제 차단 지속 | 차단 판정 | blocked_sig 기록 — 동일 op_sig 자동 재시도 안 함, 구성·차단율 변경 시에만 재실행, UI 알림 1회. 이 상태의 미복구는 FR-3 예외로 요구에 명문화(리뷰3 B-2) |
+| 시스템 시각 역행·미래 시각 필드 | now < last_purge_ts 또는 미래 next_retry_ts | 해당 억제·스킵 무시 → purge 실행(보수적, 리뷰3 m-2 포함) |
+| sidecar 의미적 손상(타입·범위 이상) | 로드 시 필드별 검증 | 메타 부재와 동일 취급 → 스킵 없이 purge 후 재생성(리뷰3 m-2) |
+| purge 성공 후 meta 저장 실패 | 다음 사이클 재실행 | 안전 — 삭제(file_path 기준)·optimize는 멱등(재실행해도 결과 동일). 문서화+테스트(리뷰3 m-2) |
 | 스킵 오판(purge 필요한데 스킵) | op_sig 비교 로직 테스트 | SHA-256 + 정규화 스냅샷(프로세스 간 안정, 리뷰 m-1 반영). 잔여 위험은 24h 강제 reconciliation이 상한 |
 | sidecar 메타 파일 손상/유실 | 로드 실패 | meta 없음 = "스킵 불가"로 간주(보수적) → 그 사이클 purge 실행 후 재생성 |
 | 장기 유휴로 스킵만 반복 | last_purge_ts 경과 | 24h 초과 시 0건이어도 강제 purge(리뷰 B-1 반영) |
