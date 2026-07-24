@@ -139,3 +139,22 @@ scripts/          diag_search.py · inspect_index.py · test_shared_db.py(5b 사
 - 설정값 하드코딩 금지 — 전부 config.yaml.
 - UI 작업 시 `UI_SPEC.md` · `mockup.html` 먼저 읽고, 스펙과 다른 판단 필요 시 먼저 묻는다.
 - 로그 레벨: DEBUG(흐름 추적) / INFO(정상 결과) / WARNING(복구 가능) / ERROR(즉시 확인).
+
+<!-- ai-dev-workflow:review-recipe (init_project.py가 자동 주입 — 이 블록은 직접 수정하지 말 것) -->
+## 설계 리뷰 요청 처리 (ai-dev-workflow)
+
+사용자가 "설계 리뷰" / "GPT 리뷰" / "리뷰 받아줘" 등을 요청하면 — **네가 직접 리뷰하지 말고** 아래대로 한다:
+
+1. 리뷰 대상 설계를 `docs/ai-workflow/`(architecture.md·requirements.md·adr/ 등)에 작성·갱신한다.
+2. 새 브랜치로 커밋·푸시한다.
+3. base=main으로 **설계 PR을 연다.**
+   → `.github/workflows/gpt-design-review.yml`(채널 B)가 자동으로 **GPT 독립 리뷰**를 PR 코멘트로 단다
+   (repo Secret `OPENAI_API_KEY` 필요 — 없으면 무해 skip).
+4. 리뷰가 달리면 항목별 수용/기각을 판단·반영하고 `docs/ai-workflow/reviews/`에 처리 기록을 남긴다.
+
+핵심: **"리뷰 요청 = 설계 PR 열기"** 이며, 리뷰는 GitHub Action이 GPT를 호출해 수행한다(에이전트가 직접 하지 않음). 워크플로는 이미 이 저장소에 설정돼 있으니 새로 만들지 않는다.
+
+- **PC 즉시 실행**(API 키 환경변수 있을 때): `python scripts/ai_workflow/gpt_review.py <문서> [--source <dir>]`
+- **정액 구독만 있을 때**(채널 C): 위 명령에 `--emit`을 붙여 나온 파일을 ChatGPT에 붙여넣는다.
+- 정본·상세: `docs/ai-workflow/README.md` (규약 정본은 `brovior/ai-dev-workflow`).
+<!-- /ai-dev-workflow:review-recipe -->

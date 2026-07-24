@@ -1,4 +1,4 @@
-# vendored from ai-dev-workflow v0.1.4 — templates/gpt-design-review.yml
+# vendored from ai-dev-workflow v0.1.5 — templates/gpt-design-review.yml
 # 직접 수정 금지: 개선은 ai-dev-workflow 정본에 하고 init_project.py --update로 동기화한다.
 # 채널 B — GPT 독립 설계 리뷰 (비동기, 모바일/웹 세션의 주 채널)
 #
