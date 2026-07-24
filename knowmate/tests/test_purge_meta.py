@@ -247,6 +247,24 @@ class TestMetaTransitions:
         out = purge_meta.on_blocked(meta, "sig-a")
         assert out.blocked_capability_sig is None
 
+    def test_on_blocked_unsupported_clears_reconciled_sig(self):
+        """리뷰16 M-2 회귀: unsupported 전이도 다른 전이(성공/실패/mass_delete 차단)와
+        동일하게 reconciled_sig를 해제해야 한다 — 그렇지 않으면 이후 capability_sig가
+        바뀌어 억제가 풀려도, 이전 op_sig의 성공 스킵 자격이 남아 있어 최대 24h 동안
+        재검증을 가로막을 수 있다."""
+        meta = PurgeMeta(reconciled_sig="old-success-sig", last_purge_ts=1000.0)
+        out = purge_meta.on_blocked(meta, "sig-b", reason="unsupported", capability_sig="0.1.0")
+        assert out.reconciled_sig is None
+
+    def test_unsupported_release_reruns_even_with_prior_success_meta(self):
+        """리뷰16 M-2 회귀(엔드투엔드): 이전 op_sig에 대한 성공 메타(reconciled_sig)가
+        있었더라도, unsupported 전이 → capability_sig 변경 흐름을 거치면 판정 3(성공
+        스킵)에 가려지지 않고 즉시 재실행돼야 한다."""
+        meta = PurgeMeta(reconciled_sig="sig-a", last_purge_ts=1000.0)
+        meta = purge_meta.on_blocked(meta, "sig-b", reason="unsupported", capability_sig="cap1")
+        d = purge_meta.decide(meta, "sig-b", processed_count=0, now=1005.0, capability_sig="cap2")
+        assert d.should_run
+
 
 class TestComputeCapabilitySig:
     def test_returns_nonempty_string(self):

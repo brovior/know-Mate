@@ -215,17 +215,25 @@ class CollectorWorker(QThread):
             return "success"
 
         # file_path 컬럼만 projection 조회 — 벡터(1024차원)·암호화 원문 미로드.
-        # AttributeError는 "이 lancedb 버전엔 select()가 없다"는 API 비호환(영구 장애)
-        # 신호라 일시적 DB 오류와 구분한다 — 재시도로 복구될 수 없으므로 백오프를
-        # 반복하지 않고 차단과 동일하게 장기 억제한다(설계 리뷰 11차 M-2).
-        try:
-            tbl = self._indexer.table.search().select(["file_path"]).to_arrow()
-        except AttributeError as exc:
-            logger.error(
-                "[purge] projection API(table.search().select) 미지원 — 배포된 lancedb "
-                "버전과 호환되지 않습니다(영구 장애, 재시도 무의미): %s", exc,
-            )
+        # "unsupported"는 **API 자체(search/select 메서드)가 없다는 사실만**으로 판정한다
+        # (좁은 capability probe, 설계 리뷰 16차 M-3) — 이전에는 `.search().select().to_arrow()`
+        # 호출 체인 전체를 하나의 try로 감싸 AttributeError를 잡았는데, 그러면 API는
+        # 존재하지만 내부 구현 결함·테스트 더블 오류 등 다른 원인으로 발생한 AttributeError까지
+        # "영구 장애"로 오분류해 30분 백오프·24h reconciliation 없이 capability_sig가 바뀔
+        # 때까지 무기한 억제되는 위험이 있었다. 메서드 존재만 좁게 확인하고, 실제 호출
+        # 실행 중 예외는 일시적 실패("failed")로 처리한다.
+        table = self._indexer.table
+        search_fn = getattr(table, "search", None)
+        if not callable(search_fn):
+            logger.error("[purge] projection API(table.search) 미지원 — 배포된 lancedb 버전과 호환되지 않습니다(영구 장애, 재시도 무의미)")
             return "unsupported"
+        search_result = search_fn()
+        select_fn = getattr(search_result, "select", None)
+        if not callable(select_fn):
+            logger.error("[purge] projection API(search().select) 미지원 — 배포된 lancedb 버전과 호환되지 않습니다(영구 장애, 재시도 무의미)")
+            return "unsupported"
+        try:
+            tbl = select_fn(["file_path"]).to_arrow()
         except Exception as exc:
             logger.warning("[purge] DB 조회 실패(일시적 장애로 간주, 백오프 후 재시도): %s", exc)
             return "failed"

@@ -60,3 +60,15 @@
 - `requirements.md`가 제공되지 않아 R-0001/R-0002의 전체 요구사항 및 AC/NFR 대응 완전성은 확인할 수 없다.
 - 소스 코드가 제공되지 않아 `_shutdown()`의 최종 판정 도달 보장, `stop_worker()` 반환값 전달, unsupported 예외 처리 범위, 메타 상태 전이 및 테스트 구현 여부는 확인이 필요하다.
 - `table.search().select(["file_path"]).to_arrow()`가 실제 저장소 단계에서 컬럼 pruning을 수행하는지는 문서의 필수 성능 수용 시험 결과로 최종 확인해야 한다.
+
+## 처리 기록 (중립 검토)
+
+| ID | 판단 | 사유/반영 |
+|---|---|---|
+| M-1 | 수용 | A-0001 컴포넌트 표의 `lifecycle.stop_worker()` 설명을 "기존 유지, 변경 없음"에서 "에스컬레이션 순서는 유지하되 반환값 계약이 변경됨(terminate() 사용 여부 bool 반환)"으로 정정, ADR-0001 결정문에도 동일 계약을 명시. `StopWorkerResult` 같은 전용 타입 도입은 현재 이 값을 소비하는 곳이 `finalize_shutdown` 1곳뿐이라 과설계로 판단해 기각(bool 반환 유지, docstring으로 의미 고정). `docs/ai-workflow/architecture.md`, `docs/ai-workflow/adr/ADR-0001-explicit-quit-for-tray-app.md`. |
+| M-2 | 수용(코드는 이미 정확, 문서·회귀 테스트 보강) | 실제 `on_blocked()`는 unsupported 전이에서도 항상 `reconciled_sig=None`으로 새 `PurgeMeta`를 반환해 지적된 시나리오가 이미 발생하지 않음을 재확인(수동 검증 + 신규 회귀 테스트 2건 추가). 다만 architecture.md의 unsupported 전이 의사코드에 `reconciled_sig` 해제가 누락돼 있어 문서만 보강 — 코드-문서 불일치를 인정. `docs/ai-workflow/architecture.md`, `knowmate/tests/test_purge_meta.py`. |
+| M-3 | 수용 | `_purge_removed_folders`의 unsupported 판정을 `.search().select().to_arrow()` 호출 체인 전체를 감싸던 넓은 `except AttributeError`에서, `getattr`+`callable`로 메서드 존재 자체만 확인하는 좁은 capability probe로 변경. `select(...).to_arrow()` 실행 중 예외는 "failed"(일시적)로 분류하도록 분리, 기존 테스트를 시나리오에 맞게 수정하고 "존재하지만 예외" 케이스에 대한 신규 테스트를 추가. `knowmate/collector/scheduler.py`, `knowmate/tests/test_phase3.py`. |
+| m-1 | 수용 | 성능 수용 절차에 "5개 측정 프로세스는 동일 seed DB를 각자 별도 디렉터리로 복제해 단독 실행, 실행 전 행 수·스키마·제거 대상 수 확인"을 명시. `docs/ai-workflow/architecture.md`. |
+| N-1 | 수용 | A-0001/A-0002 리뷰 이력에 15·16차 반영 내용 추가. `docs/ai-workflow/architecture.md`. |
+
+**종결 판정**: M-1·M-2·M-3(Major 3건) 모두 검토해 반영(M-2는 코드가 이미 정확했음을 확인하고 문서·테스트만 보강). m-1·N-1도 수용. Blocker/Major 잔존 0건.

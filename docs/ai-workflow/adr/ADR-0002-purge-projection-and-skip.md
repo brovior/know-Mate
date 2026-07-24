@@ -2,7 +2,7 @@
 
 | 상태 | 날짜 | 결정자 | 리뷰 |
 |---|---|---|---|
-| Accepted | 2026-07-24 | Claude (Chief Architect) | reviews/REVIEW-20260724-adr-0001-explicit-quit-for-tray-app-adr-0002-purge-projectio-*.md (1~15차, Blocker/Major 전건 처리·구현 반영, 리뷰11 M-1 축소채택·리뷰12 marker 비동기화/단일인스턴스 순서 정정·리뷰13 marker 해제 위치 재이동·리뷰14 unsupported capability_sig 재설계/marker join 상한 추가·리뷰15 terminate() 강제종료 시 hard_exit 강제/capability_sig 확장 근거 명시) |
+| Accepted | 2026-07-24 | Claude (Chief Architect) | reviews/REVIEW-20260724-adr-0001-explicit-quit-for-tray-app-adr-0002-purge-projectio-*.md (1~16차, Blocker/Major 전건 처리·구현 반영, 리뷰11 M-1 축소채택·리뷰12 marker 비동기화/단일인스턴스 순서 정정·리뷰13 marker 해제 위치 재이동·리뷰14 unsupported capability_sig 재설계/marker join 상한 추가·리뷰15 terminate() 강제종료 시 hard_exit 강제/capability_sig 확장·리뷰16 stop_worker 계약 문서화/unsupported capability probe 좁힘 근거 명시) |
 
 ## 맥락 (Context)
 - `_purge_removed_folders`(watch_folders에서 제거된 폴더의 청크를 DB에서 삭제)는 매 인덱싱
@@ -40,13 +40,18 @@ separator·UTF-8)의 SHA-256이며, 경로는 서명·소속판정 공용 정규
 순회, pandas 변환 생략). lancedb 0.34.0에서 실측 검증됨(결과 스키마에 `file_path`만 실림, 전체
 로드 대비 약 6배 빠름, 숨은 기본 limit 없음 — 상세는 architecture.md § 핵심 결정과 트레이드오프).
 검토했던 `table.to_lance().to_table(columns=[...])`는 별도 `pylance` 설치가 필요해 기각. 미지원
-lancedb 버전에서는 `.select()` 호출이 `AttributeError`로 실패하는데, 이는 재시도로 복구되지 않는
-**영구 장애**(배포 의존성 비호환)이므로 일시적 DB I/O 실패와 구분한다 — `"unsupported"`로 분류돼
-장기 억제되고(30분 백오프 반복 없음) 1회 UI 알림으로 업데이트를 안내한다(리뷰11 M-2로 "failed"와
-분리; 호환 전체-로드 모드를 두지 않는 원칙은 유지 — 조용한 폴백 금지). 억제 해제 판정은 대량삭제
-차단(`op_sig` 기준)과 달리 **`compute_capability_sig()`(lancedb 버전 지문)** 기준이다(리뷰14 M-1) —
-unsupported는 watch_folders 구성이 아니라 실행 환경의 문제이므로, op_sig로 억제하면 사용자가
-안내대로 앱을 업데이트해도 폴더 구성이 그대로면 억제가 절대 풀리지 않는 결함이 있었다.
+lancedb 버전에서는 `table.search`/`search().select` **메서드 자체가 없다**(재시도로 복구되지 않는
+**영구 장애**, 배포 의존성 비호환). 판정은 `getattr`+`callable`로 메서드 존재 여부만 좁게
+확인한다(리뷰16 M-3) — `select(...).to_arrow()` **호출 도중** 발생하는 예외(AttributeError
+포함)까지 하나의 넓은 try로 잡으면, API는 있지만 다른 원인(내부 결함·테스트 더블 오류 등)으로
+난 예외까지 영구 억제로 오분류해 capability_sig가 바뀔 때까지 무기한 억제되는 위험이 있었다.
+메서드 부재로 확인된 경우만 `"unsupported"`로 분류돼 장기 억제되고(30분 백오프 반복 없음) 1회
+UI 알림으로 업데이트를 안내한다(리뷰11 M-2로 "failed"와 분리; 호환 전체-로드 모드를 두지 않는
+원칙은 유지 — 조용한 폴백 금지). 억제 해제 판정은 대량삭제 차단(`op_sig` 기준)과 달리
+**`compute_capability_sig()`(lancedb 버전 + 앱 버전 + projection 호출방식 버전, 리뷰15 M-1로
+확장)** 기준이다(리뷰14 M-1) — unsupported는 watch_folders 구성이 아니라 실행 환경의 문제이므로,
+op_sig로 억제하면 사용자가 안내대로 앱을 업데이트해도 폴더 구성이 그대로면 억제가 절대 풀리지
+않는 결함이 있었다.
 
 ## 검토한 대안 (Alternatives)
 | 대안 | 장점 | 단점 | 기각 사유 |

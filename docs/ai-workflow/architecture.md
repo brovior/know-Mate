@@ -60,7 +60,7 @@
 |---|---|---|
 | `main()` | `app.setQuitOnLastWindowClosed(False)` 설정 | `knowmate/app/main.py` |
 | `MainWindow._shutdown()` | 스케줄러 정지 → 트레이 숨김 → 워커 종료 → **최종 판정: 워커 비실행 확인 시 `quit()`, 실행 중·판정 불가 시 `hard_exit`(정확히 하나)** | `knowmate/app/main.py` |
-| `lifecycle.stop_worker()` | 행오버 워커 에스컬레이션(기존 유지, 변경 없음) | `knowmate/app/lifecycle.py` |
+| `lifecycle.stop_worker()` | 행오버 워커 에스컬레이션(정상→terminate→하드 종료 순서는 기존 유지). **반환값 계약이 변경됨**(리뷰15 B-1) — `terminate()`가 이번 호출에서 쓰였는지 `bool`로 반환하고, 호출부(`_shutdown()`)가 이 값을 `finalize_shutdown(force_hard_exit=)`로 전달해야 한다(누락 시 강제 중단된 워커가 정상 종료로 오분류됨, 리뷰16 M-1) | `knowmate/app/lifecycle.py` |
 
 ### 데이터 흐름
 ```
@@ -182,6 +182,14 @@ daemon 사실이 성립하는 한 불필요 — 미도입).
   억제를 op_sig가 아닌 capability_sig(lancedb 버전) 기준으로 재설계(M-1)·마커 삭제
   daemon에 짧은 join 상한 추가(M-2)·성능 수용 절차의 warm-up 범위를 DB open까지로
   제한(M-3) — 전 라운드 Blocker/Major 전건 처리, 미종결 0건 유지
+- reviews/REVIEW-20260724-...-projectio-{15,16}.md (2회, 전건 REQUEST_CHANGES) — 15차
+  QThread.terminate() 성공을 정상 종료로 오분류하던 결함 수정(stop_worker가 terminate
+  사용 여부 반환 → finalize_shutdown force_hard_exit로 전파, B-1)·capability_sig에
+  앱 버전·projection 호출방식 버전 포함(M-1)·sidecar 필드/판정순서 의사코드 갱신(M-2)·
+  성능 수용 절차를 projection 단계/end-to-end 단계로 분리 측정(m-1), 16차 stop_worker
+  반환값 계약 변경을 컴포넌트 표에 반영(M-1)·unsupported 판정을 API 메서드 존재
+  여부만으로 좁게 확인하도록 capability probe 도입(M-3)·성능 시험의 DB 격리(프로세스별
+  seed DB 복제) 명시(m-1) — 전 라운드 Blocker/Major 전건 처리, 미종결 0건 유지
 
 ## A-0002: purge 조회 경량화 — 컬럼 projection + 조건부 스킵  (상태: Accepted / 대응 요구: R-0002)
 
@@ -251,8 +259,15 @@ state 기반이라 무관 — 변경 없음.
                  # 가로막는 결함 방지(리뷰4 B-2, 대안2 채택: 별도 강제분기보다 상태가 단순)
       대량삭제 차단: meta["blocked_sig"]=op_sig; meta["blocked_reason"]="mass_delete" + 기존 UI 알림(1회) —
                  구성·차단율 변경으로 op_sig가 바뀌어야 재실행
-      unsupported(projection API 비호환, `AttributeError`): meta["blocked_sig"]=op_sig;
-                 meta["blocked_reason"]="unsupported"; meta["blocked_capability_sig"]=capability_sig
+      unsupported(projection API 메서드 자체가 없음 — 판정 범위는 아래 핵심 결정 참조):
+                 meta["blocked_sig"]=op_sig; meta["blocked_reason"]="unsupported";
+                 meta["blocked_capability_sig"]=capability_sig;
+                 **meta["reconciled_sig"]도 함께 해제**(다른 전이와 동일하게 성공 스킵
+                 자격을 무효화 — 명시하지 않으면 이전 op_sig의 성공 메타가 남아 있다가
+                 capability_sig 변경으로 억제가 풀린 뒤에도 판정 3(성공 스킵)이 최대 24h
+                 재검증을 가로막을 수 있다는 리뷰16 M-2 지적을 코드는 이미 반영하고
+                 있었으나(on_blocked이 항상 새 PurgeMeta로 교체) 이 의사코드에 빠져
+                 있었다 — 문서 정정)
                  + UI 알림(capability_sig 변화 기준 1회) — **24h 강제 reconciliation 예외**
                  (시간이 아니라 capability_sig 변화로만 재검증, 리뷰14/15 M-1)
   # 실패·차단 상태는 sidecar 저장과 **무관하게 프로세스 내 메모리에 즉시 반영**(리뷰4 M-2) —
@@ -286,7 +301,7 @@ meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_stat
 ### 실패 모드
 | 실패 | 감지 | 대응(격리/재시도/중단) |
 |---|---|---|
-| projection API가 배포 고정 lancedb 버전에 없음 | `table.search().select([...])` 호출이 `AttributeError` | **"unsupported"로 분류**(리뷰11 M-2) — 재시도로 복구되지 않는 영구 장애이므로 일시적 DB I/O 실패("failed", 30분 백오프)와 구분한다. `on_blocked`와 동일한 형태로 장기 억제(반복 재시도 없음) + 1회 UI 알림("앱 업데이트 필요")하되, 억제 해제 판정은 **op_sig가 아니라 `compute_capability_sig()`(lancedb 버전 지문)**로 한다(리뷰14 M-1 — unsupported는 watch_folders 구성과 무관한 환경 문제라, op_sig 기준이면 폴더 구성이 그대로일 때 앱 업데이트 안내가 실제로는 억제를 풀지 못하는 결함이 있었다). 즉 **unsupported는 24시간 강제 reconciliation 예외** — 시간이 아니라 capability_sig 변화(앱/lancedb 업데이트)로만 재검증한다. 호환 전체-로드 모드 없음 — 요구와 모순되는 폴백 자체를 두지 않음(리뷰3 M-2). lancedb 0.34.0에서 실측 검증 완료(위 핵심 결정 참조) |
+| projection API가 배포 고정 lancedb 버전에 없음 | `table.search`/`search().select` **메서드 존재 자체**를 `getattr`+`callable`로 좁게 확인(리뷰16 M-3) — `select(...).to_arrow()` **호출 도중** 발생하는 예외(AttributeError 포함)는 API 부재가 아니라 내부 결함일 수 있으므로 "failed"(일시적)로 분류하고, "unsupported"는 메서드가 아예 없을 때만 판정한다. 넓은 try로 호출 체인 전체를 감싸면 다른 원인의 AttributeError까지 영구 억제로 오분류할 위험이 있었다(리뷰16 M-3 지적, 이전엔 체인 전체를 하나의 `except AttributeError`로 감쌌음) | **"unsupported"로 분류**(리뷰11 M-2) — 재시도로 복구되지 않는 영구 장애이므로 일시적 DB I/O 실패("failed", 30분 백오프)와 구분한다. `on_blocked`와 동일한 형태로 장기 억제(반복 재시도 없음) + 1회 UI 알림("앱 업데이트 필요")하되, 억제 해제 판정은 **op_sig가 아니라 `compute_capability_sig()`(lancedb 버전 지문)**로 한다(리뷰14 M-1 — unsupported는 watch_folders 구성과 무관한 환경 문제라, op_sig 기준이면 폴더 구성이 그대로일 때 앱 업데이트 안내가 실제로는 억제를 풀지 못하는 결함이 있었다). 즉 **unsupported는 24시간 강제 reconciliation 예외** — 시간이 아니라 capability_sig 변화(앱/lancedb 업데이트)로만 재검증한다. 호환 전체-로드 모드 없음 — 요구와 모순되는 폴백 자체를 두지 않음(리뷰3 M-2). lancedb 0.34.0에서 실측 검증 완료(위 핵심 결정 참조) |
 | purge 도중 일시적 예외 | purge 반환/예외 | failed_sig+next_retry_ts 기록, 백오프(기본 30분) 중 **DB 조회 없이 return**(판정 1·2가 성공 스킵보다 선행 — 리뷰3 B-1) |
 | 대량삭제 차단 지속 | 차단 판정 | blocked_sig 기록 — 동일 op_sig 자동 재시도 안 함, 구성·차단율 변경 시에만 재실행, UI 알림 1회. 이 상태의 미복구는 FR-3 예외로 요구에 명문화(리뷰3 B-2) |
 | last_purge_ts가 미래값 | now < last_purge_ts | 성공 스킵 무효 → purge 실행(모든 미래값 무효) |
@@ -319,7 +334,12 @@ meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_stat
   첫 회 이후 차분이 구조적으로 0에 수렴해 거짓 합격할 수 있음이 리뷰13 M-3에서 지적돼 폐기했다.)
   - 테스트 DB: 10만 행, file_path는 사내 실사용 경로 분포를 대표하는 길이(30~200자 구간에서
     표본화)로 생성. 제거 대상 경로를 테이블의 앞·중간·끝 위치에 각각 배치해 반환 행 수와
-    삭제 후보 분류의 완전성도 함께 확인한다(리뷰13 m-1).
+    삭제 후보 분류의 완전성도 함께 확인한다(리뷰13 m-1). **5개 측정 프로세스는 동일한 seed
+    DB를 각자 별도 디렉터리로 복제해 단독으로 실행**한다(리뷰16 m-1) — 같은 DB를 순차
+    재사용하면 첫 실행의 삭제·`optimize()`가 이후 실행의 행 수·삭제 후보·저장 구조를
+    바꿔 초기 조건이 달라지고, 동시 접근은 LanceDB의 단독 writer·파일 락 가정과도
+    충돌한다. 각 실행 전 행 수·스키마·제거 대상 수를 확인해 5개 복제본의 초기 조건이
+    동일함을 기록한다.
   - 측정: **5개의 독립 프로세스**에서 각각 1회씩 실행한다(동일 프로세스 반복이 아님 — 리뷰13
     M-3). 각 프로세스의 warm-up은 **DB open과 스키마/행 수 조회(`count_rows()` 등)로만
     한정**하고 baseline RSS를 기록한다 — measurement 대상인 `file_path` projection 쿼리·Arrow
@@ -362,3 +382,11 @@ meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_stat
   억제를 op_sig가 아닌 capability_sig(lancedb 버전) 기준으로 재설계(M-1)·마커 삭제
   daemon에 짧은 join 상한 추가(M-2)·성능 수용 절차의 warm-up 범위를 DB open까지로
   제한(M-3) — 전 라운드 Blocker/Major 전건 처리, 미종결 0건 유지
+- reviews/REVIEW-20260724-...-projectio-{15,16}.md (2회, 전건 REQUEST_CHANGES) — 15차
+  QThread.terminate() 성공을 정상 종료로 오분류하던 결함 수정(stop_worker가 terminate
+  사용 여부 반환 → finalize_shutdown force_hard_exit로 전파, B-1)·capability_sig에
+  앱 버전·projection 호출방식 버전 포함(M-1)·sidecar 필드/판정순서 의사코드 갱신(M-2)·
+  성능 수용 절차를 projection 단계/end-to-end 단계로 분리 측정(m-1), 16차 stop_worker
+  반환값 계약 변경을 컴포넌트 표에 반영(M-1)·unsupported 판정을 API 메서드 존재
+  여부만으로 좁게 확인하도록 capability probe 도입(M-3)·성능 시험의 DB 격리(프로세스별
+  seed DB 복제) 명시(m-1) — 전 라운드 Blocker/Major 전건 처리, 미종결 0건 유지

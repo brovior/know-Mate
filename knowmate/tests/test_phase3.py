@@ -898,9 +898,12 @@ class TestPurgeRemovedFolders:
         assert "대량 삭제" in alerts[0]
 
     def test_projection_api_missing_returns_unsupported(self, tmp_path: Path):
-        """table.search()에 select()가 없는(lancedb 버전 비호환) 경우 "failed"(일시적
-        장애)가 아니라 "unsupported"(영구 장애)로 구분된다(설계 리뷰 11차 M-2) —
-        재시도로 복구되지 않으므로 30분 백오프를 반복하지 않고 장기 억제해야 한다."""
+        """table.search()의 반환값에 select 메서드 자체가 없는(lancedb 버전 비호환) 경우
+        "failed"(일시적 장애)가 아니라 "unsupported"(영구 장애)로 구분된다(설계 리뷰
+        11차 M-2) — 재시도로 복구되지 않으므로 30분 백오프를 반복하지 않고 장기
+        억제해야 한다. 판정은 **메서드 존재 여부만**(getattr/callable) 좁게 확인한다
+        (설계 리뷰 16차 M-3) — select가 존재하지만 호출 중 예외를 던지는 경우는
+        아래 test_select_raises_attribute_error_is_treated_as_transient_failure 참조."""
         from knowmate.rag.embedding import EmbeddingClient
         from knowmate.rag.indexer import Indexer
         from knowmate.collector.scheduler import CollectorWorker
@@ -912,8 +915,7 @@ class TestPurgeRemovedFolders:
         indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
 
         class _NoSelectQueryBuilder:
-            def select(self, *a, **kw):
-                raise AttributeError("이 lancedb 버전엔 select()가 없음(시뮬레이션)")
+            pass  # select 메서드 자체가 없음(구버전 lancedb 시뮬레이션)
 
         class _TableWithoutSelect:
             def search(self):
@@ -927,6 +929,39 @@ class TestPurgeRemovedFolders:
 
         result = worker._purge_removed_folders([str(folder)], {}, dry_run=False, max_delete_ratio=0.30)
         assert result == "unsupported"
+
+    def test_select_raises_attribute_error_is_treated_as_transient_failure(self, tmp_path: Path):
+        """리뷰16 M-3: select 메서드 자체는 존재하는데 호출 도중 AttributeError(또는 다른
+        예외)가 나면, API 부재가 아니라 내부 결함일 수 있으므로 "unsupported"(영구 억제)가
+        아니라 "failed"(일시적, 30분 백오프 후 재시도)로 분류해야 한다 — 넓은 try로
+        호출 체인 전체를 감싸면 이런 경우까지 capability_sig가 바뀔 때까지 무기한
+        억제되는 위험이 있었다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+
+        class _QueryBuilderThatRaises:
+            def select(self, *a, **kw):
+                raise AttributeError("select는 있지만 내부 결함으로 실패(시뮬레이션)")
+
+        class _TableWithBrokenSelect:
+            def search(self):
+                return _QueryBuilderThatRaises()
+
+        worker = CollectorWorker(
+            config=_make_config(str(folder)), indexer=indexer,
+            extractor=None, state_file=tmp_path / "state.json",
+        )
+        worker._indexer._table = _TableWithBrokenSelect()
+
+        result = worker._purge_removed_folders([str(folder)], {}, dry_run=False, max_delete_ratio=0.30)
+        assert result == "failed"
 
 
 # ============================================================
