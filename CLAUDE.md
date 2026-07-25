@@ -97,7 +97,7 @@ scripts/          diag_search.py · inspect_index.py · test_shared_db.py(5b 사
 
 9. **scopes 빈 배열이면 전체 검색 fallback 금지.** JS 1차 + knowledge_agent 2차 차단.
 
-10. **LanceDB API**: `optimize()` 사용 (`compact_files()` deprecated 금지). DataFrame 변환은 `table.to_arrow().to_pandas()` (`table.to_pandas()` 직접 금지).
+10. **LanceDB API**: `optimize()` 사용 (`compact_files()` deprecated 금지). **전체 테이블 로드 금지** — 필요한 컬럼만 `table.search().select([...]).to_arrow()`로 projection한 뒤 `.to_pandas()`로 변환한다(`table.to_pandas()` 직접 호출 및 `select()` 없는 `table.to_arrow()` 모두 금지 — 벡터·암호화 원문까지 전부 메모리에 올라간다. 유휴 자동 인덱싱처럼 반복 호출되는 경로에서 특히 치명적이었다, bridge.py 상주 메모리 사고 참고).
 
 ---
 

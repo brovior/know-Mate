@@ -24,6 +24,9 @@ class Bridge(QObject):
         self._worker = collector_worker
         self._last_indexed: str = ""
         self._doc_count: int = 0
+        self._local_count: int = 0
+        self._shared_count: int = 0
+        self._mail_count: int = 0
 
     # ------------------------------------------------------------------
     # 에이전트 질의
@@ -271,35 +274,9 @@ class Bridge(QObject):
     def getIndexStatus(self) -> str:
         """현재 인덱싱 상태를 JSON으로 반환한다. LanceDB를 직접 조회해 실제 건수를 반환."""
         running = bool(self._worker and self._worker.isRunning())
-        local_count = 0
-        shared_count = 0
-        last_indexed = self._last_indexed
-
-        mail_count = 0
-        try:
-            if self._worker and hasattr(self._worker, "_indexer"):
-                df = self._worker._indexer.table.to_arrow().to_pandas()
-                active = df[~df["is_deleted"]]
-                # 문서 수 = 고유 file_path 개수 (청크 행 수가 아님)
-                local_count  = int(active.loc[active["scope"] == "local", "file_path"].nunique())
-                shared_count = int(active.loc[active["scope"] == "shared", "file_path"].nunique())
-                self._doc_count = local_count + shared_count
-                # DB에서 가장 최근 인덱싱 시각 조회 (UTC → 로컬 시간 변환)
-                if not active.empty and "indexed_at" in active.columns:
-                    raw_ts = active["indexed_at"].max()
-                    if raw_ts:
-                        from datetime import datetime
-                        dt = datetime.fromisoformat(str(raw_ts))
-                        last_indexed = dt.astimezone().strftime("%Y-%m-%d %H:%M")
-        except Exception:
-            pass
-
-        try:
-            if self._worker and hasattr(self._worker, "_email_indexer") and self._worker._email_indexer:
-                edf = self._worker._email_indexer.table.to_arrow().to_pandas()
-                mail_count = int(edf[~edf["is_deleted"]]["mail_uid"].nunique())
-        except Exception:
-            pass
+        local_count, shared_count, mail_count, last_indexed = self._compute_doc_mail_counts(
+            want_last_indexed=True
+        )
 
         status = {
             "status":        "running" if running else "idle",
@@ -310,6 +287,58 @@ class Bridge(QObject):
             "mail_count":    mail_count,
         }
         return json.dumps(status, ensure_ascii=False)
+
+    def _compute_doc_mail_counts(self, want_last_indexed: bool = False) -> tuple[int, int, int, str]:
+        """문서·메일 건수를 벡터·암호문 없이 필요한 컬럼만 projection 조회해 계산한다.
+
+        이전에는 `table.to_arrow().to_pandas()`로 chunks·emails 테이블 **전체**
+        (1024차원 벡터·AES 암호화 원문 포함)를 로드했다 — 유휴 자동 인덱싱이 60초마다
+        도는 동안 변경 파일이 0건이어도 매번 호출돼, 상주 메모리가 유휴 방치 중에도
+        계속 쌓이는 원인이었다(A-0002가 purge에서 고친 것과 동일한 안티패턴이 다른
+        위치에 있었음). 필요한 건 고유 file_path/mail_uid 개수와 최근 인덱싱 시각뿐이라
+        `search().select([...])`로 projection한다(ADR-0002에서 실측 검증된 방식과 동일).
+
+        want_last_indexed: True면 chunks 테이블에서 최근 인덱싱 시각도 함께 계산한다
+            (getIndexStatus는 필요, 완료 콜백은 datetime.now()를 쓰므로 불필요).
+        반환: (local_count, shared_count, mail_count, last_indexed) — 조회 실패 시
+            직전에 계산된 값으로 폴백한다(일시적 조회 실패로 화면이 0으로 튀지 않도록).
+        """
+        local_count = self._local_count
+        shared_count = self._shared_count
+        mail_count = self._mail_count
+        last_indexed = self._last_indexed
+
+        try:
+            if self._worker and hasattr(self._worker, "_indexer"):
+                cols = ["file_path", "scope", "is_deleted"]
+                if want_last_indexed:
+                    cols.append("indexed_at")
+                tbl = self._worker._indexer.table.search().select(cols).to_arrow()
+                df = tbl.to_pandas()
+                active = df[~df["is_deleted"]]
+                # 문서 수 = 고유 file_path 개수 (청크 행 수가 아님)
+                local_count  = int(active.loc[active["scope"] == "local", "file_path"].nunique())
+                shared_count = int(active.loc[active["scope"] == "shared", "file_path"].nunique())
+                self._doc_count = local_count + shared_count
+                if want_last_indexed and not active.empty and "indexed_at" in active.columns:
+                    raw_ts = active["indexed_at"].max()
+                    if raw_ts:
+                        from datetime import datetime
+                        dt = datetime.fromisoformat(str(raw_ts))
+                        last_indexed = dt.astimezone().strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            pass
+
+        try:
+            if self._worker and hasattr(self._worker, "_email_indexer") and self._worker._email_indexer:
+                etbl = self._worker._email_indexer.table.search().select(["mail_uid", "is_deleted"]).to_arrow()
+                edf = etbl.to_pandas()
+                mail_count = int(edf[~edf["is_deleted"]]["mail_uid"].nunique())
+        except Exception:
+            pass
+
+        self._local_count, self._shared_count, self._mail_count = local_count, shared_count, mail_count
+        return local_count, shared_count, mail_count, last_indexed
 
     def set_worker(self, worker) -> None:
         """단일 수집기 워커를 등록하고 시그널을 바인딩한다 (수동·유휴 인덱싱 공유)."""
@@ -333,26 +362,15 @@ class Bridge(QObject):
         self._last_indexed = datetime.now().strftime("%Y-%m-%d %H:%M")
         self.indexFinished.emit(message)
 
-        local_count = 0
-        shared_count = 0
-        mail_count = 0
-        try:
-            if self._worker and hasattr(self._worker, "_indexer"):
-                df = self._worker._indexer.table.to_arrow().to_pandas()
-                active = df[~df["is_deleted"]]
-                # 문서 수 = 고유 file_path 개수 (청크 행 수가 아님)
-                local_count  = int(active.loc[active["scope"] == "local", "file_path"].nunique())
-                shared_count = int(active.loc[active["scope"] == "shared", "file_path"].nunique())
-                self._doc_count = local_count + shared_count
-        except Exception:
-            pass
-
-        try:
-            if self._worker and hasattr(self._worker, "_email_indexer") and self._worker._email_indexer:
-                edf = self._worker._email_indexer.table.to_arrow().to_pandas()
-                mail_count = int(edf[~edf["is_deleted"]]["mail_uid"].nunique())
-        except Exception:
-            pass
+        # 문서·메일 개수를 바꿀 수 있는 변경이 이번 사이클에 하나도 없었으면(유휴
+        # 방치 중 대부분의 사이클) DB를 열지 않고 직전 값을 그대로 재사용한다 —
+        # CollectorWorker._run_cycle이 처리 건수·orphan 정리·메일 인덱싱 여부로
+        # 판정해 남긴 신호(worker.last_cycle_changed)를 읽는다. 워커가 아직 이
+        # 속성을 갖지 않은(구버전 테스트 더블 등) 경우는 안전하게 재계산한다.
+        if not getattr(self._worker, "last_cycle_changed", True):
+            local_count, shared_count, mail_count = self._local_count, self._shared_count, self._mail_count
+        else:
+            local_count, shared_count, mail_count, _ = self._compute_doc_mail_counts()
 
         status = {
             "last_indexed":  self._last_indexed,
