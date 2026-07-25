@@ -237,6 +237,17 @@ def terminate_stuck_office(exe: str) -> int:
             "COM 행오버 추정 — %s 프로세스 %d개 강제 종료(블로킹 해제): %s",
             up, len(targets), sorted(targets),
         )
+        # 강제 종료는 Office에 "비정상 종료" 표식을 남기고, 그 표식은 다음 기동 때
+        # 세이프모드 프롬프트 → 또 행오버 → 또 강제 종료의 루프를 만든다. 방금
+        # 우리가 만든 표식이므로 여기서 바로 지운다(다음 Dispatch 직전에도 한 번 더
+        # 지우지만, 그 사이 사용자가 Office를 열면 프롬프트를 보게 되므로 즉시 정리).
+        # 이 함수는 워치독 daemon 타이머에서 호출되므로 어떤 예외도 밖으로 내보내지
+        # 않는다 — 여기서 터지면 타이머 스레드가 조용히 죽는다.
+        try:
+            from knowmate.secure.office_resiliency import clear_resiliency_markers
+            clear_resiliency_markers(up)
+        except Exception as exc:
+            logger.debug("Resiliency 표식 정리 실패(무시): %s", exc)
     return len(targets)
 
 

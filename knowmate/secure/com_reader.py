@@ -55,6 +55,28 @@ _tls = threading.local()
 _WD_ALERTS_NONE = 0          # wdAlertsNone
 _MSO_SEC_FORCE_DISABLE = 3   # msoAutomationSecurityForceDisable (매크로 강제 비활성)
 _XL_ALERTS_OFF = False
+_XL_REPAIR_FILE = 1          # xlRepairFile — 손상 파일을 복구 모드로 연다(복구 확인창 대신)
+_XL_UPDATE_LINKS_NEVER = 0   # 외부 링크를 갱신하지 않음(네트워크 대기·갱신 확인창 방지)
+
+# 암호 보호 문서용 더미 암호. 빈 문자열이나 미지정이면 Office가 **암호 입력창**을 띄우고,
+# 백그라운드라 아무도 답할 수 없어 그대로 멈춘다(워치독 강제 종료 → 세이프모드 루프의
+# 또 다른 진입점). 틀린 암호를 미리 주면 프롬프트 없이 즉시 실패하고, 보호되지 않은
+# 문서에서는 이 인자가 무시된다.
+_DUMMY_PASSWORD = "\x00aegisdesk-no-prompt"
+
+
+def _com_missing():
+    """지정하지 않을 COM 선택 인자용 sentinel(DISP_E_PARAMNOTFOUND).
+
+    위치 인자로만 호출하므로(late binding에서 이름 인자는 신뢰할 수 없음) 중간의
+    "관심 없는" 인자를 건너뛰려면 이 값이 필요하다. pythoncom import 실패 시
+    None으로 폴백한다(비Windows — 어차피 이 경로는 실행되지 않는다).
+    """
+    try:
+        import pythoncom  # type: ignore
+        return pythoncom.Missing
+    except ImportError:
+        return None
 
 
 def _dispatch_and_own(win32com, prog_id: str, exe_name: str):
@@ -64,9 +86,16 @@ def _dispatch_and_own(win32com, prog_id: str, exe_name: str):
     이렇게 등록해 두면 office_guard가 우리 자신을 점유로 오판하지 않는다
     (자기 감지 스킵 방지). 사용자가 이미 열어둔 인스턴스에 붙은 경우엔 새
     프로세스가 없어 아무것도 등록되지 않는다(그 경로는 가드가 먼저 차단).
+
+    Dispatch 직전에 Resiliency 표식을 지운다 — 이전 사이클에서 워치독이 강제
+    종료한 흔적이 남아 있으면 이번 기동 때 "안전 모드로 시작할까요?" 프롬프트가
+    뜨는데, 그 프롬프트는 Dispatch가 반환하기도 전에 떠서 DisplayAlerts 같은 앱
+    수준 설정으로는 억제할 수 없다(강제 종료 ↔ 세이프모드 무한 루프의 고리).
     """
     from knowmate.secure.office_guard import office_pids_live, register_owned_pids
+    from knowmate.secure.office_resiliency import clear_resiliency_markers
 
+    clear_resiliency_markers(exe_name)
     before = office_pids_live(exe_name)
     app = win32com.Dispatch(prog_id)
     register_owned_pids(office_pids_live(exe_name) - before)
@@ -130,16 +159,27 @@ class WordComReader:
         """doc 파일을 열어 본문 텍스트를 반환한다."""
         try:
             word = _get_word_app()
-            # ConfirmConversions=False: 변환 확인창 억제
-            # ReadOnly=True, AddToRecentFiles=False, Visible=False
+            # 모든 모달 프롬프트를 사전 차단한다 — 백그라운드라 아무도 답할 수 없어
+            # 프롬프트 하나가 그대로 행오버가 되고, 워치독 강제 종료 → 세이프모드 표식
+            # → 다음 기동 때 또 프롬프트로 이어지는 루프의 시작점이 된다.
+            # 이름 인자 대신 위치 인자로 넘긴다(late binding에서 이름 인자는 신뢰 불가).
+            _m = _com_missing()
             doc = word.Documents.Open(
                 str(Path(path).resolve()),
-                False,   # ConfirmConversions
-                True,    # ReadOnly
-                False,   # AddToRecentFiles
-                "",      # PasswordDocument
-                "",      # PasswordTemplate
-                False,   # Revert
+                False,            # ConfirmConversions — 변환 확인창 억제
+                True,             # ReadOnly
+                False,            # AddToRecentFiles — 사용자 최근 문서 목록 오염 방지
+                _DUMMY_PASSWORD,  # PasswordDocument — 암호 입력창 대신 즉시 실패
+                _DUMMY_PASSWORD,  # PasswordTemplate
+                False,            # Revert
+                _DUMMY_PASSWORD,  # WritePasswordDocument
+                _DUMMY_PASSWORD,  # WritePasswordTemplate
+                _m,               # Format
+                _m,               # Encoding
+                False,            # Visible
+                True,             # OpenAndRepair — 손상 문서를 복구 확인창 없이 연다
+                _m,               # DocumentDirection
+                True,             # NoEncodingDialog — 인코딩 선택창 억제(구형 .doc 단골 블로커)
             )
             text = doc.Content.Text
             doc.Close(False)
@@ -156,7 +196,27 @@ class ExcelComReader:
         """xls 파일을 열어 시트 전체를 탭 구분 텍스트로 반환한다."""
         try:
             excel = _get_excel_app()
-            wb = excel.Workbooks.Open(str(Path(path).resolve()))
+            # Word와 같은 이유로 모든 모달 프롬프트를 사전 차단한다(위 주석 참조).
+            # 특히 CorruptLoad=xlRepairFile은 "파일이 손상됐습니다. 복구할까요?" 확인창을
+            # 없애는데, 이 확인창은 앱 수준 DisplayAlerts=False로도 억제되지 않는다.
+            _m = _com_missing()
+            wb = excel.Workbooks.Open(
+                str(Path(path).resolve()),
+                _XL_UPDATE_LINKS_NEVER,  # UpdateLinks
+                True,                    # ReadOnly
+                _m,                      # Format
+                _DUMMY_PASSWORD,         # Password — 암호 입력창 대신 즉시 실패
+                _DUMMY_PASSWORD,         # WriteResPassword
+                True,                    # IgnoreReadOnlyRecommended — 읽기전용 권장 창 억제
+                _m,                      # Origin
+                _m,                      # Delimiter
+                _m,                      # Editable
+                False,                   # Notify — 잠긴 파일을 대기하지 않고 즉시 실패
+                _m,                      # Converter
+                False,                   # AddToMru — 사용자 최근 문서 목록 오염 방지
+                _m,                      # Local
+                _XL_REPAIR_FILE,         # CorruptLoad — 손상 파일을 복구 확인창 없이 연다
+            )
             lines: list[str] = []
             for sheet in wb.Sheets:
                 sheet_lines: list[str] = []
