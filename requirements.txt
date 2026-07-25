@@ -4,12 +4,16 @@ PyQt6-WebEngine>=6.6.0          # QWebEngineView, QWebEngineScript
                                   # QWebChannel은 PyQt6에 포함
 
 # ── 벡터 DB ──────────────────────────────────────────────────────────────────
-lancedb>=0.34.0,<0.35            # purge projection(table.search().select([...])) 0.34.0에서 실측 검증됨.
-                                  # 상한은 빌드 재현성 목적(포터블 빌드에 검증된 버전이 번들되도록) —
+lancedb==0.34.0                  # purge projection(table.search().select([...]))을 **이 버전에서만**
+                                  # 실측 검증했다(결과 스키마에 file_path만 실림·전건 반환·약 6배 빠름).
+                                  # 범위(>=0.34.0,<0.35)가 아니라 정확히 고정하는 이유: 범위를 두면
+                                  # 빌드 때 실측하지 않은 0.34.x가 선택될 수 있어 "검증된 버전을
+                                  # 번들한다"는 목적 자체가 성립하지 않는다(설계 리뷰 20차 M-1).
                                   # 배포는 PyInstaller onedir라 사용자가 임의로 버전을 바꿀 수 없으므로
                                   # 런타임 위험 방지가 아니라 빌드 시점 실수 방지가 핵심(설계 리뷰 19차 M-2).
-                                  # 앱 시작 시 lancedb.__version__으로 이 범위를 재확인해
+                                  # 앱 시작 시 lancedb.__version__으로 이 값을 재확인해
                                   # 검증 안 된 버전이 번들된 채 배포되면 조기에 드러나게 한다.
+                                  # 상위 버전으로 올릴 때는 projection 실측을 다시 하고 이 값을 갱신할 것.
 pyarrow>=14.0.0                  # LanceDB 스키마·Arrow 변환
 pandas>=2.0.0                    # retriever pd.concat + to_arrow().to_pandas()
                                   # (2.0+ 에서 _append() 제거 → concat 사용)

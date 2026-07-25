@@ -25,25 +25,46 @@ class TestParseVersionTuple:
 
 
 class TestIsSupportedLancedbVersion:
-    def test_min_boundary_supported(self):
+    def test_exact_supported_version(self):
         assert lancedb_compat.is_supported_lancedb_version("0.34.0") is True
 
-    def test_within_range_supported(self):
-        assert lancedb_compat.is_supported_lancedb_version("0.34.5") is True
+    def test_same_minor_higher_patch_unsupported(self):
+        """리뷰20 M-1: 0.34.x 범위가 아니라 **정확히 한 버전**만 허용한다 — projection
+        계약을 실측한 건 0.34.0뿐이라, 범위를 허용하면 검증 안 된 패치가 빌드에
+        섞여도 이 검사를 통과해 버려 고정의 목적이 무너진다."""
+        assert lancedb_compat.is_supported_lancedb_version("0.34.5") is False
+        assert lancedb_compat.is_supported_lancedb_version("0.34.1") is False
 
-    def test_below_min_unsupported(self):
+    def test_lower_version_unsupported(self):
         assert lancedb_compat.is_supported_lancedb_version("0.33.9") is False
 
-    def test_max_boundary_exclusive_unsupported(self):
-        """상한(0.35.0)은 배타적 — 도달하면 검증 범위 밖으로 취급한다."""
+    def test_next_minor_unsupported(self):
         assert lancedb_compat.is_supported_lancedb_version("0.35.0") is False
 
-    def test_above_max_unsupported(self):
+    def test_much_higher_unsupported(self):
         assert lancedb_compat.is_supported_lancedb_version("0.40.0") is False
+
+    def test_two_component_version_matches_when_patch_is_zero(self):
+        """"0.34"는 (0,34,0)으로 정규화되므로 검증 버전과 일치한다."""
+        assert lancedb_compat.is_supported_lancedb_version("0.34") is True
 
     def test_unparseable_version_treated_as_supported(self):
         """알 수 없는 버전 형식은 비호환 증거가 아니므로 오탐 방지를 위해 통과시킨다."""
         assert lancedb_compat.is_supported_lancedb_version("unknown") is True
+
+    def test_supported_version_matches_requirements_pin(self):
+        """SUPPORTED_VERSION과 requirements.txt의 `lancedb==` 값이 어긋나면, 시작 시
+        검사가 정상 빌드를 경고하거나 잘못된 빌드를 통과시킨다 — 둘을 함께 고정한다."""
+        from pathlib import Path
+        req = Path(__file__).resolve().parents[2] / "requirements.txt"
+        pinned = None
+        for line in req.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("lancedb=="):
+                pinned = stripped.split("==", 1)[1].split()[0].split("#")[0].strip()
+                break
+        assert pinned is not None, "requirements.txt에 `lancedb==` 고정이 없다"
+        assert lancedb_compat._parse_version_tuple(pinned) == lancedb_compat.SUPPORTED_VERSION
 
 
 class TestCheckLancedbVersion:
