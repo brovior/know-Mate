@@ -384,6 +384,24 @@ hard_exit 주입) 사외 단위 테스트가 가능하다.
 직접 접촉 없이 `office_guard` API만 호출해 원칙3(보안·Office 코드 격리)을 지키고, `terminate_fn`·
 `timer_factory` 주입으로 사외 단위 테스트가 가능하다.
 
+**세이프모드 루프 차단 (`secure/office_resiliency.py`)**: 위 강제 종료에는 자기 강화되는 부작용이
+있었다 — Office는 비정상 종료를 겪으면 `HKCU\...\Office\<ver>\<App>\Resiliency` 아래에 표식을
+남기고, **다음 기동 때 "안전 모드로 시작할까요?" 프롬프트**를 띄운다. 이 프롬프트는 `Dispatch()`가
+반환하기도 전에 뜨므로 앱 수준 `DisplayAlerts=False`로는 억제할 수 없다 → 또 행오버 → 또 kill →
+표식 재생성의 무한 루프가 된다(사내 실사용 로그로 확인). 그래서 ① `_dispatch_and_own`이 Dispatch
+**직전**에, ② `terminate_stuck_office`가 kill **직후**에 표식을 지운다. 지우는 대상은
+`DisabledItems`·`StartupItems`뿐이고 **`DocumentRecovery`는 절대 건드리지 않는다** — 그건 *사용자
+본인이* 저장하지 못하고 잃은 문서의 복구 목록이라 지우면 실제 업무 데이터가 복구 불가능해지고,
+비모달 작업창이라 자동화를 막지도 않아 지울 이유도 없다.
+
+같은 맥락에서 문서 열기 호출 자체도 **모달 프롬프트가 뜰 수 있는 모든 경로를 인자로 사전
+차단**한다(프롬프트 하나 = 행오버 하나): Excel은 `CorruptLoad=xlRepairFile`(손상 복구 확인창)·
+`IgnoreReadOnlyRecommended`·`Notify=False`(잠긴 파일 대기)·`UpdateLinks=0`(외부 링크 갱신), Word는
+`OpenAndRepair`·`NoEncodingDialog`(구형 .doc 인코딩 선택창). 암호 보호 문서에는 **더미 암호**를
+넘겨 암호 입력창 대신 즉시 실패시킨다(보호되지 않은 문서에서는 무시되는 인자). late binding에서
+이름 인자는 신뢰할 수 없어 전부 위치 인자로 넘기며, 관심 없는 중간 인자는 `pythoncom.Missing`으로
+건너뛴다.
+
 *잔여 한계(후속 과제)*: (1) 프로세스 내부 COM 마샬링 데드락은 Office kill로도 안 풀림 → 종료 확실화
 (A)가 최후 안전망. (2) 같은 파일이 매 사이클 행오버하면 사이클마다 타임아웃 낭비 → state에 실패
 횟수를 기록해 "N회 연속 시간초과 파일은 스킵"이 다음 단계. (3) Dispatch-hang 종료 시 그 사이 사용자가
