@@ -230,6 +230,16 @@ watch_folders에서 빠진 폴더의 청크를 DB `file_path` 기준으로 정�
   인식 비교**(`p == root or p.startswith(root + "/")`)라 `C:/watch`가 `C:/watch-old/...`를
   하위로 오판하지 않는다.
 
+**건수 조회(UI 표시) 경량화** (`app/bridge.py`, 2026-07-25): 위와 같은 안티패턴이 다른 위치에도
+있었다 — `Bridge.getIndexStatus`/`_on_worker_finished`(화면의 "문서 N개/메일 N개" 표시용)가
+chunks·emails 테이블 **전체**를 `to_arrow().to_pandas()`로 로드했고, 이건 유휴 인덱싱 사이클이
+끝날 때마다(60초 주기, 변경 0건이어도 매번) 호출돼 상주 메모리가 방치 시간에 비례해 계속
+쌓이는 원인이었다(베타 실측 ~1GB). 동일한 두 축으로 해결: ① `Bridge._compute_doc_mail_counts`가
+`file_path`/`scope`/`is_deleted`(+ 필요 시 `indexed_at`), `mail_uid`/`is_deleted`만 projection
+조회 ② `CollectorWorker.last_cycle_changed`(처리 건수 + orphan 정리 + 메일 인덱싱 중 하나라도
+있었는지)가 False면 `_on_worker_finished`가 DB를 아예 열지 않고 직전 캐시값을 재사용. 조회
+실패 시에도 0으로 튀지 않고 직전 값으로 폴백(부수 개선).
+
 ---
 
 ## 스캔 트리거 / 태스크 우선순위

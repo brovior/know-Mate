@@ -144,6 +144,11 @@ class CollectorWorker(QThread):
         # 인메모리 캐시(설계 리뷰6 m-2) — 프로세스 재시작 전까지 sidecar 저장 실패가
         # 매 사이클 재조회를 유발하지 않도록 한다.
         self._purge_meta_cache = None
+        # 이번 사이클에 문서 수·메일 수가 실제로 바뀔 수 있는 변경(신규/수정/삭제 처리·
+        # orphan 정리·메일 인덱싱)이 있었는지 — bridge가 finished 시그널 처리 시 이 값이
+        # False면 건수 재계산(DB projection 조회)을 건너뛴다. 기본값 True(안전한 방향 —
+        # 아직 사이클을 한 번도 안 돈 상태에서 조회되면 재계산하도록).
+        self.last_cycle_changed: bool = True
 
     def run(self):
         """증분 스캔 사이클 1회를 실행한다."""
@@ -496,6 +501,8 @@ class CollectorWorker(QThread):
                 break
             if self._cancelled:
                 logger.info("수집기 취소됨")
+                # 취소는 드문 수동 조작이라 판정 비용을 아낄 이유가 없다 — 항상 재계산
+                self.last_cycle_changed = True
                 self.finished.emit(f"인덱싱 취소됨 ({done}건 처리 완료)")
                 producer.join(timeout=5)
                 save_state(self._state_file, state)
@@ -684,6 +691,12 @@ class CollectorWorker(QThread):
                 "COM 추출 행오버 %d건을 타임아웃으로 강제 해제(해당 파일은 실패·다음 사이클 재시도)",
                 com_timeout_count,
             )
+        # 문서·메일 개수를 바꿀 수 있는 변경이 하나도 없었으면(유휴 방치 중 대부분의
+        # 사이클) bridge가 건수 재계산(DB projection 조회)을 건너뛸 수 있게 표시한다
+        # (설계: bridge._on_worker_finished, 유휴 60초마다 DB를 여는 것 자체를 없앤다).
+        self.last_cycle_changed = (
+            done > 0 or report.newly_marked > 0 or report.physically_deleted > 0 or mail_indexed > 0
+        )
         self.finished.emit(summary)
 
 

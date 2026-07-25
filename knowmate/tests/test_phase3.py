@@ -1074,6 +1074,58 @@ class TestPurgeMetaIntegration:
         assert loaded.last_purge_ts is not None
 
 
+class TestLastCycleChangedFlag:
+    """CollectorWorker.last_cycle_changed — bridge가 유휴 사이클마다 DB를 열어
+    건수를 재계산할지 판정하는 신호(상주 메모리 개선, bridge._on_worker_finished
+    참조). run() 실행 후 실제로 이 속성이 사실과 맞게 세팅되는지 검증한다."""
+
+    def test_true_when_new_file_indexed(self, tmp_path: Path):
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        (folder / "doc.txt").write_bytes(b"hello")
+        worker, _indexer, _state_file = _make_worker(tmp_path, str(folder))
+
+        worker.run()
+
+        assert worker.last_cycle_changed is True
+
+    def test_false_when_no_changes_and_no_orphans(self, tmp_path: Path):
+        """파일 변경도, orphan 정리도, 메일 인덱싱도 없는 사이클은 False여야
+        bridge가 DB 조회를 건너뛸 수 있다."""
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        (folder / "doc.txt").write_bytes(b"hello")
+        worker, _indexer, _state_file = _make_worker(tmp_path, str(folder))
+        worker.run()  # 1차: 신규 파일 인덱싱(True가 나야 정상)
+        assert worker.last_cycle_changed is True
+
+        worker.run()  # 2차: 변경 없음 → False가 나야 함
+
+        assert worker.last_cycle_changed is False
+
+    def test_true_on_cancel(self, tmp_path: Path):
+        """취소는 드문 수동 조작이라 판정 비용을 아낄 이유가 없다 — 항상 True."""
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        for i in range(5):
+            (folder / f"doc{i}.txt").write_bytes(b"hello")
+        worker, _indexer, _state_file = _make_worker(tmp_path, str(folder))
+        worker.cancel()
+
+        worker.run()
+
+        assert worker.last_cycle_changed is True
+
+    def test_defaults_to_true_before_first_run(self, tmp_path: Path):
+        """아직 사이클을 한 번도 안 돈 상태에서 bridge가 조회하면 안전한 방향
+        (재계산)이어야 한다."""
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        worker, _indexer, _state_file = _make_worker(tmp_path, str(folder))
+
+        assert worker.last_cycle_changed is True
+
+
 class TestMaxDeleteRatioFailClosed:
     """config.yaml은 사용자가 직접 편집 가능하므로 max_delete_ratio에 NaN·범위 밖 값이
     들어와도 대량삭제 차단기가 우회되지 않아야 한다(설계 리뷰 10차 B-1) — 삭제 안전장치는
