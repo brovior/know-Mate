@@ -10,7 +10,10 @@ import logging
 import threading
 from pathlib import Path
 
+from knowmate.secure import com_stage
 from knowmate.secure.text_util import format_table
+
+logger = logging.getLogger(__name__)
 
 _MSO_GROUP = 6  # msoGroup — 그룹 도형 Type 값
 
@@ -77,6 +80,24 @@ def _com_missing():
         return pythoncom.Missing
     except ImportError:
         return None
+
+
+def _close_quietly(timer: com_stage.StageTimer, obj, method_name: str, *args) -> None:
+    """obj가 None이 아니면 method_name(*args)를 CLOSE 단계로 계측하며 호출한다.
+
+    닫기 자체의 예외는 로그만 남기고 삼킨다 — 이미 있는 원본 예외(예: 셀 순회 중
+    실패)를 덮어쓰지 않고, 닫기 실패로 사이클 전체를 막지 않기 위함이다. 항상
+    `finally`에서 호출돼 **오픈에 성공한 문서는 예외가 나도 반드시 닫히도록** 한다
+    (이전에는 정상 경로에서만 Close가 호출돼, 셀 읽기 중 예외가 나면 워크북이
+    열린 채 남았다).
+    """
+    if obj is None:
+        return
+    try:
+        with timer.stage(com_stage.STAGE_CLOSE):
+            getattr(obj, method_name)(*args)
+    except Exception as exc:
+        logger.debug("[com] 닫기 실패(무시): %s", exc)
 
 
 def _dispatch_and_own(win32com, prog_id: str, exe_name: str):
@@ -156,84 +177,115 @@ class WordComReader:
     """doc 파일을 COM(Word)으로 파싱하는 리더. 스레드별 싱글톤을 사용한다."""
 
     def parse(self, path: str) -> str:
-        """doc 파일을 열어 본문 텍스트를 반환한다."""
+        """doc 파일을 열어 본문 텍스트를 반환한다.
+
+        단계(dispatch/open/read/close)별 소요시간을 계측해 워치독·소비자 로그와
+        연계한다 — 어느 단계에서 멈췄는지 로그 한 줄로 알 수 있어야 한다는 요구
+        (COM 처리 안정화). 문서 오픈에 성공했다면 그 뒤 어느 단계에서 예외가
+        나도 `finally`에서 반드시 `Close`를 시도한다.
+        """
+        timer = com_stage.StageTimer(path)
+        doc = None
         try:
-            word = _get_word_app()
+            with timer.stage(com_stage.STAGE_DISPATCH):
+                word = _get_word_app()
             # 모든 모달 프롬프트를 사전 차단한다 — 백그라운드라 아무도 답할 수 없어
             # 프롬프트 하나가 그대로 행오버가 되고, 워치독 강제 종료 → 세이프모드 표식
             # → 다음 기동 때 또 프롬프트로 이어지는 루프의 시작점이 된다.
             # 이름 인자 대신 위치 인자로 넘긴다(late binding에서 이름 인자는 신뢰 불가).
             _m = _com_missing()
-            doc = word.Documents.Open(
-                str(Path(path).resolve()),
-                False,            # ConfirmConversions — 변환 확인창 억제
-                True,             # ReadOnly
-                False,            # AddToRecentFiles — 사용자 최근 문서 목록 오염 방지
-                _DUMMY_PASSWORD,  # PasswordDocument — 암호 입력창 대신 즉시 실패
-                _DUMMY_PASSWORD,  # PasswordTemplate
-                False,            # Revert
-                _DUMMY_PASSWORD,  # WritePasswordDocument
-                _DUMMY_PASSWORD,  # WritePasswordTemplate
-                _m,               # Format
-                _m,               # Encoding
-                False,            # Visible
-                True,             # OpenAndRepair — 손상 문서를 복구 확인창 없이 연다
-                _m,               # DocumentDirection
-                True,             # NoEncodingDialog — 인코딩 선택창 억제(구형 .doc 단골 블로커)
-            )
-            text = doc.Content.Text
-            doc.Close(False)
+            with timer.stage(com_stage.STAGE_OPEN):
+                doc = word.Documents.Open(
+                    str(Path(path).resolve()),
+                    False,            # ConfirmConversions — 변환 확인창 억제
+                    True,             # ReadOnly
+                    False,            # AddToRecentFiles — 사용자 최근 문서 목록 오염 방지
+                    _DUMMY_PASSWORD,  # PasswordDocument — 암호 입력창 대신 즉시 실패
+                    _DUMMY_PASSWORD,  # PasswordTemplate
+                    False,            # Revert
+                    _DUMMY_PASSWORD,  # WritePasswordDocument
+                    _DUMMY_PASSWORD,  # WritePasswordTemplate
+                    _m,               # Format
+                    _m,               # Encoding
+                    False,            # Visible
+                    True,             # OpenAndRepair — 손상 문서를 복구 확인창 없이 연다
+                    _m,               # DocumentDirection
+                    True,             # NoEncodingDialog — 인코딩 선택창 억제(구형 .doc 단골 블로커)
+                )
+            with timer.stage(com_stage.STAGE_READ):
+                text = doc.Content.Text
             return text
         except Exception:
             _tls.word = None  # 예외 시 이 스레드의 인스턴스 리셋
             raise
+        finally:
+            _close_quietly(timer, doc, "Close", False)
+            com_stage.clear()
+            timer.log_summary()
 
 
 class ExcelComReader:
     """xls 파일을 COM(Excel)으로 파싱하는 리더. 스레드별 싱글톤을 사용한다."""
 
     def parse(self, path: str) -> str:
-        """xls 파일을 열어 시트 전체를 탭 구분 텍스트로 반환한다."""
+        """xls 파일을 열어 시트 전체를 탭 구분 텍스트로 반환한다.
+
+        단계(dispatch/open/sheets/cell_read/close)별 소요시간을 계측한다 — DRM
+        문서 등에서 어느 단계가 hang의 원인인지(Open 자체인지, 셀 순회인지)를
+        로그 한 줄로 구분할 수 있어야 한다는 요구(COM 처리 안정화). 시트 목록
+        조회(sheets)와 셀 읽기(cell_read)를 별도 단계로 나누기 위해, `wb.Sheets`를
+        먼저 리스트로 materialize한 뒤 셀 순회를 시작한다.
+        """
+        timer = com_stage.StageTimer(path)
+        wb = None
         try:
-            excel = _get_excel_app()
+            with timer.stage(com_stage.STAGE_DISPATCH):
+                excel = _get_excel_app()
             # Word와 같은 이유로 모든 모달 프롬프트를 사전 차단한다(위 주석 참조).
             # 특히 CorruptLoad=xlRepairFile은 "파일이 손상됐습니다. 복구할까요?" 확인창을
             # 없애는데, 이 확인창은 앱 수준 DisplayAlerts=False로도 억제되지 않는다.
             _m = _com_missing()
-            wb = excel.Workbooks.Open(
-                str(Path(path).resolve()),
-                _XL_UPDATE_LINKS_NEVER,  # UpdateLinks
-                True,                    # ReadOnly
-                _m,                      # Format
-                _DUMMY_PASSWORD,         # Password — 암호 입력창 대신 즉시 실패
-                _DUMMY_PASSWORD,         # WriteResPassword
-                True,                    # IgnoreReadOnlyRecommended — 읽기전용 권장 창 억제
-                _m,                      # Origin
-                _m,                      # Delimiter
-                _m,                      # Editable
-                False,                   # Notify — 잠긴 파일을 대기하지 않고 즉시 실패
-                _m,                      # Converter
-                False,                   # AddToMru — 사용자 최근 문서 목록 오염 방지
-                _m,                      # Local
-                _XL_REPAIR_FILE,         # CorruptLoad — 손상 파일을 복구 확인창 없이 연다
-            )
+            with timer.stage(com_stage.STAGE_OPEN):
+                wb = excel.Workbooks.Open(
+                    str(Path(path).resolve()),
+                    _XL_UPDATE_LINKS_NEVER,  # UpdateLinks
+                    True,                    # ReadOnly
+                    _m,                      # Format
+                    _DUMMY_PASSWORD,         # Password — 암호 입력창 대신 즉시 실패
+                    _DUMMY_PASSWORD,         # WriteResPassword
+                    True,                    # IgnoreReadOnlyRecommended — 읽기전용 권장 창 억제
+                    _m,                      # Origin
+                    _m,                      # Delimiter
+                    _m,                      # Editable
+                    False,                   # Notify — 잠긴 파일을 대기하지 않고 즉시 실패
+                    _m,                      # Converter
+                    False,                   # AddToMru — 사용자 최근 문서 목록 오염 방지
+                    _m,                      # Local
+                    _XL_REPAIR_FILE,         # CorruptLoad — 손상 파일을 복구 확인창 없이 연다
+                )
+            with timer.stage(com_stage.STAGE_SHEETS):
+                sheets = list(wb.Sheets)
             lines: list[str] = []
-            for sheet in wb.Sheets:
-                sheet_lines: list[str] = []
-                used = sheet.UsedRange
-                for row in used.Rows:
-                    cells = [str(cell.Value) if cell.Value is not None else "" for cell in row.Cells]
-                    row_text = "\t".join(cells)
-                    if row_text.strip():
-                        sheet_lines.append(row_text)
-                if sheet_lines:
-                    lines.append(f"=== 시트: {sheet.Name} ===")
-                    lines.extend(sheet_lines)
-            wb.Close(False)
+            with timer.stage(com_stage.STAGE_CELL_READ):
+                for sheet in sheets:
+                    sheet_lines: list[str] = []
+                    used = sheet.UsedRange
+                    for row in used.Rows:
+                        cells = [str(cell.Value) if cell.Value is not None else "" for cell in row.Cells]
+                        row_text = "\t".join(cells)
+                        if row_text.strip():
+                            sheet_lines.append(row_text)
+                    if sheet_lines:
+                        lines.append(f"=== 시트: {sheet.Name} ===")
+                        lines.extend(sheet_lines)
             return "\n".join(lines)
         except Exception:
             _tls.excel = None
             raise
+        finally:
+            _close_quietly(timer, wb, "Close", False)
+            com_stage.clear()
+            timer.log_summary()
 
 
 def _ppt_shape_texts(shape) -> list[str]:
@@ -284,23 +336,34 @@ class PowerPointComReader:
     """ppt 파일을 COM(PowerPoint)으로 파싱하는 리더. 스레드별 싱글톤을 사용한다."""
 
     def parse(self, path: str) -> str:
-        """ppt 파일을 열어 슬라이드 텍스트를 반환한다 (표·그룹 도형 포함)."""
+        """ppt 파일을 열어 슬라이드 텍스트를 반환한다 (표·그룹 도형 포함).
+
+        단계(dispatch/open/read/close)별 소요시간을 계측한다(COM 처리 안정화).
+        """
+        timer = com_stage.StageTimer(path)
+        prs = None
         try:
-            ppt = _get_ppt_app()
-            prs = ppt.Presentations.Open(str(Path(path).resolve()), ReadOnly=True, WithWindow=False)
-            slides: list[str] = []
-            for slide in prs.Slides:
-                texts: list[str] = []
-                for shape in slide.Shapes:
-                    texts.extend(_ppt_shape_texts(shape))
-                texts = [t for t in texts if t.strip()]
-                if texts:
-                    slides.append("\n".join(texts))
-            prs.Close()
+            with timer.stage(com_stage.STAGE_DISPATCH):
+                ppt = _get_ppt_app()
+            with timer.stage(com_stage.STAGE_OPEN):
+                prs = ppt.Presentations.Open(str(Path(path).resolve()), ReadOnly=True, WithWindow=False)
+            with timer.stage(com_stage.STAGE_READ):
+                slides: list[str] = []
+                for slide in prs.Slides:
+                    texts: list[str] = []
+                    for shape in slide.Shapes:
+                        texts.extend(_ppt_shape_texts(shape))
+                    texts = [t for t in texts if t.strip()]
+                    if texts:
+                        slides.append("\n".join(texts))
             return "\n\n".join(slides)
         except Exception:
             _tls.ppt = None
             raise
+        finally:
+            _close_quietly(timer, prs, "Close")
+            com_stage.clear()
+            timer.log_summary()
 
 
 _word_reader = WordComReader()
@@ -337,7 +400,7 @@ def quit_com_apps() -> None:
         owned = clear_owned_pids()
         terminate_owned_office_processes(owned)
     except Exception as exc:
-        logging.getLogger(__name__).debug("COM 소유 프로세스 정리 실패(무시): %s", exc)
+        logger.debug("COM 소유 프로세스 정리 실패(무시): %s", exc)
 
 
 class ComReader:

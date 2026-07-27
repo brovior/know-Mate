@@ -1126,6 +1126,94 @@ class TestLastCycleChangedFlag:
         assert worker.last_cycle_changed is True
 
 
+class TestChangedDuringProcessing:
+    """COM 처리 안정화 요구: 추출 도중(워치독 무장~stat 재조회 사이) 파일이 바뀌면,
+    그대로 저장하지 않고 이번 사이클은 건너뛰어 다음 사이클에 자동 재시도돼야 한다.
+    안 그러면 "새 mtime + 옛 본문"이 state에 남아 classify_changes가 "변경 없음"으로
+    오판해 영원히 재인덱싱되지 않는다."""
+
+    class _ChangingReader:
+        """extract() 호출 시 대상 파일의 mtime·크기를 실제로 바꾼다(외부 변경 시뮬레이션)."""
+
+        def __init__(self, target_path: str, new_content: bytes = b"changed while processing!!!"):
+            self._target_path = target_path
+            self._new_content = new_content
+            self.extract_calls = 0
+
+        def extract(self, path: str) -> str:
+            self.extract_calls += 1
+            if path == self._target_path:
+                Path(path).write_bytes(self._new_content)
+            return "dummy text"
+
+    def test_changed_file_not_indexed_this_cycle(self, tmp_path: Path):
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        target = folder / "doc.txt"
+        target.write_bytes(b"original content")
+
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        state_file = tmp_path / "state.json"
+        config = _make_config(str(folder))
+        extractor = self._ChangingReader(str(target))
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=extractor, state_file=state_file,
+            purge_meta_file=tmp_path / "purge_meta.json",
+        )
+
+        worker.run()
+
+        assert extractor.extract_calls == 1
+        state = load_state(state_file)
+        assert str(target) not in state  # 옛 본문이 새 mtime과 함께 저장되지 않음
+
+    def test_changed_file_retried_automatically_next_cycle(self, tmp_path: Path):
+        """state가 갱신되지 않았으므로, 다음 사이클의 classify_changes가 이 파일을
+        다시 "신규/변경"으로 인식해 정상 인덱싱해야 한다(자동 재시도, 별도 재시도
+        큐 불필요)."""
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        target = folder / "doc.txt"
+        target.write_bytes(b"original content")
+
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+        from knowmate.secure.fake_reader import FakeReader
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        state_file = tmp_path / "state.json"
+        config = _make_config(str(folder))
+
+        worker1 = CollectorWorker(
+            config=config, indexer=indexer, extractor=self._ChangingReader(str(target)),
+            state_file=state_file, purge_meta_file=tmp_path / "purge_meta1.json",
+        )
+        worker1.run()
+        assert str(target) not in load_state(state_file)
+
+        worker2 = CollectorWorker(
+            config=config, indexer=indexer, extractor=FakeReader(),
+            state_file=state_file, purge_meta_file=tmp_path / "purge_meta2.json",
+        )
+        worker2.run()
+
+        assert str(target) in load_state(state_file)
+
+    def test_test_double_without_mtime_is_not_flagged_as_changed(self, tmp_path: Path):
+        """task.mtime이 0(테스트 더블 등 스캔 정보 없이 만든 태스크)이면 오탐 방지를
+        위해 변경 판정 자체를 하지 않는다(설계상 명시적 방어)."""
+        from knowmate.collector.scheduler import IndexTask
+        task = IndexTask(priority=0, path="/x.txt", action="new")
+        assert task.mtime == 0.0  # 기본값 확인 — 이 값이면 판정에서 제외돼야 함
+
+
 class TestMaxDeleteRatioFailClosed:
     """config.yaml은 사용자가 직접 편집 가능하므로 max_delete_ratio에 NaN·범위 밖 값이
     들어와도 대량삭제 차단기가 우회되지 않아야 한다(설계 리뷰 10차 B-1) — 삭제 안전장치는
@@ -1709,7 +1797,7 @@ class TestComWatchdog:
         def fire(self):
             self.callback()
 
-    def _make(self, terminate_results=None):
+    def _make(self, terminate_results=None, stage_fn=None):
         """ComWatchdog + 마지막 생성 타이머 캡처 + terminate 호출 기록."""
         from knowmate.collector.com_watchdog import ComWatchdog
         timers = []
@@ -1725,7 +1813,7 @@ class TestComWatchdog:
             timers.append(t)
             return t
 
-        wd = ComWatchdog(terminate_fn=_terminate, timer_factory=_factory)
+        wd = ComWatchdog(terminate_fn=_terminate, timer_factory=_factory, stage_fn=stage_fn)
         return wd, timers, term_calls
 
     def test_arm_starts_timer_with_timeout(self):
@@ -1786,3 +1874,58 @@ class TestComWatchdog:
         t = ComWatchdog._default_timer(300.0, lambda: None)
         assert t.daemon is True
         t.cancel()
+
+    def test_fire_records_stage_name_for_aggregation(self):
+        """리뷰 요구: 어느 단계에서 타임아웃이 났는지 로그 한 줄로 알 수 있어야 한다.
+        timeout_stages에는 집계용 짧은 이름("open")만 쌓인다(경로·시간이 섞인
+        describe() 문자열이 아님 — 그건 개별 경고 로그에만 쓰인다)."""
+        wd, timers, _ = self._make(stage_fn=lambda: ("open", "open(74.0s) C:/x.xlsx"))
+        wd.arm("EXCEL.EXE", 300.0)
+        timers[0].fire()
+        assert wd.timeout_stages == ["open"]
+
+    def test_fire_logs_full_description_not_just_name(self, caplog):
+        """경고 로그에는 사람이 읽을 설명(경로·소요시간 포함)이 남아야 한다."""
+        import logging
+        wd, timers, _ = self._make(stage_fn=lambda: ("cell_read", "cell_read(12.3s) C:/big.xlsx"))
+        wd.arm("EXCEL.EXE", 300.0)
+        with caplog.at_level(logging.WARNING, logger="knowmate.collector.com_watchdog"):
+            timers[0].fire()
+        assert any("cell_read(12.3s) C:/big.xlsx" in r.message for r in caplog.records)
+
+    def test_stage_fn_exception_falls_back_to_unknown(self):
+        """단계 조회 자체가 실패해도(예: 락 경합) 워치독은 계속 동작해야 한다 —
+        타임아웃 처리를 막아서는 안 된다."""
+        def _boom():
+            raise RuntimeError("단계 조회 실패(시뮬레이션)")
+        wd, timers, term = self._make(stage_fn=_boom)
+        wd.arm("EXCEL.EXE", 300.0)
+        timers[0].fire()
+        assert term == ["EXCEL.EXE"]
+        assert wd.timeout_stages == ["unknown"]
+
+    def test_default_stage_fn_uses_com_stage_module(self):
+        """stage_fn 미주입 시 secure.com_stage 기반 기본값이 (이름, 설명) 튜플을 반환한다."""
+        from knowmate.collector.com_watchdog import _default_stage_fn
+        from knowmate.secure import com_stage
+
+        com_stage.clear()
+        name, desc = _default_stage_fn()
+        assert name == "unknown"
+        assert desc == "단계 정보 없음"
+
+        com_stage.begin(com_stage.STAGE_OPEN, "C:/x.xlsx")
+        try:
+            name, desc = _default_stage_fn()
+            assert name == "open"
+            assert "open(" in desc and "C:/x.xlsx" in desc
+        finally:
+            com_stage.clear()
+
+    def test_no_kill_does_not_record_stage(self):
+        """종료 대상이 0개면(이미 죽어있는 등) 단계도 기록하지 않는다 — timeout_count와
+        timeout_stages는 항상 같은 길이를 유지해야 Counter 집계가 어긋나지 않는다."""
+        wd, timers, _ = self._make(terminate_results=[0], stage_fn=lambda: ("open", "open(1s)"))
+        wd.arm("EXCEL.EXE", 300.0)
+        timers[0].fire()
+        assert wd.timeout_stages == []

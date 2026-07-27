@@ -92,6 +92,7 @@ class IndexTask:
     action: str = field(compare=False)
     com_rank: int = field(default=_PLAIN_RANK, compare=False)
     size: int = field(default=0, compare=False)  # COM 워치독 타임아웃(크기 비례) 산정용
+    mtime: float = field(default=0.0, compare=False)  # 처리 중 외부 변경 감지용(스캔 시점 값)
 
 
 def _com_timeout_for_size(size_bytes: int, base: float, per_mb: float, cap: float) -> float:
@@ -476,7 +477,10 @@ class CollectorWorker(QThread):
                         sort_key = (priority, com_rank)
                         task_queue.put((
                             sort_key, next(_seq),
-                            IndexTask(priority, path, action, com_rank, size=meta.get("size", 0)),
+                            IndexTask(
+                                priority, path, action, com_rank,
+                                size=meta.get("size", 0), mtime=meta.get("mtime", 0.0),
+                            ),
                         ))
                         found += 1
                     if self._cancelled:
@@ -494,6 +498,7 @@ class CollectorWorker(QThread):
         failed = []
         deferred = []
         unreadable = []
+        changed_during = []  # 추출 도중 파일이 바뀌어 이번 사이클에 인덱싱하지 않은 경로들
 
         while True:
             _sort_key, _seq_no, task = task_queue.get()
@@ -537,6 +542,23 @@ class CollectorWorker(QThread):
                 extract_sec = time.perf_counter() - _extract_t0
                 logger.debug("[단계2] 텍스트 추출 완료: %s (%d자, %.2fs)", task.path, len(text), extract_sec)
                 stat = Path(task.path).stat()
+
+                # 처리 중(추출~여기 사이) 파일이 바뀌었으면 지금 뽑은 text는 옛 내용일
+                # 수 있다 — 그대로 저장하면 "새 mtime + 옛 본문"이 state에 남아 다음
+                # 사이클의 classify_changes가 "변경 없음"으로 오판해 영원히 재인덱싱되지
+                # 않는다. task.mtime>0(스캔 시점 값을 실제로 받았을 때만 — 테스트 더블 등
+                # 0.0인 경우는 판정하지 않음)일 때만 비교하고, epsilon을 둬 파일시스템
+                # mtime 해상도 오차로 인한 오탐(=영구 미인덱싱)을 피한다.
+                if task.mtime > 0 and (
+                    abs(stat.st_mtime - task.mtime) > 1e-6 or stat.st_size != task.size
+                ):
+                    logger.warning(
+                        "[collector] 처리 중 파일 변경 감지 — 인덱싱 건너뜀(다음 사이클 재시도): %s",
+                        task.path,
+                    )
+                    changed_during.append(task.path)
+                    continue
+
                 scope = get_scope(task.path)
 
                 if task.action == "modified":
@@ -669,6 +691,8 @@ class CollectorWorker(QThread):
             summary += f" / Office 점유로 연기 {len(deferred)}건"
         if unreadable:
             summary += f" / 판독불가 {len(unreadable)}건"
+        if changed_during:
+            summary += f" / 처리 중 변경 감지 {len(changed_during)}건"
         drm_deferred_count = producer_state.get("drm_deferred", 0)
         if drm_deferred_count:
             summary += f" / 유휴로 DRM 문서 스킵 {drm_deferred_count}건"
@@ -681,15 +705,23 @@ class CollectorWorker(QThread):
             logger.info("Office 점유로 연기된 파일 %d건(다음 사이클 재시도)", len(deferred))
         if unreadable:
             logger.info("판독불가(DRM/암호화·손상 추정) 파일 %d건: %s", len(unreadable), unreadable)
+        if changed_during:
+            logger.info(
+                "처리 중 외부 변경 감지로 건너뛴 파일 %d건(다음 사이클 재시도): %s",
+                len(changed_during), changed_during,
+            )
         if drm_deferred_count:
             logger.info(
                 "DRM 세션 만료 추정으로 DRM 의심 문서 %d건 스킵(활동 재개·세션 유효 시 재시도)",
                 drm_deferred_count,
             )
         if com_timeout_count:
+            from collections import Counter
+            stage_counts = Counter(watchdog.timeout_stages) if watchdog is not None else Counter()
             logger.warning(
-                "COM 추출 행오버 %d건을 타임아웃으로 강제 해제(해당 파일은 실패·다음 사이클 재시도)",
-                com_timeout_count,
+                "COM 추출 행오버 %d건을 타임아웃으로 강제 해제(해당 파일은 실패·다음 사이클 재시도) "
+                "[단계별: %s]",
+                com_timeout_count, dict(stage_counts),
             )
         # 문서·메일 개수를 바꿀 수 있는 변경이 하나도 없었으면(유휴 방치 중 대부분의
         # 사이클) bridge가 건수 재계산(DB projection 조회)을 건너뛸 수 있게 표시한다
