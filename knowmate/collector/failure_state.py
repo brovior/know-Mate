@@ -46,19 +46,41 @@ READ_STRATEGY_VERSION = 1
 KIND_TEMPORARY_BUSY = "TEMPORARY_BUSY"          # Office를 사용자/다른 프로세스가 점유 중
 KIND_OPEN_TIMEOUT = "OPEN_TIMEOUT"              # 파일 Open 단계에서 워치독 타임아웃
 KIND_READ_TIMEOUT = "READ_TIMEOUT"              # 열렸지만 셀/본문 읽기 단계에서 타임아웃
+KIND_OPEN_ERROR = "OPEN_ERROR"                  # 6a: 워치독 미발화 COM 오류, Open 단계
+KIND_READ_ERROR = "READ_ERROR"                  # 6a: 워치독 미발화 COM 오류, Read 단계
 KIND_NEEDS_USER_ACTION = "NEEDS_USER_ACTION"    # 손상·암호·복구 등 사용자 조치 필요(DRM/판독불가)
 KIND_FILE_CHANGED = "FILE_CHANGED"              # 처리 도중 파일이 변경됨(자체 해소)
 KIND_UNKNOWN_TRANSIENT = "UNKNOWN_TRANSIENT"    # 원인 미확정 — 기본값
 
 _ALL_KINDS = frozenset({
     KIND_TEMPORARY_BUSY, KIND_OPEN_TIMEOUT, KIND_READ_TIMEOUT,
+    KIND_OPEN_ERROR, KIND_READ_ERROR,
     KIND_NEEDS_USER_ACTION, KIND_FILE_CHANGED, KIND_UNKNOWN_TRANSIENT,
 })
 
-# 워치독 발화 단계 → 타임아웃 세부 분류. dispatch/open은 파일을 열기도 전에 멈춘
-# 것(연결·오픈 문제), sheets/cell_read/read는 열린 뒤 내용을 읽다 멈춘 것.
+# SOURCE_CHANGED(설계 초안 검토 중 잠깐 고려됐던 이름)로 수동 편집된 sidecar가
+# 있어도 폐기하지 않고 FILE_CHANGED로 정규화한다(A-0003 §6 — 개명하지 않기로
+# 확정했지만, 외부 편집 대비 하위호환만 유지).
+_KIND_ALIASES = {"SOURCE_CHANGED": KIND_FILE_CHANGED}
+
+# 워치독 발화 단계 → 타임아웃/오류 세부 분류. dispatch/open은 파일을 열기도 전에
+# 멈춘 것(연결·오픈 문제), sheets/cell_read/read는 열린 뒤 내용을 읽다 멈춘 것.
 _OPEN_STAGES = frozenset({"dispatch", "open"})
 _READ_STAGES = frozenset({"sheets", "cell_read", "read"})
+
+
+def _normalize_stage(stage: str | None) -> str | None:
+    """원시 단계 이름을 "open"/"read"로 정규화한다(연속성 판정·A-0003 §4 참고).
+
+    OPEN_ERROR·OPEN_TIMEOUT은 항상 _OPEN_STAGES에서만, READ_ERROR·READ_TIMEOUT은
+    항상 _READ_STAGES에서만 나오므로 현재는 kind만으로도 이미 같은 구분이 되지만,
+    stage가 kind와 독립적으로 저장되는 미래 확장에도 안전하도록 명시적으로 둔다.
+    """
+    if stage in _OPEN_STAGES:
+        return "open"
+    if stage in _READ_STAGES:
+        return "read"
+    return stage
 
 # COM 오류 중 "다른 프로세스가 지금 바쁘다"는 확실한 신호로만 좁게 분류한다.
 # RPC_E_CALL_REJECTED(0x80010001) · RPC_E_SERVERCALL_RETRYLATER(0x8001010A)
@@ -87,13 +109,31 @@ class FailureRecord:
 
 
 _DEFAULT_TEMPORARY_BUSY_SEC = 300.0                        # 5분 base(+지터로 5~10분)
-_DEFAULT_TIMEOUT_LADDER_SEC = (1800.0, 21600.0, 86400.0)    # 30분 → 6시간 → 24시간
-_DEFAULT_UNKNOWN_LADDER_SEC = (1800.0, 21600.0, 86400.0)    # 위와 동일 사다리(별도 조정 가능)
+_DEFAULT_TIMEOUT_LADDER_SEC = (1800.0, 21600.0)             # 30분 → 6시간 (3회차부터는 승격 상한)
+_DEFAULT_UNKNOWN_LADDER_SEC = (1800.0, 21600.0)             # 위와 동일 사다리(별도 조정 가능)
 _DEFAULT_FILE_CHANGED_SEC = 0.0                             # 다음 사이클 즉시
 _DEFAULT_NEEDS_USER_ACTION_MAX_SEC = 7 * 24 * 3600.0        # 7일 안전밸브
 
 # TEMPORARY_BUSY 지터 폭 — base(300초) + 0~이 값 만큼 가산해 5~10분 범위를 만든다.
 _TEMPORARY_BUSY_JITTER_SEC = 300.0
+
+# 승격 상태(6a·A-0003 §5) — UI 표시("반복 중"/"조치 필요")와 백오프 사다리 길이
+# 초과 시 상한(needs_user_action_max_sec)을 이 임계로 판정한다. 사용자 결정(안 B):
+# "3회 이상 → 사용자 조치 필요"는 대기 시간까지 의미하므로, 사다리는 2단(30분·6시간)
+# 까지만 두고 3회차부터 escalation_state가 NEEDS_ACTION으로 승격시켜
+# needs_user_action_max_sec(기본 7일)을 적용한다.
+_DEFAULT_ESCALATION_REPEAT_AT = 2
+_DEFAULT_ESCALATION_ACTION_AT = 3
+
+ESCALATION_NORMAL = "NORMAL"
+ESCALATION_REPEATED = "REPEATED"
+ESCALATION_NEEDS_ACTION = "NEEDS_ACTION"
+
+# 백오프에서 원인별 정책이 항상 우선하는 kind — 승격 사다리(3회=7일)를 타지 않는다
+# (3차 리뷰 M-2: TEMPORARY_BUSY가 사다리를 타면 파일을 3번 열어둔 사용자가 7일
+# 대기로 넘어가는 회귀가 생긴다. UI 상태는 여전히 공통 적용된다 — escalation_state
+# 참고).
+_FIXED_BACKOFF_KINDS = frozenset({KIND_TEMPORARY_BUSY, KIND_FILE_CHANGED, KIND_NEEDS_USER_ACTION})
 
 
 @dataclass(frozen=True)
@@ -113,6 +153,8 @@ class BackoffPolicy:
     unknown_ladder_sec: tuple[float, ...] = _DEFAULT_UNKNOWN_LADDER_SEC
     file_changed_sec: float = _DEFAULT_FILE_CHANGED_SEC
     needs_user_action_max_sec: float = _DEFAULT_NEEDS_USER_ACTION_MAX_SEC
+    escalation_repeat_at: int = _DEFAULT_ESCALATION_REPEAT_AT
+    escalation_action_at: int = _DEFAULT_ESCALATION_ACTION_AT
 
     @classmethod
     def from_config(cls, collector_cfg: dict) -> "BackoffPolicy":
@@ -146,6 +188,11 @@ class BackoffPolicy:
         if not isinstance(enabled, bool):
             enabled = True
 
+        repeat_at = raw.get("escalation_repeat_at", _DEFAULT_ESCALATION_REPEAT_AT)
+        action_at = raw.get("escalation_action_at", _DEFAULT_ESCALATION_ACTION_AT)
+        if not _is_valid_escalation_pair(repeat_at, action_at):
+            repeat_at, action_at = _DEFAULT_ESCALATION_REPEAT_AT, _DEFAULT_ESCALATION_ACTION_AT
+
         return cls(
             enabled=enabled,
             temporary_busy_sec=_sec("temporary_busy_sec", _DEFAULT_TEMPORARY_BUSY_SEC),
@@ -155,7 +202,19 @@ class BackoffPolicy:
             needs_user_action_max_sec=_sec(
                 "needs_user_action_max_sec", _DEFAULT_NEEDS_USER_ACTION_MAX_SEC
             ),
+            escalation_repeat_at=int(repeat_at),
+            escalation_action_at=int(action_at),
         )
+
+
+def _is_valid_escalation_pair(repeat_at, action_at) -> bool:
+    """승격 임계 두 값이 `0 < repeat_at < action_at`인 정수인지 확인한다
+    (2차 리뷰 M-2 — 순서가 뒤바뀌면 REPEATED 상태가 아예 나타나지 않거나
+    NEEDS_ACTION보다 늦게 반응하는 등 판정이 무의미해진다)."""
+    for v in (repeat_at, action_at):
+        if not isinstance(v, int) or isinstance(v, bool) or v <= 0:
+            return False
+    return repeat_at < action_at
 
 
 def _is_valid_nonneg_seconds(value) -> bool:
@@ -176,11 +235,32 @@ def _path_jitter_fraction(file_path: str) -> float:
     return int.from_bytes(digest[:4], "big") / 0xFFFFFFFF
 
 
+def escalation_state(rec: FailureRecord, policy: BackoffPolicy) -> str:
+    """연속 실패 횟수만으로 3상태를 판정하는 단일 진실원(A-0003 §5 — 2차 리뷰 M-2).
+
+    UI(`bridge.py`)와 백오프(`backoff_seconds`)가 **모두 이 함수만** 호출한다.
+    임계를 여러 호출부가 각자 해석하면 같은 레코드를 서로 다르게 판정할 위험이
+    있다(2차 리뷰 M-2가 지적한 위험 그 자체 — kind와 무관하게 순수 카운트만 본다).
+    """
+    if rec.consecutive_failures >= policy.escalation_action_at:
+        return ESCALATION_NEEDS_ACTION
+    if rec.consecutive_failures >= policy.escalation_repeat_at:
+        return ESCALATION_REPEATED
+    return ESCALATION_NORMAL
+
+
 def backoff_seconds(rec: FailureRecord, file_path: str, policy: BackoffPolicy) -> float:
     """이 기록에 다음 재시도까지 적용할 대기 시간(초)을 계산한다.
 
-    분류별 정책 + 연속 실패 횟수(사다리형은 횟수가 사다리보다 크면 마지막 칸에
-    고정) + TEMPORARY_BUSY만 경로 기반 결정적 지터를 반영한다.
+    **원인별 고정 정책이 승격 사다리보다 항상 우선한다**(3차 리뷰 M-2 — 사용자
+    결정 안 B로 "3회 이상=7일 대기"가 확정되면서, 이 우선순위가 없으면 파일을
+    3번 연속 열어둔 사용자(TEMPORARY_BUSY)의 재시도가 7일 뒤로 밀리는 회귀가
+    생긴다). TEMPORARY_BUSY·FILE_CHANGED·NEEDS_USER_ACTION은 회차와 무관하게
+    항상 같은 값이고, 그 외(OPEN_ERROR·READ_ERROR·OPEN_TIMEOUT·READ_TIMEOUT·
+    UNKNOWN_TRANSIENT)만 승격 사다리(`escalation_state`)를 탄다.
+
+    UI 상태(`escalation_state`)는 이 함수와 무관하게 모든 kind에 공통 적용된다
+    — "표시"와 "대기"가 서로 다른 축이라는 것이 A-0003 §1·§5의 핵심이다.
     """
     if rec.kind == KIND_TEMPORARY_BUSY:
         jitter = _path_jitter_fraction(file_path) * _TEMPORARY_BUSY_JITTER_SEC
@@ -189,7 +269,11 @@ def backoff_seconds(rec: FailureRecord, file_path: str, policy: BackoffPolicy) -
         return policy.file_changed_sec
     if rec.kind == KIND_NEEDS_USER_ACTION:
         return policy.needs_user_action_max_sec
-    if rec.kind in (KIND_OPEN_TIMEOUT, KIND_READ_TIMEOUT):
+
+    if escalation_state(rec, policy) == ESCALATION_NEEDS_ACTION:
+        return policy.needs_user_action_max_sec  # 승격 상한 재사용(안전밸브 — FR-4)
+
+    if rec.kind in (KIND_OPEN_TIMEOUT, KIND_READ_TIMEOUT, KIND_OPEN_ERROR, KIND_READ_ERROR):
         ladder = policy.timeout_ladder_sec
     else:  # KIND_UNKNOWN_TRANSIENT (및 알 수 없는 미래 분류에 대한 안전한 기본)
         ladder = policy.unknown_ladder_sec
@@ -279,7 +363,8 @@ def classify(
 
     우선순위: 워치독 타임아웃(단계로 OPEN/READ 구분) > OfficeBusyError류(이름으로
     판별, win32 없이도 동작) > COM busy HRESULT > UnreadableFormatError류 >
-    나머지는 UNKNOWN_TRANSIENT.
+    failed_stage로 OPEN_ERROR/READ_ERROR 구분(6a — 이전엔 이 인자를 받고도 쓰지
+    않아 전부 UNKNOWN_TRANSIENT로 떨어졌다) > 나머지는 UNKNOWN_TRANSIENT.
     """
     if watchdog_stage is not None:
         if watchdog_stage in _OPEN_STAGES:
@@ -296,6 +381,11 @@ def classify(
 
     if exc_type_name == "UnreadableFormatError":
         return KIND_NEEDS_USER_ACTION, _format_error_code(hresult)
+
+    if failed_stage in _OPEN_STAGES:
+        return KIND_OPEN_ERROR, _format_error_code(hresult)
+    if failed_stage in _READ_STAGES:
+        return KIND_READ_ERROR, _format_error_code(hresult)
 
     return KIND_UNKNOWN_TRANSIENT, _format_error_code(hresult)
 
@@ -331,6 +421,7 @@ def load_failures(path: Path) -> dict[str, FailureRecord]:
             continue
         try:
             kind = raw.get("kind")
+            kind = _KIND_ALIASES.get(kind, kind)
             if kind not in _ALL_KINDS:
                 continue
             strategy_version = raw.get("strategy_version")
@@ -402,15 +493,21 @@ def note_failure(
 ) -> None:
     """파일 1건의 실패를 기록한다.
 
-    같은 (mtime, size)로, **같은 분류**로 다시 실패하면(=같은 파일 내용이 같은
-    이유로 계속 실패) 연속 실패 횟수를 누적한다. mtime·size가 바뀌었거나
-    (초기화 조건 1) 분류가 달라졌으면(4차 — 백오프 사다리는 분류별로 독립적이어야
-    한다) 1로 리셋한다. 분류까지 같아야 누적하지 않으면, 예를 들어 사용자가 파일을
-    하루 종일 열어둬 TEMPORARY_BUSY가 여러 번 쌓인 뒤 우연히 시간초과가 1번 나면
-    consecutive가 크게 이어받아 곧장 긴 백오프로 튀는 오류가 생긴다.
+    같은 (mtime, size)로, **같은 (분류, 정규화 단계)**로 다시 실패하면(=같은 파일
+    내용이 같은 이유·같은 단계에서 계속 실패) 연속 실패 횟수를 누적한다. mtime·size가
+    바뀌었거나(초기화 조건 1) 분류·단계가 달라졌으면(4차 — 백오프 사다리는 분류별로
+    독립적이어야 한다) 1로 리셋한다. 분류까지 같아야 누적하지 않으면, 예를 들어
+    사용자가 파일을 하루 종일 열어둬 TEMPORARY_BUSY가 여러 번 쌓인 뒤 우연히
+    시간초과가 1번 나면 consecutive가 크게 이어받아 곧장 긴 백오프로 튀는 오류가
+    생긴다. 단계까지 비교하는 것은 A-0003 §4(6a) — 현재는 kind가 이미 단계를
+    함의하지만(OPEN_ERROR는 항상 open류 단계), 미래에 kind와 단계가 분리될 경우를
+    대비한 안전망이다.
     """
     prev = records.get(file_path)
-    if prev is not None and prev.mtime == mtime and prev.size == size and prev.kind == kind:
+    if (
+        prev is not None and prev.mtime == mtime and prev.size == size
+        and prev.kind == kind and _normalize_stage(prev.stage) == _normalize_stage(stage)
+    ):
         consecutive = prev.consecutive_failures + 1
     else:
         consecutive = 1

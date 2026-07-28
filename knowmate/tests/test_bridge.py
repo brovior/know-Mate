@@ -290,6 +290,31 @@ class TestFailureManagementSlots:
         assert cards[0]["excluded"] is False
         assert cards[0]["next_retry_ts"] is not None  # 7일 안전밸브 — 영구 무시 아님
 
+    def test_get_failures_escalation_matches_backoff_computation(self, tmp_path, monkeypatch):
+        """6a AC-4: bridge.getFailures()의 escalation 필드가 backoff_seconds()가
+        실제로 쓰는 것과 같은 escalation_state() 호출 결과여야 한다 — 판정 로직이
+        두 곳에서 갈라지면 화면과 실제 대기 시간이 어긋난다(2차 리뷰 M-2)."""
+        from knowmate.collector import failure_state
+
+        failure_file = tmp_path / "index_failure.json"
+        target = str(tmp_path / "broken.xlsx")
+        records = {}
+        for i in range(3):
+            failure_state.note_failure(
+                records, target, failure_state.KIND_OPEN_ERROR, "open", None,
+                mtime=100.0, size=10, now=1_699_999_000.0 + i,
+            )
+        failure_state.save_failures(failure_file, records)
+        self._patch_collector_config(monkeypatch)
+
+        worker = _FakeWorkerForFailures(failure_file, tmp_path / "state.json")
+        bridge = _make_bridge(worker)
+
+        cards = __import__("json").loads(bridge.getFailures())
+
+        assert cards[0]["consecutive_failures"] == 3
+        assert cards[0]["escalation"] == "NEEDS_ACTION"
+
     def test_get_failures_marks_excluded_files(self, tmp_path, monkeypatch):
         from knowmate.collector import failure_state
 

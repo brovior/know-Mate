@@ -802,7 +802,9 @@ function closeFailuresPanel() {
 
 function _failCategory(card) {
   if (card.excluded) return "excluded";
-  if (card.kind === "NEEDS_USER_ACTION") return "action";
+  // 6a: "조치 필요"는 kind(NEEDS_USER_ACTION류)뿐 아니라 반복 승격(escalation)
+  // 으로도 진입한다 — 같은 원인으로 3회 이상 실패하면 원인이 무엇이든 표시된다.
+  if (card.kind === "NEEDS_USER_ACTION" || card.escalation === "NEEDS_ACTION") return "action";
   return "waiting";
 }
 
@@ -887,11 +889,14 @@ function _renderFailCard(card) {
       </div>`;
   }
   const waitLabel = _formatFailWait(card.next_retry_ts);
+  // 6a: 같은 원인으로 2회째 반복되면(아직 조치 필요 임계 전) 배지에 "반복"을
+  // 덧붙인다 — kind 배지(원인)와 escalation(누적)은 서로 다른 축이라 별도 표시.
+  const repeatSuffix = card.escalation === "REPEATED" ? " · 반복" : "";
   return `
     <div class="f-card">
       <div class="f-top">
         <span class="f-name">${escHtml(card.name)}</span>
-        <span class="f-badge ${escHtml(card.badge_class)}">${escHtml(card.badge_label)}</span>
+        <span class="f-badge ${escHtml(card.badge_class)}">${escHtml(card.badge_label)}${repeatSuffix}</span>
       </div>
       <div class="f-path">${escHtml(card.dir)}</div>
       <div class="f-meta">

@@ -1427,6 +1427,20 @@ class TestFailureStateIntegration:
         def extract(self, path: str) -> str:
             raise RuntimeError("추출 실패(시뮬레이션)")
 
+    class _FailingInOpenStageReader:
+        """6a AC-7: 워치독 없이 COM Open 단계에서 실패하는 상황을 흉내낸다.
+
+        ComReader가 실제로 하는 것과 동일하게 com_stage.StageTimer로 단계를
+        기록한 채 예외를 던진다 — classify() 단위 테스트만으로는 이 배관
+        (com_stage.take_last_failed_stage() → scheduler.py → classify())이
+        실제로 이어지는지 검증할 수 없다는 것이 6단계 설계 리뷰 M-3 지적이었다."""
+
+        def extract(self, path: str) -> str:
+            from knowmate.secure import com_stage
+            timer = com_stage.StageTimer(path)
+            with timer.stage("open"):
+                raise RuntimeError("COM Open 실패(시뮬레이션, 워치독 미발화)")
+
     def test_failure_recorded_and_state_json_untouched(self, tmp_path: Path):
         from knowmate.rag.embedding import EmbeddingClient
         from knowmate.rag.indexer import Indexer
@@ -1458,6 +1472,40 @@ class TestFailureStateIntegration:
         assert str(target) in failures
         assert failures[str(target)].consecutive_failures == 1
         assert failures[str(target)].kind == failure_state.KIND_UNKNOWN_TRANSIENT
+
+    def test_open_stage_failure_without_watchdog_classified_as_open_error(self, tmp_path: Path):
+        """6a AC-7 — 통합 경로: 실제 라우팅(worker.run()) → COM 실패(워치독 미발화,
+        com_stage로 단계만 기록) → classify() → note_failure() → sidecar 저장까지
+        전부 실제로 실행해 최종 kind가 OPEN_ERROR인지 확인한다. classify() 단위
+        테스트만으로는 com_stage 배관이 scheduler.py와 실제로 이어지는지 검증할
+        수 없다(6단계 설계 리뷰 M-3)."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+        from knowmate.collector import failure_state
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        target = folder / "broken.xlsx"
+        target.write_bytes(b"fake xlsx content")
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        state_file = tmp_path / "state.json"
+        failure_file = tmp_path / "index_failure.json"
+        config = _make_config(str(folder))
+
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=self._FailingInOpenStageReader(),
+            state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json",
+            failure_file=failure_file,
+        )
+        worker.run()
+
+        failures = failure_state.load_failures(failure_file)
+        assert str(target) in failures
+        assert failures[str(target)].kind == failure_state.KIND_OPEN_ERROR
+        assert failures[str(target)].stage == "open"
 
     def test_consecutive_failures_accumulate_across_cycles(self, tmp_path: Path):
         from knowmate.rag.embedding import EmbeddingClient
