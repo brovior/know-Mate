@@ -407,3 +407,142 @@ meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_stat
   별칭으로 명시(m-1)·성능 수용 기준을 "예시" 문구 없이 중앙값 ≤30MB·개별 ≤60MB로 확정하고
   Windows 릴리스 시험에서 `PeakWorkingSetSize` 병행 측정을 필수로 승격(m-2). 이 라운드로
   Blocker/Major/Minor 전건 처리 완료, Accepted 재확인
+
+---
+
+## A-0003: 실패 분류 정교화 — 원인축과 누적축의 분리  (상태: Draft / 대응 요구: R-0003)
+
+### 개요
+6단계 요청은 분류를 다음 8종으로 세분화하는 것이다.
+
+```
+OPEN_ERROR · OPEN_ERROR_REPEATED · OPEN_TIMEOUT · READ_TIMEOUT
+DRM_DENIED · PASSWORD_PROTECTED · SOURCE_CHANGED · NEEDS_USER_ACTION
+```
+
+이 설계는 요청의 **의도**(반복 Open 오류가 UNKNOWN_TRANSIENT에 머물지 않게)를 그대로 받되,
+목록을 그대로 `kind` enum에 넣지 않는다. 목록에 **서로 다른 두 축이 섞여 있고**, 한 축을 다른
+축의 값으로 표현하면 4차·#68에서 고친 버그가 재발하기 때문이다(§핵심 결정 1).
+
+### 컴포넌트와 책임
+| 컴포넌트 | 책임 | 변경 |
+|---|---|---|
+| `failure_state.classify()` | 예외 → (원인, HRESULT) | `failed_stage` 실제 사용 + 시그니처 판별 훅 |
+| `failure_state.FailureRecord` | 실패 1건의 상태 | `escalated` 파생 속성 추가(저장 필드 아님) |
+| `failure_state.backoff_seconds()` | 원인+회차 → 대기 | 승격 상태 분기 추가 |
+| `secure/signature.py` | 파일 시그니처 판별 | `is_encrypted_ooxml()` 추가 |
+| `app/bridge.py` | 화면용 카드 변환 | 배지 매핑에 신규 분류 추가 |
+
+### 데이터 흐름
+```
+COM 실패
+  ├─ 워치독 발화?  ─예→ stage로 OPEN_TIMEOUT / READ_TIMEOUT        (기존)
+  └─ 아니오
+       ├─ OfficeBusyError · busy HRESULT → TEMPORARY_BUSY           (기존)
+       ├─ 시그니처 판별(1회, 수 바이트)
+       │    ├─ 확장자 OOXML인데 OLE2       → PASSWORD_PROTECTED     (신규)
+       │    └─ OOXML도 OLE2도 아님          → DRM_DENIED             (신규)
+       └─ failed_stage 사용                                          (신규 — 기존엔 무시됨)
+            ├─ open/dispatch → OPEN_ERROR
+            ├─ sheets/cell_read/read → READ_ERROR
+            └─ 단계 불명 → UNKNOWN_TRANSIENT                         (폴백 유지)
+
+기록 시점: note_failure(...)가 consecutive_failures 누적
+표시·정책 시점: escalation = consecutive_failures >= 임계  (kind와 독립)
+```
+
+### 핵심 결정과 트레이드오프
+
+**1. `OPEN_ERROR_REPEATED`를 `kind` 값으로 만들지 않는다 (가장 중요).**
+
+`note_failure()`는 **분류가 달라지면 `consecutive_failures`를 1로 리셋**한다(4차 결정 —
+TEMPORARY_BUSY가 여러 번 쌓인 뒤 우연히 타임아웃 1번 나면 곧장 긴 백오프로 튀는 것을 막기 위해).
+
+여기에 `OPEN_ERROR → OPEN_ERROR_REPEATED` 전이를 넣으면:
+
+| 회차 | kind | consecutive | 결과 |
+|---|---|---|---|
+| 1 | OPEN_ERROR | 1 | 30분 |
+| 2 | OPEN_ERROR | 2 | 6시간 |
+| 3 | OPEN_ERROR**_REPEATED** | **1로 리셋** | **30분** ← 승격했는데 백오프가 후퇴 |
+
+승격시키려던 파일이 오히려 더 자주 재시도된다. #68에서 고친 "이력 손실로 백오프가 처음 칸으로
+되돌아가는" 버그와 **정확히 같은 형태**다. 회피하려면 `note_failure`에 "이 두 kind는 같은
+계열이니 리셋하지 말라"는 예외를 넣어야 하는데, 그건 kind가 사실은 원인축이 아님을 자백하는 것이다.
+
+→ **채택**: `kind`는 원인만 표현. "반복됨"은 `consecutive_failures`에서 파생한다.
+`OPEN_ERROR_REPEATED`가 필요한 곳(화면 배지·로그)에서는 `kind=OPEN_ERROR ∧ consecutive>=2`로
+동일한 정보를 얻는다. 저장 필드가 늘지 않고, 리셋 규칙에 예외가 생기지 않는다.
+
+트레이드오프: 요청받은 이름이 enum에 그대로 나타나지 않는다. 화면 표시 문자열로는 그대로 쓴다.
+
+**2. `TEMPORARY_BUSY`와 `UNKNOWN_TRANSIENT`를 목록에서 빼지 않는다.**
+
+요청 목록엔 둘 다 없지만 제거하면 회귀다.
+- `TEMPORARY_BUSY`: "다른 사람이 열어둠"은 5~10분이면 자체 해소된다. OPEN_ERROR(30분~)로
+  합치면 사용자가 파일을 닫아도 최대 30분을 기다린다.
+- `UNKNOWN_TRANSIENT`: COM 실패 양상을 전부 열거할 수 없다. 폴백 버킷이 없으면 미매핑 오류가
+  갈 곳을 잃는다. 3차 설계 주석의 "확실한 것만 분류하고 나머지는 UNKNOWN으로" 원칙을 유지한다.
+
+**3. 암호/DRM은 HRESULT가 아니라 파일 시그니처로 판별한다.**
+
+3차 주석은 "COM 오류 코드만으로 암호/손상 구분 불가"라고 결론지었다(더미 암호를 넘겨 즉시
+실패시키므로 일반 COM 오류와 코드가 같음). 이 제약은 유효하다 — 그래서 **COM을 쓰지 않는**
+근거를 쓴다.
+
+ECMA-376 암호화 문서는 확장자가 `.xlsx`여도 내용은 **OLE2/CFB 컨테이너**이고 그 안에
+`EncryptedPackage` 스트림이 있다. 즉 매직 8바이트만으로:
+
+| 확장자 | 실제 시그니처 | 판정 |
+|---|---|---|
+| .xlsx/.docx/.pptx | ZIP(`PK\x03\x04`) | 정상 |
+| .xlsx/.docx/.pptx | **OLE2** | **PASSWORD_PROTECTED** |
+| .xlsx/.docx/.pptx | 둘 다 아님 | **DRM_DENIED** |
+
+`signature.py`에 `is_ole2`/`is_zip`이 이미 있어 `is_encrypted_ooxml()` 한 함수만 추가하면 된다.
+COM 왕복 0회, 파일 앞 8바이트만 읽는다(NFR-1 충족).
+
+한계(명시): 구형 `.xls`/`.doc`의 암호는 OLE2 내부 FilePass 레코드라 매직만으로 구분되지
+않는다. 이 경우는 기존대로 OPEN_ERROR → 승격 경로를 탄다. 무리한 추측보다 정직한 미분류가 낫다.
+
+**4. `SOURCE_CHANGED`는 기존 `FILE_CHANGED`의 개명이며, 값 변경 시 마이그레이션이 필요하다.**
+
+`load_failures()`는 `kind not in _ALL_KINDS`인 항목을 **조용히 버린다.** 개명만 하면 기존
+기록이 전부 폐기된다 — 동작상 안전하지만(다음 사이클 재시도) 승격 카운트가 초기화되므로
+의도치 않은 이력 손실이다. 개명 실익이 낮아 **기존 이름 유지**를 권고하되, 개명한다면
+`READ_STRATEGY_VERSION`을 올려 폐기를 명시적으로 만든다.
+
+**5. 승격 후에도 안전밸브를 유지한다.**
+
+"3회 이상 → 사용자 조치 필요"를 문자 그대로 "재시도 중단"으로 구현하면 4차 완료 기준(영구
+무시 없음)을 깬다. 그 기준은 세이프모드 루프 사건 — 우리가 만든 일시적 상태 때문에 멀쩡한
+파일이 영구히 안 읽히던 사고 — 에서 나왔다. 승격 상태의 대기는 `needs_user_action_max_sec`
+(기본 7일)을 상한으로 재사용한다.
+
+### 실패 모드
+| 상황 | 동작 | 근거 |
+|---|---|---|
+| 시그니처 읽기 실패(권한·네트워크 단절) | 판별 생략, 기존 분류 유지 | fail-open — 판별 실패가 기록을 막으면 안 됨 |
+| 구 kind 값이 든 기존 기록 로드 | 해당 항목만 폐기(기존 동작) | 파일 전체를 버리지 않음 |
+| 승격 임계 config가 비정상값 | 기본값 폴백 | 4차 `BackoffPolicy.from_config` 관례(fail-open) |
+| DRM 문서인데 세션 유효해 실제로 열림 | 성공 → 기록 삭제 | 승격은 재시도 시점만 조정, 차단이 아님 |
+
+### 검증 계획
+- `classify()` 단위 테스트: 워치독 미발화 + `failed_stage="open"` → OPEN_ERROR (AC-1)
+- 승격 전이 테스트: 동일 원인 3회 실패 후 `consecutive_failures`가 3을 유지 (AC-3 — #68 회귀 방어)
+- 시그니처 테스트: OLE2 헤더를 가진 `.xlsx` 픽스처 → PASSWORD_PROTECTED (AC-4)
+- 안전밸브 테스트: 승격 상태 + 7일 경과 → `should_defer` False (AC-5)
+- 하위호환 테스트: `kind="FILE_CHANGED"` 든 JSON 로드 시 예외 없음 (AC-6)
+- 원칙7 회귀 테스트 유지(예외 메시지 비저장)
+
+### 열린 질문 (리뷰 요청)
+1. **승격 임계 회차**: 요청은 3회. 현 사다리는 3회차에 이미 24시간이다. 3회 승격이면 24시간
+   칸이 사실상 사라지는데, 임계를 3으로 둘지 4로 둘지?
+2. **`IFR_PM_0066.xlsx`의 실제 HRESULT 미확보**: 이 설계는 원인을 몰라도 단계+반복으로 승격되게
+   하므로 동작은 하지만, 해당 파일의 `last_error_code`를 확인하면 전용 분류를 추가할 수 있다.
+   운영 로그에서 확보 가능한가?
+3. **READ_ERROR 신설 여부**: Open만 세분화 요청됐으나 대칭성을 위해 Read 계열 일반 오류도
+   분리할지, 아니면 UNKNOWN_TRANSIENT로 남길지.
+
+### 리뷰 이력
+- (대기) GPT 독립 리뷰 — 채널 B
