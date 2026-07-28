@@ -125,7 +125,10 @@ def _build_pipeline() -> dict[str, Any]:
         email_indexer=email_indexer,
     )
     llm = get_llm_client(cfg)
-    extractor = get_extractor(cfg.get("extractor", "fake"))
+    extractor = get_extractor(
+        cfg.get("extractor", "fake"),
+        xlsx_block_rows=chunking.get("xlsx_block_rows"),
+    )
 
     return {
         "indexer": indexer,

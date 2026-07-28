@@ -13,6 +13,7 @@ from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal
 from knowmate.collector.cleanup import CleanupManager
 from knowmate.collector.scanner import get_scope, iter_scan_folder
 from knowmate.collector.state import load_state, save_state
+from knowmate.secure import com_stage
 from knowmate.secure.office_guard import OfficeBusyError
 from knowmate.secure.signature import UnreadableFormatError, is_ole2, is_zip
 
@@ -92,6 +93,7 @@ class IndexTask:
     action: str = field(compare=False)
     com_rank: int = field(default=_PLAIN_RANK, compare=False)
     size: int = field(default=0, compare=False)  # COM 워치독 타임아웃(크기 비례) 산정용
+    mtime: float = field(default=0.0, compare=False)  # 처리 중 외부 변경 감지용(스캔 시점 값)
 
 
 def _com_timeout_for_size(size_bytes: int, base: float, per_mb: float, cap: float) -> float:
@@ -114,7 +116,8 @@ class CollectorWorker(QThread):
     indexing_needed = pyqtSignal(str)
 
     def __init__(self, config, indexer, extractor, state_file=None, email_indexer=None,
-                 parent=None, get_idle_seconds=None, com_restart_fn=None):
+                 parent=None, get_idle_seconds=None, com_restart_fn=None,
+                 purge_meta_file=None, failure_file=None, get_now=None):
         """수집기 워커를 초기화한다.
 
         get_idle_seconds: () -> float, 현재 OS 유휴 경과초 조회(테스트 주입용,
@@ -124,6 +127,15 @@ class CollectorWorker(QThread):
         com_restart_fn: () -> None, COM Office 주기 재기동 시 호출(테스트 주입용,
             기본은 secure.com_reader.quit_com_apps). COM 파일 N건 처리마다 Office를
             선제적으로 재기동해 장시간 사이클에서의 핸들·메모리 누수를 완화한다.
+        purge_meta_file: purge 스킵/reconciliation 상태 sidecar 경로(테스트 주입용,
+            기본은 %APPDATA%/AegisDesk/index_state.meta.json). index_state.json과
+            분리된 별도 파일이라 기존 state 스키마·소비자에 영향이 없다.
+        failure_file: 파일별 실패 이력 sidecar 경로(테스트 주입용, 기본
+            %APPDATA%/AegisDesk/index_failure.json). index_state.json과 분리된
+            별도 파일 — 3차(실패 원인 분류 및 기록), 기록만 하고 동작은 바꾸지 않는다.
+        get_now: () -> float, 현재 시각(epoch, 테스트 주입용, 기본 time.time). 4차
+            백오프 판정(failure_state.should_defer)에 쓴다 — 테스트가 "24시간 뒤엔
+            재시도된다"를 실제로 24시간 기다리지 않고 검증할 수 있어야 한다.
         """
         super().__init__(parent)
         self._config = config
@@ -139,9 +151,32 @@ class CollectorWorker(QThread):
             from knowmate.secure.com_reader import quit_com_apps as _default_restart
             com_restart_fn = _default_restart
         self._com_restart_fn = com_restart_fn
+        self._get_now = get_now or time.time
         from knowmate.config import get_data_dir
         default_state_file = get_data_dir() / "index_state.json"
         self._state_file = state_file or default_state_file
+        default_purge_meta_file = get_data_dir() / "index_state.meta.json"
+        self._purge_meta_file = purge_meta_file or default_purge_meta_file
+        default_failure_file = get_data_dir() / "index_failure.json"
+        self._failure_file = failure_file or default_failure_file
+        # 사이클 안에서 억제·성공 상태를 sidecar 저장과 무관하게 즉시 반영하기 위한
+        # 인메모리 캐시(설계 리뷰6 m-2) — 프로세스 재시작 전까지 sidecar 저장 실패가
+        # 매 사이클 재조회를 유발하지 않도록 한다.
+        self._purge_meta_cache = None
+        # 이번 사이클에 문서 수·메일 수가 실제로 바뀔 수 있는 변경(신규/수정/삭제 처리·
+        # orphan 정리·메일 인덱싱)이 있었는지 — bridge가 finished 시그널 처리 시 이 값이
+        # False면 건수 재계산(DB projection 조회)을 건너뛴다. 기본값 True(안전한 방향 —
+        # 아직 사이클을 한 번도 안 돈 상태에서 조회되면 재계산하도록).
+        self.last_cycle_changed: bool = True
+        # 수동 재인덱싱(사용자의 [인덱싱 시작]/트레이 [재인덱싱])이 다음 사이클
+        # 시작 시 실패 기록을 비워달라고 요청했는지(초기화 조건 4). 유휴 자동
+        # 사이클은 이 플래그를 세우지 않는다 — 매번 비우면 연속 실패 횟수가
+        # 영원히 1에 머물러 3차 기록 자체가 무의미해진다.
+        self._retry_requested = False
+
+    def request_failure_retry(self) -> None:
+        """다음 사이클 시작 시 실패 기록을 초기화하도록 요청한다(수동 트리거 전용)."""
+        self._retry_requested = True
 
     def run(self):
         """증분 스캔 사이클 1회를 실행한다."""
@@ -185,49 +220,67 @@ class CollectorWorker(QThread):
         logger.info("수집기 취소 요청됨")
 
     def _purge_removed_folders(
-        self, watch_folders: list[str], state: dict, dry_run: bool = True,
+        self, normalized_folders: list[str], state: dict, dry_run: bool = True,
         max_delete_ratio: float = 0.30,
-    ) -> None:
-        """watch_folders에 속하지 않는 청크를 LanceDB에서 직접 삭제한다.
+    ) -> str:
+        """정규화된 watch_folders에 속하지 않는 청크를 LanceDB에서 직접 삭제한다.
 
-        state.json 대신 LanceDB의 file_path 컬럼을 기준으로 삭제해
-        state와 DB 불일치 상황도 처리한다.
+        state.json 대신 LanceDB의 file_path 컬럼(projection 조회 — 벡터·암호문
+        미로드)을 기준으로 삭제해 state와 DB 불일치 상황도 처리한다.
+
+        반환: "success"(정상 완료 또는 삭제 대상 없음) | "blocked"(대량삭제 차단) |
+        "failed"(DB 조회·삭제의 일시적 예외 — 백오프 후 재시도) |
+        "unsupported"(projection API 자체가 없음 — 배포 lancedb 버전 비호환, 영구
+        장애이므로 재시도로 복구되지 않는다) — 호출부(purge_meta 상태 전이)가 사용한다.
 
         안전장치:
-        - watch_folders가 비어 있으면(온보딩 전·config 초기화 직후 등) 아무것도
+        - normalized_folders가 비어 있으면(온보딩 전·config 초기화 직후 등) 아무것도
           "제거된 폴더"로 간주하지 않고 즉시 건너뛴다. 빈 목록을 "전부 삭제"로
           해석하지 않는다.
         - dry_run=True이면 state·DB 어느 쪽도 변경하지 않는다(완전한 예행연습).
-          기존에는 dry_run이어도 state 항목이 먼저 지워지는 버그가 있었다.
         - 삭제 대상이 전체 인덱스의 max_delete_ratio를 초과하면 CleanupManager와
-          동일한 대량 삭제 차단을 적용한다(이 함수엔 원래 이 안전장치가 없었다).
+          동일한 대량 삭제 차단을 적용한다.
         """
-        if not watch_folders:
+        from knowmate.collector import purge_meta
+
+        if not normalized_folders:
             logger.info("[purge] watch_folders 비어 있음 — 정리 건너뜀 (전체 삭제 오판 방지)")
-            return
+            return "success"
 
-        normalized = [f.replace("\\", "/").rstrip("/") for f in watch_folders]
-
-        def belongs_to_any(path_str: str) -> bool:
-            p = path_str.replace("\\", "/")
-            return any(p.startswith(w + "/") or p == w for w in normalized)
-
-        # LanceDB에서 현재 file_path 목록 조회
+        # file_path 컬럼만 projection 조회 — 벡터(1024차원)·암호화 원문 미로드.
+        # "unsupported"는 **API 자체(search/select 메서드)가 없다는 사실만**으로 판정한다
+        # (좁은 capability probe, 설계 리뷰 16차 M-3) — 이전에는 `.search().select().to_arrow()`
+        # 호출 체인 전체를 하나의 try로 감싸 AttributeError를 잡았는데, 그러면 API는
+        # 존재하지만 내부 구현 결함·테스트 더블 오류 등 다른 원인으로 발생한 AttributeError까지
+        # "영구 장애"로 오분류해 30분 백오프·24h reconciliation 없이 capability_sig가 바뀔
+        # 때까지 무기한 억제되는 위험이 있었다. 메서드 존재만 좁게 확인하고, 실제 호출
+        # 실행 중 예외는 일시적 실패("failed")로 처리한다.
+        table = self._indexer.table
+        search_fn = getattr(table, "search", None)
+        if not callable(search_fn):
+            logger.error("[purge] projection API(table.search) 미지원 — 배포된 lancedb 버전과 호환되지 않습니다(영구 장애, 재시도 무의미)")
+            return "unsupported"
+        search_result = search_fn()
+        select_fn = getattr(search_result, "select", None)
+        if not callable(select_fn):
+            logger.error("[purge] projection API(search().select) 미지원 — 배포된 lancedb 버전과 호환되지 않습니다(영구 장애, 재시도 무의미)")
+            return "unsupported"
         try:
-            df = self._indexer.table.to_arrow().to_pandas()
+            tbl = select_fn(["file_path"]).to_arrow()
         except Exception as exc:
-            logger.warning("[purge] DB 조회 실패: %s", exc)
-            return
+            logger.warning("[purge] DB 조회 실패(일시적 장애로 간주, 백오프 후 재시도): %s", exc)
+            return "failed"
 
-        if df.empty:
-            return
+        all_paths = tbl.column("file_path").to_pylist()
+        if not all_paths:
+            return "success"
 
-        total_indexed = df["file_path"].nunique()
-        stale_mask = ~df["file_path"].apply(belongs_to_any)
-        stale_paths_db = df.loc[stale_mask, "file_path"].unique().tolist()
+        unique_paths = set(all_paths)
+        total_indexed = len(unique_paths)
+        stale_paths_db = [p for p in unique_paths if not purge_meta.belongs_to_any(p, normalized_folders)]
 
         if not stale_paths_db:
-            return
+            return "success"
 
         # 대량 삭제 차단 (CleanupManager.run()의 안전장치와 대칭)
         ratio = len(stale_paths_db) / total_indexed if total_indexed else 1.0
@@ -236,13 +289,13 @@ class CollectorWorker(QThread):
                 "[purge] 대량 삭제 차단 (%.0f%% > %.0f%%): %d/%d개 경로. "
                 "watch_folders 설정을 확인하세요: %s",
                 ratio * 100, max_delete_ratio * 100,
-                len(stale_paths_db), total_indexed, watch_folders,
+                len(stale_paths_db), total_indexed, normalized_folders,
             )
             self.indexing_needed.emit(
                 f"대량 삭제가 감지되어 정리를 건너뛰었습니다 "
                 f"({len(stale_paths_db)}/{total_indexed}개 경로). watch_folders 설정을 확인하세요."
             )
-            return
+            return "blocked"
 
         if dry_run:
             logger.info(
@@ -250,10 +303,12 @@ class CollectorWorker(QThread):
                 len(stale_paths_db),
                 stale_paths_db,
             )
-            return
+            return "success"
 
         # 실제 삭제 시에만 state에서도 제거 (dry_run 시엔 state를 건드리지 않는다)
-        stale_state_paths = [p for p in list(state.keys()) if not belongs_to_any(p)]
+        stale_state_paths = [
+            p for p in list(state.keys()) if not purge_meta.belongs_to_any(p, normalized_folders)
+        ]
         for p in stale_state_paths:
             state.pop(p, None)
 
@@ -261,6 +316,7 @@ class CollectorWorker(QThread):
 
         # 경로별로 삭제 (SQL 길이 제한 방지)
         any_deleted = False
+        delete_failed = False
         for path_str in stale_paths_db:
             try:
                 safe = path_str.replace("'", "''")
@@ -269,12 +325,15 @@ class CollectorWorker(QThread):
                 logger.info("[purge] 삭제 완료: %s", path_str)
             except Exception as exc:
                 logger.error("[purge] 삭제 실패: %s - %s", path_str, exc)
+                delete_failed = True
 
         if any_deleted:
             try:
                 self._indexer.optimize()
             except Exception as exc:
                 logger.warning("[purge] optimize 실패: %s", exc)
+
+        return "failed" if delete_failed else "success"
 
     def _run_cycle(self):
         """스캔 -> 분류 -> 인덱싱 -> orphan 정리 -> 저장 순으로 사이클을 실행한다."""
@@ -285,7 +344,29 @@ class CollectorWorker(QThread):
 
         watch_folders = collector_cfg.get("watch_folders", [])
         dry_run = cleanup_cfg.get("dry_run", True)
-        max_delete_ratio = float(cleanup_cfg.get("max_delete_ratio", 0.30))
+
+        # 삭제 안전장치(대량삭제 차단기)에 쓰이는 값이라 fail-closed로 검증한다 —
+        # config.yaml은 사용자가 직접 편집 가능하고, YAML의 `.nan`이 그대로 들어오면
+        # `ratio > max_delete_ratio` 비교가 항상 거짓이 되어 차단기가 무력화된다
+        # (설계 리뷰 10차 B-1). 무효 값은 조용히 기본값(0.30 — 정상 동작 허용)으로
+        # 폴백하지 않고, 사실상 모든 삭제를 막는 0.0으로 대체 + 알림해 안전 쪽으로 fail한다.
+        from knowmate.collector import purge_meta
+        raw_max_delete_ratio = cleanup_cfg.get("max_delete_ratio", 0.30)
+        if purge_meta.is_valid_ratio(raw_max_delete_ratio):
+            max_delete_ratio = float(raw_max_delete_ratio)
+        else:
+            logger.error(
+                "[purge] max_delete_ratio 설정값이 비정상(%r) — fail-closed로 0.0(사실상 전체 "
+                "삭제 차단) 적용. config.yaml의 collector.cleanup.max_delete_ratio를 0~1 사이 "
+                "값으로 수정하세요.",
+                raw_max_delete_ratio,
+            )
+            self.indexing_needed.emit(
+                "max_delete_ratio 설정값이 비정상적입니다 — 안전을 위해 이번 사이클은 "
+                "삭제를 차단합니다. 설정을 확인하세요."
+            )
+            max_delete_ratio = 0.0
+
         chunk_size = int(chunk_cfg.get("chunk_size", 400))
         overlap = int(chunk_cfg.get("overlap", 80))
         max_file_size_mb = float(chunk_cfg.get("max_file_size_mb", 30.0))
@@ -315,12 +396,38 @@ class CollectorWorker(QThread):
         # 워치독(반응적, 행오버 시 kill)과 달리 이건 선제적 예방책. 0 이하면 비활성.
         com_restart_every = int(collector_cfg.get("com_restart_every_n_files", 30))
 
+        # purge(제거된 폴더 청크 정리) 스킵/강제 reconciliation 판정 — 설계
+        # docs/ai-workflow/architecture.md § A-0002. op_sig는 이번 사이클의 watch_folders
+        # 구성·dry_run·max_delete_ratio로 결정되며, 변경 0건 + 동일 op_sig + 마지막 성공
+        # purge 후 강제주기 미경과면 DB 조회 없이 스킵한다(유휴 방치 중 매분 전체 로드 방지).
+        # 삭제 안전장치가 아니므로(언제 실행할지만 좌우) 무효 값은 기본값으로 폴백(fail-open).
+        raw_force_reconcile = collector_cfg.get("purge_force_reconcile_sec", purge_meta.DEFAULT_FORCE_RECONCILE_SEC)
+        purge_force_reconcile_sec = (
+            float(raw_force_reconcile)
+            if purge_meta.is_valid_positive_seconds(raw_force_reconcile)
+            else purge_meta.DEFAULT_FORCE_RECONCILE_SEC
+        )
+        raw_backoff = collector_cfg.get("purge_backoff_sec", purge_meta.DEFAULT_BACKOFF_SEC)
+        purge_backoff_sec = (
+            float(raw_backoff) if purge_meta.is_valid_positive_seconds(raw_backoff) else purge_meta.DEFAULT_BACKOFF_SEC
+        )
+        normalized_watch_folders = purge_meta.normalize_folders(watch_folders)
+        purge_op_sig = purge_meta.compute_op_sig(normalized_watch_folders, dry_run, max_delete_ratio)
+
         self._indexer._chunk_size = chunk_size
         self._indexer._overlap = overlap
         self._indexer._max_chunks_per_file = max_chunks_per_file
         self._indexer._xlsx_max_rows_per_sheet = xlsx_max_rows_per_sheet
 
         state = load_state(self._state_file)
+
+        from knowmate.collector import failure_state
+        failures = failure_state.load_failures(self._failure_file)
+        if self._retry_requested:
+            logger.info("[failure] 사용자 재시도 요청 — 실패 기록 초기화 (%d건)", len(failures))
+            failures = {}
+        self._retry_requested = False
+        backoff_policy = failure_state.BackoffPolicy.from_config(collector_cfg)
 
         # ── 스캔·인덱싱 파이프라인 (하이브리드) ──────────────────────────
         # 생산자 스레드: 폴더를 walk 하며 신규/변경 파일을 큐에 넣는다(os.walk+stat만).
@@ -340,7 +447,14 @@ class CollectorWorker(QThread):
         task_queue: "_queue.PriorityQueue" = _queue.PriorityQueue()
         _SENTINEL = None
         _seq = itertools.count()
-        producer_state = {"total": None, "seen": set(), "drm_deferred": 0, "drm_skip_logged": False}
+        producer_state = {"total": None, "seen": set(), "drm_deferred": 0, "drm_skip_logged": False, "backoff_deferred": 0}
+        # 생산자는 별도 스레드이고 소비자가 같은 failures dict를 실시간으로 갱신하므로,
+        # 락 없이 공유하면 경합이다. 사이클 시작 시점의 얕은 복사를 생산자에게 주면
+        # 경합이 사라지는 대신 생산자의 시야가 그 시점에 고정된다 — 그래서 소비자
+        # 쪽의 should_defer 재확인(아래)이 권위 있는 최종 판단이 된다(4차 설계 참고:
+        # watch_folders가 겹치면 같은 파일이 두 번 enqueue될 수 있는데, 그 두 번째는
+        # 생산자 스냅샷만으로는 못 걸러내고 소비자 검사만 잡을 수 있다).
+        failures_snapshot = dict(failures)
 
         # COM 추출 행오버 워치독 (base<=0이면 비활성)
         from knowmate.collector.com_watchdog import ComWatchdog
@@ -381,6 +495,15 @@ class CollectorWorker(QThread):
                             action = "modified"
                         else:
                             continue  # 변경 없음 → 인덱싱 대상 아님
+                        # 4차: 백오프 판정을 DRM 유휴 검사보다 먼저 한다 — 여기서 걸러야
+                        # 큐 삽입·Office 기동·워치독 무장 비용이 전부 발생하지 않는다.
+                        # 사이클 시작 시점 스냅샷 기준(경합 회피) — 최종 판단은 소비자 쪽.
+                        if failure_state.should_defer(
+                            failures_snapshot.get(path), path, meta.get("mtime", 0.0),
+                            meta.get("size", 0), self._get_now(), backoff_policy,
+                        ):
+                            producer_state["backoff_deferred"] += 1
+                            continue
                         # 실시간 유휴 판정: 값싼 유휴 조회(_get_idle_seconds)를 먼저 하고,
                         # 임계를 넘었을 때만 파일 시그니처(_is_drm_suspected, 파일 읽기)를
                         # 확인한다. 사이클 시작 1회가 아니라 파일마다 현재 유휴를 보므로,
@@ -410,7 +533,10 @@ class CollectorWorker(QThread):
                         sort_key = (priority, com_rank)
                         task_queue.put((
                             sort_key, next(_seq),
-                            IndexTask(priority, path, action, com_rank, size=meta.get("size", 0)),
+                            IndexTask(
+                                priority, path, action, com_rank,
+                                size=meta.get("size", 0), mtime=meta.get("mtime", 0.0),
+                            ),
                         ))
                         found += 1
                     if self._cancelled:
@@ -430,6 +556,8 @@ class CollectorWorker(QThread):
         unreadable = []
         com_since_restart = 0
         restart_count = 0
+        changed_during = []  # 추출 도중 파일이 바뀌어 이번 사이클에 인덱싱하지 않은 경로들
+        consumer_backoff_deferred = 0  # 소비자 재확인이 처리 직전에 걸러낸 건수(4차)
 
         while True:
             _sort_key, _seq_no, task = task_queue.get()
@@ -437,10 +565,30 @@ class CollectorWorker(QThread):
                 break
             if self._cancelled:
                 logger.info("수집기 취소됨")
+                # 취소는 드문 수동 조작이라 판정 비용을 아낄 이유가 없다 — 항상 재계산
+                self.last_cycle_changed = True
                 self.finished.emit(f"인덱싱 취소됨 ({done}건 처리 완료)")
                 producer.join(timeout=5)
                 save_state(self._state_file, state)
+                failure_state.save_failures(self._failure_file, failures)
                 return
+
+            # 4차: 소비자 쪽 재확인 — 권위 있는 최종 판단(생산자는 사이클 시작 시점
+            # 스냅샷이라 그 사이 상태가 바뀌었을 수 있다. 특히 watch_folders가 겹쳐
+            # 같은 파일이 두 번 enqueue된 경우, 첫 처리가 실패해 기록이 생기면 두
+            # 번째는 이 재확인만이 걸러낼 수 있다). Office 기동 전에 걸러야 비용이
+            # 안 든다.
+            _rec = failures.get(task.path)
+            if failure_state.should_defer(
+                _rec, task.path, task.mtime, task.size, self._get_now(), backoff_policy,
+            ):
+                consumer_backoff_deferred += 1
+                logger.debug(
+                    "[failure] 백오프로 건너뜀(%s): %s",
+                    failure_state.describe_wait(_rec, task.path, self._get_now(), backoff_policy),
+                    task.path,
+                )
+                continue
 
             filename = Path(task.path).name
             done += 1
@@ -457,6 +605,7 @@ class CollectorWorker(QThread):
                 # COM 경유 파일만 워치독 무장(plain은 COM을 안 타 무의미하고, 느린
                 # openpyxl 파싱 중 애먼 Office를 죽이는 오발을 피함).
                 _wd_exe = None
+                _wd_fired_stage = None  # 이번 파일에서 워치독이 실제로 발화했다면 그 단계
                 if watchdog is not None and is_com:
                     _wd_exe = _og.process_for_ext(Path(task.path).suffix.lower())
                 try:
@@ -469,11 +618,32 @@ class CollectorWorker(QThread):
                     text = self._extractor.extract(task.path)
                 finally:
                     if _wd_exe:
-                        watchdog.disarm()
+                        _wd_fired_stage = watchdog.disarm()
                         _og.end_com_op()
                 extract_sec = time.perf_counter() - _extract_t0
                 logger.debug("[단계2] 텍스트 추출 완료: %s (%d자, %.2fs)", task.path, len(text), extract_sec)
                 stat = Path(task.path).stat()
+
+                # 처리 중(추출~여기 사이) 파일이 바뀌었으면 지금 뽑은 text는 옛 내용일
+                # 수 있다 — 그대로 저장하면 "새 mtime + 옛 본문"이 state에 남아 다음
+                # 사이클의 classify_changes가 "변경 없음"으로 오판해 영원히 재인덱싱되지
+                # 않는다. task.mtime>0(스캔 시점 값을 실제로 받았을 때만 — 테스트 더블 등
+                # 0.0인 경우는 판정하지 않음)일 때만 비교하고, epsilon을 둬 파일시스템
+                # mtime 해상도 오차로 인한 오탐(=영구 미인덱싱)을 피한다.
+                if task.mtime > 0 and (
+                    abs(stat.st_mtime - task.mtime) > 1e-6 or stat.st_size != task.size
+                ):
+                    logger.warning(
+                        "[collector] 처리 중 파일 변경 감지 — 인덱싱 건너뜀(다음 사이클 재시도): %s",
+                        task.path,
+                    )
+                    changed_during.append(task.path)
+                    failure_state.note_failure(
+                        failures, task.path, failure_state.KIND_FILE_CHANGED, None, None,
+                        task.mtime, task.size, self._get_now(),
+                    )
+                    continue
+
                 scope = get_scope(task.path)
 
                 if task.action == "modified":
@@ -507,6 +677,7 @@ class CollectorWorker(QThread):
                     task.action, task.path, len(chunk_ids), extract_sec,
                 )
                 com_used = is_com
+                failure_state.note_success(failures, task.path)
             except OfficeBusyError as exc:
                 # 사용자가 Office를 열어둔 상태 → 이번 사이클만 연기(실패 아님).
                 # state를 갱신하지 않으므로 다음 유휴 사이클에서 자동 재시도된다.
@@ -514,16 +685,40 @@ class CollectorWorker(QThread):
                 # 주기 재기동 카운트 대상이 아니다(com_used는 False로 유지).
                 logger.warning("[collector] Office 점유로 연기(다음 사이클 재시도): %s", exc)
                 deferred.append(task.path)
+                _failed_stage = com_stage.take_last_failed_stage()
+                kind, error_code = failure_state.classify(
+                    exc, watchdog_stage=_wd_fired_stage, failed_stage=_failed_stage,
+                )
+                failure_state.note_failure(
+                    failures, task.path, kind, _wd_fired_stage or _failed_stage, error_code,
+                    task.mtime, task.size, self._get_now(),
+                )
             except UnreadableFormatError as exc:
                 # OOXML 확장자이나 zip 아님(DRM 래핑·손상 등)에 COM도 불가한 경우.
                 # 일반 실패와 구분해 로그·요약에 표시 — "버그"가 아니라 DRM/손상임을 알림.
                 logger.warning("[collector] 판독불가(DRM/암호화·손상 추정): %s", exc)
                 unreadable.append(task.path)
                 com_used = is_com
+                _failed_stage = com_stage.take_last_failed_stage()
+                kind, error_code = failure_state.classify(
+                    exc, watchdog_stage=_wd_fired_stage, failed_stage=_failed_stage,
+                )
+                failure_state.note_failure(
+                    failures, task.path, kind, _wd_fired_stage or _failed_stage, error_code,
+                    task.mtime, task.size, self._get_now(),
+                )
             except Exception as exc:
                 logger.error("파일 처리 실패 (건너뜀): %s - %s", task.path, exc)
                 failed.append(task.path)
                 com_used = is_com
+                _failed_stage = com_stage.take_last_failed_stage()
+                kind, error_code = failure_state.classify(
+                    exc, watchdog_stage=_wd_fired_stage, failed_stage=_failed_stage,
+                )
+                failure_state.note_failure(
+                    failures, task.path, kind, _wd_fired_stage or _failed_stage, error_code,
+                    task.mtime, task.size, self._get_now(),
+                )
 
             if com_used:
                 com_since_restart += 1
@@ -542,10 +737,53 @@ class CollectorWorker(QThread):
         # 생산자 스레드 정리 (정상 종료 시 이미 끝나 있음)
         producer.join(timeout=5)
 
-        # watch_folders에서 제거된 폴더의 청크를 정리한다 (dry_run·대량삭제차단 준수)
-        self._purge_removed_folders(
-            watch_folders, state, dry_run=dry_run, max_delete_ratio=max_delete_ratio,
+        # watch_folders에서 제거된 폴더의 청크를 정리한다 (dry_run·대량삭제차단 준수).
+        # 판정 순서는 차단 → 백오프 → 성공 스킵 → 실행 순으로 고정(purge_meta.decide) —
+        # 실패 직후 성공 서명을 해제하지 않으면 백오프가 성공 스킵에 가려 무력화된다.
+        purge_meta_now = time.time()
+        purge_capability_sig = purge_meta.compute_capability_sig()
+        purge_meta_state = self._purge_meta_cache
+        if purge_meta_state is None:
+            purge_meta_state = purge_meta.load_purge_meta(self._purge_meta_file)
+        decision = purge_meta.decide(
+            purge_meta_state, purge_op_sig, done, purge_meta_now,
+            force_reconcile_sec=purge_force_reconcile_sec, backoff_sec=purge_backoff_sec,
+            capability_sig=purge_capability_sig,
         )
+        if not decision.should_run:
+            logger.debug("[purge] 스킵(%s)", decision.reason)
+        else:
+            result = self._purge_removed_folders(
+                normalized_watch_folders, state, dry_run=dry_run, max_delete_ratio=max_delete_ratio,
+            )
+            if result == "success":
+                purge_meta_state = purge_meta.on_success(purge_meta_state, purge_op_sig, purge_meta_now)
+            elif result == "blocked":
+                purge_meta_state = purge_meta.on_blocked(purge_meta_state, purge_op_sig, reason="mass_delete")
+            elif result == "unsupported":
+                # 영구 장애(API 비호환) — 30분 백오프로 반복 재시도해도 복구되지 않으므로
+                # 장기 억제하되, watch_folders가 아니라 lancedb 버전 지문(capability_sig)으로
+                # 판정한다(설계 리뷰 14차 M-1) — op_sig로 억제하면 사용자가 안내대로 앱을
+                # 업데이트해도 폴더 구성이 그대로면 억제가 절대 풀리지 않는 결함이 있었다.
+                # 알림도 동일하게 capability_sig 변화 기준 1회로 제한한다.
+                if purge_meta_state.blocked_capability_sig != purge_capability_sig:
+                    self.indexing_needed.emit(
+                        "제거된 폴더 정리 기능이 이 배포 환경과 호환되지 않습니다. "
+                        "앱을 최신 버전으로 업데이트하세요."
+                    )
+                purge_meta_state = purge_meta.on_blocked(
+                    purge_meta_state, purge_op_sig, reason="unsupported",
+                    capability_sig=purge_capability_sig,
+                )
+            else:  # "failed"
+                purge_meta_state = purge_meta.on_transient_failure(
+                    purge_meta_state, purge_op_sig, purge_meta_now, backoff_sec=purge_backoff_sec,
+                )
+            # 성공·실패·차단 상태 모두 sidecar 저장 성공 여부와 무관하게 프로세스 내
+            # 캐시에 즉시 반영한다 — 저장이 실패해도 이번 프로세스 안에서는 판정이
+            # 유지된다(성공=정상 스킵 지속, 실패·차단=억제·알림 1회 유지).
+            self._purge_meta_cache = purge_meta_state
+            purge_meta.save_purge_meta(self._purge_meta_file, purge_meta_state)
 
         cleanup = CleanupManager(
             indexer=self._indexer,
@@ -558,6 +796,19 @@ class CollectorWorker(QThread):
             self.indexing_needed.emit(f"일부 폴더 정리 건너뜀: {report.skipped_folders}")
 
         save_state(self._state_file, state)
+
+        # 실패 이력 저장 — 더 이상 존재하지 않는 파일 기록은 정리한 뒤 저장한다.
+        # 이번 범위는 기록뿐이라, 여기 기록된 값으로 이번 사이클의 처리를
+        # 바꾸지 않는다(재시도 정책은 4차).
+        pruned_count = failure_state.prune(failures)
+        failure_state.save_failures(self._failure_file, failures)
+        failure_summary = failure_state.summarize(failures)
+        if failure_summary:
+            logger.info(
+                "[failure] 누적 실패 기록 %d건 [분류별: %s]%s",
+                sum(failure_summary.values()), failure_summary,
+                f" (정리된 기록 {pruned_count}건)" if pruned_count else "",
+            )
 
         # 메일 스캔 (.mysingle) — mail.enabled: true 일 때만
         mail_indexed = 0
@@ -582,6 +833,8 @@ class CollectorWorker(QThread):
             summary += f" / Office 점유로 연기 {len(deferred)}건"
         if unreadable:
             summary += f" / 판독불가 {len(unreadable)}건"
+        if changed_during:
+            summary += f" / 처리 중 변경 감지 {len(changed_during)}건"
         drm_deferred_count = producer_state.get("drm_deferred", 0)
         if drm_deferred_count:
             summary += f" / 유휴로 DRM 문서 스킵 {drm_deferred_count}건"
@@ -590,22 +843,45 @@ class CollectorWorker(QThread):
             summary += f" / COM 시간초과 강제해제 {com_timeout_count}건"
         if restart_count:
             summary += f" / COM 재기동 {restart_count}회"
+        backoff_deferred_total = producer_state.get("backoff_deferred", 0) + consumer_backoff_deferred
+        if backoff_deferred_total:
+            summary += f" / 재시도 대기 {backoff_deferred_total}건"
         if failed:
             logger.warning("실패 파일 목록: %s", failed)
         if deferred:
             logger.info("Office 점유로 연기된 파일 %d건(다음 사이클 재시도)", len(deferred))
         if unreadable:
             logger.info("판독불가(DRM/암호화·손상 추정) 파일 %d건: %s", len(unreadable), unreadable)
+        if changed_during:
+            logger.info(
+                "처리 중 외부 변경 감지로 건너뛴 파일 %d건(다음 사이클 재시도): %s",
+                len(changed_during), changed_during,
+            )
         if drm_deferred_count:
             logger.info(
                 "DRM 세션 만료 추정으로 DRM 의심 문서 %d건 스킵(활동 재개·세션 유효 시 재시도)",
                 drm_deferred_count,
             )
         if com_timeout_count:
+            from collections import Counter
+            stage_counts = Counter(watchdog.timeout_stages) if watchdog is not None else Counter()
             logger.warning(
-                "COM 추출 행오버 %d건을 타임아웃으로 강제 해제(해당 파일은 실패·다음 사이클 재시도)",
-                com_timeout_count,
+                "COM 추출 행오버 %d건을 타임아웃으로 강제 해제(해당 파일은 실패·다음 사이클 재시도) "
+                "[단계별: %s]",
+                com_timeout_count, dict(stage_counts),
             )
+        if backoff_deferred_total:
+            logger.info(
+                "[failure] 백오프로 건너뜀 %d건(생산자 %d + 소비자 %d) [분류별: %s]",
+                backoff_deferred_total, producer_state.get("backoff_deferred", 0),
+                consumer_backoff_deferred, failure_summary,
+            )
+        # 문서·메일 개수를 바꿀 수 있는 변경이 하나도 없었으면(유휴 방치 중 대부분의
+        # 사이클) bridge가 건수 재계산(DB projection 조회)을 건너뛸 수 있게 표시한다
+        # (설계: bridge._on_worker_finished, 유휴 60초마다 DB를 여는 것 자체를 없앤다).
+        self.last_cycle_changed = (
+            done > 0 or report.newly_marked > 0 or report.physically_deleted > 0 or mail_indexed > 0
+        )
         self.finished.emit(summary)
 
 

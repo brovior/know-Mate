@@ -127,6 +127,26 @@ class WordComReader:
 ```
 > **매번 Quit() 하는 방식 절대 사용 금지.**
 
+**Excel 셀 읽기 — 범위 단위 일괄 읽기 (`chunking.xlsx_block_rows`, 기본 1000)**
+
+COM 호출은 프로세스 간 마샬링이라 왕복 1회가 수십~수백 µs다. 셀마다 `cell.Value`를 읽으면
+1000행 × 20열 시트에서 왕복이 2만 번 발생해 `cell_read` 단계가 지배적 비용이 된다
+(`com_timeout_per_mb_sec: 20`이라는 큰 여유가 필요했던 이유). `ExcelComReader`는
+`sheet.Range(sheet.Cells(r1,c1), sheet.Cells(r2,c2)).Value`로 **블록당 왕복 1회**로 읽는다.
+한 번에 전부 올리면 순간 메모리가 커지므로 `xlsx_block_rows`(기본 1000)행 단위로 분할한다.
+
+- **`.Value` 사용, `.Value2` 금지** — Value2는 날짜를 일련번호(45730.0)로 돌려줘
+  `rag/date_filter.py`의 날짜 기반 검색 품질을 떨어뜨린다. 성능 이득은 왕복 제거에서
+  거의 다 나오므로 `.Value`로 충분하다(출력은 기존 `str(cell.Value)`와 동일).
+- **pywin32 `Range.Value`는 1×1 범위에서 2차원 튜플이 아니라 스칼라를 반환**한다(대표적 함정).
+  `_normalize_range_values()`가 1×N·N×1까지 포함해 항상 (행, 열) 2차원으로 맞춘다.
+- 설정값은 `secure/` 관례대로 **주입**한다(`get_extractor(mode, xlsx_block_rows=...)` →
+  `AutoReader` → `ComReader` → `ExcelComReader`). `secure/`는 전역 `get_config()`를
+  직접 조회하지 않는다. 잘못된 값(0·음수·비정수)은 1000으로 폴백한다(fail-safe).
+
+> **후속 과제**: `com_reader.py`가 약 490줄로 300줄 규칙을 초과한다. Word/Excel/PPT 리더
+> 3개를 별도 모듈로 분리하는 리팩터링을 별건으로 진행할 것.
+
 **Office 점유 가드 (`secure/office_guard.py`)**
 
 COM 자동화는 대상 Office 프로세스가 이미 떠 있으면 그 인스턴스에 붙는다(사용자당 1 인스턴스). 백그라운드
@@ -199,6 +219,46 @@ openpyxl이 `docProps/custom.xml` 타입 오류로 실패하면, custom.xml 파�
 watch_folders에서 빠진 폴더의 청크를 DB `file_path` 기준으로 정리. 동일 안전장치 적용 —
 ① `watch_folders`가 비면 즉시 스킵(빈 목록을 "전부 삭제"로 오판 방지) ② dry_run이면 state·DB 모두 불변
 ③ 삭제 대상이 `max_delete_ratio` 초과 시 차단 + UI 알림.
+
+**purge 조회 경량화 + 조건부 스킵** (`collector/purge_meta.py`, 설계 A-0002/ADR-0002, 2026-07-24):
+유휴 자동 인덱싱이 기본 60초마다 반복되는데, `_purge_removed_folders`가 매 사이클 chunks 테이블
+**전체**(1024차원 벡터 + AES 암호화 원문 포함)를 `to_arrow().to_pandas()`로 로드해, 변경 파일이
+0건이어도 매분 수십 MB를 할당/해제했다(베타에서 exe 메모리 70MB 도달 관측 — 인덱스가 커지면
+사이클당 수백 MB로 확대). 두 축으로 해결한다.
+
+- **컬럼 projection**: `table.search().select(["file_path"]).to_arrow()`로 `file_path` 컬럼만
+  조회(벡터·원문 미로드). 구현 착수 시 실측으로 확인(`table.to_lance().to_table(columns=...)`은
+  별도 `pylance` 설치가 필요해 채택 안 함 — `search().select()`가 기본 limit 없이 전건을 반환하고
+  컬럼도 정확히 요청한 것만 실려 오는 것을 확인).
+- **조건부 스킵**(`purge_meta.decide`): "op_sig(정규화된 watch_folders+dry_run+max_delete_ratio의
+  SHA-256 canonical JSON) 불변 + 이번 사이클 처리 0건 + 마지막 성공 purge 후 24시간(config화,
+  `purge_force_reconcile_sec`) 미만"이면 DB 조회 자체를 생략한다. 판정은 **차단 → 백오프 → 성공
+  스킵 → 실행** 순으로 고정 — 실패 직후 성공 서명(`reconciled_sig`)을 해제하지 않으면 백오프가
+  "이전 성공 메타로 인한 스킵"에 가려 무력화되는 결함이 있었다(설계 리뷰 3~4차에서 발견).
+- **상태 전이**: 성공 시 모든 억제 해제 + `reconciled_sig`/`last_purge_ts` 기록. 일시적 예외 시
+  `failed_sig`+`next_retry_ts`(기본 30분 백오프, `purge_backoff_sec`)를 걸고 `reconciled_sig`·
+  `blocked_sig`를 함께 해제. 대량삭제 차단 시 `blocked_sig`만 남기고(동일 구성으론 자동 재시도
+  안 함 — 사용자가 구성·차단율을 바꿔야 재실행) 나머지 상태를 해제한다(전이별 필드 완전성은
+  설계 리뷰 8차 m-1로 확정).
+- **메타 저장**: `index_state.json`과 분리된 sidecar `index_state.meta.json`(tmp→replace 원자
+  교체) — 기존 state 스키마·소비자 무변경. 성공·실패·차단 상태 모두 **sidecar 저장 성공 여부와
+  무관하게 워커 인스턴스의 메모리 캐시(`CollectorWorker._purge_meta_cache`)에 즉시 반영**해,
+  저장 실패(권한·디스크·백신 잠금)가 매 사이클 재조회를 유발하지 않는다 — 재시작 후에는 sidecar가
+  최신이 아니므로 보수적으로 재실행된다(purge는 멱등이라 안전).
+- **경로 정규화**(`purge_meta.normalize_folders`/`belongs_to_any`): 서명 계산과 소속 판정이
+  동일한 정규화 규칙(절대경로화→normpath→normcase→구분자 통일)을 쓰고, 소속 판정은 **경계
+  인식 비교**(`p == root or p.startswith(root + "/")`)라 `C:/watch`가 `C:/watch-old/...`를
+  하위로 오판하지 않는다.
+
+**건수 조회(UI 표시) 경량화** (`app/bridge.py`, 2026-07-25): 위와 같은 안티패턴이 다른 위치에도
+있었다 — `Bridge.getIndexStatus`/`_on_worker_finished`(화면의 "문서 N개/메일 N개" 표시용)가
+chunks·emails 테이블 **전체**를 `to_arrow().to_pandas()`로 로드했고, 이건 유휴 인덱싱 사이클이
+끝날 때마다(60초 주기, 변경 0건이어도 매번) 호출돼 상주 메모리가 방치 시간에 비례해 계속
+쌓이는 원인이었다(베타 실측 ~1GB). 동일한 두 축으로 해결: ① `Bridge._compute_doc_mail_counts`가
+`file_path`/`scope`/`is_deleted`(+ 필요 시 `indexed_at`), `mail_uid`/`is_deleted`만 projection
+조회 ② `CollectorWorker.last_cycle_changed`(처리 건수 + orphan 정리 + 메일 인덱싱 중 하나라도
+있었는지)가 False면 `_on_worker_finished`가 DB를 아예 열지 않고 직전 캐시값을 재사용. 조회
+실패 시에도 0으로 튀지 않고 직전 값으로 폴백(부수 개선).
 
 ---
 
@@ -299,6 +359,39 @@ DRM 문서는 스킵된다(COM Open 실패/로그인 모달 대기로 사이클�
 곳의 실패가 이후 정리를 건너뛰지 않게) 처리한다. 로직은 PyQt6 비의존으로 분리해(worker 덕타이핑,
 hard_exit 주입) 사외 단위 테스트가 가능하다.
 
+**암묵 종료 의존 제거 (설계 A-0001/ADR-0001, 2026-07-24)**: 위 `stop_worker` 에스컬레이션은
+"워커가 실행 중일 때"만 진입하는 안전망이라, 인덱싱이 돌지 않는 **유휴 상태에서의 트레이 [종료]**
+(실사용의 대부분)는 커버하지 못했다. 원인은 이벤트 루프 종료를 Qt 기본값
+`quitOnLastWindowClosed=True`에만 의존한 것 — 이 규칙은 "마지막으로 **보이는** 창이 닫힐 때"만
+발동하는데, 트레이 상주 상태(창이 `hide()`됨)에서 [종료]→`close()`를 해도 "보이는 창이 닫히는"
+사건 자체가 없어 `app.exec()`가 영영 반환되지 않았다(트레이 아이콘만 사라지고 프로세스 잔존이
+항상 재현되던 원인). `main()`에서 `app.setQuitOnLastWindowClosed(False)`로 암묵 종료를 끄고,
+`_shutdown()` 마지막에 `lifecycle.finalize_shutdown(worker, quit_fn, hard_exit)`를 항상 호출한다:
+`worker.isRunning()`이 False로 확인되면 `QApplication.quit()`, 실행 중이거나 조회 자체가
+예외(판정 불가)면 보수적으로 `hard_exit` — 둘 중 정확히 하나만 실행된다. `_shutdown()`은
+`_shutdown_done` 플래그로 프로세스 수명 기준 1회만 실행되도록 멱등화했다(근접한 이중 종료 요청
+방어). `finalize_shutdown`도 `stop_worker`와 동형으로 PyQt6 비의존 분리 — `quit_fn`/`hard_exit`
+주입으로 사외 단위 테스트 가능(`knowmate/tests/test_phase3.py::TestFinalizeShutdown`).
+
+**강제 종료 표식 (dirty-shutdown marker, 설계 리뷰 10차 M-1 → 11차 B-1로 방식 수정)**: 자동
+손상 감지·복구는 여전히 보류하지만(아래), "강제 종료가 있었다"는 사실 자체는 저비용으로 남긴다.
+처음엔 hard-exit 직전에 표식을 기록하는 방식이었으나, 그 동기 파일 쓰기 자체가 블록되면(백신·
+네트워크 드라이브 등) 최후 안전망인 하드 종료가 멈추는 모순이 있어(9차 B-1로 확립한 "하드 종료는
+무조건·즉시" 불변식과 충돌 — 11차 B-1) 방식을 바꿨다: `main()`이 **시작 시** 미리
+`lifecycle.check_and_remark_dirty_shutdown()`으로 `%APPDATA%/AegisDesk/dirty_shutdown.flag`를
+확인·재기록하고, `finalize_shutdown`의 **정상 quit 경로에서만** `clear_dirty_shutdown()`으로
+지운다. `stop_worker`/`finalize_shutdown`의 hard-exit 분기는 이제 파일 I/O를 전혀 거치지 않는다.
+표식이 남아있던 채로 시작되면(직전 실행이 못 지웠다는 뜻) WARNING 로그 + 트레이 풍선 알림(로그만
+으로는 GUI 사용자가 놓치기 쉬움, 11차 M-1)으로 재인덱싱을 권장한다.
+
+**남은 한계(후속 과제, 설계 리뷰 8차 M-1 — 보류)**: `QThread.terminate()`/`os._exit()`가 LanceDB
+쓰기(add/delete/optimize) 도중 발생했을 때의 커밋 원자성은 실제 손상 시나리오를 재현·검증할 수
+없는 상태에서 추측성 자동 복구(격리·재구축) 로직을 넣는 게 오히려 위험하다고 판단해 지금은 넣지
+않았다. 인덱스는 원본 문서에서 **언제든 재생성 가능한 파생 데이터**이므로, 최악의 경우 "인덱스
+폴더 삭제 후 재인덱싱"이 항상 유효한 완전 복구 경로다 — 실제 장애 사례가 쌓이면 자동 감지·격리를
+근거 있게 설계한다. 위 dirty-shutdown 표식은 "언제 그 복구가 필요할지"에 대한 최소한의 신호일
+뿐, 자동 격리·재구축은 여전히 하지 않는다.
+
 ## COM 행오버 워치독 (`collector/com_watchdog.py` + `secure/office_guard.py`)
 
 동기 COM 호출(Excel/Word 열기·셀 순회)이 멈추면 그 호출을 한 스레드가 COM 안에 갇힌다 — 같은
@@ -321,11 +414,147 @@ hard_exit 주입) 사외 단위 테스트가 가능하다.
 직접 접촉 없이 `office_guard` API만 호출해 원칙3(보안·Office 코드 격리)을 지키고, `terminate_fn`·
 `timer_factory` 주입으로 사외 단위 테스트가 가능하다.
 
+**세이프모드 루프 차단 (`secure/office_resiliency.py`)**: 위 강제 종료에는 자기 강화되는 부작용이
+있었다 — Office는 비정상 종료를 겪으면 `HKCU\...\Office\<ver>\<App>\Resiliency` 아래에 표식을
+남기고, **다음 기동 때 "안전 모드로 시작할까요?" 프롬프트**를 띄운다. 이 프롬프트는 `Dispatch()`가
+반환하기도 전에 뜨므로 앱 수준 `DisplayAlerts=False`로는 억제할 수 없다 → 또 행오버 → 또 kill →
+표식 재생성의 무한 루프가 된다(사내 실사용 로그로 확인). 그래서 ① `_dispatch_and_own`이 Dispatch
+**직전**에, ② `terminate_stuck_office`가 kill **직후**에 표식을 지운다. 지우는 대상은
+`DisabledItems`·`StartupItems`뿐이고 **`DocumentRecovery`는 절대 건드리지 않는다** — 그건 *사용자
+본인이* 저장하지 못하고 잃은 문서의 복구 목록이라 지우면 실제 업무 데이터가 복구 불가능해지고,
+비모달 작업창이라 자동화를 막지도 않아 지울 이유도 없다.
+
+같은 맥락에서 문서 열기 호출 자체도 **모달 프롬프트가 뜰 수 있는 모든 경로를 인자로 사전
+차단**한다(프롬프트 하나 = 행오버 하나): Excel은 `CorruptLoad=xlRepairFile`(손상 복구 확인창)·
+`IgnoreReadOnlyRecommended`·`Notify=False`(잠긴 파일 대기)·`UpdateLinks=0`(외부 링크 갱신), Word는
+`OpenAndRepair`·`NoEncodingDialog`(구형 .doc 인코딩 선택창). 암호 보호 문서에는 **더미 암호**를
+넘겨 암호 입력창 대신 즉시 실패시킨다(보호되지 않은 문서에서는 무시되는 인자). late binding에서
+이름 인자는 신뢰할 수 없어 전부 위치 인자로 넘기며, 관심 없는 중간 인자는 `pythoncom.Missing`으로
+건너뛴다.
+
 *잔여 한계(후속 과제)*: (1) 프로세스 내부 COM 마샬링 데드락은 Office kill로도 안 풀림 → 종료 확실화
-(A)가 최후 안전망. (2) 같은 파일이 매 사이클 행오버하면 사이클마다 타임아웃 낭비 → state에 실패
-횟수를 기록해 "N회 연속 시간초과 파일은 스킵"이 다음 단계. (3) Dispatch-hang 종료 시 그 사이 사용자가
-같은 앱을 새로 열면 죽일 수 있는 수 초 경합(가드가 사전 차단해 창이 좁고, 결과도 "방금 연 창 닫힘"
-vs "영구 행오버"의 교환).
+(A)가 최후 안전망. (2) 같은 파일이 매 사이클 행오버하면 사이클마다 타임아웃 낭비 → **아래
+"실패 이력 기록"(3차)·"실패 백오프"(4차)에서 해결** — 유형별 재시도 시점 조정까지 구현됨.
+(3) Dispatch-hang 종료 시 그 사이 사용자가 같은 앱을 새로 열면
+죽일 수 있는 수 초 경합(가드가 사전 차단해 창이 좁고, 결과도 "방금 연 창 닫힘" vs "영구 행오버"의
+교환).
+
+**단계 구분·확실한 닫기·처리 중 변경 감지 (`secure/com_stage.py`, 2026-07-25)**: DRM 문서 hang이
+`Workbooks.Open()`에서 멈춘 건지 셀 순회에서 멈춘 건지 구분할 방법이 없어, 원인에 따라 완전히
+다른 대응(사전 판별 vs 벌크 읽기 교체)을 결정할 수 없었다. 세 가지로 해결한다.
+
+- **단계 계측**: `com_stage.StageTimer`가 각 리더의 `parse()` 안에서
+  `dispatch → open → sheets(Excel만) → cell_read(Excel)/read(Word·PPT) → close`를
+  컨텍스트 매니저(`timer.stage(name)`)로 감싸 단계별 소요시간을 기록하고, 현재 단계를
+  모듈 레벨 슬롯(`threading.Lock` 보호)에 게시한다. `ComWatchdog`가 다른 스레드(daemon
+  타이머)에서 이 슬롯을 읽어(`stage_fn`, 기본 `com_stage.current_stage_name`/`describe`)
+  타임아웃 경고 로그에 `[단계: open(74.0s) <path>]`를 남기고, 사이클 요약에는 단계
+  **이름**만 모아 `Counter`로 집계한다(`COM 시간초과 3건 [단계별: {'open': 3}]`). 로그에는
+  경로·단계명·소요시간만 남고 셀 값·본문은 절대 남기지 않는다(원칙7).
+- **확실한 닫기**: 이전에는 `wb.Close(False)`가 **정상 경로에서만** 실행돼, 셀 순회 중
+  예외가 나면 워크북이 열린 채 남았다. 이제 `wb`(`doc`/`prs`)를 try 밖에서 `None`으로
+  초기화하고, `finally`의 `_close_quietly()`가 CLOSE 단계로 계측하며 항상 닫기를 시도한다
+  (닫기 자체의 실패는 로그만 남기고 삼켜 원본 예외를 덮어쓰지 않음).
+- **처리 중 변경 감지**: `IndexTask`에 스캔 시점 `mtime`을 실어, 추출 완료 후 재조회한
+  `stat()` 결과와 비교한다. 달라졌으면(파일이 처리 도중 수정됨) 그 사이클엔 인덱싱하지
+  않고 **state도 갱신하지 않은 채** 건너뛴다 — 그러지 않으면 "새 mtime + 옛 본문"이
+  저장돼 다음 사이클의 `classify_changes`가 "변경 없음"으로 오판, 영구 미인덱싱된다.
+  state 미갱신이라 다음 사이클에 자동 재검출·재시도된다(별도 재시도 큐 불필요).
+  `task.mtime > 0`일 때만 판정하고(테스트 더블 등 스캔 정보 없는 태스크는 판정 제외)
+  epsilon을 둬(1e-6초) 파일시스템 mtime 해상도 오차로 인한 오탐(=영구 미인덱싱)을 피한다.
+
+## 실패 이력 기록 (`collector/failure_state.py` · `index_failure.json`, 2026-07-28)
+
+지금까지 수집기는 실패한 파일을 그 사이클 안(`failed`/`unreadable`/`deferred` 리스트)에서만
+알았고 다음 실행까지 남는 상태가 없었다 — "이 파일은 원래 못 읽는 파일인가, 오전처럼 잠깐
+문제가 생겨 안 읽힌 건가"를 구분할 방법이 없었다는 뜻이다(세이프모드 루프 사건이 후자의
+실례였다). **3차는 그 구분에 필요한 근거를 기록만 했다** — 기록된 분류·연속 실패
+횟수로 재시도를 늦추거나 파일을 건너뛰는 정책은 바로 아래 "실패 백오프"(4차)에서
+구현한다.
+
+**분류 6종** (`failure_state.classify`): `TEMPORARY_BUSY`(Office 점유·COM
+RPC_E_CALL_REJECTED류) · `OPEN_TIMEOUT`(워치독 발화, 단계가 dispatch/open) ·
+`READ_TIMEOUT`(워치독 발화, 단계가 sheets/cell_read/read) · `NEEDS_USER_ACTION`
+(`UnreadableFormatError` — DRM 래핑·손상 추정) · `FILE_CHANGED`(처리 중 mtime·size
+변경 감지) · `UNKNOWN_TRANSIENT`(나머지 전부, 기본값). COM 오류 코드만으로 실제 원인을
+100% 확정할 수 없다(암호·손상 문서가 더미 암호로 즉시 실패하는 현재 구현상 일반 COM
+오류와 코드로 구분되지 않는다) — 그래서 확실한 것만 분류하고 나머지는 `UNKNOWN_TRANSIENT`로
+떨어뜨리되, `last_error_code`(HRESULT)는 그대로 보존해 실측 로그가 쌓이면 분류를 넓힐
+근거로 쓴다.
+
+**연계**: 워치독의 `ComWatchdog.disarm()`이 이번 파일에서 실제로 발화했는지(발화했다면
+어느 단계인지)를 반환하도록 확장했고, `com_stage.take_last_failed_stage()`가 COM 파싱
+중 예외가 난 단계를 (읽고 비우는 방식으로) 스케줄러에 공개한다 — 둘 다 `classify()`의
+입력이다.
+
+**저장** — `index_state.json`(성공 상태)과 완전히 분리된 sidecar
+`%APPDATA%/AegisDesk/index_failure.json`(purge sidecar `index_state.meta.json`과 동일
+관례). 문서 내용·셀 값은 물론 **예외 메시지도 저장하지 않는다**(시트명 등 내용 조각이
+섞여 들어올 수 있어서) — 저장하는 건 경로·분류·단계·HRESULT 문자열·연속 실패 횟수·
+마지막 실패 시각(epoch)뿐이다.
+
+**초기화(기록 삭제) 조건**: ① mtime·size 변경(다른 내용이 된 파일) ② 추출 성공
+③ `READ_STRATEGY_VERSION` 변경(추출 로직이 바뀌면 과거 실패가 무효 — 예: 셀 단위→범위
+단위 일괄 읽기 전환이 이 bump 대상이었다) ④ 사용자의 수동 재인덱싱(`CollectorWorker.
+request_failure_retry()` — `bridge.startReindex`·트레이 [재인덱싱]만 호출, **유휴 자동
+사이클은 호출하지 않는다** — 매번 비우면 연속 실패 횟수가 영원히 1에 머물러 기록 자체가
+무의미해진다) ⑤ 파일이 더 이상 존재하지 않음(사이클 종료 시 `prune()` — "이번 스캔에서
+못 봤음"이 아니라 `Path.exists()`가 False일 때만, 네트워크 드라이브 일시 단절로 멀쩡한
+기록이 날아가지 않게).
+
+## 실패 백오프 (`collector/failure_state.py` § `BackoffPolicy`, 2026-07-28)
+
+3차가 남긴 `index_failure.json`을 읽어서, 문제 파일을 매 사이클(유휴 60초)마다 다시
+열지 않도록 재시도 시점을 미룬다. **완료 기준은 "영구적인 무시가 아니라 재시도 시점
+조정"** — 모든 분류에 상한이 있고, 파일이 바뀌거나 수동 재인덱싱하면 즉시 다시
+시도된다.
+
+**정책 표** (`config.yaml › collector.failure_backoff`):
+
+| 분류 | 대기 | 비고 |
+|---|---|---|
+| `TEMPORARY_BUSY` | 5~10분(고정, 지터 포함) | 연속 횟수와 무관 — 하루 종일 열어둬도 계속 5~10분마다 재확인(escalation 금지) |
+| `OPEN_TIMEOUT`·`READ_TIMEOUT` | 30분 → 6시간 → 24시간 | 연속 실패 횟수(사다리보다 크면 마지막 칸 고정) |
+| `UNKNOWN_TRANSIENT` | 30분 → 6시간 → 24시간 | 별도 config 키(`unknown_ladder_sec`) — 실측 후 독립 조정 가능 |
+| `NEEDS_USER_ACTION` | 시간 기반 재시도 없음 + **7일 안전밸브** | 파일 변경·수동 요청 시 즉시. 7일 상한은 스펙 밖 추가 — 세이프모드 루프 사건처럼 "우리가 만든 일시적 상태 때문에 멀쩡한 파일이 영구히 안 읽히는" 사고를 코드로 막는다 |
+| `FILE_CHANGED` | 0초 | mtime이 이미 바뀌어 기록이 스스로 무효화됨 |
+
+`TEMPORARY_BUSY`의 지터는 `hashlib.sha256(경로)` 기반 결정적 값이다(파이썬 내장
+`hash()`는 프로세스마다 솔트가 달라 재시작 시 값이 바뀌므로 쓸 수 없다) — 여러 파일의
+재시도 시각이 한 사이클에 몰리는 것을 흩어준다.
+
+**연속 횟수는 "같은 분류가 연속된 횟수"** (3차 `note_failure` 수정) — 분류가 바뀌면
+1로 리셋한다. 안 그러면 사용자가 파일을 하루 종일 열어둬 `TEMPORARY_BUSY`가 여러 번
+쌓인 뒤 우연히 시간초과가 1번 나면 `consecutive`를 그대로 이어받아 곧장 24시간 백오프로
+튀는 오류가 생긴다.
+
+**백오프 검사는 반드시 두 지점** — `should_defer()` 하나를 두 곳에서 호출한다
+(판정 로직이 갈라지면 그 자체가 버그의 원천):
+
+1. **생산자**(`_producer`, 큐에 넣기 전): action 확정 직후, DRM 유휴 스킵 검사보다
+   앞. 여기서 걸러야 큐·Office 기동·워치독 무장 비용이 전부 발생하지 않는다.
+2. **소비자**(처리 직전): `task_queue.get()` 직후, `done += 1` 앞. **권위 있는 최종
+   판단** — 생산자는 스레드 경합을 피하려고 사이클 시작 시점의 스냅샷(`dict(failures)`)
+   으로 판단하는데, 소비자는 실시간 `failures` 딕셔너리를 본다. 특히 `watch_folders`가
+   겹치면(예: `C:/docs`와 `C:/docs/sub`를 둘 다 등록) 같은 파일이 큐에 두 번 들어갈
+   수 있는데(`_producer`의 `seen` 집합은 `.add()`만 하고 중복 검사에 쓰이지 않는다),
+   생산자 스냅샷만으로는 그 두 번째를 못 잡고 소비자 검사만 잡을 수 있다.
+
+`should_defer()`의 판정 순서는 항상 "재시도하는 쪽"이 먼저다(fail-open): 기록 없음 →
+처리 / 정책 `enabled: false` → 처리 / **mtime·size 불일치(파일 변경) → 처리** / 그 외엔
+`마지막 실패 시각 + backoff_seconds() > now`면 건너뜀.
+
+**`BackoffPolicy.from_config`은 fail-open** — `purge_meta.is_valid_ratio`(삭제 안전장치,
+fail-closed)와 반대 방향이다. 백오프는 삭제를 막는 안전장치가 아니라 "언제 재시도할지"만
+정하므로, 잘못된 설정값의 결과는 "예상보다 자주 재시도"(무해)여야지 "영구히 재시도 안
+함"이면 안 된다. `enabled: false`는 이 기능 도입 전(매 사이클 재시도) 동작으로 되돌리는
+비상 스위치다.
+
+**최대 리스크는 조용한 미인덱싱**(파일이 백오프에 걸려 아무도 모르게 영영 안 들어가는
+것)이라 여러 겹으로 방어한다: 모든 분류에 상한(7일 포함) · mtime/size 변경 시 무조건
+즉시 재시도 · 사이클 요약에 `재시도 대기 N건` 상시 노출(`producer_state["backoff_deferred"]`
++ 소비자 쪽 카운터 합산) · `enabled: false` 비상 스위치 · 수동 재인덱싱이 기록을 전부
+초기화.
 
 **주기 재기동 (선제적 완화책, `collector.com_restart_every_n_files`)**: 워치독은 행오버가 **발생한
 뒤** 반응적으로 kill하는 안전망이지만, 행오버가 없어도 한 Office 인스턴스가 COM 파일을 수백 건

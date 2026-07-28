@@ -13,6 +13,11 @@
   *다음 파일이 쓰는* Office를 죽이는 오사살을 막는다.
 - **락 + active 플래그**: disarm과 타이머 발화가 겹쳐도 한쪽만 유효하게 한다.
 - **daemon 타이머**: 비데몬 스레드가 살아 프로세스 종료(트레이 [종료])를 막지 않게 한다.
+
+**단계 귀속**: 발화 시 `stage_fn()`(기본 `secure.com_stage.describe`)을 호출해 "그 순간
+어느 단계에 몇 초째 있었는지"를 로그와 `timeout_stages`에 남긴다. 이게 없으면 타임아웃이
+집계 카운터로만 남아, 어느 파일이 `Workbooks.Open()`에서 죽었는지 셀 순회에서 죽었는지
+구분할 방법이 없었다(경로별 귀속은 여전히 안 되지만, 최소한 단계별 분포는 알 수 있다).
 """
 import logging
 import threading
@@ -20,24 +25,49 @@ import threading
 logger = logging.getLogger(__name__)
 
 
+def _default_stage_fn() -> tuple[str, str]:
+    """(단계 이름, 사람이 읽을 설명) 튜플을 반환한다.
+
+    이름("open")은 사이클 요약의 `Counter` 집계용, 설명("open(74.0s) <path>")은
+    개별 타임아웃 발생 시 warning 로그용 — 목적이 달라 하나로 합치면 집계가
+    안 되거나(설명은 매번 문자열이 달라짐) 사람이 못 읽는다(이름만으로는 몇
+    초째인지 모름).
+
+    지연 import — com_watchdog은 collector/, com_stage는 secure/에 있어 순환 참조를
+    피하려 함수 호출 시점에만 import한다(모듈 로드 시점 import 시 secure 쪽이 아직 준비
+    안 됐을 수 있는 초기화 순서 문제 방지).
+    """
+    from knowmate.secure.com_stage import current_stage_name, describe
+    return current_stage_name(), describe()
+
+
 class ComWatchdog:
     """COM 추출 호출을 감싸 행오버 시 대상 Office 프로세스를 종료하는 워치독."""
 
-    def __init__(self, terminate_fn, timer_factory=None):
+    def __init__(self, terminate_fn, timer_factory=None, stage_fn=None):
         """워치독을 초기화한다.
 
         terminate_fn: (exe: str) -> int, 해당 exe의 우리 Office 프로세스를 종료하고
             종료 수를 반환하는 콜백(기본 사용 시 office_guard.terminate_stuck_office).
         timer_factory: (interval_sec, callback) -> timer, 테스트 주입용.
             기본은 daemon threading.Timer.
+        stage_fn: () -> (name: str, description: str), 발화 시점의 현재 단계를 반환하는
+            콜백(테스트 주입용). name은 사이클 요약 집계용("open"), description은 개별
+            경고 로그용("open(74.0s) <path>"). 기본은 secure.com_stage 기반.
         """
         self._terminate_fn = terminate_fn
         self._timer_factory = timer_factory or self._default_timer
+        self._stage_fn = stage_fn or _default_stage_fn
         self._lock = threading.Lock()
         self._gen = 0
         self._active = False
         self._timer = None
         self.timeout_count = 0  # 워치독이 실제로 프로세스를 종료한 횟수
+        self.timeout_stages: list[str] = []  # 종료가 실제로 일어난 시점의 단계 **이름**(순서대로, 집계용)
+        # 가장 최근 arm()~disarm() 구간에서 발화했는지, 발화했다면 어느 단계였는지.
+        # disarm()이 파일 단위로 이 값을 소비해 반환한다(파일 단위 실패 귀속용).
+        self._fired_gen: int | None = None
+        self._fired_stage: str | None = None
 
     @staticmethod
     def _default_timer(interval, callback):
@@ -63,16 +93,35 @@ class ComWatchdog:
             killed = self._terminate_fn(exe)
             if killed:
                 self.timeout_count += 1
-                logger.warning("COM 추출 타임아웃 — %s 강제 해제(%d개 종료)", exe, killed)
+                try:
+                    stage_name, stage_desc = self._stage_fn()
+                except Exception:
+                    stage_name, stage_desc = "unknown", "단계 조회 실패"
+                self.timeout_stages.append(stage_name)
+                self._fired_gen = gen
+                self._fired_stage = stage_name
+                logger.warning(
+                    "COM 추출 타임아웃 — %s 강제 해제(%d개 종료) [단계: %s]",
+                    exe, killed, stage_desc,
+                )
             # 종료 후에는 비활성화(같은 파일에 중복 발화 방지)
             self._active = False
             return killed
 
-    def disarm(self) -> None:
-        """정상 완료 시 워치독을 해제한다."""
+    def disarm(self) -> str | None:
+        """정상 완료(또는 예외 처리) 시 워치독을 해제한다.
+
+        이번 arm() 세대에서 실제로 타이머가 발화해 프로세스를 종료했으면 그
+        시점의 단계 이름을 반환하고, 발화하지 않았으면(정상 처리 또는 아직
+        타임아웃 전) None을 반환한다 — 호출부(스케줄러)가 "이 파일이 워치독
+        타임아웃으로 실패했는지"를 판별하는 유일한 방법이다.
+        """
         with self._lock:
             self._active = False
             timer = self._timer
             self._timer = None
+            gen = self._gen
+            fired_stage = self._fired_stage if self._fired_gen == gen else None
         if timer is not None:
             timer.cancel()
+        return fired_stage

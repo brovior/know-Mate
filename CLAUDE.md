@@ -6,6 +6,7 @@
 ## 모델 사용 정책
 
 - **분석·설계·계획 수립**: Opus 이상 모델 허용.
+- **리뷰(설계 리뷰·코드 리뷰·GPT 리뷰 처리)**: 반드시 Opus 이상 모델로 수행한다. **Sonnet은 리뷰 작업 참여 금지.** 현재 모델이 Sonnet인 상태에서 리뷰 요청이 오면 먼저 사용자에게 Opus 계열 전환(`/model`)을 안내하고, 전환 후 진행한다.
 - **실제 코드 작성·구현**: Sonnet 사용. 구현 착수 시점에 현재 모델이 Opus 계열이면 사용자에게 Sonnet 전환(`/model`)을 먼저 안내할 것.
 - **예외**: 동시성(스레드), 보안(crypto), 대규모 리팩터링 등 고위험 구현은 사용자 판단으로 상위 모델 허용.
 - 참고: `/model opusplan`은 계획=Opus / 실행=Sonnet을 자동 전환한다.
@@ -96,7 +97,7 @@ scripts/          diag_search.py · inspect_index.py · test_shared_db.py(5b 사
 
 9. **scopes 빈 배열이면 전체 검색 fallback 금지.** JS 1차 + knowledge_agent 2차 차단.
 
-10. **LanceDB API**: `optimize()` 사용 (`compact_files()` deprecated 금지). DataFrame 변환은 `table.to_arrow().to_pandas()` (`table.to_pandas()` 직접 금지).
+10. **LanceDB API**: `optimize()` 사용 (`compact_files()` deprecated 금지). **전체 테이블 로드 금지** — 필요한 컬럼만 `table.search().select([...]).to_arrow()`로 projection한 뒤 `.to_pandas()`로 변환한다(`table.to_pandas()` 직접 호출 및 `select()` 없는 `table.to_arrow()` 모두 금지 — 벡터·암호화 원문까지 전부 메모리에 올라간다. 유휴 자동 인덱싱처럼 반복 호출되는 경로에서 특히 치명적이었다, bridge.py 상주 메모리 사고 참고).
 
 ---
 
@@ -140,8 +141,12 @@ scripts/          diag_search.py · inspect_index.py · test_shared_db.py(5b 사
 - UI 작업 시 `UI_SPEC.md` · `mockup.html` 먼저 읽고, 스펙과 다른 판단 필요 시 먼저 묻는다.
 - 로그 레벨: DEBUG(흐름 추적) / INFO(정상 결과) / WARNING(복구 가능) / ERROR(즉시 확인).
 
-<!-- ai-dev-workflow:review-recipe (init_project.py가 자동 주입 — 이 블록은 직접 수정하지 말 것) -->
+<!-- ai-dev-workflow:review-recipe (init_project.py가 자동 주입·갱신 — 이 블록은 직접 수정하지 말 것) -->
 ## 설계 리뷰 요청 처리 (ai-dev-workflow)
+
+> ⚠️ **모델 규칙 (필수)**: 이 설계·리뷰 워크플로(Chief Architect 판단)는 **반드시 Opus 이상 모델**로
+> 수행한다. **현재 세션이 Sonnet 이하이면, 리뷰·설계 작업을 시작하기 전에 사용자에게 "Opus 이상으로
+> 모델을 변경해 달라"고 먼저 요청**하고, 변경 전까지 진행하지 않는다. (설계 확정 후의 코딩·구현은 Sonnet도 허용.)
 
 사용자가 "설계 리뷰" / "GPT 리뷰" / "리뷰 받아줘" 등을 요청하면 — **네가 직접 리뷰하지 말고** 아래대로 한다:
 

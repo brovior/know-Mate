@@ -1,4 +1,4 @@
-<!-- vendored from ai-dev-workflow v0.1.5 — prompts/gpt-architect-reviewer.md
+<!-- vendored from ai-dev-workflow v0.1.6 — prompts/gpt-architect-reviewer.md
      직접 수정 금지: 개선은 정본에 하고 init_project.py --update로 동기화. -->
 # 역할 계약: GPT 독립 아키텍처 리뷰어
 

@@ -25,9 +25,19 @@ __all__ = [
 class AutoReader:
     """확장자 기반으로 PlainReader 또는 ComReader를 자동 선택하는 TextExtractor 구현체."""
 
-    def __init__(self) -> None:
-        """AutoReader를 초기화한다."""
+    def __init__(self, xlsx_block_rows: int | None = None) -> None:
+        """AutoReader를 초기화한다.
+
+        xlsx_block_rows: COM 경로에서 Excel 범위를 한 번에 읽을 행 수
+            (config `chunking.xlsx_block_rows`). `secure/`는 전역 `get_config()`를
+            직접 조회하지 않고 호출부가 값을 주입하는 관례를 따른다
+            (`get_crypto_manager(cfg)`·`get_extractor(mode)`와 동일). None이면
+            `ComReader`/`ExcelComReader`가 자체 기본값으로 폴백한다 — 여기서
+            기본값을 해석하지 않아야 `com_reader`(COM 의존)를 모듈 로드 시점에
+            import하지 않는 지연 import 격리가 유지된다.
+        """
         self._plain = PlainReader()
+        self._xlsx_block_rows = xlsx_block_rows
 
     def extract(self, path: str) -> str:
         """확장자에 따라 PlainReader 또는 ComReader로 파일을 파싱해 텍스트를 반환한다.
@@ -58,17 +68,17 @@ class AutoReader:
                 )
                 self._guard_office_busy(ext, path)
                 from knowmate.secure.com_reader import ComReader
-                return ComReader().extract(path)
+                return ComReader(xlsx_block_rows=self._xlsx_block_rows).extract(path)
         if ext in {".doc", ".ppt"}:
             self._guard_office_busy(ext, path)
             # COM 의존 코드: secure/ 안에서만 import
             from knowmate.secure.com_reader import ComReader
-            return ComReader().extract(path)
+            return ComReader(xlsx_block_rows=self._xlsx_block_rows).extract(path)
         if ext in _OOXML_EXTS and not is_zip(path):
             logger.warning("확장자는 OOXML이나 실제 zip 아님(OLE2/DRM 등 추정) → COM 경유: %s", path)
             self._guard_office_busy(ext, path)
             from knowmate.secure.com_reader import ComReader
-            return ComReader().extract(path)
+            return ComReader(xlsx_block_rows=self._xlsx_block_rows).extract(path)
         return self._plain.extract(path)
 
     @staticmethod
@@ -82,12 +92,17 @@ class AutoReader:
             )
 
 
-def get_extractor(mode: str) -> TextExtractor:
-    """mode에 따라 적합한 TextExtractor 인스턴스를 반환한다."""
+def get_extractor(mode: str, xlsx_block_rows: int | None = None) -> TextExtractor:
+    """mode에 따라 적합한 TextExtractor 인스턴스를 반환한다.
+
+    xlsx_block_rows: COM 경로에서 Excel 범위를 한 번에 읽을 행 수
+        (config `chunking.xlsx_block_rows`). auto 모드에서만 의미가 있고,
+        fake/plain 모드는 COM을 타지 않아 무시된다.
+    """
     if mode == "fake":
         return FakeReader()
     if mode == "plain":
         return PlainReader()
     if mode == "auto":
-        return AutoReader()
+        return AutoReader(xlsx_block_rows=xlsx_block_rows)
     raise ValueError(f"알 수 없는 extractor 모드: {mode!r}")
