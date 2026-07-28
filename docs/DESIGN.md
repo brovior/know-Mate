@@ -127,6 +127,26 @@ class WordComReader:
 ```
 > **매번 Quit() 하는 방식 절대 사용 금지.**
 
+**Excel 셀 읽기 — 범위 단위 일괄 읽기 (`chunking.xlsx_block_rows`, 기본 1000)**
+
+COM 호출은 프로세스 간 마샬링이라 왕복 1회가 수십~수백 µs다. 셀마다 `cell.Value`를 읽으면
+1000행 × 20열 시트에서 왕복이 2만 번 발생해 `cell_read` 단계가 지배적 비용이 된다
+(`com_timeout_per_mb_sec: 20`이라는 큰 여유가 필요했던 이유). `ExcelComReader`는
+`sheet.Range(sheet.Cells(r1,c1), sheet.Cells(r2,c2)).Value`로 **블록당 왕복 1회**로 읽는다.
+한 번에 전부 올리면 순간 메모리가 커지므로 `xlsx_block_rows`(기본 1000)행 단위로 분할한다.
+
+- **`.Value` 사용, `.Value2` 금지** — Value2는 날짜를 일련번호(45730.0)로 돌려줘
+  `rag/date_filter.py`의 날짜 기반 검색 품질을 떨어뜨린다. 성능 이득은 왕복 제거에서
+  거의 다 나오므로 `.Value`로 충분하다(출력은 기존 `str(cell.Value)`와 동일).
+- **pywin32 `Range.Value`는 1×1 범위에서 2차원 튜플이 아니라 스칼라를 반환**한다(대표적 함정).
+  `_normalize_range_values()`가 1×N·N×1까지 포함해 항상 (행, 열) 2차원으로 맞춘다.
+- 설정값은 `secure/` 관례대로 **주입**한다(`get_extractor(mode, xlsx_block_rows=...)` →
+  `AutoReader` → `ComReader` → `ExcelComReader`). `secure/`는 전역 `get_config()`를
+  직접 조회하지 않는다. 잘못된 값(0·음수·비정수)은 1000으로 폴백한다(fail-safe).
+
+> **후속 과제**: `com_reader.py`가 약 490줄로 300줄 규칙을 초과한다. Word/Excel/PPT 리더
+> 3개를 별도 모듈로 분리하는 리팩터링을 별건으로 진행할 것.
+
 **Office 점유 가드 (`secure/office_guard.py`)**
 
 COM 자동화는 대상 Office 프로세스가 이미 떠 있으면 그 인스턴스에 붙는다(사용자당 1 인스턴스). 백그라운드
@@ -413,10 +433,11 @@ hard_exit 주입) 사외 단위 테스트가 가능하다.
 건너뛴다.
 
 *잔여 한계(후속 과제)*: (1) 프로세스 내부 COM 마샬링 데드락은 Office kill로도 안 풀림 → 종료 확실화
-(A)가 최후 안전망. (2) 같은 파일이 매 사이클 행오버하면 사이클마다 타임아웃 낭비 → state에 실패
-횟수를 기록해 "N회 연속 시간초과 파일은 스킵"이 다음 단계. (3) Dispatch-hang 종료 시 그 사이 사용자가
-같은 앱을 새로 열면 죽일 수 있는 수 초 경합(가드가 사전 차단해 창이 좁고, 결과도 "방금 연 창 닫힘"
-vs "영구 행오버"의 교환).
+(A)가 최후 안전망. (2) 같은 파일이 매 사이클 행오버하면 사이클마다 타임아웃 낭비 → **실패 이력 기록은
+아래(`index_failure.json`)에서 구현**, 그 기록을 바탕으로 재시도를 늦추거나 건너뛰는 정책은 아직
+없음(4차, 실측 로그가 쌓인 뒤 착수). (3) Dispatch-hang 종료 시 그 사이 사용자가 같은 앱을 새로 열면
+죽일 수 있는 수 초 경합(가드가 사전 차단해 창이 좁고, 결과도 "방금 연 창 닫힘" vs "영구 행오버"의
+교환).
 
 **단계 구분·확실한 닫기·처리 중 변경 감지 (`secure/com_stage.py`, 2026-07-25)**: DRM 문서 hang이
 `Workbooks.Open()`에서 멈춘 건지 셀 순회에서 멈춘 건지 구분할 방법이 없어, 원인에 따라 완전히
@@ -441,6 +462,44 @@ vs "영구 행오버"의 교환).
   state 미갱신이라 다음 사이클에 자동 재검출·재시도된다(별도 재시도 큐 불필요).
   `task.mtime > 0`일 때만 판정하고(테스트 더블 등 스캔 정보 없는 태스크는 판정 제외)
   epsilon을 둬(1e-6초) 파일시스템 mtime 해상도 오차로 인한 오탐(=영구 미인덱싱)을 피한다.
+
+## 실패 이력 기록 (`collector/failure_state.py` · `index_failure.json`, 2026-07-28)
+
+지금까지 수집기는 실패한 파일을 그 사이클 안(`failed`/`unreadable`/`deferred` 리스트)에서만
+알았고 다음 실행까지 남는 상태가 없었다 — "이 파일은 원래 못 읽는 파일인가, 오전처럼 잠깐
+문제가 생겨 안 읽힌 건가"를 구분할 방법이 없었다는 뜻이다(세이프모드 루프 사건이 후자의
+실례였다). **이번 3차는 그 구분에 필요한 근거를 기록만 한다** — 기록된 분류·연속 실패
+횟수로 재시도를 늦추거나 파일을 건너뛰는 로직은 아직 한 줄도 없다(그건 4차).
+
+**분류 6종** (`failure_state.classify`): `TEMPORARY_BUSY`(Office 점유·COM
+RPC_E_CALL_REJECTED류) · `OPEN_TIMEOUT`(워치독 발화, 단계가 dispatch/open) ·
+`READ_TIMEOUT`(워치독 발화, 단계가 sheets/cell_read/read) · `NEEDS_USER_ACTION`
+(`UnreadableFormatError` — DRM 래핑·손상 추정) · `FILE_CHANGED`(처리 중 mtime·size
+변경 감지) · `UNKNOWN_TRANSIENT`(나머지 전부, 기본값). COM 오류 코드만으로 실제 원인을
+100% 확정할 수 없다(암호·손상 문서가 더미 암호로 즉시 실패하는 현재 구현상 일반 COM
+오류와 코드로 구분되지 않는다) — 그래서 확실한 것만 분류하고 나머지는 `UNKNOWN_TRANSIENT`로
+떨어뜨리되, `last_error_code`(HRESULT)는 그대로 보존해 실측 로그가 쌓이면 분류를 넓힐
+근거로 쓴다.
+
+**연계**: 워치독의 `ComWatchdog.disarm()`이 이번 파일에서 실제로 발화했는지(발화했다면
+어느 단계인지)를 반환하도록 확장했고, `com_stage.take_last_failed_stage()`가 COM 파싱
+중 예외가 난 단계를 (읽고 비우는 방식으로) 스케줄러에 공개한다 — 둘 다 `classify()`의
+입력이다.
+
+**저장** — `index_state.json`(성공 상태)과 완전히 분리된 sidecar
+`%APPDATA%/AegisDesk/index_failure.json`(purge sidecar `index_state.meta.json`과 동일
+관례). 문서 내용·셀 값은 물론 **예외 메시지도 저장하지 않는다**(시트명 등 내용 조각이
+섞여 들어올 수 있어서) — 저장하는 건 경로·분류·단계·HRESULT 문자열·연속 실패 횟수·
+마지막 실패 시각(epoch)뿐이다.
+
+**초기화(기록 삭제) 조건**: ① mtime·size 변경(다른 내용이 된 파일) ② 추출 성공
+③ `READ_STRATEGY_VERSION` 변경(추출 로직이 바뀌면 과거 실패가 무효 — 예: 셀 단위→범위
+단위 일괄 읽기 전환이 이 bump 대상이었다) ④ 사용자의 수동 재인덱싱(`CollectorWorker.
+request_failure_retry()` — `bridge.startReindex`·트레이 [재인덱싱]만 호출, **유휴 자동
+사이클은 호출하지 않는다** — 매번 비우면 연속 실패 횟수가 영원히 1에 머물러 기록 자체가
+무의미해진다) ⑤ 파일이 더 이상 존재하지 않음(사이클 종료 시 `prune()` — "이번 스캔에서
+못 봤음"이 아니라 `Path.exists()`가 False일 때만, 네트워크 드라이브 일시 단절로 멀쩡한
+기록이 날아가지 않게).
 
 ## 단일 인스턴스 보장 (`app/single_instance.py`)
 

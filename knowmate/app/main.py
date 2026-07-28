@@ -144,6 +144,8 @@ class MainWindow(QMainWindow):
         """트레이 메뉴에서 재인덱싱을 트리거한다(진행 중이면 무시)."""
         worker = getattr(self._bridge, "_worker", None)
         if worker is not None and not worker.isRunning():
+            if hasattr(worker, "request_failure_retry"):
+                worker.request_failure_retry()
             worker.start()
 
     def _quit_app(self) -> None:
@@ -188,7 +190,10 @@ class MainWindow(QMainWindow):
                 batch_size=batch_size,
                 crypto=crypto,
             )
-            self._extractor = get_extractor(cfg.get("extractor", "fake"))
+            self._extractor = get_extractor(
+                cfg.get("extractor", "fake"),
+                xlsx_block_rows=chunking.get("xlsx_block_rows"),
+            )
 
             # 단일 워커를 생성해 bridge에 연결한다 (수동·유휴 인덱싱 공유)
             self._make_worker()

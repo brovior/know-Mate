@@ -15,8 +15,10 @@ from knowmate.secure import com_stage
 def _clear_stage_state():
     """테스트 간 모듈 레벨 상태가 새지 않도록 전후로 초기화한다."""
     com_stage.clear()
+    com_stage.take_last_failed_stage()
     yield
     com_stage.clear()
+    com_stage.take_last_failed_stage()
 
 
 class TestBeginClearSnapshot:
@@ -138,3 +140,42 @@ class TestStageTimer:
             timer.log_summary()
         messages = [r.message for r in caplog.records]
         assert any("open=" in m and "/docs/salary.xlsx" in m for m in messages)
+
+
+class TestTakeLastFailedStage:
+    """3차(실패 원인 분류 및 기록) — 스케줄러가 실패 단계를 읽어갈 통로."""
+
+    def test_none_when_no_failure(self):
+        assert com_stage.take_last_failed_stage() is None
+
+    def test_returns_failed_stage_after_exception(self):
+        timer = com_stage.StageTimer("/x.xlsx")
+        with pytest.raises(ValueError):
+            with timer.stage(com_stage.STAGE_CELL_READ):
+                raise ValueError("실패")
+        assert com_stage.take_last_failed_stage() == com_stage.STAGE_CELL_READ
+
+    def test_reading_clears_the_slot(self):
+        timer = com_stage.StageTimer("/x.xlsx")
+        with pytest.raises(ValueError):
+            with timer.stage(com_stage.STAGE_OPEN):
+                raise ValueError("실패")
+        assert com_stage.take_last_failed_stage() == com_stage.STAGE_OPEN
+        assert com_stage.take_last_failed_stage() is None  # 두 번째 호출은 비어있음
+
+    def test_success_does_not_set_failed_stage(self):
+        timer = com_stage.StageTimer("/x.xlsx")
+        with timer.stage(com_stage.STAGE_OPEN):
+            pass
+        assert com_stage.take_last_failed_stage() is None
+
+    def test_only_first_failed_stage_published(self):
+        """StageTimer.failed_stage와 동일하게, 첫 실패 단계만 모듈 슬롯에 남는다."""
+        timer = com_stage.StageTimer("/x.xlsx")
+        with pytest.raises(ValueError):
+            with timer.stage(com_stage.STAGE_CELL_READ):
+                raise ValueError("셀 읽기 실패")
+        with pytest.raises(RuntimeError):
+            with timer.stage(com_stage.STAGE_CLOSE):
+                raise RuntimeError("닫기도 실패")
+        assert com_stage.take_last_failed_stage() == com_stage.STAGE_CELL_READ

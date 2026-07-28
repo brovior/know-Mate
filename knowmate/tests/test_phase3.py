@@ -300,7 +300,11 @@ def _make_worker(tmp_path: Path, watch_folder: str):
     extractor = FakeReader()
     config = _make_config(watch_folder)
     state_file = tmp_path / "state.json"
-    return CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json"), indexer, state_file
+    worker = CollectorWorker(
+        config=config, indexer=indexer, extractor=extractor, state_file=state_file,
+        purge_meta_file=tmp_path / "purge_meta.json", failure_file=tmp_path / "index_failure.json",
+    )
+    return worker, indexer, state_file
 
 
 class TestCollectorWorker:
@@ -337,7 +341,7 @@ class TestCollectorWorker:
         config = _make_config(str(folder))
         state_file = tmp_path / "state.json"
 
-        worker = CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json")
+        worker = CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json", failure_file=tmp_path / "index_failure_1.json")
         worker.run()
 
         from knowmate.collector.state import load_state
@@ -349,7 +353,7 @@ class TestCollectorWorker:
         f.write_bytes(b"modified content - different from original")
 
         # 같은 indexer 재사용 (DB 재생성 충돌 방지)
-        worker2 = CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json")
+        worker2 = CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json", failure_file=tmp_path / "index_failure_2.json")
         worker2.run()
 
         state2 = load_state(state_file)
@@ -384,7 +388,7 @@ class TestCollectorWorker:
             "chunking": {"chunk_size": 400, "overlap": 80},
         }
         state_file = tmp_path / "state.json"
-        worker = CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json")
+        worker = CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json", failure_file=tmp_path / "index_failure_3.json")
         worker.run()
 
         from knowmate.collector.state import load_state
@@ -394,7 +398,7 @@ class TestCollectorWorker:
         del_path = str(files[0])
         files[0].unlink()
 
-        worker2 = CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json")
+        worker2 = CollectorWorker(config=config, indexer=indexer, extractor=extractor, state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json", failure_file=tmp_path / "index_failure_4.json")
         worker2.run()
 
         # orphan 파일의 청크가 soft delete 마킹되었는지 확인
@@ -456,7 +460,7 @@ class TestCollectorWorker:
         indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
         config = _make_config(str(folder))
         state_file = tmp_path / "state.json"
-        worker = CollectorWorker(config=config, indexer=indexer, extractor=FailingExtractor(), state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json")
+        worker = CollectorWorker(config=config, indexer=indexer, extractor=FailingExtractor(), state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json", failure_file=tmp_path / "index_failure_5.json")
 
         finished_msgs = []
         worker.finished.connect(finished_msgs.append)
@@ -601,6 +605,7 @@ class TestQueuePriority:
             config=_make_config(str(folder)), indexer=indexer,
             extractor=FakeReader(), state_file=state_file,
             purge_meta_file=tmp_path / "purge_meta.json",
+            failure_file=tmp_path / "index_failure_multi_1.json",
         )
         worker.run()
 
@@ -663,6 +668,7 @@ class TestDrmIdleSkip:
         worker = CollectorWorker(
             config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
             purge_meta_file=tmp_path / "purge_meta.json",
+            failure_file=tmp_path / "index_failure_idle_1.json",
             get_idle_seconds=lambda: 200.0,  # 임계(100) 초과 상태를 실시간으로 보고
         )
         worker.run()
@@ -692,6 +698,7 @@ class TestDrmIdleSkip:
         worker = CollectorWorker(
             config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
             purge_meta_file=tmp_path / "purge_meta.json",
+            failure_file=tmp_path / "index_failure_idle_2.json",
             get_idle_seconds=lambda: 5.0,  # 방금 활동함 → 스킵 안 함
         )
         worker.run()
@@ -737,6 +744,7 @@ class TestDrmIdleSkip:
         worker = CollectorWorker(
             config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
             purge_meta_file=tmp_path / "purge_meta.json",
+            failure_file=tmp_path / "index_failure_idle_3.json",
             get_idle_seconds=_idle,
         )
         worker.run()
@@ -769,6 +777,7 @@ class TestDrmIdleSkip:
         worker = CollectorWorker(
             config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
             purge_meta_file=tmp_path / "purge_meta.json",
+            failure_file=tmp_path / "index_failure_idle_4.json",
             get_idle_seconds=lambda: 99999.0,  # 아주 긴 유휴
         )
         worker.run()
@@ -981,6 +990,7 @@ class TestPurgeMetaIntegration:
         return CollectorWorker(
             config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
             purge_meta_file=meta_file,
+            failure_file=tmp_path / "index_failure_multi_2.json",
         )
 
     def test_first_cycle_runs_purge_no_prior_meta(self, tmp_path: Path):
@@ -1163,7 +1173,7 @@ class TestChangedDuringProcessing:
         extractor = self._ChangingReader(str(target))
         worker = CollectorWorker(
             config=config, indexer=indexer, extractor=extractor, state_file=state_file,
-            purge_meta_file=tmp_path / "purge_meta.json",
+            purge_meta_file=tmp_path / "purge_meta.json", failure_file=tmp_path / "index_failure.json",
         )
 
         worker.run()
@@ -1194,6 +1204,7 @@ class TestChangedDuringProcessing:
         worker1 = CollectorWorker(
             config=config, indexer=indexer, extractor=self._ChangingReader(str(target)),
             state_file=state_file, purge_meta_file=tmp_path / "purge_meta1.json",
+            failure_file=tmp_path / "index_failure1.json",
         )
         worker1.run()
         assert str(target) not in load_state(state_file)
@@ -1201,6 +1212,7 @@ class TestChangedDuringProcessing:
         worker2 = CollectorWorker(
             config=config, indexer=indexer, extractor=FakeReader(),
             state_file=state_file, purge_meta_file=tmp_path / "purge_meta2.json",
+            failure_file=tmp_path / "index_failure2.json",
         )
         worker2.run()
 
@@ -1212,6 +1224,217 @@ class TestChangedDuringProcessing:
         from knowmate.collector.scheduler import IndexTask
         task = IndexTask(priority=0, path="/x.txt", action="new")
         assert task.mtime == 0.0  # 기본값 확인 — 이 값이면 판정에서 제외돼야 함
+
+
+class TestFailureStateIntegration:
+    """3차(실패 원인 분류 및 기록) — CollectorWorker가 index_failure.json을 배선하는지.
+
+    이번 범위는 기록뿐이다 — 여기 기록된 값이 이번 사이클의 인덱싱 여부를
+    바꾸지 않는지도 함께 확인한다(파일이 실패해도 계속 큐에 남아 매 사이클
+    재시도된다 — 4차 전까지는 건너뛰는 로직이 없다)."""
+
+    class _AlwaysFailingReader:
+        def extract(self, path: str) -> str:
+            raise RuntimeError("추출 실패(시뮬레이션)")
+
+    def test_failure_recorded_and_state_json_untouched(self, tmp_path: Path):
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+        from knowmate.collector import failure_state
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        target = folder / "broken.xlsx"
+        target.write_bytes(b"fake xlsx content")
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        state_file = tmp_path / "state.json"
+        failure_file = tmp_path / "index_failure.json"
+        config = _make_config(str(folder))
+
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=self._AlwaysFailingReader(),
+            state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json",
+            failure_file=failure_file,
+        )
+        worker.run()
+
+        # index_state.json은 실패 파일로 오염되지 않는다(성공 상태와 분리 원칙)
+        assert str(target) not in load_state(state_file)
+
+        failures = failure_state.load_failures(failure_file)
+        assert str(target) in failures
+        assert failures[str(target)].consecutive_failures == 1
+        assert failures[str(target)].kind == failure_state.KIND_UNKNOWN_TRANSIENT
+
+    def test_consecutive_failures_accumulate_across_cycles(self, tmp_path: Path):
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+        from knowmate.collector import failure_state
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        target = folder / "broken.xlsx"
+        target.write_bytes(b"fake xlsx content")
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        state_file = tmp_path / "state.json"
+        failure_file = tmp_path / "index_failure.json"
+        config = _make_config(str(folder))
+
+        for _ in range(3):
+            worker = CollectorWorker(
+                config=config, indexer=indexer, extractor=self._AlwaysFailingReader(),
+                state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json",
+                failure_file=failure_file,
+            )
+            worker.run()
+
+        failures = failure_state.load_failures(failure_file)
+        assert failures[str(target)].consecutive_failures == 3
+
+    def test_success_after_failure_clears_record(self, tmp_path: Path):
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+        from knowmate.secure.fake_reader import FakeReader
+        from knowmate.collector import failure_state
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        target = folder / "flaky.txt"
+        target.write_bytes(b"content")
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        state_file = tmp_path / "state.json"
+        failure_file = tmp_path / "index_failure.json"
+        config = _make_config(str(folder))
+
+        worker1 = CollectorWorker(
+            config=config, indexer=indexer, extractor=self._AlwaysFailingReader(),
+            state_file=state_file, purge_meta_file=tmp_path / "purge_meta1.json",
+            failure_file=failure_file,
+        )
+        worker1.run()
+        assert str(target) in failure_state.load_failures(failure_file)
+
+        # 실패해도 state.json에 안 남았으므로 다음 사이클도 "신규"로 재시도된다
+        # (이번 범위엔 실패 기록에 따른 스킵 로직이 없다는 것도 함께 확인).
+        worker2 = CollectorWorker(
+            config=config, indexer=indexer, extractor=FakeReader(),
+            state_file=state_file, purge_meta_file=tmp_path / "purge_meta2.json",
+            failure_file=failure_file,
+        )
+        worker2.run()
+
+        assert str(target) not in failure_state.load_failures(failure_file)
+        assert str(target) in load_state(state_file)
+
+    def test_request_failure_retry_clears_all_records_on_next_cycle(self, tmp_path: Path):
+        """수동 재인덱싱(초기화 조건 4) — request_failure_retry() 호출 후 다음
+        run()이 기존 실패 기록을 모두 비운다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+        from knowmate.collector import failure_state
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        target = folder / "broken.xlsx"
+        target.write_bytes(b"fake xlsx content")
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        state_file = tmp_path / "state.json"
+        failure_file = tmp_path / "index_failure.json"
+        config = _make_config(str(folder))
+
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=self._AlwaysFailingReader(),
+            state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json",
+            failure_file=failure_file,
+        )
+        worker.run()
+        assert str(target) in failure_state.load_failures(failure_file)
+        # 계속 실패하는 파일이므로, 재시도 요청 없이 한 번 더 돌리면 연속 실패가 누적된다
+        worker.run()
+        assert failure_state.load_failures(failure_file)[str(target)].consecutive_failures == 2
+
+        worker.request_failure_retry()
+        worker.run()
+
+        # 재시도 요청 직후 사이클도 다시 실패하지만, 초기화됐다가 새로 1건만 기록되므로 1이어야 한다
+        assert failure_state.load_failures(failure_file)[str(target)].consecutive_failures == 1
+
+    def test_idle_cycle_does_not_clear_failure_records(self, tmp_path: Path):
+        """유휴 자동 사이클(request_failure_retry 미호출)은 실패 기록을 비우지
+        않는다 — 비우면 연속 실패 횟수가 영원히 1에 머물러 3차 기록이 무의미해진다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+        from knowmate.collector import failure_state
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        target = folder / "broken.xlsx"
+        target.write_bytes(b"fake xlsx content")
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        state_file = tmp_path / "state.json"
+        failure_file = tmp_path / "index_failure.json"
+        config = _make_config(str(folder))
+
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=self._AlwaysFailingReader(),
+            state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json",
+            failure_file=failure_file,
+        )
+        worker.run()
+        worker.run()  # request_failure_retry() 호출 없이 두 번째 사이클
+
+        assert failure_state.load_failures(failure_file)[str(target)].consecutive_failures == 2
+
+    def test_prune_removes_record_for_deleted_file(self, tmp_path: Path):
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+        from knowmate.secure.fake_reader import FakeReader
+        from knowmate.collector import failure_state
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        target = folder / "broken.xlsx"
+        target.write_bytes(b"fake xlsx content")
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        state_file = tmp_path / "state.json"
+        failure_file = tmp_path / "index_failure.json"
+        config = _make_config(str(folder))
+
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=self._AlwaysFailingReader(),
+            state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json",
+            failure_file=failure_file,
+        )
+        worker.run()
+        assert str(target) in failure_state.load_failures(failure_file)
+
+        target.unlink()  # 파일 자체가 사라짐 — 다음 사이클(빈 폴더 스캔)에 정리돼야 함
+        worker2 = CollectorWorker(
+            config=config, indexer=indexer, extractor=FakeReader(),
+            state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json",
+            failure_file=failure_file,
+        )
+        worker2.run()
+
+        assert str(target) not in failure_state.load_failures(failure_file)
 
 
 class TestMaxDeleteRatioFailClosed:
@@ -1248,6 +1471,7 @@ class TestMaxDeleteRatioFailClosed:
         worker = CollectorWorker(
             config=config, indexer=indexer, extractor=FakeReader(),
             state_file=tmp_path / "state.json", purge_meta_file=tmp_path / "purge_meta.json",
+            failure_file=tmp_path / "index_failure_multi_3.json",
         )
         alerts = []
         worker.indexing_needed.connect(alerts.append)
@@ -1838,6 +2062,30 @@ class TestComWatchdog:
         assert timers[0].cancelled
         timers[0].fire()  # 취소됐어야 하지만 강제로 콜백을 불러도
         assert term == []  # active=False라 무시
+
+    def test_disarm_returns_none_when_not_fired(self):
+        """3차: 정상 완료 시 disarm()은 어느 단계에서도 발화하지 않았음(None)을 반환한다."""
+        wd, timers, _ = self._make()
+        wd.arm("EXCEL.EXE", 300.0)
+        assert wd.disarm() is None
+
+    def test_disarm_returns_stage_when_fired_before_disarm(self):
+        """3차: 타임아웃으로 실제 발화한 뒤(finally에서) disarm()을 부르면 그 단계
+        이름을 반환해야 스케줄러가 파일 단위로 실패를 귀속시킬 수 있다."""
+        wd, timers, _ = self._make(stage_fn=lambda: ("open", "open(74.0s) C:/x.xlsx"))
+        wd.arm("EXCEL.EXE", 300.0)
+        timers[0].fire()
+        assert wd.disarm() == "open"
+
+    def test_disarm_after_next_arm_does_not_leak_old_fired_stage(self):
+        """3차: 파일1 타이머가 뒤늦게 발화해도, 파일2 처리 중의 disarm()에는
+        영향을 주면 안 된다(세대 불일치 — 오귀속 방지)."""
+        wd, timers, _ = self._make(stage_fn=lambda: ("open", "desc"))
+        wd.arm("EXCEL.EXE", 300.0)   # 파일1 (gen1)
+        wd.disarm()
+        wd.arm("WINWORD.EXE", 300.0)  # 파일2 (gen2)
+        timers[0].fire()  # 파일1의 지연 발화 — gen 불일치라 무시됨
+        assert wd.disarm() is None  # 파일2는 아직 안 발화했으므로 None
 
     def test_stale_generation_does_not_fire(self):
         """이전 파일의 타이머가 다음 파일 처리 중 발화해도 오사살하지 않는다."""

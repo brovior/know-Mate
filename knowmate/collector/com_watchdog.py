@@ -64,6 +64,10 @@ class ComWatchdog:
         self._timer = None
         self.timeout_count = 0  # 워치독이 실제로 프로세스를 종료한 횟수
         self.timeout_stages: list[str] = []  # 종료가 실제로 일어난 시점의 단계 **이름**(순서대로, 집계용)
+        # 가장 최근 arm()~disarm() 구간에서 발화했는지, 발화했다면 어느 단계였는지.
+        # disarm()이 파일 단위로 이 값을 소비해 반환한다(파일 단위 실패 귀속용).
+        self._fired_gen: int | None = None
+        self._fired_stage: str | None = None
 
     @staticmethod
     def _default_timer(interval, callback):
@@ -94,6 +98,8 @@ class ComWatchdog:
                 except Exception:
                     stage_name, stage_desc = "unknown", "단계 조회 실패"
                 self.timeout_stages.append(stage_name)
+                self._fired_gen = gen
+                self._fired_stage = stage_name
                 logger.warning(
                     "COM 추출 타임아웃 — %s 강제 해제(%d개 종료) [단계: %s]",
                     exe, killed, stage_desc,
@@ -102,11 +108,20 @@ class ComWatchdog:
             self._active = False
             return killed
 
-    def disarm(self) -> None:
-        """정상 완료 시 워치독을 해제한다."""
+    def disarm(self) -> str | None:
+        """정상 완료(또는 예외 처리) 시 워치독을 해제한다.
+
+        이번 arm() 세대에서 실제로 타이머가 발화해 프로세스를 종료했으면 그
+        시점의 단계 이름을 반환하고, 발화하지 않았으면(정상 처리 또는 아직
+        타임아웃 전) None을 반환한다 — 호출부(스케줄러)가 "이 파일이 워치독
+        타임아웃으로 실패했는지"를 판별하는 유일한 방법이다.
+        """
         with self._lock:
             self._active = False
             timer = self._timer
             self._timer = None
+            gen = self._gen
+            fired_stage = self._fired_stage if self._fired_gen == gen else None
         if timer is not None:
             timer.cancel()
+        return fired_stage
