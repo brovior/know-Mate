@@ -407,3 +407,328 @@ meta 저장: index_state.json 이 아니라 **별도 sidecar 파일**(index_stat
   별칭으로 명시(m-1)·성능 수용 기준을 "예시" 문구 없이 중앙값 ≤30MB·개별 ≤60MB로 확정하고
   Windows 릴리스 시험에서 `PeakWorkingSetSize` 병행 측정을 필수로 승격(m-2). 이 라운드로
   Blocker/Major/Minor 전건 처리 완료, Accepted 재확인
+
+---
+
+## A-0003: 실패 분류 정교화 — 원인축과 누적축의 분리  (상태: Draft / 대응 요구: R-0003)
+
+### 개요
+6단계 요청은 분류를 다음 8종으로 세분화하는 것이다.
+
+```
+OPEN_ERROR · OPEN_ERROR_REPEATED · OPEN_TIMEOUT · READ_TIMEOUT
+DRM_DENIED · PASSWORD_PROTECTED · SOURCE_CHANGED · NEEDS_USER_ACTION
+```
+
+이 설계는 요청의 **의도**(반복 Open 오류가 UNKNOWN_TRANSIENT에 머물지 않게)를 그대로 받되,
+목록을 그대로 `kind` enum에 넣지 않는다. 목록에 **서로 다른 두 축이 섞여 있고**, 한 축을 다른
+축의 값으로 표현하면 4차·#68에서 고친 버그가 재발하기 때문이다(§핵심 결정 1).
+
+### 컴포넌트와 책임
+| 컴포넌트 | 책임 | 변경 |
+|---|---|---|
+| `failure_state.classify()` | 예외 → (원인, HRESULT) | `failed_stage` 실제 사용 + 시그니처 판별 훅 |
+| `failure_state.escalation_state()` | 레코드+정책 → 3상태 판정 | **신설**(단일 진실원 — UI·백오프가 공유, 리뷰2 M-2) |
+| `failure_state.backoff_seconds()` | 원인+회차 → 대기 | `escalation_state()` 사용 |
+| `app/bridge.py` | 화면용 카드 변환 | `escalation_state()` 사용 + 배지 매핑 추가 |
+| ~~`secure/signature.py`~~ | ~~컨테이너 판별~~ | **6b로 이연**(리뷰2 B-2·M-3) |
+
+### 데이터 흐름 — **6a (구현 계약)**
+```
+COM 실패
+  ├─ 워치독 발화?  ─예→ stage로 OPEN_TIMEOUT / READ_TIMEOUT        (기존)
+  └─ 아니오
+       ├─ OfficeBusyError · busy HRESULT → TEMPORARY_BUSY           (기존)
+       ├─ UnreadableFormatError          → NEEDS_USER_ACTION        (기존)
+       └─ failed_stage 사용                                          (신규 — 기존엔 무시됨)
+            ├─ open/dispatch → OPEN_ERROR
+            ├─ sheets/cell_read/read → READ_ERROR
+            └─ 단계 불명 → UNKNOWN_TRANSIENT                         (폴백 유지)
+
+기록 시점: note_failure(...)가 (kind, normalized_stage) 기준으로 consecutive_failures 누적
+표시·정책 시점: escalation = consecutive_failures >= 임계  (kind와 독립)
+```
+
+라우팅 전제(1차 리뷰 M-3 — 코드 확인 완료): `.xlsx`가 zip이 아니면 `secure/__init__.py:77`이
+COM으로 폴백한다. 암호 문서는 COM Open이 더미 암호로 즉시 실패하며 그 예외가 `classify()`에
+도달한다. 오라벨은 같은 경로로 들어가지만 **성공**하므로 분류 대상이 아니다.
+
+**6a에서 이 파일들은 `OPEN_ERROR`로 기록되고 승격 경로를 탄다** — 원인을 세분하지 못해도
+"반복 실패 중이니 확인 필요"는 사용자에게 전달된다. 원인 세분(암호/DRM)은 6b의 몫이다.
+
+### 데이터 흐름 — 6b (후속 개념안, **구현 계약 아님**)
+
+*아래는 6b 설계에서 확정할 방향의 스케치다. 이번 구현 대상이 아니며, 착수 전제조건은
+위 §범위 분할을 따른다.*
+
+```
+OOXML 확장자 + COM 실패 (6a에서 OPEN_ERROR로 기록된 것 중)
+  └─ 컨테이너 판별 (bounded traversal, 시간 예산 포함)
+       ├─ CFB에 EncryptedPackage + EncryptionInfo → PASSWORD_PROTECTED  (양성 증거)
+       ├─ 위 스트림 없는 OLE2                      → 오라벨 → OPEN_ERROR 유지
+       ├─ ZIP도 OLE2도 아님                        → UNRECOGNIZED_CONTAINER
+       └─ 예산 초과·판별 불가                       → OPEN_ERROR 유지(6a 결과)
+```
+
+### 범위 분할 — 6a(이번) / 6b(후속)  *(2차 리뷰 B-2·M-3 반영)*
+
+2차 리뷰에서 컨테이너 판별의 실제 비용이 초안 추정보다 훨씬 크다는 것이 드러났다. 이에 따라
+**컨테이너 판별을 6b로 분리하고, 6a는 판별 없이 완결되도록** 범위를 나눈다.
+
+| | 6a (이번 구현 대상) | 6b (후속, 별도 설계) |
+|---|---|---|
+| 내용 | `failed_stage` 활용(OPEN_ERROR/READ_ERROR) · 승격 상태기계 · 연속성 키 · config | `PASSWORD_PROTECTED` · `DRM_DENIED` |
+| 신규 I/O | **없음** | CFB bounded traversal |
+| 신규 의존성 | 없음 | CFB 파서(vendoring 또는 고정 의존성) |
+| 행오버 위험 | **없음** | 있음(M-3) |
+| 분류 | 위 4종 + 기존 유지 | 위 2종 추가 |
+
+분할 근거:
+1. **원래 요청의 핵심은 6a로 완결된다.** "반복 Open 오류가 UNKNOWN_TRANSIENT에 머물지 않게"는
+   `failed_stage` 활용 + 승격만으로 달성되며, 둘 다 순수 파이썬에 신규 I/O가 0이다.
+2. **B-2**: CFB 디렉터리는 FAT 체인이라 첫 섹터만으로 부족하고, 섹터 크기도 512B 고정이 아니다
+   (헤더 오프셋 `0x1E`의 sector shift). DIFAT·순환 체인·절단 입력까지 다루면 "30줄"이 아니다.
+   초안의 비용 추정이 틀렸다.
+3. **M-3**: 판별 I/O는 COM 워치독이 이미 해제된 뒤에 일어난다. SMB·DRM 드라이브에서 `open`/
+   `read`가 블록되면 **수집기 QThread에 새 행오버 경로**가 생긴다. 바이트 수 상한은 시간
+   상한을 보장하지 않는다 — 이 프로젝트가 COM 워치독을 따로 둔 이유와 같은 위험이다.
+4. 6a를 먼저 배포하면 실측 `last_error_code` 분포가 쌓여, 6b에서 어떤 분류가 실제로 필요한지
+   근거를 갖고 정할 수 있다(3차 주석의 "실측 로그가 쌓이면 그걸 보고 분류를 넓히는 게 순서다"와 동일).
+
+6b 착수 전제조건(설계에 명시):
+- 검증된 CFB 파서 확보(vendoring 또는 폐쇄망 미러 확인) — 직접 구현 시 sector shift·FAT/DIFAT·
+  디렉터리 체인·순환/범위초과 sector ID·크기 검증을 포함한 bounded traversal 명세 필수
+- 픽스처: 첫 섹터 밖 스트림 배치, 4096B 섹터, 순환·절단 체인
+- 판별 I/O의 시간 예산·행오버 대응 정책(M-3 대안 1~4 중 택일)
+- 예산 내 판별 불가 시 `UNRECOGNIZED_CONTAINER`로 떨어뜨리고 AC 보장 범위도 동일하게 한정
+- 워치독 발화 시에도 판별을 수행할지(분류 우선순위) 확정 — 2차 리뷰 M-1
+
+### 핵심 결정과 트레이드오프
+
+**1. `OPEN_ERROR_REPEATED`를 `kind` 값으로 만들지 않는다 (가장 중요).**
+
+`note_failure()`는 **분류가 달라지면 `consecutive_failures`를 1로 리셋**한다(4차 결정 —
+TEMPORARY_BUSY가 여러 번 쌓인 뒤 우연히 타임아웃 1번 나면 곧장 긴 백오프로 튀는 것을 막기 위해).
+
+여기에 `OPEN_ERROR → OPEN_ERROR_REPEATED` 전이를 넣으면:
+
+| 회차 | kind | consecutive | 결과 |
+|---|---|---|---|
+| 1 | OPEN_ERROR | 1 | 30분 |
+| 2 | OPEN_ERROR | 2 | 6시간 |
+| 3 | OPEN_ERROR**_REPEATED** | **1로 리셋** | **30분** ← 승격했는데 백오프가 후퇴 |
+
+승격시키려던 파일이 오히려 더 자주 재시도된다. #68에서 고친 "이력 손실로 백오프가 처음 칸으로
+되돌아가는" 버그와 **정확히 같은 형태**다. 회피하려면 `note_failure`에 "이 두 kind는 같은
+계열이니 리셋하지 말라"는 예외를 넣어야 하는데, 그건 kind가 사실은 원인축이 아님을 자백하는 것이다.
+
+→ **채택**: `kind`는 원인만 표현. "반복됨"은 `consecutive_failures`에서 파생한다.
+`OPEN_ERROR_REPEATED`가 필요한 곳(화면 배지·로그)에서는 `kind=OPEN_ERROR ∧ consecutive>=2`로
+동일한 정보를 얻는다. 저장 필드가 늘지 않고, 리셋 규칙에 예외가 생기지 않는다.
+
+트레이드오프: 요청받은 이름이 enum에 그대로 나타나지 않는다. 화면 표시 문자열로는 그대로 쓴다.
+
+**2. `TEMPORARY_BUSY`와 `UNKNOWN_TRANSIENT`를 목록에서 빼지 않는다.**
+
+요청 목록엔 둘 다 없지만 제거하면 회귀다.
+- `TEMPORARY_BUSY`: "다른 사람이 열어둠"은 5~10분이면 자체 해소된다. OPEN_ERROR(30분~)로
+  합치면 사용자가 파일을 닫아도 최대 30분을 기다린다.
+- `UNKNOWN_TRANSIENT`: COM 실패 양상을 전부 열거할 수 없다. 폴백 버킷이 없으면 미매핑 오류가
+  갈 곳을 잃는다. 3차 설계 주석의 "확실한 것만 분류하고 나머지는 UNKNOWN으로" 원칙을 유지한다.
+
+**3. 암호는 컨테이너 내부의 양성 증거로만 판별한다. DRM은 음성 증거로 확정하지 않는다.**
+*(초안 전면 수정 — 리뷰 B-1 수용)*
+
+초안은 "OOXML 확장자인데 OLE2면 `PASSWORD_PROTECTED`"라는 8바이트 규칙을 제안했다. **이 규칙은
+틀렸다.** 이 저장소가 이미 알고 있는 반례가 있다 — `signature.py` 모듈 docstring:
+
+> 확장자가 OOXML(.docx/.xlsx/.pptx)이라도 실제 내용이 구형 OLE2 바이너리인 **오라벨** 파일을
+> 가려내기 위함
+
+오라벨 파일은 정확히 "OOXML 확장자 + OLE2 내용"이면서 **COM으로 정상적으로 열리는** 파일이다
+(`secure/__init__.py:77`이 이 경우를 COM으로 라우팅하는 이유가 바로 그것이다). 8바이트 규칙은
+오라벨 전부를 암호 문서로 오분류한다. 마찬가지로 "ZIP도 OLE2도 아님"은 DRM의 **양성 증거가
+아니라 단순 미식별**이며, 손상·전송 중단된 부분 파일도 같은 곳에 떨어진다. 기존
+`_is_drm_suspected()`가 이름에 "suspected"를 붙여 둔 것이 정확한 신중함이었는데, 초안은 그걸
+단정형 `DRM_DENIED`로 승격시켰다.
+
+수정안:
+
+| 조건 | 판정 | 증거 성격 |
+|---|---|---|
+| CFB 디렉터리에 `EncryptedPackage` **및** `EncryptionInfo` 스트림 존재 | `PASSWORD_PROTECTED` | **양성** |
+| OOXML 확장자 + OLE2인데 위 스트림 없음 | 오라벨 등 → 원인축 그대로(OPEN_ERROR 등) | — |
+| ZIP도 OLE2도 아님 | `UNRECOGNIZED_CONTAINER` | 미식별(DRM 확정 아님) |
+| 지원 DRM의 고유 매직 확인됨 | `DRM_DENIED` | **양성** (매직 확보 전까지 보류) |
+
+> **구현은 6b로 이연됨** *(2차 리뷰 B-2 수용)*. 초안은 "CFB 헤더의 첫 디렉터리 섹터를 읽어
+> 두 스트림 확인, 30줄이면 충분"이라고 적었으나 **이 비용 추정이 틀렸다.** CFB 디렉터리는
+> FAT 체인으로 이어져 첫 섹터 밖에 엔트리가 놓일 수 있고, 섹터 크기도 512B 고정이 아니다
+> (헤더 `0x1E`의 sector shift — 4096B 변형 존재). 첫 섹터만 보면 **정상적인 암호 문서를
+> 놓친다**(AC-4 미충족). 올바른 구현은 DIFAT·순환 체인·절단 입력까지 다뤄야 하며, 그 자체로
+> 별도 설계와 픽스처가 필요하다. 위 §범위 분할의 6b 전제조건 참고.
+
+**`DRM_DENIED`는 이번 범위에서 보류한다.** 실제 지원 대상 DRM(나스카 등)의 안정적인 고유
+시그니처 샘플을 확보하기 전에는 부여할 근거가 없다. 확보 전까지는
+`UNRECOGNIZED_CONTAINER`로 기록하고, 승격 경로를 통해 사용자에게 노출한다.
+
+한계(유지): 구형 `.xls`/`.doc`의 암호는 OLE2 내부 FilePass 레코드라 이 방식으로도 구분되지
+않는다. OPEN_ERROR → 승격 경로를 탄다. 무리한 추측보다 정직한 미분류가 낫다.
+
+**4. 실패 연속성 키를 `(kind, normalized_stage)`로 정의한다.** *(리뷰 M-2 수용)*
+
+`OPEN_ERROR`는 여러 HRESULT를 하나로 묶으므로, `consecutive_failures` 누적 기준을 명시하지
+않으면 두 방향 모두 오동작한다 — `kind`만 비교하면 서로 다른 Open 오류가 번갈아 나도 같은
+원인으로 승격되고, HRESULT까지 엄격히 비교하면 같은 장애의 코드 변동으로 카운터가 계속
+초기화된다.
+
+→ 연속성 키 = `(kind, normalized_stage)`. `normalized_stage`는 `dispatch|open` → `open`,
+`sheets|cell_read|read` → `read`로 정규화한 값. **HRESULT(`last_error_code`)는 진단 정보로만
+보존하고 연속성 판정에 쓰지 않는다.** 특정 HRESULT군을 분리해야 할 근거가 실측으로 생기면
+그때 정규화 테이블을 명시적으로 추가한다(회귀 테스트 동반).
+
+**5. 승격 정책표 (확정 — 사용자 결정 B).** *(1차 M-1 / 3차 M-3 종결)*
+
+사용자 결정: **"3회 이상 → 사용자 조치 필요"는 대기 시간까지 의미한다(안 B).** 원 요청 문언
+그대로이며, 기존 사다리의 24시간 칸은 **의도적으로 제거**한다.
+
+| 연속 실패 | 대기(백오프) | UI 상태 | 배지 |
+|---|---|---|---|
+| 1회 | 30분 | 일반 | 원인명 |
+| 2회 | 6시간 | **반복 중** | 원인명 + "반복" |
+| 3회 이상 | **7일**(안전밸브 상한) | **사용자 조치 필요** | "조치 필요" |
+
+- 3회차에 대기가 24시간 → 7일로 바뀐다. 기존 4차 사다리 대비 **동작 변경**이며 의도된 것이다.
+- 7일은 `needs_user_action_max_sec` 재사용 — 영구 무시 없음(FR-4), 경과 후 1회 재시도.
+- 파일 변경·수동 재시도는 회차와 무관하게 즉시 반영(기존 동작). 7일을 기다릴 필요 없이
+  [확인 필요한 문서] 화면의 「지금 다시 시도」로 즉시 재시도 가능하다(5차 기능).
+
+임계값 2·3은 전부 config화한다(`escalation_repeat_at`, `escalation_action_at`).
+
+**예외: `TEMPORARY_BUSY`는 이 사다리를 타지 않는다.** *(3차 리뷰 M-2 수용)*
+
+3차 리뷰가 §2와 §5의 모순을 짚었다 — §2는 "`TEMPORARY_BUSY`를 OPEN_ERROR에 합치면 사용자가
+파일을 닫아도 최대 30분 대기하는 회귀"라고 했는데, §5 표를 원인 구분 없이 적용하면 파일을
+3번 연속 열어둔 사용자의 파일이 **7일 대기로 넘어간다**. 내가 회귀라고 지목한 상황보다
+336배 나쁘다.
+
+→ **백오프는 원인별 정책을 우선한다:**
+
+| 원인 | 대기 정책 |
+|---|---|
+| `TEMPORARY_BUSY` | **항상 5~10분**(기존 유지, 회차 무관) — 사용자가 파일을 닫으면 곧 해소 |
+| `FILE_CHANGED` | 항상 즉시(기존 유지) |
+| `NEEDS_USER_ACTION` | 항상 7일(기존 유지) |
+| `OPEN_ERROR`·`READ_ERROR`·`UNKNOWN_TRANSIENT` | 위 §5 사다리 적용 |
+
+→ **UI 상태(`escalation_state`)는 모든 원인에 공통 적용한다.** 파일을 일주일째 열어둔
+사용자에게 "이 문서가 계속 사용 중입니다 — 닫아주세요"를 보여주는 것은 유용하다. 즉
+`TEMPORARY_BUSY`도 3회차부터 "조치 필요"로 **표시되지만 대기는 5~10분을 유지**한다.
+
+이것이 §1의 "원인축과 누적축 분리"가 실제로 작동하는 방식이다 — 누적축은 **표시**를,
+원인축은 **대기**를 지배한다.
+
+**상태 판정은 단일 순수 함수로만 한다** *(2차 리뷰 M-2 수용)*. 초안의 컴포넌트 표는
+`FailureRecord.escalated`(bool) 하나를 적었는데, 위 표는 `일반`/`반복 중`/`사용자 조치 필요`
+**3상태**라 bool로 표현되지 않는다. UI(`bridge.py`)와 백오프(`backoff_seconds()`)가 각각
+`consecutive_failures`와 임계값을 해석하면 같은 레코드를 서로 다르게 판정할 수 있다.
+
+```python
+def escalation_state(rec, policy) -> str:   # NORMAL | REPEATED | NEEDS_ACTION
+```
+
+`failure_state`에 이 함수 하나를 두고 UI·백오프가 **모두 이것만** 호출한다. config 교차 검증
+(`0 < repeat_at < action_at`, 정수, bool 제외)도 이 모듈에서 하며, 위반 시 기본값 폴백
+(4차 `BackoffPolicy.from_config` 관례).
+
+**6. `FILE_CHANGED` 이름을 유지한다(확정). 개명하지 않는다.** *(리뷰 m-1 수용 — 권고를 결정으로)*
+
+`load_failures()`는 `kind not in _ALL_KINDS`인 항목을 **조용히 버린다.** `SOURCE_CHANGED`로
+개명하면 기존 기록이 전부 폐기되고, 다른 원인의 유효한 누적 이력까지 함께 사라진다. 개명 실익이
+없으므로 **`FILE_CHANGED` 유지로 확정**한다. 하위호환을 위해 `load_failures()`에서
+`SOURCE_CHANGED` → `FILE_CHANGED` 별칭 매핑만 둔다(외부에서 손으로 편집한 파일 대비).
+
+분류 체계 변경은 `READ_STRATEGY_VERSION`이 아니라 **`SCHEMA_VERSION`**(이미 존재, 현재 1)을
+쓴다. 리뷰 지적대로 추출 전략 변경과 분류 스키마 변경은 별개 축이며, 전자에 후자를 얹으면
+분류만 바뀌어도 멀쩡한 추출 이력이 폐기된다.
+
+**7. 승격 후에도 안전밸브를 유지한다.**
+
+"3회 이상 → 사용자 조치 필요"를 문자 그대로 "재시도 중단"으로 구현하면 4차 완료 기준(영구
+무시 없음)을 깬다. 그 기준은 세이프모드 루프 사건 — 우리가 만든 일시적 상태 때문에 멀쩡한
+파일이 영구히 안 읽히던 사고 — 에서 나왔다. 승격 상태의 대기는 `needs_user_action_max_sec`
+(기본 7일)을 상한으로 재사용한다.
+
+### 실패 모드
+**6a 경로만** — 신규 파일 I/O가 없으므로 I/O 관련 실패 모드는 이 범위에 존재하지 않는다.
+
+| 상황 | 동작 | 근거 |
+|---|---|---|
+| `failed_stage`가 `None`(단계 미기록) | `UNKNOWN_TRANSIENT` 폴백 유지 | 기존 동작 — 폴백 버킷을 없애지 않는다(§2) |
+| `failed_stage`가 미등록 문자열(신규 단계 추가 시) | `UNKNOWN_TRANSIENT` 폴백 | 정규화 테이블에 없는 값을 추측하지 않는다 |
+| 승격 임계 config가 비정상값(`repeat_at >= action_at`·0·음수·bool) | 기본값 폴백 + WARNING | 4차 `BackoffPolicy.from_config` 관례(fail-open) — 잘못된 설정의 결과는 "예상보다 자주 재시도"여야지 "영구히 재시도 안 함"이면 안 된다 |
+| 구 kind 값이 든 기존 기록 로드 | **해당 항목만** 폐기(기존 동작) | 파일 전체를 버리지 않는다 — 다른 원인의 유효한 누적 이력 보존 |
+| `SOURCE_CHANGED` 별칭이 든 기록(수동 편집 등) | `FILE_CHANGED`로 매핑 | §6 — 폐기 대신 정규화 |
+| 승격된 파일이 다음 시도에서 성공 | 기록 삭제(`note_success`) | 승격은 재시도 시점 조정이지 차단이 아님 |
+
+*(6b의 실패 모드 — 시그니처 읽기 실패·CFB 절단/순환 체인·판별 I/O 행오버 — 는 6b 설계에서
+다룬다. 6a에는 해당 경로가 없다.)*
+
+### 검증 계획
+- `classify()` 단위: 워치독 미발화 + `failed_stage="open"` → OPEN_ERROR (AC-1)
+- 승격 전이: 동일 `(kind, stage)` 3회 실패 후 `consecutive_failures`가 3 유지 (AC-3 — #68 회귀 방어)
+- 연속성 키(M-2): 같은 kind·같은 stage인데 HRESULT만 다른 실패가 **누적**됨 / stage가 다르면 리셋됨
+- **상태 판정 단일화(리뷰2 M-2)**: `escalation_state()`가 임계 경계값(1/2/3/4회)에서 정확히
+  NORMAL/REPEATED/NEEDS_ACTION을 반환하고, `bridge`와 `backoff_seconds`가 **같은 레코드에
+  대해 같은 상태**를 보고하는지 교차 검증
+- config 교차 검증: `repeat_at >= action_at`, 0·음수·bool 입력 시 기본값 폴백
+- *(암호/DRM 판별 테스트는 6b 범위 — 이번 구현 대상 아님)*
+- **통합 경로(M-3)**: `파일 → AutoReader 라우팅 → COM 실패 주입 → classify → note_failure →
+  sidecar` 를 끝까지 통과시켜 최종 `FailureRecord.kind` 검증 (AC-7). 라우팅 함수는 실제로
+  실행하고 COM 실패만 주입한다 — `classify()` 단위 테스트만으로는 라우팅 회귀를 못 잡는다.
+- **UI 변환(1차 m-2)**: `bridge.getFailures()`가 `consecutive < 임계` / `>= 임계`를 각각 다른
+  배지·문구로 변환하는지, **6a에서 실제 생성되는 원인**(`OPEN_ERROR`·`READ_ERROR`·
+  `TEMPORARY_BUSY`·`UNKNOWN_TRANSIENT`)의 **원인 표시와 "조치 필요" 상태가 동시에 보존**되는지 (AC-2)
+- **원인별 백오프 우선(3차 M-2)**: `TEMPORARY_BUSY`가 3회 이상 실패해도 대기는 **5~10분을
+  유지**하면서 UI 상태만 NEEDS_ACTION으로 승격되는지 — §5 예외표 회귀 방어
+- **B안 정책값(3차 M-3)**: 3회차 대기가 24시간이 아니라 **7일**인지(사용자 결정 B 고정)
+- 안전밸브: 승격 상태 + 7일 경과 → `should_defer` False (AC-5)
+- 하위호환: 구 kind 값·`SOURCE_CHANGED` 별칭이 든 JSON 로드 시 예외 없음 (AC-6)
+- 원칙7 회귀 테스트 유지(예외 메시지 비저장)
+
+### 남은 확인 사항
+1. ~~**승격 해석 확정(사용자)**~~ — **종결(2026-07-28)**: 사용자 결정 **안 B** — 3회차부터
+   대기 시간 자체를 7일로. §5 정책표 확정 완료.
+2. ~~**R-0001 제약과 A-0001 계약의 모순**~~ — **종결(2026-07-28)**: 사용자 승인 후 PR #71로
+   제약 문언을 "호출 방식 호환 유지(반환값 추가는 허용)"로 정정, 머지 완료. (원 기록) 2차 리뷰 B-1. R-0001 제약은
+   "기존 `stop_worker` 인터페이스 불변"인데 A-0001은 "반환값 계약이 변경됨(리뷰15 B-1)"이라고
+   명시한다. 문서로 확인한 결과 **실재하는 모순이 맞다.** 다만 ① 6단계와 무관한 기존 Accepted
+   문서이고 ② R-0001은 Approved라 제약 문언 수정에 사람 승인이 필요하므로, 이 PR에서 임의로
+   고치지 않는다. 제안: R-0001 제약을 "기존 **호출 방식** 호환 유지(반환값 추가는 허용)"로
+   수정 — bool 반환은 리뷰15 B-1로 이미 승인·구현된 변경이고 호출부가 무시해도 동작하므로,
+   제약 문언 쪽이 stale하다. 별도 PR로 처리 권고.
+3. **DRM 고유 시그니처 샘플 미확보** — 확보 전까지 `DRM_DENIED` 부여를 보류(1차 리뷰 B-1
+   대안 2). 6b 착수 전제조건에 포함.
+4. **`IFR_PM_0066.xlsx`의 HRESULT·failed_stage** — 전용 분류 추가 판단용 운영 근거로는
+   가치가 있으나 6a의 선행 조건은 아니다(양차 리뷰 모두 동일 판단).
+5. **`SCHEMA_VERSION` 증가 시 동작 명세**(2차 리뷰 확인 필요) — 항목별 변환이 아니라
+   **알려진 kind는 보존, 미등록 kind만 항목 단위 폐기**로 한다(기존 `load_failures` 동작 유지).
+   파일 전체 폐기는 하지 않는다 — 다른 원인의 유효한 누적 이력까지 잃기 때문. 6a 구현 시
+   테스트로 고정한다(AC-6).
+6. **R-0003이 Draft인 채 A-0003을 진행한 것** — 의도적이다. 요구 탐색과 설계를 같은 PR에서
+   돌려 리뷰를 한 번에 받되, **구현은 사람 승인 후** 착수한다.
+
+### 리뷰 이력
+- 2026-07-28 GPT 독립 리뷰 1차(채널 B, gpt-5.6-sol) — **REQUEST_CHANGES**.
+  B-1(Blocker) 전면 수용해 §3 재작성, M-1·M-2·M-3·m-1·m-2 전건 수용.
+  처리 기록: `reviews/REVIEW-20260728-architecture-requirements.md`
+- 2026-07-28 GPT 독립 리뷰 3차 — **REQUEST_CHANGES**. M-2(TEMPORARY_BUSY ↔ 승격 사다리 모순)를
+  수용해 §5에 원인별 백오프 우선 예외표 추가. M-1·m-1 수용해 데이터 흐름·실패 모드·검증
+  계획을 6a 전용으로 재작성하고 6b는 "구현 계약 아님" 절로 분리. M-3은 **사용자 결정(안 B)**
+  으로 종결 — 3회차부터 대기 7일. B-1(R-0001 모순)은 별도 PR #71로 해소·머지 완료.
+  처리 기록: `reviews/REVIEW-20260728-architecture-requirements-3.md`
+- 2026-07-28 GPT 독립 리뷰 2차 — **REQUEST_CHANGES**. B-2(CFB 첫 섹터 한계)·M-3(판별 I/O
+  행오버)을 수용해 **컨테이너 판별을 6b로 분리**하고 6a를 신규 I/O 0으로 확정. M-2 수용해
+  `escalation_state()` 단일 함수 도입. B-1(R-0001↔A-0001 모순)은 실재 확인했으나 별건으로
+  분리(위 남은 확인 사항 2번). N-1 수정.
+  처리 기록: `reviews/REVIEW-20260728-architecture-requirements-2.md`
