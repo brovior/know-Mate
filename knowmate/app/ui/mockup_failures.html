@@ -258,6 +258,14 @@ body {
 </head>
 <body>
 
+<p class="mock-note" style="margin-bottom:20px;">
+  <b>이 파일은 설계 시안입니다.</b> 실제 화면은 <code>index.html</code> ·
+  <code>app.js</code> · <code>styles.css</code>에 구현돼 있으며, 동작·문구가
+  다를 경우 <b>구현 쪽이 정본</b>입니다. 시안 이후 바뀐 점:
+  ① 「기록 초기화」 버튼 삭제(「지금 다시 시도」와 결과가 같고 실패 이력만 잃어서),
+  ② 사이드바 진입점 건수에서 제외된 파일은 제외(이미 조치가 끝난 항목이라).
+</p>
+
 <div class="mock-label">1. 메인 화면 — 「확인 필요한 문서」 오버레이</div>
 
 <div class="frame">
@@ -361,7 +369,7 @@ body {
             <span><span class="k">단계</span> 파일 열기</span>
             <span><span class="k">실패</span> 7회</span>
             <span><span class="k">마지막</span> 오늘 09:12</span>
-            <span class="k">다음 재시도</span><span class="next none">자동 재시도 안 함</span>
+            <span class="k">다음 재시도</span><span class="next">7일 후 재확인</span>
           </div>
           <div class="f-actions">
             <button class="f-btn primary">⟳ 지금 다시 시도</button>
@@ -380,7 +388,7 @@ body {
             <span><span class="k">단계</span> 파일 열기</span>
             <span><span class="k">실패</span> 4회</span>
             <span><span class="k">마지막</span> 어제 17:40</span>
-            <span class="k">다음 재시도</span><span class="next none">자동 재시도 안 함</span>
+            <span class="k">다음 재시도</span><span class="next">7일 후 재확인</span>
           </div>
           <div class="f-actions">
             <button class="f-btn primary">⟳ 지금 다시 시도</button>
