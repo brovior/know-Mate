@@ -439,16 +439,26 @@ COM 실패
   ├─ 워치독 발화?  ─예→ stage로 OPEN_TIMEOUT / READ_TIMEOUT        (기존)
   └─ 아니오
        ├─ OfficeBusyError · busy HRESULT → TEMPORARY_BUSY           (기존)
-       ├─ 시그니처 판별(1회, 수 바이트)
-       │    ├─ 확장자 OOXML인데 OLE2       → PASSWORD_PROTECTED     (신규)
-       │    └─ OOXML도 OLE2도 아님          → DRM_DENIED             (신규)
+       ├─ 컨테이너 판별 (실패한 파일에 한해 1회, 상한 64KB)
+       │    ├─ CFB에 EncryptedPackage+EncryptionInfo → PASSWORD_PROTECTED  (신규·양성증거)
+       │    ├─ OOXML 확장자 + OLE2인데 위 스트림 없음 → 오라벨 → 아래 단계축으로
+       │    └─ ZIP도 OLE2도 아님            → UNRECOGNIZED_CONTAINER (신규·미식별)
        └─ failed_stage 사용                                          (신규 — 기존엔 무시됨)
             ├─ open/dispatch → OPEN_ERROR
             ├─ sheets/cell_read/read → READ_ERROR
             └─ 단계 불명 → UNKNOWN_TRANSIENT                         (폴백 유지)
 
-기록 시점: note_failure(...)가 consecutive_failures 누적
+기록 시점: note_failure(...)가 (kind, normalized_stage) 기준으로 consecutive_failures 누적
 표시·정책 시점: escalation = consecutive_failures >= 임계  (kind와 독립)
+```
+
+라우팅 전제(리뷰 M-3 — 코드 확인 완료): `.xlsx`가 zip이 아니면 `secure/__init__.py:77`이
+COM으로 폴백한다. 암호 문서는 COM Open이 더미 암호로 즉시 실패하며 그 예외가 `classify()`에
+도달한다. 오라벨은 같은 경로로 들어가지만 **성공**하므로 분류 대상이 아니다 — 즉 분류가
+실제로 보는 모집단은 "OOXML 확장자 + 비ZIP + COM 실패"이고, 그 안에서 암호와 그 외를 가르는
+것이 §3의 양성 증거 판별이다.
+
+```
 ```
 
 ### 핵심 결정과 트레이드오프
@@ -484,35 +494,90 @@ TEMPORARY_BUSY가 여러 번 쌓인 뒤 우연히 타임아웃 1번 나면 곧�
 - `UNKNOWN_TRANSIENT`: COM 실패 양상을 전부 열거할 수 없다. 폴백 버킷이 없으면 미매핑 오류가
   갈 곳을 잃는다. 3차 설계 주석의 "확실한 것만 분류하고 나머지는 UNKNOWN으로" 원칙을 유지한다.
 
-**3. 암호/DRM은 HRESULT가 아니라 파일 시그니처로 판별한다.**
+**3. 암호는 컨테이너 내부의 양성 증거로만 판별한다. DRM은 음성 증거로 확정하지 않는다.**
+*(초안 전면 수정 — 리뷰 B-1 수용)*
 
-3차 주석은 "COM 오류 코드만으로 암호/손상 구분 불가"라고 결론지었다(더미 암호를 넘겨 즉시
-실패시키므로 일반 COM 오류와 코드가 같음). 이 제약은 유효하다 — 그래서 **COM을 쓰지 않는**
-근거를 쓴다.
+초안은 "OOXML 확장자인데 OLE2면 `PASSWORD_PROTECTED`"라는 8바이트 규칙을 제안했다. **이 규칙은
+틀렸다.** 이 저장소가 이미 알고 있는 반례가 있다 — `signature.py` 모듈 docstring:
 
-ECMA-376 암호화 문서는 확장자가 `.xlsx`여도 내용은 **OLE2/CFB 컨테이너**이고 그 안에
-`EncryptedPackage` 스트림이 있다. 즉 매직 8바이트만으로:
+> 확장자가 OOXML(.docx/.xlsx/.pptx)이라도 실제 내용이 구형 OLE2 바이너리인 **오라벨** 파일을
+> 가려내기 위함
 
-| 확장자 | 실제 시그니처 | 판정 |
+오라벨 파일은 정확히 "OOXML 확장자 + OLE2 내용"이면서 **COM으로 정상적으로 열리는** 파일이다
+(`secure/__init__.py:77`이 이 경우를 COM으로 라우팅하는 이유가 바로 그것이다). 8바이트 규칙은
+오라벨 전부를 암호 문서로 오분류한다. 마찬가지로 "ZIP도 OLE2도 아님"은 DRM의 **양성 증거가
+아니라 단순 미식별**이며, 손상·전송 중단된 부분 파일도 같은 곳에 떨어진다. 기존
+`_is_drm_suspected()`가 이름에 "suspected"를 붙여 둔 것이 정확한 신중함이었는데, 초안은 그걸
+단정형 `DRM_DENIED`로 승격시켰다.
+
+수정안:
+
+| 조건 | 판정 | 증거 성격 |
 |---|---|---|
-| .xlsx/.docx/.pptx | ZIP(`PK\x03\x04`) | 정상 |
-| .xlsx/.docx/.pptx | **OLE2** | **PASSWORD_PROTECTED** |
-| .xlsx/.docx/.pptx | 둘 다 아님 | **DRM_DENIED** |
+| CFB 디렉터리에 `EncryptedPackage` **및** `EncryptionInfo` 스트림 존재 | `PASSWORD_PROTECTED` | **양성** |
+| OOXML 확장자 + OLE2인데 위 스트림 없음 | 오라벨 등 → 원인축 그대로(OPEN_ERROR 등) | — |
+| ZIP도 OLE2도 아님 | `UNRECOGNIZED_CONTAINER` | 미식별(DRM 확정 아님) |
+| 지원 DRM의 고유 매직 확인됨 | `DRM_DENIED` | **양성** (매직 확보 전까지 보류) |
 
-`signature.py`에 `is_ole2`/`is_zip`이 이미 있어 `is_encrypted_ooxml()` 한 함수만 추가하면 된다.
-COM 왕복 0회, 파일 앞 8바이트만 읽는다(NFR-1 충족).
+구현: CFB 헤더(512B)의 오프셋 `0x30`에서 첫 디렉터리 섹터를 읽고, 디렉터리 엔트리 이름
+(UTF-16LE, 엔트리당 128B)에서 두 스트림을 확인한다. 상한 64KB 읽기로 끝나며 COM 왕복은 0회다.
+`olefile` 의존성 추가는 하지 않는다 — 폐쇄망 사내 PyPI 미러에 없을 수 있고, 필요한 파싱이
+30줄 수준이라 직접 구현이 낫다.
 
-한계(명시): 구형 `.xls`/`.doc`의 암호는 OLE2 내부 FilePass 레코드라 매직만으로 구분되지
-않는다. 이 경우는 기존대로 OPEN_ERROR → 승격 경로를 탄다. 무리한 추측보다 정직한 미분류가 낫다.
+**`DRM_DENIED`는 이번 범위에서 보류한다.** 실제 지원 대상 DRM(나스카 등)의 안정적인 고유
+시그니처 샘플을 확보하기 전에는 부여할 근거가 없다. 확보 전까지는
+`UNRECOGNIZED_CONTAINER`로 기록하고, 승격 경로를 통해 사용자에게 노출한다.
 
-**4. `SOURCE_CHANGED`는 기존 `FILE_CHANGED`의 개명이며, 값 변경 시 마이그레이션이 필요하다.**
+한계(유지): 구형 `.xls`/`.doc`의 암호는 OLE2 내부 FilePass 레코드라 이 방식으로도 구분되지
+않는다. OPEN_ERROR → 승격 경로를 탄다. 무리한 추측보다 정직한 미분류가 낫다.
 
-`load_failures()`는 `kind not in _ALL_KINDS`인 항목을 **조용히 버린다.** 개명만 하면 기존
-기록이 전부 폐기된다 — 동작상 안전하지만(다음 사이클 재시도) 승격 카운트가 초기화되므로
-의도치 않은 이력 손실이다. 개명 실익이 낮아 **기존 이름 유지**를 권고하되, 개명한다면
-`READ_STRATEGY_VERSION`을 올려 폐기를 명시적으로 만든다.
+**4. 실패 연속성 키를 `(kind, normalized_stage)`로 정의한다.** *(리뷰 M-2 수용)*
 
-**5. 승격 후에도 안전밸브를 유지한다.**
+`OPEN_ERROR`는 여러 HRESULT를 하나로 묶으므로, `consecutive_failures` 누적 기준을 명시하지
+않으면 두 방향 모두 오동작한다 — `kind`만 비교하면 서로 다른 Open 오류가 번갈아 나도 같은
+원인으로 승격되고, HRESULT까지 엄격히 비교하면 같은 장애의 코드 변동으로 카운터가 계속
+초기화된다.
+
+→ 연속성 키 = `(kind, normalized_stage)`. `normalized_stage`는 `dispatch|open` → `open`,
+`sheets|cell_read|read` → `read`로 정규화한 값. **HRESULT(`last_error_code`)는 진단 정보로만
+보존하고 연속성 판정에 쓰지 않는다.** 특정 HRESULT군을 분리해야 할 근거가 실측으로 생기면
+그때 정규화 테이블을 명시적으로 추가한다(회귀 테스트 동반).
+
+**5. 승격 임계와 백오프 사다리를 분리한다.** *(리뷰 M-1 수용 — 정책표 확정)*
+
+요청은 "3회 이상 → 사용자 조치 필요"인데 현 사다리는 3회차가 24시간이라, 문자 그대로 읽으면
+24시간 칸이 사라진다. §1에서 원인축과 누적축을 분리한 것과 같은 논리로 **"UI 상태"와 "대기
+시간"도 분리**하면 둘 다 만족한다.
+
+| 연속 실패 | 대기(백오프) | UI 상태 | 배지 |
+|---|---|---|---|
+| 1회 | 30분 | 일반 | 원인명 |
+| 2회 | 6시간 | **반복 중** | 원인명 + "반복" |
+| 3회 | 24시간 | **사용자 조치 필요** | "조치 필요" |
+| 4회 이상 | **7일**(안전밸브 상한) | 사용자 조치 필요 | "조치 필요" |
+
+- 사용자가 요청한 "3회 = 조치 필요"는 **상태·표시로** 정확히 충족된다.
+- 백오프는 기존 사다리를 유지해 3회차의 24시간 칸이 사라지지 않는다.
+- 4회차부터 `needs_user_action_max_sec`(기본 7일)을 상한으로 재사용 — 영구 무시 없음(FR-4).
+- 파일 변경·수동 재시도는 회차와 무관하게 즉시 반영(기존 동작).
+
+임계값 2·3은 전부 config화한다(`escalation_repeat_at`, `escalation_action_at`).
+
+> ⚠️ **사용자 확인 필요**: 이 표는 "3회 이상 → 사용자 조치 필요"를 *상태*로 해석한 것이다.
+> 만약 의도가 "3회차부터 재시도 간격을 7일로"였다면 3회 행의 대기를 24시간 → 7일로 바꾼다.
+
+**6. `FILE_CHANGED` 이름을 유지한다(확정). 개명하지 않는다.** *(리뷰 m-1 수용 — 권고를 결정으로)*
+
+`load_failures()`는 `kind not in _ALL_KINDS`인 항목을 **조용히 버린다.** `SOURCE_CHANGED`로
+개명하면 기존 기록이 전부 폐기되고, 다른 원인의 유효한 누적 이력까지 함께 사라진다. 개명 실익이
+없으므로 **`FILE_CHANGED` 유지로 확정**한다. 하위호환을 위해 `load_failures()`에서
+`SOURCE_CHANGED` → `FILE_CHANGED` 별칭 매핑만 둔다(외부에서 손으로 편집한 파일 대비).
+
+분류 체계 변경은 `READ_STRATEGY_VERSION`이 아니라 **`SCHEMA_VERSION`**(이미 존재, 현재 1)을
+쓴다. 리뷰 지적대로 추출 전략 변경과 분류 스키마 변경은 별개 축이며, 전자에 후자를 얹으면
+분류만 바뀌어도 멀쩡한 추출 이력이 폐기된다.
+
+**7. 승격 후에도 안전밸브를 유지한다.**
 
 "3회 이상 → 사용자 조치 필요"를 문자 그대로 "재시도 중단"으로 구현하면 4차 완료 기준(영구
 무시 없음)을 깬다. 그 기준은 세이프모드 루프 사건 — 우리가 만든 일시적 상태 때문에 멀쩡한
@@ -528,21 +593,33 @@ COM 왕복 0회, 파일 앞 8바이트만 읽는다(NFR-1 충족).
 | DRM 문서인데 세션 유효해 실제로 열림 | 성공 → 기록 삭제 | 승격은 재시도 시점만 조정, 차단이 아님 |
 
 ### 검증 계획
-- `classify()` 단위 테스트: 워치독 미발화 + `failed_stage="open"` → OPEN_ERROR (AC-1)
-- 승격 전이 테스트: 동일 원인 3회 실패 후 `consecutive_failures`가 3을 유지 (AC-3 — #68 회귀 방어)
-- 시그니처 테스트: OLE2 헤더를 가진 `.xlsx` 픽스처 → PASSWORD_PROTECTED (AC-4)
-- 안전밸브 테스트: 승격 상태 + 7일 경과 → `should_defer` False (AC-5)
-- 하위호환 테스트: `kind="FILE_CHANGED"` 든 JSON 로드 시 예외 없음 (AC-6)
+- `classify()` 단위: 워치독 미발화 + `failed_stage="open"` → OPEN_ERROR (AC-1)
+- 승격 전이: 동일 `(kind, stage)` 3회 실패 후 `consecutive_failures`가 3 유지 (AC-3 — #68 회귀 방어)
+- 연속성 키(M-2): 같은 kind·같은 stage인데 HRESULT만 다른 실패가 **누적**됨 / stage가 다르면 리셋됨
+- **암호 판별 양성**: CFB 디렉터리에 두 스트림을 넣은 `.xlsx` 픽스처 → PASSWORD_PROTECTED (AC-4)
+- **오분류 회귀 방어(B-1)**: 스트림 없는 OLE2 오라벨 `.xlsx` 픽스처 → PASSWORD_PROTECTED **아님** (AC-4)
+- **통합 경로(M-3)**: `파일 → AutoReader 라우팅 → COM 실패 주입 → classify → note_failure →
+  sidecar` 를 끝까지 통과시켜 최종 `FailureRecord.kind` 검증 (AC-7). 라우팅 함수는 실제로
+  실행하고 COM 실패만 주입한다 — `classify()` 단위 테스트만으로는 라우팅 회귀를 못 잡는다.
+- **UI 변환(m-2)**: `bridge.getFailures()`가 `consecutive < 임계` / `>= 임계`를 각각 다른
+  배지·문구로 변환하는지, `PASSWORD_PROTECTED`·`UNRECOGNIZED_CONTAINER`의 **원인 표시와
+  "조치 필요" 상태가 동시에 보존**되는지 (AC-2)
+- 안전밸브: 승격 상태 + 7일 경과 → `should_defer` False (AC-5)
+- 하위호환: 구 kind 값·`SOURCE_CHANGED` 별칭이 든 JSON 로드 시 예외 없음 (AC-6)
 - 원칙7 회귀 테스트 유지(예외 메시지 비저장)
 
-### 열린 질문 (리뷰 요청)
-1. **승격 임계 회차**: 요청은 3회. 현 사다리는 3회차에 이미 24시간이다. 3회 승격이면 24시간
-   칸이 사실상 사라지는데, 임계를 3으로 둘지 4로 둘지?
-2. **`IFR_PM_0066.xlsx`의 실제 HRESULT 미확보**: 이 설계는 원인을 몰라도 단계+반복으로 승격되게
-   하므로 동작은 하지만, 해당 파일의 `last_error_code`를 확인하면 전용 분류를 추가할 수 있다.
-   운영 로그에서 확보 가능한가?
-3. **READ_ERROR 신설 여부**: Open만 세분화 요청됐으나 대칭성을 위해 Read 계열 일반 오류도
-   분리할지, 아니면 UNKNOWN_TRANSIENT로 남길지.
+### 남은 확인 사항
+1. **승격 해석 확정** — §5의 정책표는 "3회 = 조치 필요"를 *상태*로 해석했다. *대기 시간*을
+   3회차부터 7일로 바꾸는 의도였는지 사용자 확인 필요.
+2. **DRM 고유 시그니처 샘플 미확보** — 확보 전까지 `DRM_DENIED` 부여를 보류하고
+   `UNRECOGNIZED_CONTAINER`로 기록한다(리뷰 B-1 대안 2 채택). 나스카 등 실제 대상 DRM 파일
+   샘플이 확보되면 별도 변경으로 추가.
+3. **`IFR_PM_0066.xlsx`의 HRESULT·failed_stage** — 전용 분류 추가 판단용 운영 근거로는
+   가치가 있으나, 범용 Open 승격의 선행 조건은 아니다(리뷰 확인 필요 항목과 동일 판단).
+4. **R-0003이 Draft인 채 A-0003을 진행한 것** — 의도적이다. 요구 탐색과 설계를 같은 PR에서
+   돌려 리뷰를 한 번에 받되, **구현은 사람 승인 후** 착수한다.
 
 ### 리뷰 이력
-- (대기) GPT 독립 리뷰 — 채널 B
+- 2026-07-28 GPT 독립 리뷰(채널 B, gpt-5.6-sol) — **REQUEST_CHANGES**.
+  B-1(Blocker) 전면 수용해 §3 재작성, M-1·M-2·M-3·m-1·m-2 전건 수용.
+  처리 기록: `reviews/REVIEW-20260728-architecture-requirements.md`
