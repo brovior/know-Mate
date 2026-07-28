@@ -36,6 +36,7 @@ function onBridgeReady() {
     if (el) el.textContent = "v" + v;
   }).catch(() => {});
   loadRecentQuestions();
+  refreshFailAttention();
 }
 
 /* -- 커스텀 타이틀바 -- */
@@ -190,6 +191,7 @@ function onIndexProgress(json) {
 function onIndexFinished(message) {
   hideIndexProgress();
   showToast(message.length > 60 ? message.substring(0, 60) + "…" : message);
+  refreshFailAttention();
 }
 
 function onStatusUpdated(dataOrJson) {
@@ -760,4 +762,186 @@ function openConfigFile() {
   bridge.openConfigFile().then(result => {
     if (result !== "ok") showToast("설정 파일을 열지 못했습니다.");
   }).catch(() => showToast("설정 파일을 열지 못했습니다."));
+}
+
+/* ===== 확인 필요한 문서 (5차) ===== */
+let _failCards = [];
+let _failFilter = "all";
+
+function refreshFailAttention() {
+  if (!bridge) return;
+  bridge.getFailures().then(json => {
+    let cards;
+    try { cards = JSON.parse(json); } catch { return; }
+    const btn = document.getElementById("btnFailAttention");
+    const text = document.getElementById("failAttentionText");
+    const count = cards.filter(c => !c.excluded).length;
+    if (!btn || !text) return;
+    if (count > 0) {
+      text.textContent = `확인 필요한 문서 ${count}건`;
+      btn.style.display = "flex";
+    } else {
+      btn.style.display = "none";
+    }
+  }).catch(() => {});
+}
+
+function openFailuresPanel() {
+  if (!bridge) { showToast("브리지가 준비되지 않았습니다."); return; }
+  bridge.getFailures().then(json => {
+    try { _failCards = JSON.parse(json); } catch { _failCards = []; }
+    _failFilter = "all";
+    renderFailuresPanel();
+    document.getElementById("failuresOverlay").classList.add("show");
+  }).catch(() => showToast("실패 목록을 불러오지 못했습니다."));
+}
+
+function closeFailuresPanel() {
+  document.getElementById("failuresOverlay").classList.remove("show");
+}
+
+function _failCategory(card) {
+  if (card.excluded) return "excluded";
+  if (card.kind === "NEEDS_USER_ACTION") return "action";
+  return "waiting";
+}
+
+function setFailFilter(cat) {
+  _failFilter = cat;
+  renderFailuresPanel();
+}
+
+function renderFailuresPanel() {
+  const filters = document.getElementById("failFilters");
+  const counts = { all: _failCards.length, action: 0, waiting: 0, excluded: 0 };
+  _failCards.forEach(c => counts[_failCategory(c)]++);
+  if (filters) {
+    filters.querySelectorAll(".filter-chip").forEach(chip => {
+      const cat = chip.dataset.cat;
+      chip.textContent = `${_failFilterLabel(cat)} ${counts[cat]}`;
+      chip.classList.toggle("active", cat === _failFilter);
+      chip.onclick = () => setFailFilter(cat);
+    });
+  }
+
+  const body = document.getElementById("failBody");
+  if (!body) return;
+  const visible = _failCards.filter(c => _failFilter === "all" || _failCategory(c) === _failFilter);
+  if (visible.length === 0) {
+    body.innerHTML = '<div class="fail-empty">해당하는 문서가 없습니다.</div>';
+    return;
+  }
+  body.innerHTML = visible.map(_renderFailCard).join("");
+}
+
+function _failFilterLabel(cat) {
+  return { all: "전체", action: "조치 필요", waiting: "재시도 대기", excluded: "제외됨" }[cat] || cat;
+}
+
+function _formatFailTimestamp(ts) {
+  if (!ts) return "-";
+  const d = new Date(ts * 1000);
+  const now = new Date();
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  if (d.toDateString() === now.toDateString()) return `오늘 ${hh}:${mm}`;
+  const yesterday = new Date(now); yesterday.setDate(now.getDate() - 1);
+  if (d.toDateString() === yesterday.toDateString()) return `어제 ${hh}:${mm}`;
+  const days = Math.floor((now - d) / 86400000);
+  if (days > 0 && days < 7) return `${days}일 전`;
+  return `${d.getMonth() + 1}/${d.getDate()}`;
+}
+
+function _formatFailWait(nextTs) {
+  if (nextTs == null) return "다음 사이클에 재시도 예정";
+  const remaining = Math.max(nextTs - Date.now() / 1000, 0);
+  if (remaining <= 0) return "다음 사이클에 재시도 예정";
+  const days = Math.floor(remaining / 86400);
+  const hours = Math.floor((remaining % 86400) / 3600);
+  const minutes = Math.floor((remaining % 3600) / 60);
+  if (days > 0) return `${days}일 ${hours}시간 후`;
+  if (hours > 0) return `${hours}시간 ${minutes}분 후`;
+  return `${minutes}분 후`;
+}
+
+function _renderFailCard(card) {
+  const pathEsc = escHtml(card.path).replace(/'/g, "\\'");
+  if (card.excluded) {
+    return `
+      <div class="f-card excluded">
+        <div class="f-top">
+          <span class="f-name">${escHtml(card.name)}</span>
+          <span class="f-badge b-gray">제외됨</span>
+        </div>
+        <div class="f-path">${escHtml(card.dir)}</div>
+        <div class="f-meta">
+          <span><span class="k">단계</span> ${escHtml(card.stage_label)}</span>
+          <span><span class="k">실패</span> ${card.consecutive_failures}회</span>
+          <span><span class="k">마지막</span> ${_formatFailTimestamp(card.last_failed_ts)}</span>
+          <span class="k">다음 재시도</span><span class="next none">사용자가 제외함</span>
+        </div>
+        <div class="f-actions">
+          <button class="f-btn primary" onclick="unexcludeFailureFile('${pathEsc}')">제외 해제</button>
+          <button class="f-btn" onclick="revealFailureFile('${pathEsc}')">🗀 파일 위치 열기</button>
+        </div>
+      </div>`;
+  }
+  const waitLabel = _formatFailWait(card.next_retry_ts);
+  return `
+    <div class="f-card">
+      <div class="f-top">
+        <span class="f-name">${escHtml(card.name)}</span>
+        <span class="f-badge ${escHtml(card.badge_class)}">${escHtml(card.badge_label)}</span>
+      </div>
+      <div class="f-path">${escHtml(card.dir)}</div>
+      <div class="f-meta">
+        <span><span class="k">단계</span> ${escHtml(card.stage_label)}</span>
+        <span><span class="k">실패</span> ${card.consecutive_failures}회</span>
+        <span><span class="k">마지막</span> ${_formatFailTimestamp(card.last_failed_ts)}</span>
+        <span class="k">다음 재시도</span><span class="next">${waitLabel}</span>
+      </div>
+      <div class="f-actions">
+        <button class="f-btn primary" onclick="retryFailureFile('${pathEsc}')">⟳ 지금 다시 시도</button>
+        <button class="f-btn" onclick="revealFailureFile('${pathEsc}')">🗀 파일 위치 열기</button>
+        <button class="f-btn danger spacer" onclick="excludeFailureFile('${pathEsc}')">인덱싱 제외</button>
+      </div>
+    </div>`;
+}
+
+function retryFailureFile(path) {
+  if (!bridge) return;
+  bridge.retryFile(path).then(result => {
+    if (result === "busy") { showToast("인덱싱이 이미 진행 중입니다."); return; }
+    closeFailuresPanel();
+    showIndexRunning();
+  }).catch(() => showToast("재시도 요청에 실패했습니다."));
+}
+
+function excludeFailureFile(path) {
+  if (!bridge) return;
+  bridge.excludeFile(path).then(() => {
+    bridge.getFailures().then(json => {
+      try { _failCards = JSON.parse(json); } catch { _failCards = []; }
+      renderFailuresPanel();
+      refreshFailAttention();
+    });
+  }).catch(() => showToast("인덱싱 제외에 실패했습니다."));
+}
+
+function unexcludeFailureFile(path) {
+  if (!bridge) return;
+  bridge.unexcludeFile(path).then(() => {
+    bridge.getFailures().then(json => {
+      try { _failCards = JSON.parse(json); } catch { _failCards = []; }
+      renderFailuresPanel();
+      refreshFailAttention();
+    });
+  }).catch(() => showToast("제외 해제에 실패했습니다."));
+}
+
+function revealFailureFile(path) {
+  if (!bridge) return;
+  bridge.revealFile(path).then(result => {
+    if (result === "not_found") showToast("원본을 찾을 수 없음");
+  }).catch(() => showToast("파일 위치 열기 실패"));
 }

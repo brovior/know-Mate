@@ -444,6 +444,22 @@ def request_retry_all(records: dict[str, FailureRecord]) -> int:
     return len(records)
 
 
+def request_retry_one(records: dict[str, FailureRecord], file_path: str) -> bool:
+    """지정한 파일 1건에만 force_retry를 세운다(5차: [확인 필요한 문서] 화면의
+    개별 「지금 다시 시도」 버튼 전용). request_retry_all과 동일하게 이력은
+    보존한다. 기록이 없으면 아무 것도 하지 않고 False를 반환한다."""
+    rec = records.get(file_path)
+    if rec is None or rec.force_retry:
+        return False
+    records[file_path] = FailureRecord(
+        mtime=rec.mtime, size=rec.size, kind=rec.kind, stage=rec.stage,
+        consecutive_failures=rec.consecutive_failures,
+        last_failed_ts=rec.last_failed_ts, last_error_code=rec.last_error_code,
+        strategy_version=rec.strategy_version, force_retry=True,
+    )
+    return True
+
+
 def note_success(records: dict[str, FailureRecord], file_path: str) -> None:
     """추출에 성공했으면 그 파일의 실패 기록을 지운다(초기화 조건 2)."""
     records.pop(file_path, None)

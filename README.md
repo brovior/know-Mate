@@ -100,6 +100,7 @@ build.bat
 | `search.score_threshold` | `0.3` | 유사도 임계값(검색 엄격도, 0~0.7) | ✅ |
 | `search.top_k_max` | `10` | 답변 참고 문서 수 (3~20) | ✅ |
 | `collector.watch_folders` | `[]` | 인덱싱할 폴더 목록 (앱의 [폴더 관리]에서 지정) | |
+| `collector.exclude_files` | `[]` | 인덱싱 제외한 파일 절대경로 목록 ([확인 필요한 문서] 화면에서 지정) | ✅ |
 | `collector.idle_enabled` | `true` | 유휴 시 자동 인덱싱 on/off | ✅ |
 | `collector.idle_seconds` | `60` | 유휴 감지 후 자동 인덱싱 간격(초) | ✅(분 단위) |
 | `collector.drm_idle_threshold_sec` | `480` | 이 시간(초) 이상 유휴면 DRM/SSO 세션 만료로 보고 DRM 의심 문서를 해당 사이클에서 건너뜀 | |

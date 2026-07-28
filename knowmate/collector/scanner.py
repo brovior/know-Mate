@@ -31,18 +31,28 @@ def get_scope(path: str) -> str:
     return "local"
 
 
+def normalize_path_key(path: str) -> str:
+    """경로 비교용 정규화 키. `/` 통일 + casefold — Windows 경로는 대소문자를
+    구분하지 않고 `watch_folders`도 이미 `/` 정규화 관례를 쓴다(config.py 참고)."""
+    return path.replace("\\", "/").casefold()
+
+
 def iter_scan_folder(
     folder: Path,
     max_file_size_mb: float = 30.0,
     cancel_check: Callable[[], bool] | None = None,
+    exclude_files: frozenset[str] | None = None,
 ) -> Iterator[tuple[str, dict]]:
     """지원 확장자 파일을 walk 하며 (절대경로, {"mtime","size"})를 하나씩 yield 한다.
 
     스트리밍 인덱싱용 — 트리 전체 열거를 기다리지 않고 발견 즉시 소비할 수 있다.
     max_file_size_mb 초과 파일은 WARNING 로그 후 제외한다.
     cancel_check: True를 반환하면 즉시 순회를 중단한다(취소 지원).
+    exclude_files: 사용자가 [확인 필요한 문서] 화면에서 인덱싱 제외한 경로 집합
+        (normalize_path_key로 정규화된 값). 열거 단계에서 걸러 stat조차 하지 않는다.
     """
     max_bytes = int(max_file_size_mb * 1024 * 1024)
+    exclude_files = exclude_files or frozenset()
     # os.scandir 스택 순회: 디렉터리 열거 시 크기·수정시각을 함께 받아오고
     # DirEntry.stat()이 그 캐시를 재사용해 Windows/SMB에서 파일별 stat 왕복이 0이 된다.
     stack: list[str] = [str(folder)]
@@ -68,6 +78,8 @@ def iter_scan_folder(
                         continue
                     if os.path.splitext(name)[1].lower() not in SUPPORTED_EXT:
                         continue
+                    if exclude_files and normalize_path_key(entry.path) in exclude_files:
+                        continue
                     try:
                         st = entry.stat()  # Windows: scandir 캐시 재사용(무 syscall)
                         if st.st_size > max_bytes:
@@ -87,6 +99,7 @@ def scan_folder(
     folder: Path,
     max_file_size_mb: float = 30.0,
     on_progress: Callable[[int], None] | None = None,
+    exclude_files: frozenset[str] | None = None,
 ) -> dict[str, dict]:
     """지원 확장자 파일의 mtime 과 size 를 수집해 dict로 반환한다(iter_scan_folder 래퍼).
 
@@ -95,7 +108,7 @@ def scan_folder(
     """
     result: dict[str, dict] = {}
     found = 0
-    for path, meta in iter_scan_folder(folder, max_file_size_mb=max_file_size_mb):
+    for path, meta in iter_scan_folder(folder, max_file_size_mb=max_file_size_mb, exclude_files=exclude_files):
         result[path] = meta
         found += 1
         if on_progress and found % _SCAN_HEARTBEAT_EVERY == 0:

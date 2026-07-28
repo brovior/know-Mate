@@ -221,3 +221,156 @@ class TestOnWorkerFinishedSkipsWhenUnchanged:
         bridge._on_worker_finished("인덱싱 완료")
 
         assert worker._indexer.table.last_query_builder is not None
+
+
+class _FakeDeleteTable:
+    """delete()만 기록하는 indexer.table 대역 (excludeFile 청크 삭제 검증용)."""
+
+    def __init__(self):
+        self.deleted_where: list[str] = []
+
+    def delete(self, where: str) -> None:
+        self.deleted_where.append(where)
+
+
+class _FakeIndexerForDelete:
+    def __init__(self):
+        self.table = _FakeDeleteTable()
+
+
+class _FakeWorkerForFailures:
+    """실패 파일 관리 슬롯(getFailures/retryFile/excludeFile) 테스트용 워커 대역."""
+
+    def __init__(self, failure_file, state_file, running=False):
+        self._failure_file = failure_file
+        self._state_file = state_file
+        self._indexer = _FakeIndexerForDelete()
+        self._running = running
+        self._get_now = lambda: 1_700_000_000.0
+
+    def isRunning(self):
+        return self._running
+
+    def start(self):
+        self._running = True
+
+
+class TestFailureManagementSlots:
+    def _patch_collector_config(self, monkeypatch, exclude_files=None):
+        """config.get_config/update_exclude_files를 인메모리 dict로 대체한다
+        (%APPDATA% 실제 파일을 건드리지 않기 위해)."""
+        import knowmate.config as config_module
+        state = {"collector": {"exclude_files": list(exclude_files or [])}}
+        monkeypatch.setattr(config_module, "get_config", lambda: state)
+
+        def _update(paths):
+            state["collector"]["exclude_files"] = paths
+        monkeypatch.setattr(config_module, "update_exclude_files", _update)
+        return state
+
+    def test_get_failures_reports_pending_record(self, tmp_path, monkeypatch):
+        from knowmate.collector import failure_state
+
+        failure_file = tmp_path / "index_failure.json"
+        records = {}
+        failure_state.note_failure(
+            records, str(tmp_path / "broken.xlsx"), failure_state.KIND_NEEDS_USER_ACTION,
+            "open", None, mtime=100.0, size=10, now=1_699_999_000.0,
+        )
+        failure_state.save_failures(failure_file, records)
+        self._patch_collector_config(monkeypatch)
+
+        worker = _FakeWorkerForFailures(failure_file, tmp_path / "state.json")
+        bridge = _make_bridge(worker)
+
+        cards = __import__("json").loads(bridge.getFailures())
+
+        assert len(cards) == 1
+        assert cards[0]["kind"] == "NEEDS_USER_ACTION"
+        assert cards[0]["excluded"] is False
+        assert cards[0]["next_retry_ts"] is not None  # 7일 안전밸브 — 영구 무시 아님
+
+    def test_get_failures_marks_excluded_files(self, tmp_path, monkeypatch):
+        from knowmate.collector import failure_state
+
+        failure_file = tmp_path / "index_failure.json"
+        target = str(tmp_path / "temp.xlsx")
+        records = {}
+        failure_state.note_failure(
+            records, target, failure_state.KIND_UNKNOWN_TRANSIENT, None, None,
+            mtime=1.0, size=1, now=1_699_999_000.0,
+        )
+        failure_state.save_failures(failure_file, records)
+        self._patch_collector_config(monkeypatch, exclude_files=[target])
+
+        worker = _FakeWorkerForFailures(failure_file, tmp_path / "state.json")
+        bridge = _make_bridge(worker)
+
+        cards = __import__("json").loads(bridge.getFailures())
+
+        assert len(cards) == 1
+        assert cards[0]["excluded"] is True
+        assert cards[0]["next_retry_ts"] is None
+
+    def test_retry_file_sets_force_retry_and_starts_worker(self, tmp_path, monkeypatch):
+        from knowmate.collector import failure_state
+
+        failure_file = tmp_path / "index_failure.json"
+        target = str(tmp_path / "broken.xlsx")
+        records = {}
+        failure_state.note_failure(
+            records, target, failure_state.KIND_UNKNOWN_TRANSIENT, None, None,
+            mtime=1.0, size=1, now=1000.0,
+        )
+        failure_state.save_failures(failure_file, records)
+
+        worker = _FakeWorkerForFailures(failure_file, tmp_path / "state.json")
+        bridge = _make_bridge(worker)
+
+        result = bridge.retryFile(target)
+
+        assert result == "ok"
+        assert worker.isRunning() is True
+        assert failure_state.load_failures(failure_file)[target].force_retry is True
+
+    def test_retry_file_refuses_when_worker_running(self, tmp_path):
+        worker = _FakeWorkerForFailures(tmp_path / "f.json", tmp_path / "s.json", running=True)
+        bridge = _make_bridge(worker)
+
+        result = bridge.retryFile(str(tmp_path / "x.xlsx"))
+
+        assert result == "busy"
+
+    def test_exclude_file_adds_to_config_and_deletes_chunks(self, tmp_path, monkeypatch):
+        state = self._patch_collector_config(monkeypatch)
+        worker = _FakeWorkerForFailures(tmp_path / "f.json", tmp_path / "s.json")
+        bridge = _make_bridge(worker)
+        target = str(tmp_path / "excluded.xlsx")
+
+        result = bridge.excludeFile(target)
+
+        assert result == "ok"
+        assert target in state["collector"]["exclude_files"]
+        assert len(worker._indexer.table.deleted_where) == 1
+        assert target in worker._indexer.table.deleted_where[0]
+
+    def test_exclude_file_is_idempotent(self, tmp_path, monkeypatch):
+        target = str(tmp_path / "excluded.xlsx")
+        state = self._patch_collector_config(monkeypatch, exclude_files=[target])
+        worker = _FakeWorkerForFailures(tmp_path / "f.json", tmp_path / "s.json")
+        bridge = _make_bridge(worker)
+
+        bridge.excludeFile(target)
+
+        assert state["collector"]["exclude_files"].count(target) == 1
+
+    def test_unexclude_file_removes_from_config(self, tmp_path, monkeypatch):
+        target = str(tmp_path / "excluded.xlsx")
+        state = self._patch_collector_config(monkeypatch, exclude_files=[target])
+        worker = _FakeWorkerForFailures(tmp_path / "f.json", tmp_path / "s.json")
+        bridge = _make_bridge(worker)
+
+        result = bridge.unexcludeFile(target)
+
+        assert result == "ok"
+        assert target not in state["collector"]["exclude_files"]
