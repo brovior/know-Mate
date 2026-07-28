@@ -480,6 +480,160 @@ class TestCollectorWorker:
 
 
 # ============================================================
+# TestComRestart — COM Office 주기 재기동 (PyQt6 필요)
+# ============================================================
+
+@pytest.mark.skipif(not _HAS_PYQT6, reason="PyQt6 미설치 — 폐쇄망 외 환경")
+class TestComRestart:
+    """COM 파일 N건 처리마다 com_restart_fn이 호출되는지 검증한다.
+
+    FakeReader를 쓰므로 실제 COM은 호출되지 않지만, is_com 분류는
+    확장자/시그니처 기반(_classify_extract_method)이라 FakeReader와 무관하게
+    동작한다 — .doc는 항상 com으로 분류된다.
+    """
+
+    def _make_worker_with_spy(self, tmp_path: Path, watch_folder: str, restart_every: int):
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.secure.fake_reader import FakeReader
+        from knowmate.collector.scheduler import CollectorWorker
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        extractor = FakeReader()
+        config = {
+            "collector": {
+                "watch_folders": [watch_folder],
+                "idle_seconds": 60,
+                "com_restart_every_n_files": restart_every,
+            },
+            "cleanup": {"dry_run": True, "max_delete_ratio": 0.30},
+            "chunking": {"chunk_size": 400, "overlap": 80},
+        }
+        state_file = tmp_path / "state.json"
+        spy = MagicMock()
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=extractor, state_file=state_file,
+            com_restart_fn=spy,
+        )
+        return worker, spy
+
+    def test_restart_fires_every_n_com_files(self, tmp_path: Path):
+        """COM 파일(.doc) 6개, 주기 3 -> 재기동 2회."""
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        for i in range(6):
+            (folder / f"file{i}.doc").write_bytes(b"legacy doc content")
+
+        worker, spy = self._make_worker_with_spy(tmp_path, str(folder), restart_every=3)
+        worker.run()
+
+        assert spy.call_count == 2
+
+    def test_restart_disabled_when_zero(self, tmp_path: Path):
+        """com_restart_every_n_files=0 -> 재기동 안 함."""
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        for i in range(6):
+            (folder / f"file{i}.doc").write_bytes(b"legacy doc content")
+
+        worker, spy = self._make_worker_with_spy(tmp_path, str(folder), restart_every=0)
+        worker.run()
+
+        spy.assert_not_called()
+
+    def test_plain_files_not_counted(self, tmp_path: Path):
+        """plain 파일(.txt)만 있으면 COM 카운트 대상이 아니라 재기동 안 함."""
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        for i in range(6):
+            (folder / f"file{i}.txt").write_bytes(b"normal text content")
+
+        worker, spy = self._make_worker_with_spy(tmp_path, str(folder), restart_every=3)
+        worker.run()
+
+        spy.assert_not_called()
+
+    def test_office_busy_deferred_not_counted(self, tmp_path: Path):
+        """OfficeBusyError로 연기된 파일은 COM을 실제로 쓰지 않아 카운트 대상이 아니다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+        from knowmate.secure.office_guard import OfficeBusyError
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        for i in range(6):
+            (folder / f"file{i}.doc").write_bytes(b"legacy doc content")
+
+        class AlwaysBusyExtractor:
+            def extract(self, path: str) -> str:
+                raise OfficeBusyError("사용자 Office 점유 중")
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        config = {
+            "collector": {
+                "watch_folders": [str(folder)],
+                "idle_seconds": 60,
+                "com_restart_every_n_files": 3,
+            },
+            "cleanup": {"dry_run": True, "max_delete_ratio": 0.30},
+            "chunking": {"chunk_size": 400, "overlap": 80},
+        }
+        state_file = tmp_path / "state.json"
+        spy = MagicMock()
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=AlwaysBusyExtractor(), state_file=state_file,
+            com_restart_fn=spy,
+        )
+        worker.run()
+
+        spy.assert_not_called()
+
+    def test_restart_failure_does_not_stop_cycle(self, tmp_path: Path):
+        """com_restart_fn이 예외를 던져도 사이클은 계속 완료된다."""
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        for i in range(4):
+            (folder / f"file{i}.doc").write_bytes(b"legacy doc content")
+
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.secure.fake_reader import FakeReader
+        from knowmate.collector.scheduler import CollectorWorker
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        config = {
+            "collector": {
+                "watch_folders": [str(folder)],
+                "idle_seconds": 60,
+                "com_restart_every_n_files": 2,
+            },
+            "cleanup": {"dry_run": True, "max_delete_ratio": 0.30},
+            "chunking": {"chunk_size": 400, "overlap": 80},
+        }
+        state_file = tmp_path / "state.json"
+
+        def failing_restart():
+            raise RuntimeError("재기동 실패")
+
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
+            com_restart_fn=failing_restart,
+        )
+        finished_msgs = []
+        worker.finished.connect(finished_msgs.append)
+        worker.run()
+
+        from knowmate.collector.state import load_state
+        state = load_state(state_file)
+        assert len(state) == 4
+        assert len(finished_msgs) == 1
+
+
+# ============================================================
 # TestQueuePriority — COM 우선순위 캐싱 (PyQt6 필요)
 # ============================================================
 
@@ -1354,9 +1508,12 @@ class TestFailureStateIntegration:
         assert str(target) not in failure_state.load_failures(failure_file)
         assert str(target) in load_state(state_file)
 
-    def test_request_failure_retry_clears_all_records_on_next_cycle(self, tmp_path: Path):
-        """수동 재인덱싱(초기화 조건 4) — request_failure_retry() 호출 후 다음
-        run()이 기존 실패 기록을 모두 비운다."""
+    def test_request_failure_retry_bypasses_backoff_but_keeps_history(self, tmp_path: Path):
+        """수동 재인덱싱(초기화 조건 4 수정판) — request_failure_retry() 호출 후 다음
+        run()은 백오프 창 안이어도 즉시 재시도하지만, 그 파일이 다시 실패하면
+        consecutive_failures는 초기화되지 않고 계속 누적된다(이력 보존). 예전엔
+        기록을 통째로 비워 재인덱싱 버튼 한 번에 만성 실패 파일의 백오프가
+        처음 칸(30분)으로 되돌아가는 문제가 있었다."""
         from knowmate.rag.embedding import EmbeddingClient
         from knowmate.rag.indexer import Indexer
         from knowmate.collector.scheduler import CollectorWorker
@@ -1386,13 +1543,16 @@ class TestFailureStateIntegration:
         worker.run()
         assert failure_state.load_failures(failure_file)[str(target)].consecutive_failures == 2
 
-        # request_failure_retry()는 기록을 통째로 비우므로, 백오프 창 안이어도
-        # (clock을 더 돌리지 않아도) 즉시 재시도돼야 한다 — should_defer(rec=None) == False
+        # request_failure_retry()는 기록을 지우지 않고 force_retry만 세우므로, 백오프
+        # 창 안이어도(clock을 더 돌리지 않아도) 즉시 재시도된다.
         worker.request_failure_retry()
         worker.run()
 
-        # 재시도 요청 직후 사이클도 다시 실패하지만, 초기화됐다가 새로 1건만 기록되므로 1이어야 한다
-        assert failure_state.load_failures(failure_file)[str(target)].consecutive_failures == 1
+        # 재시도 요청 직후 사이클도 다시 실패하지만, 같은 (mtime, size, kind)로
+        # 계속 실패한 것이므로 이력이 이어져 3으로 누적돼야 한다(초기화되지 않음).
+        rec = failure_state.load_failures(failure_file)[str(target)]
+        assert rec.consecutive_failures == 3
+        assert rec.force_retry is False  # 이번 시도 결과로 소비되어 꺼짐
 
     def test_idle_cycle_does_not_clear_failure_records(self, tmp_path: Path):
         """유휴 자동 사이클(request_failure_retry 미호출)은 실패 기록을 비우지

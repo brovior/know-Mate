@@ -556,6 +556,72 @@ fail-closed)와 반대 방향이다. 백오프는 삭제를 막는 안전장치�
 + 소비자 쪽 카운터 합산) · `enabled: false` 비상 스위치 · 수동 재인덱싱이 기록을 전부
 초기화.
 
+**주기 재기동 (선제적 완화책, `collector.com_restart_every_n_files`)**: 워치독은 행오버가 **발생한
+뒤** 반응적으로 kill하는 안전망이지만, 행오버가 없어도 한 Office 인스턴스가 COM 파일을 수백 건
+연속 처리하면 핸들·메모리가 누적돼 후반부가 느려지거나 불안정해질 수 있다. 이를 선제적으로
+예방하기 위해 소비자 루프가 **실제로 COM을 사용한 파일**(`_classify_extract_method=="com"`이고
+`OfficeBusyError`로 연기되지 않은 경우)만 카운트해, `com_restart_every_n_files`건마다
+`com_reader.quit_com_apps()`를 호출해 word/excel/ppt 인스턴스를 일괄 종료한다(다음 COM 파일에서
+자동 재Dispatch). 앱별 개별 카운트 대신 **일괄 재기동**을 택한 건 외과적 정밀도 대비 복잡도 이득이
+작기 때문이다. 재기동 실패는 삼키고 사이클을 계속한다(로그·요약에 "COM 재기동 N회"). 이 완화책은
+DRM COM Helper 프로세스 분리(아래) 착수 **전** 실측 단계이며, 최종적으로는 helper 분리가 격리를
+대체한다.
+
+## DRM 추출 텍스트의 벡터DB 저장 — 컴플라이언스 확정 필요 (미해결 · 코드 아님)
+
+**현황**: beta2에서 DRM 보호 문서 COM 인덱싱을 도입한 시점부터, Office로 복호화해 추출한 평문이
+청크로 분할되어 LanceDB `text` 컬럼(AES-256-GCM + DPAPI 키, 원칙5)에 저장되고 있다. 이는 아래 helper
+프로세스 분리 여부와 **무관하게 이미 발생 중**인 상태다(pipe·helper는 *임시 평문 파일*만 방지할 뿐,
+벡터DB의 청크 원문 저장 자체는 그대로다).
+
+**쟁점**: 우리 저장 방식(앱 레벨 암호화 — "해당 PC·해당 사용자면 복호화 가능")과 나스카/파수류 DRM의
+보호 모델("SSO 세션 유지 중 + 허가된 렌더링 앱에서만 복호화")은 보호 수준이 다르다. 우리는 DRM 봉투
+**밖으로** 내용을 꺼내 더 약한 보호로 재보관하는 구조 → 원본 DRM 파일은 PC 밖으로 나가면 못 열리지만
+우리 인덱스는 (그 사용자 계정 하에선) 열린다.
+
+**필요 조치**: 코드로 풀 문제가 아니라 보안/DRM 관리부서에 **"DRM 문서의 추출 텍스트를 로컬 앱
+암호화로 보관해도 되는가"**를 명시 확인받는 컴플라이언스 사안.
+- **허용** → 현행 유지. 확인 사실(승인 일자·담당 부서)을 이 섹션에 추가 기록.
+- **불허** → DRM 의심 문서(`scheduler._is_drm_suspected`, 서명 `<## ` 감지)를 인덱싱에서 제외하는
+  config 스위치가 최소 대응. 판별 로직이 이미 있어 스위치 추가는 소규모 작업.
+
+> **상태**: ✅ **허용 승인 완료 (2026-07-23)** — DRM 추출 텍스트를 현행 AES-256-GCM + DPAPI 저장
+> 방식으로 계속 보관하는 것으로 결론. 현행 유지(별도 코드 변경 없음), DRM 의심 문서 인덱싱 제외
+> 스위치(불허 시 대응)는 **불필요**로 확정.
+
+## DRM COM Helper 프로세스 분리 (로드맵 · 비개발자 정식 배포 전 완료 조건)
+
+**목적**: COM 추출을 메인 프로세스에서 떼어내 별도 helper 프로세스에서 수행 → 행오버·크래시가
+메인(UI·LanceDB)을 오염시키지 않게 **격리**. 현행 워치독·주기 재기동은 이 격리 전의 실측 완화책이며,
+helper 분리가 최종 구조다.
+
+**채택 구조 (확정)**
+- **재실행 방식**: `sys.executable --com-worker` + `subprocess.Popen`. `multiprocessing` **금지**(frozen
+  `freeze_support` 함정 + LanceDB 파일 락 원칙8 리스크). onedir 빌드에서 `sys.executable`은
+  `AegisDesk.exe` 자신이라 파이썬 별도 배포 없이 자기 재실행 가능.
+- **argv 분기 위치**: `main.py` 최상단에서 PyQt6·단일 인스턴스 가드·LanceDB import **전에** 분기.
+  특히 단일 인스턴스 가드보다 앞서야 helper가 "이미 실행 중" 오판으로 기존 창을 복원시키고 죽는 사고를
+  막는다. QWebEngine import를 안 타 helper 기동도 가볍다.
+- **IPC**: 임시 평문 파일 금지(원칙5) → stdin/stdout **length-prefix 바이너리 프로토콜**
+  (`sys.stdout.buffer` 직접 쓰기).
+  - **stdout은 프로토콜 전용 예약**: helper의 로그·경고·`print`가 stdout에 한 글자라도 섞이면
+    length-prefix 프레이밍이 깨진다 → helper 로그는 전부 stderr/파일로.
+  - **부모는 stdout·stderr를 지속 소비**: 파이프 커널 버퍼(Windows 기본 수십 KB)가 차면 자식 write가
+    블록되는 교착이 실재. stdout은 프레임 읽기로 자연 소비되나 **stderr는 별도 스레드**(또는
+    DEVNULL/로그파일 리다이렉트)로 빼야 교착을 막는다.
+- **kill 순서**: helper가 `Dispatch` **직후** Office PID·생성시각을 부모에 **선보고** → timeout 시
+  **소유 확인된 Office 먼저 종료 → 2~3초 유예 → helper 종료**(블록된 동기 COM 호출이 RPC 오류로 풀려
+  helper가 스스로 정리하고 나올 시간). 생성시각 동반은 PID 재사용 오살 방지.
+  - **Dispatch 자체 행오버 폴백**: 선보고 전이라 죽일 Office PID를 모르는 경우 → helper 종료 후
+    "helper 시작 시각 이후 생성된 소유 미확인 Office"를 `terminate_stuck_office` 계열로 정리(관찰된
+    행오버는 주로 `Documents.Open`이라 선보고가 대개 커버하나, DRM 로그인 대기는 기동 단계에서도 발생).
+  - HWND는 참고용만(Excel `Application.Hwnd`는 있으나 Word `Application`엔 동급 속성 없음 → 종료 근거는
+    PID+생성시각으로 충분).
+- **경계 유지**: LanceDB는 **메인 프로세스에서만**(원칙8 준수). helper는 COM 추출만 담당하고 기존
+  `TextExtractor` 프로토콜(`extract(path)->str`)로 결과 반환 → 스케줄러 무변경.
+
+**선행**: 워치독·주기 재기동 효과 **실측** → helper 분리 착수. 정식(비개발자) 배포 전 완료 조건.
+
 ## 단일 인스턴스 보장 (`app/single_instance.py`)
 
 트레이 상주 앱이라(닫아도 종료되지 않음) 사용자가 바로가기를 여러 번 눌러 실수로 여러 인스턴스를

@@ -116,14 +116,17 @@ class CollectorWorker(QThread):
     indexing_needed = pyqtSignal(str)
 
     def __init__(self, config, indexer, extractor, state_file=None, email_indexer=None,
-                 parent=None, get_idle_seconds=None, purge_meta_file=None, failure_file=None,
-                 get_now=None):
+                 parent=None, get_idle_seconds=None, com_restart_fn=None,
+                 purge_meta_file=None, failure_file=None, get_now=None):
         """수집기 워커를 초기화한다.
 
         get_idle_seconds: () -> float, 현재 OS 유휴 경과초 조회(테스트 주입용,
             기본은 collector.idle_util.get_idle_seconds). DRM 세션 만료 추정에
             쓴다 — 사이클 시작 시 1회가 아니라 파일 처리 중 실시간으로 조회해,
             긴 사이클 도중 세션이 만료되면 그 시점부터 DRM 문서를 건너뛴다.
+        com_restart_fn: () -> None, COM Office 주기 재기동 시 호출(테스트 주입용,
+            기본은 secure.com_reader.quit_com_apps). COM 파일 N건 처리마다 Office를
+            선제적으로 재기동해 장시간 사이클에서의 핸들·메모리 누수를 완화한다.
         purge_meta_file: purge 스킵/reconciliation 상태 sidecar 경로(테스트 주입용,
             기본은 %APPDATA%/AegisDesk/index_state.meta.json). index_state.json과
             분리된 별도 파일이라 기존 state 스키마·소비자에 영향이 없다.
@@ -144,6 +147,10 @@ class CollectorWorker(QThread):
             from knowmate.collector.idle_util import get_idle_seconds as _default
             get_idle_seconds = _default
         self._get_idle_seconds = get_idle_seconds
+        if com_restart_fn is None:
+            from knowmate.secure.com_reader import quit_com_apps as _default_restart
+            com_restart_fn = _default_restart
+        self._com_restart_fn = com_restart_fn
         self._get_now = get_now or time.time
         from knowmate.config import get_data_dir
         default_state_file = get_data_dir() / "index_state.json"
@@ -162,13 +169,17 @@ class CollectorWorker(QThread):
         # 아직 사이클을 한 번도 안 돈 상태에서 조회되면 재계산하도록).
         self.last_cycle_changed: bool = True
         # 수동 재인덱싱(사용자의 [인덱싱 시작]/트레이 [재인덱싱])이 다음 사이클
-        # 시작 시 실패 기록을 비워달라고 요청했는지(초기화 조건 4). 유휴 자동
-        # 사이클은 이 플래그를 세우지 않는다 — 매번 비우면 연속 실패 횟수가
-        # 영원히 1에 머물러 3차 기록 자체가 무의미해진다.
+        # 시작 시 모든 실패 기록에 force_retry를 세워달라고 요청했는지(초기화
+        # 조건 4 수정판 — failure_state.request_retry_all 참고: 기록 전체를
+        # 비우면 만성 실패 파일의 연속 실패 횟수·이력까지 사라져 버튼 한 번으로
+        # 백오프가 처음 칸으로 돌아가는 문제가 있어, 이력은 남기고 "이번 한 번만"
+        # 건너뛰는 플래그로 바꿨다). 유휴 자동 사이클은 이 플래그를 세우지
+        # 않는다 — 매번 세우면 백오프가 사실상 무력화된다.
         self._retry_requested = False
 
     def request_failure_retry(self) -> None:
-        """다음 사이클 시작 시 실패 기록을 초기화하도록 요청한다(수동 트리거 전용)."""
+        """다음 사이클 시작 시 모든 실패 기록에 재시도(force_retry)를 요청한다
+        (수동 트리거 전용). 이력·연속 실패 횟수는 보존된다."""
         self._retry_requested = True
 
     def run(self):
@@ -384,6 +395,11 @@ class CollectorWorker(QThread):
         com_timeout_per_mb = float(collector_cfg.get("com_timeout_per_mb_sec", 20))
         com_timeout_cap = float(collector_cfg.get("com_timeout_max_sec", 600))
 
+        # COM Office 주기 재기동 — COM 파일을 이 건수만큼 처리하면 Office를 선제적으로
+        # 재기동(quit_com_apps)해 장시간 사이클에서의 핸들·메모리 누수를 완화한다.
+        # 워치독(반응적, 행오버 시 kill)과 달리 이건 선제적 예방책. 0 이하면 비활성.
+        com_restart_every = int(collector_cfg.get("com_restart_every_n_files", 30))
+
         # purge(제거된 폴더 청크 정리) 스킵/강제 reconciliation 판정 — 설계
         # docs/ai-workflow/architecture.md § A-0002. op_sig는 이번 사이클의 watch_folders
         # 구성·dry_run·max_delete_ratio로 결정되며, 변경 0건 + 동일 op_sig + 마지막 성공
@@ -412,8 +428,8 @@ class CollectorWorker(QThread):
         from knowmate.collector import failure_state
         failures = failure_state.load_failures(self._failure_file)
         if self._retry_requested:
-            logger.info("[failure] 사용자 재시도 요청 — 실패 기록 초기화 (%d건)", len(failures))
-            failures = {}
+            n = failure_state.request_retry_all(failures)
+            logger.info("[failure] 사용자 재시도 요청 — 이번 사이클 백오프 무시 (%d건, 이력 보존)", n)
         self._retry_requested = False
         backoff_policy = failure_state.BackoffPolicy.from_config(collector_cfg)
 
@@ -542,6 +558,8 @@ class CollectorWorker(QThread):
         failed = []
         deferred = []
         unreadable = []
+        com_since_restart = 0
+        restart_count = 0
         changed_during = []  # 추출 도중 파일이 바뀌어 이번 사이클에 인덱싱하지 않은 경로들
         consumer_backoff_deferred = 0  # 소비자 재확인이 처리 직전에 걸러낸 건수(4차)
 
@@ -582,6 +600,9 @@ class CollectorWorker(QThread):
             total_known = producer_state["total"]
             self.progress.emit(done, total_known if total_known is not None else -2, filename)
 
+            is_com = _classify_extract_method(task.path) == "com"
+            com_used = False
+
             try:
                 logger.debug("[단계1] 텍스트 추출 시작: %s", task.path)
                 _extract_t0 = time.perf_counter()
@@ -589,7 +610,7 @@ class CollectorWorker(QThread):
                 # openpyxl 파싱 중 애먼 Office를 죽이는 오발을 피함).
                 _wd_exe = None
                 _wd_fired_stage = None  # 이번 파일에서 워치독이 실제로 발화했다면 그 단계
-                if watchdog is not None and _classify_extract_method(task.path) == "com":
+                if watchdog is not None and is_com:
                     _wd_exe = _og.process_for_ext(Path(task.path).suffix.lower())
                 try:
                     if _wd_exe:
@@ -659,10 +680,13 @@ class CollectorWorker(QThread):
                     "[%s] %s -> %d청크 (extract=%.2fs)",
                     task.action, task.path, len(chunk_ids), extract_sec,
                 )
+                com_used = is_com
                 failure_state.note_success(failures, task.path)
             except OfficeBusyError as exc:
                 # 사용자가 Office를 열어둔 상태 → 이번 사이클만 연기(실패 아님).
                 # state를 갱신하지 않으므로 다음 유휴 사이클에서 자동 재시도된다.
+                # 가드가 Dispatch 전에 차단해 우리 COM을 실제로 쓰지 않았으므로
+                # 주기 재기동 카운트 대상이 아니다(com_used는 False로 유지).
                 logger.warning("[collector] Office 점유로 연기(다음 사이클 재시도): %s", exc)
                 deferred.append(task.path)
                 _failed_stage = com_stage.take_last_failed_stage()
@@ -678,6 +702,7 @@ class CollectorWorker(QThread):
                 # 일반 실패와 구분해 로그·요약에 표시 — "버그"가 아니라 DRM/손상임을 알림.
                 logger.warning("[collector] 판독불가(DRM/암호화·손상 추정): %s", exc)
                 unreadable.append(task.path)
+                com_used = is_com
                 _failed_stage = com_stage.take_last_failed_stage()
                 kind, error_code = failure_state.classify(
                     exc, watchdog_stage=_wd_fired_stage, failed_stage=_failed_stage,
@@ -689,6 +714,7 @@ class CollectorWorker(QThread):
             except Exception as exc:
                 logger.error("파일 처리 실패 (건너뜀): %s - %s", task.path, exc)
                 failed.append(task.path)
+                com_used = is_com
                 _failed_stage = com_stage.take_last_failed_stage()
                 kind, error_code = failure_state.classify(
                     exc, watchdog_stage=_wd_fired_stage, failed_stage=_failed_stage,
@@ -697,6 +723,20 @@ class CollectorWorker(QThread):
                     failures, task.path, kind, _wd_fired_stage or _failed_stage, error_code,
                     task.mtime, task.size, self._get_now(),
                 )
+
+            if com_used:
+                com_since_restart += 1
+                if com_restart_every > 0 and com_since_restart >= com_restart_every:
+                    try:
+                        self._com_restart_fn()
+                        restart_count += 1
+                        logger.info(
+                            "[collector] COM Office 주기 재기동: %d개 COM 파일 처리 후",
+                            com_since_restart,
+                        )
+                    except Exception as exc:
+                        logger.warning("[collector] COM 주기 재기동 실패(무시): %s", exc)
+                    com_since_restart = 0
 
         # 생산자 스레드 정리 (정상 종료 시 이미 끝나 있음)
         producer.join(timeout=5)
@@ -805,6 +845,8 @@ class CollectorWorker(QThread):
         com_timeout_count = watchdog.timeout_count if watchdog is not None else 0
         if com_timeout_count:
             summary += f" / COM 시간초과 강제해제 {com_timeout_count}건"
+        if restart_count:
+            summary += f" / COM 재기동 {restart_count}회"
         backoff_deferred_total = producer_state.get("backoff_deferred", 0) + consumer_backoff_deferred
         if backoff_deferred_total:
             summary += f" / 재시도 대기 {backoff_deferred_total}건"
