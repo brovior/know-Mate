@@ -77,6 +77,13 @@ class FailureRecord:
     last_failed_ts: float
     last_error_code: str | None
     strategy_version: int = READ_STRATEGY_VERSION
+    force_retry: bool = False
+    """수동 재인덱싱이 "백오프 이번 한 번만 무시하고 다시 시도"를 요청했는지
+    (초기화 조건 4 수정판 — 예전엔 기록 전체를 비웠지만, 그러면 만성 실패 파일의
+    연속 실패 횟수·이력까지 함께 사라져 재인덱싱 버튼 한 번으로 30분 백오프로
+    되돌아가는 문제가 있었다). should_defer()가 이 값을 보고 대기를 건너뛰게 하며,
+    그 시도 결과(note_success/note_failure)가 기록을 새로 만들면서 자연히
+    False로 소비된다 — 별도로 끄는 코드가 필요 없다."""
 
 
 _DEFAULT_TEMPORARY_BUSY_SEC = 300.0                        # 5분 base(+지터로 5~10분)
@@ -208,14 +215,16 @@ def should_defer(
 
     판정 순서는 "재시도하는 쪽"이 항상 먼저다(fail-open):
     기록 없음 → 처리 / 정책 비활성 → 처리 / 파일 변경(mtime·size 불일치, 완료기준
-    "파일이 변경되면 즉시 다시 시도") → 처리 / 그 외엔 마지막 실패 이후 경과 시간이
-    백오프보다 짧으면 건너뜀.
+    "파일이 변경되면 즉시 다시 시도") → 처리 / force_retry(수동 재인덱싱 요청) →
+    처리 / 그 외엔 마지막 실패 이후 경과 시간이 백오프보다 짧으면 건너뜀.
     """
     if rec is None:
         return False
     if not policy.enabled:
         return False
     if rec.mtime != mtime or rec.size != size:
+        return False
+    if rec.force_retry:
         return False
     wait = backoff_seconds(rec, file_path, policy)
     return now < rec.last_failed_ts + wait
@@ -345,13 +354,16 @@ def load_failures(path: Path) -> dict[str, FailureRecord]:
             last_error_code = raw.get("last_error_code")
             if last_error_code is not None and not isinstance(last_error_code, str):
                 continue
+            force_retry = raw.get("force_retry", False)
+            if not isinstance(force_retry, bool):
+                force_retry = False
         except (KeyError, TypeError):
             continue
         out[file_path] = FailureRecord(
             mtime=float(mtime), size=int(size), kind=kind, stage=stage,
             consecutive_failures=int(consecutive_failures),
             last_failed_ts=float(last_failed_ts), last_error_code=last_error_code,
-            strategy_version=strategy_version,
+            strategy_version=strategy_version, force_retry=force_retry,
         )
     return out
 
@@ -407,6 +419,29 @@ def note_failure(
         consecutive_failures=consecutive, last_failed_ts=now,
         last_error_code=error_code, strategy_version=READ_STRATEGY_VERSION,
     )
+
+
+def request_retry_all(records: dict[str, FailureRecord]) -> int:
+    """모든 기록에 force_retry를 세워, 이번 사이클엔 백오프를 무시하고 한 번씩
+    다시 시도하게 한다(초기화 조건 4 수정판 — 수동 재인덱싱 트리거 전용).
+
+    예전엔 `records`를 통째로 비웠지만, 그러면 만성 실패 파일의 연속 실패
+    횟수·이력까지 함께 사라져 버튼 한 번으로 백오프가 처음 칸(30분)으로
+    되돌아갔다(재인덱싱을 누른 사용자가 그 자리에서 DRM 문서 재시도 대기를
+    떠안는 사고). 이력은 그대로 두고 "이번 한 번만" 봐주는 플래그만 세운다 —
+    재시도 결과(성공/실패)가 반영되면 새 FailureRecord가 만들어지며 플래그는
+    자연히 꺼진다. 반환값은 플래그를 세운 건수(로그용).
+    """
+    for file_path, rec in list(records.items()):
+        if rec.force_retry:
+            continue
+        records[file_path] = FailureRecord(
+            mtime=rec.mtime, size=rec.size, kind=rec.kind, stage=rec.stage,
+            consecutive_failures=rec.consecutive_failures,
+            last_failed_ts=rec.last_failed_ts, last_error_code=rec.last_error_code,
+            strategy_version=rec.strategy_version, force_retry=True,
+        )
+    return len(records)
 
 
 def note_success(records: dict[str, FailureRecord], file_path: str) -> None:

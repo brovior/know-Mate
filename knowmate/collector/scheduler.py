@@ -169,13 +169,17 @@ class CollectorWorker(QThread):
         # 아직 사이클을 한 번도 안 돈 상태에서 조회되면 재계산하도록).
         self.last_cycle_changed: bool = True
         # 수동 재인덱싱(사용자의 [인덱싱 시작]/트레이 [재인덱싱])이 다음 사이클
-        # 시작 시 실패 기록을 비워달라고 요청했는지(초기화 조건 4). 유휴 자동
-        # 사이클은 이 플래그를 세우지 않는다 — 매번 비우면 연속 실패 횟수가
-        # 영원히 1에 머물러 3차 기록 자체가 무의미해진다.
+        # 시작 시 모든 실패 기록에 force_retry를 세워달라고 요청했는지(초기화
+        # 조건 4 수정판 — failure_state.request_retry_all 참고: 기록 전체를
+        # 비우면 만성 실패 파일의 연속 실패 횟수·이력까지 사라져 버튼 한 번으로
+        # 백오프가 처음 칸으로 돌아가는 문제가 있어, 이력은 남기고 "이번 한 번만"
+        # 건너뛰는 플래그로 바꿨다). 유휴 자동 사이클은 이 플래그를 세우지
+        # 않는다 — 매번 세우면 백오프가 사실상 무력화된다.
         self._retry_requested = False
 
     def request_failure_retry(self) -> None:
-        """다음 사이클 시작 시 실패 기록을 초기화하도록 요청한다(수동 트리거 전용)."""
+        """다음 사이클 시작 시 모든 실패 기록에 재시도(force_retry)를 요청한다
+        (수동 트리거 전용). 이력·연속 실패 횟수는 보존된다."""
         self._retry_requested = True
 
     def run(self):
@@ -424,8 +428,8 @@ class CollectorWorker(QThread):
         from knowmate.collector import failure_state
         failures = failure_state.load_failures(self._failure_file)
         if self._retry_requested:
-            logger.info("[failure] 사용자 재시도 요청 — 실패 기록 초기화 (%d건)", len(failures))
-            failures = {}
+            n = failure_state.request_retry_all(failures)
+            logger.info("[failure] 사용자 재시도 요청 — 이번 사이클 백오프 무시 (%d건, 이력 보존)", n)
         self._retry_requested = False
         backoff_policy = failure_state.BackoffPolicy.from_config(collector_cfg)
 

@@ -1508,9 +1508,12 @@ class TestFailureStateIntegration:
         assert str(target) not in failure_state.load_failures(failure_file)
         assert str(target) in load_state(state_file)
 
-    def test_request_failure_retry_clears_all_records_on_next_cycle(self, tmp_path: Path):
-        """수동 재인덱싱(초기화 조건 4) — request_failure_retry() 호출 후 다음
-        run()이 기존 실패 기록을 모두 비운다."""
+    def test_request_failure_retry_bypasses_backoff_but_keeps_history(self, tmp_path: Path):
+        """수동 재인덱싱(초기화 조건 4 수정판) — request_failure_retry() 호출 후 다음
+        run()은 백오프 창 안이어도 즉시 재시도하지만, 그 파일이 다시 실패하면
+        consecutive_failures는 초기화되지 않고 계속 누적된다(이력 보존). 예전엔
+        기록을 통째로 비워 재인덱싱 버튼 한 번에 만성 실패 파일의 백오프가
+        처음 칸(30분)으로 되돌아가는 문제가 있었다."""
         from knowmate.rag.embedding import EmbeddingClient
         from knowmate.rag.indexer import Indexer
         from knowmate.collector.scheduler import CollectorWorker
@@ -1540,13 +1543,16 @@ class TestFailureStateIntegration:
         worker.run()
         assert failure_state.load_failures(failure_file)[str(target)].consecutive_failures == 2
 
-        # request_failure_retry()는 기록을 통째로 비우므로, 백오프 창 안이어도
-        # (clock을 더 돌리지 않아도) 즉시 재시도돼야 한다 — should_defer(rec=None) == False
+        # request_failure_retry()는 기록을 지우지 않고 force_retry만 세우므로, 백오프
+        # 창 안이어도(clock을 더 돌리지 않아도) 즉시 재시도된다.
         worker.request_failure_retry()
         worker.run()
 
-        # 재시도 요청 직후 사이클도 다시 실패하지만, 초기화됐다가 새로 1건만 기록되므로 1이어야 한다
-        assert failure_state.load_failures(failure_file)[str(target)].consecutive_failures == 1
+        # 재시도 요청 직후 사이클도 다시 실패하지만, 같은 (mtime, size, kind)로
+        # 계속 실패한 것이므로 이력이 이어져 3으로 누적돼야 한다(초기화되지 않음).
+        rec = failure_state.load_failures(failure_file)[str(target)]
+        assert rec.consecutive_failures == 3
+        assert rec.force_retry is False  # 이번 시도 결과로 소비되어 꺼짐
 
     def test_idle_cycle_does_not_clear_failure_records(self, tmp_path: Path):
         """유휴 자동 사이클(request_failure_retry 미호출)은 실패 기록을 비우지
