@@ -13,6 +13,7 @@ from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal
 from knowmate.collector.cleanup import CleanupManager
 from knowmate.collector.scanner import get_scope, iter_scan_folder
 from knowmate.collector.state import load_state, save_state
+from knowmate.secure import com_stage
 from knowmate.secure.office_guard import OfficeBusyError
 from knowmate.secure.signature import UnreadableFormatError, is_ole2, is_zip
 
@@ -115,7 +116,7 @@ class CollectorWorker(QThread):
     indexing_needed = pyqtSignal(str)
 
     def __init__(self, config, indexer, extractor, state_file=None, email_indexer=None,
-                 parent=None, get_idle_seconds=None, purge_meta_file=None):
+                 parent=None, get_idle_seconds=None, purge_meta_file=None, failure_file=None):
         """수집기 워커를 초기화한다.
 
         get_idle_seconds: () -> float, 현재 OS 유휴 경과초 조회(테스트 주입용,
@@ -125,6 +126,9 @@ class CollectorWorker(QThread):
         purge_meta_file: purge 스킵/reconciliation 상태 sidecar 경로(테스트 주입용,
             기본은 %APPDATA%/AegisDesk/index_state.meta.json). index_state.json과
             분리된 별도 파일이라 기존 state 스키마·소비자에 영향이 없다.
+        failure_file: 파일별 실패 이력 sidecar 경로(테스트 주입용, 기본
+            %APPDATA%/AegisDesk/index_failure.json). index_state.json과 분리된
+            별도 파일 — 3차(실패 원인 분류 및 기록), 기록만 하고 동작은 바꾸지 않는다.
         """
         super().__init__(parent)
         self._config = config
@@ -141,6 +145,8 @@ class CollectorWorker(QThread):
         self._state_file = state_file or default_state_file
         default_purge_meta_file = get_data_dir() / "index_state.meta.json"
         self._purge_meta_file = purge_meta_file or default_purge_meta_file
+        default_failure_file = get_data_dir() / "index_failure.json"
+        self._failure_file = failure_file or default_failure_file
         # 사이클 안에서 억제·성공 상태를 sidecar 저장과 무관하게 즉시 반영하기 위한
         # 인메모리 캐시(설계 리뷰6 m-2) — 프로세스 재시작 전까지 sidecar 저장 실패가
         # 매 사이클 재조회를 유발하지 않도록 한다.
@@ -150,6 +156,15 @@ class CollectorWorker(QThread):
         # False면 건수 재계산(DB projection 조회)을 건너뛴다. 기본값 True(안전한 방향 —
         # 아직 사이클을 한 번도 안 돈 상태에서 조회되면 재계산하도록).
         self.last_cycle_changed: bool = True
+        # 수동 재인덱싱(사용자의 [인덱싱 시작]/트레이 [재인덱싱])이 다음 사이클
+        # 시작 시 실패 기록을 비워달라고 요청했는지(초기화 조건 4). 유휴 자동
+        # 사이클은 이 플래그를 세우지 않는다 — 매번 비우면 연속 실패 횟수가
+        # 영원히 1에 머물러 3차 기록 자체가 무의미해진다.
+        self._retry_requested = False
+
+    def request_failure_retry(self) -> None:
+        """다음 사이클 시작 시 실패 기록을 초기화하도록 요청한다(수동 트리거 전용)."""
+        self._retry_requested = True
 
     def run(self):
         """증분 스캔 사이클 1회를 실행한다."""
@@ -389,6 +404,13 @@ class CollectorWorker(QThread):
 
         state = load_state(self._state_file)
 
+        from knowmate.collector import failure_state
+        failures = failure_state.load_failures(self._failure_file)
+        if self._retry_requested:
+            logger.info("[failure] 사용자 재시도 요청 — 실패 기록 초기화 (%d건)", len(failures))
+            failures = {}
+        self._retry_requested = False
+
         # ── 스캔·인덱싱 파이프라인 (하이브리드) ──────────────────────────
         # 생산자 스레드: 폴더를 walk 하며 신규/변경 파일을 큐에 넣는다(os.walk+stat만).
         # 소비자(현재 스레드): 큐에서 꺼내 즉시 인덱싱(추출·임베딩·LanceDB 쓰기는 여기서만).
@@ -511,6 +533,7 @@ class CollectorWorker(QThread):
                 self.finished.emit(f"인덱싱 취소됨 ({done}건 처리 완료)")
                 producer.join(timeout=5)
                 save_state(self._state_file, state)
+                failure_state.save_failures(self._failure_file, failures)
                 return
 
             filename = Path(task.path).name
@@ -525,6 +548,7 @@ class CollectorWorker(QThread):
                 # COM 경유 파일만 워치독 무장(plain은 COM을 안 타 무의미하고, 느린
                 # openpyxl 파싱 중 애먼 Office를 죽이는 오발을 피함).
                 _wd_exe = None
+                _wd_fired_stage = None  # 이번 파일에서 워치독이 실제로 발화했다면 그 단계
                 if watchdog is not None and _classify_extract_method(task.path) == "com":
                     _wd_exe = _og.process_for_ext(Path(task.path).suffix.lower())
                 try:
@@ -537,7 +561,7 @@ class CollectorWorker(QThread):
                     text = self._extractor.extract(task.path)
                 finally:
                     if _wd_exe:
-                        watchdog.disarm()
+                        _wd_fired_stage = watchdog.disarm()
                         _og.end_com_op()
                 extract_sec = time.perf_counter() - _extract_t0
                 logger.debug("[단계2] 텍스트 추출 완료: %s (%d자, %.2fs)", task.path, len(text), extract_sec)
@@ -557,6 +581,10 @@ class CollectorWorker(QThread):
                         task.path,
                     )
                     changed_during.append(task.path)
+                    failure_state.note_failure(
+                        failures, task.path, failure_state.KIND_FILE_CHANGED, None, None,
+                        task.mtime, task.size, time.time(),
+                    )
                     continue
 
                 scope = get_scope(task.path)
@@ -591,19 +619,44 @@ class CollectorWorker(QThread):
                     "[%s] %s -> %d청크 (extract=%.2fs)",
                     task.action, task.path, len(chunk_ids), extract_sec,
                 )
+                failure_state.note_success(failures, task.path)
             except OfficeBusyError as exc:
                 # 사용자가 Office를 열어둔 상태 → 이번 사이클만 연기(실패 아님).
                 # state를 갱신하지 않으므로 다음 유휴 사이클에서 자동 재시도된다.
                 logger.warning("[collector] Office 점유로 연기(다음 사이클 재시도): %s", exc)
                 deferred.append(task.path)
+                _failed_stage = com_stage.take_last_failed_stage()
+                kind, error_code = failure_state.classify(
+                    exc, watchdog_stage=_wd_fired_stage, failed_stage=_failed_stage,
+                )
+                failure_state.note_failure(
+                    failures, task.path, kind, _wd_fired_stage or _failed_stage, error_code,
+                    task.mtime, task.size, time.time(),
+                )
             except UnreadableFormatError as exc:
                 # OOXML 확장자이나 zip 아님(DRM 래핑·손상 등)에 COM도 불가한 경우.
                 # 일반 실패와 구분해 로그·요약에 표시 — "버그"가 아니라 DRM/손상임을 알림.
                 logger.warning("[collector] 판독불가(DRM/암호화·손상 추정): %s", exc)
                 unreadable.append(task.path)
+                _failed_stage = com_stage.take_last_failed_stage()
+                kind, error_code = failure_state.classify(
+                    exc, watchdog_stage=_wd_fired_stage, failed_stage=_failed_stage,
+                )
+                failure_state.note_failure(
+                    failures, task.path, kind, _wd_fired_stage or _failed_stage, error_code,
+                    task.mtime, task.size, time.time(),
+                )
             except Exception as exc:
                 logger.error("파일 처리 실패 (건너뜀): %s - %s", task.path, exc)
                 failed.append(task.path)
+                _failed_stage = com_stage.take_last_failed_stage()
+                kind, error_code = failure_state.classify(
+                    exc, watchdog_stage=_wd_fired_stage, failed_stage=_failed_stage,
+                )
+                failure_state.note_failure(
+                    failures, task.path, kind, _wd_fired_stage or _failed_stage, error_code,
+                    task.mtime, task.size, time.time(),
+                )
 
         # 생산자 스레드 정리 (정상 종료 시 이미 끝나 있음)
         producer.join(timeout=5)
@@ -667,6 +720,19 @@ class CollectorWorker(QThread):
             self.indexing_needed.emit(f"일부 폴더 정리 건너뜀: {report.skipped_folders}")
 
         save_state(self._state_file, state)
+
+        # 실패 이력 저장 — 더 이상 존재하지 않는 파일 기록은 정리한 뒤 저장한다.
+        # 이번 범위는 기록뿐이라, 여기 기록된 값으로 이번 사이클의 처리를
+        # 바꾸지 않는다(재시도 정책은 4차).
+        pruned_count = failure_state.prune(failures)
+        failure_state.save_failures(self._failure_file, failures)
+        failure_summary = failure_state.summarize(failures)
+        if failure_summary:
+            logger.info(
+                "[failure] 누적 실패 기록 %d건 [분류별: %s]%s",
+                sum(failure_summary.values()), failure_summary,
+                f" (정리된 기록 {pruned_count}건)" if pruned_count else "",
+            )
 
         # 메일 스캔 (.mysingle) — mail.enabled: true 일 때만
         mail_indexed = 0

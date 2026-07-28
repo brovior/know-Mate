@@ -262,6 +262,8 @@ class Bridge(QObject):
         if self._worker.isRunning():
             self.indexAlert.emit("인덱싱이 이미 진행 중입니다.")
             return
+        if hasattr(self._worker, "request_failure_retry"):
+            self._worker.request_failure_retry()
         self._worker.start()
 
     @pyqtSlot()

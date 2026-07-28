@@ -144,6 +144,8 @@ class MainWindow(QMainWindow):
         """트레이 메뉴에서 재인덱싱을 트리거한다(진행 중이면 무시)."""
         worker = getattr(self._bridge, "_worker", None)
         if worker is not None and not worker.isRunning():
+            if hasattr(worker, "request_failure_retry"):
+                worker.request_failure_retry()
             worker.start()
 
     def _quit_app(self) -> None:

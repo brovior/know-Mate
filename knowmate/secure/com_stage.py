@@ -35,6 +35,11 @@ STAGE_CLOSE = "close"          # 문서 닫기
 _lock = threading.Lock()
 # 현재 진행 중인 단계(워커 스레드가 쓰고, 워치독 타이머 스레드가 읽는다).
 _current: dict = {"stage": None, "path": None, "started_at": None}
+# 가장 최근 파싱에서 예외가 난 단계 이름 — 실패 분류(failure_state.classify)가
+# "어느 단계에서 실패했는지"를 알아야 하는데, StageTimer는 파싱 1건마다 새로
+# 만들어져 호출부(스케줄러)가 직접 참조할 수 없다. 여기 게시해 두고
+# take_last_failed_stage()로 읽고 비운다(다음 파일로 값이 새는 것 방지).
+_last_failed_stage: str | None = None
 
 
 def begin(stage: str, path: str) -> None:
@@ -66,6 +71,20 @@ def snapshot() -> tuple[str | None, str | None, float]:
     if stage is None or started_at is None:
         return None, None, 0.0
     return stage, path, time.monotonic() - started_at
+
+
+def take_last_failed_stage() -> str | None:
+    """직전 파싱에서 예외가 난 단계 이름을 반환하고 슬롯을 비운다.
+
+    실패가 없었으면(정상 완료 또는 아직 아무것도 안 했으면) None. 스케줄러가
+    파일 1건의 예외 핸들러에서 호출해 실패 분류(failure_state.classify)에
+    넘긴다 — 읽고 나면 즉시 비워야 다음 파일의 실패로 착각하지 않는다.
+    """
+    global _last_failed_stage
+    with _lock:
+        stage = _last_failed_stage
+        _last_failed_stage = None
+    return stage
 
 
 def current_stage_name() -> str:
@@ -113,6 +132,9 @@ class StageTimer:
         self._durations[name] = elapsed
         if exc is not None and self.failed_stage is None:
             self.failed_stage = name
+            global _last_failed_stage
+            with _lock:
+                _last_failed_stage = name
 
     def summary(self) -> str:
         """단계별 소요시간 + 실패 단계를 로그 한 줄로 요약한다. 셀 값·본문 없음."""
