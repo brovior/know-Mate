@@ -1226,12 +1226,27 @@ class TestChangedDuringProcessing:
         assert task.mtime == 0.0  # 기본값 확인 — 이 값이면 판정에서 제외돼야 함
 
 
-class TestFailureStateIntegration:
-    """3차(실패 원인 분류 및 기록) — CollectorWorker가 index_failure.json을 배선하는지.
+class _MutableClock:
+    """4차 백오프 테스트용 — advance()로 시간을 앞으로 돌릴 수 있는 get_now 콜백."""
 
-    이번 범위는 기록뿐이다 — 여기 기록된 값이 이번 사이클의 인덱싱 여부를
-    바꾸지 않는지도 함께 확인한다(파일이 실패해도 계속 큐에 남아 매 사이클
-    재시도된다 — 4차 전까지는 건너뛰는 로직이 없다)."""
+    def __init__(self, start: float = 1_700_000_000.0):
+        self._now = start
+
+    def __call__(self) -> float:
+        return self._now
+
+    def advance(self, seconds: float) -> None:
+        self._now += seconds
+
+
+class TestFailureStateIntegration:
+    """3~4차(실패 원인 분류·기록 + 유형별 백오프) — CollectorWorker가
+    index_failure.json을 배선하고, 기록된 값으로 재시도 시점을 미루는지.
+
+    기본 정책(failure_backoff.enabled: true)이 켜져 있으므로, "같은 사이클
+    간격 안에서 계속 실패"를 검증하는 테스트는 _MutableClock으로 시간을
+    충분히 돌려 백오프 창을 벗어나야 한다 — 그러지 않으면 재시도 자체가
+    (의도대로) 걸러져 추출기가 호출되지 않는다."""
 
     class _AlwaysFailingReader:
         def extract(self, path: str) -> str:
@@ -1285,14 +1300,16 @@ class TestFailureStateIntegration:
         state_file = tmp_path / "state.json"
         failure_file = tmp_path / "index_failure.json"
         config = _make_config(str(folder))
+        clock = _MutableClock()
 
         for _ in range(3):
             worker = CollectorWorker(
                 config=config, indexer=indexer, extractor=self._AlwaysFailingReader(),
                 state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json",
-                failure_file=failure_file,
+                failure_file=failure_file, get_now=clock,
             )
             worker.run()
+            clock.advance(2 * 24 * 3600.0)  # 백오프 사다리 최댓값(24h)보다 충분히 뒤로
 
         failures = failure_state.load_failures(failure_file)
         assert failures[str(target)].consecutive_failures == 3
@@ -1314,21 +1331,23 @@ class TestFailureStateIntegration:
         state_file = tmp_path / "state.json"
         failure_file = tmp_path / "index_failure.json"
         config = _make_config(str(folder))
+        clock = _MutableClock()
 
         worker1 = CollectorWorker(
             config=config, indexer=indexer, extractor=self._AlwaysFailingReader(),
             state_file=state_file, purge_meta_file=tmp_path / "purge_meta1.json",
-            failure_file=failure_file,
+            failure_file=failure_file, get_now=clock,
         )
         worker1.run()
         assert str(target) in failure_state.load_failures(failure_file)
 
-        # 실패해도 state.json에 안 남았으므로 다음 사이클도 "신규"로 재시도된다
-        # (이번 범위엔 실패 기록에 따른 스킵 로직이 없다는 것도 함께 확인).
+        # 백오프 창을 벗어나야 재시도가 시도된다(의도한 동작) — 이후 성공하면
+        # 기록이 지워지는지 확인한다.
+        clock.advance(2 * 24 * 3600.0)
         worker2 = CollectorWorker(
             config=config, indexer=indexer, extractor=FakeReader(),
             state_file=state_file, purge_meta_file=tmp_path / "purge_meta2.json",
-            failure_file=failure_file,
+            failure_file=failure_file, get_now=clock,
         )
         worker2.run()
 
@@ -1353,18 +1372,22 @@ class TestFailureStateIntegration:
         state_file = tmp_path / "state.json"
         failure_file = tmp_path / "index_failure.json"
         config = _make_config(str(folder))
+        clock = _MutableClock()
 
         worker = CollectorWorker(
             config=config, indexer=indexer, extractor=self._AlwaysFailingReader(),
             state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json",
-            failure_file=failure_file,
+            failure_file=failure_file, get_now=clock,
         )
         worker.run()
         assert str(target) in failure_state.load_failures(failure_file)
-        # 계속 실패하는 파일이므로, 재시도 요청 없이 한 번 더 돌리면 연속 실패가 누적된다
+        # 백오프 창을 벗어난 뒤 재시도 요청 없이 한 번 더 돌리면 연속 실패가 누적된다
+        clock.advance(2 * 24 * 3600.0)
         worker.run()
         assert failure_state.load_failures(failure_file)[str(target)].consecutive_failures == 2
 
+        # request_failure_retry()는 기록을 통째로 비우므로, 백오프 창 안이어도
+        # (clock을 더 돌리지 않아도) 즉시 재시도돼야 한다 — should_defer(rec=None) == False
         worker.request_failure_retry()
         worker.run()
 
@@ -1373,7 +1396,12 @@ class TestFailureStateIntegration:
 
     def test_idle_cycle_does_not_clear_failure_records(self, tmp_path: Path):
         """유휴 자동 사이클(request_failure_retry 미호출)은 실패 기록을 비우지
-        않는다 — 비우면 연속 실패 횟수가 영원히 1에 머물러 3차 기록이 무의미해진다."""
+        않는다 — 비우면 연속 실패 횟수가 영원히 1에 머물러 3차 기록이 무의미해진다.
+
+        4차 백오프가 켜져 있으므로 같은 사이클 간격(clock 미이동)의 두 번째
+        run()은 재시도 자체가 걸러진다(완료 기준 "같은 문제 파일이 매 사이클마다
+        실행되지 않음") — 그래도 기록은 그대로 남아 있어야 한다(retry_requested와
+        달리 통째로 지워지면 안 됨)."""
         from knowmate.rag.embedding import EmbeddingClient
         from knowmate.rag.indexer import Indexer
         from knowmate.collector.scheduler import CollectorWorker
@@ -1396,9 +1424,11 @@ class TestFailureStateIntegration:
             failure_file=failure_file,
         )
         worker.run()
-        worker.run()  # request_failure_retry() 호출 없이 두 번째 사이클
+        worker.run()  # request_failure_retry() 호출 없이 두 번째 사이클(백오프로 재시도 걸러짐)
 
-        assert failure_state.load_failures(failure_file)[str(target)].consecutive_failures == 2
+        rec = failure_state.load_failures(failure_file)[str(target)]
+        assert rec.consecutive_failures == 1  # 두 번째 시도가 걸러졌으므로 누적되지 않음
+        assert rec.kind == failure_state.KIND_UNKNOWN_TRANSIENT  # 기록은 지워지지 않고 유지됨
 
     def test_prune_removes_record_for_deleted_file(self, tmp_path: Path):
         from knowmate.rag.embedding import EmbeddingClient
@@ -1435,6 +1465,252 @@ class TestFailureStateIntegration:
         worker2.run()
 
         assert str(target) not in failure_state.load_failures(failure_file)
+
+
+class TestFailureBackoffIntegration:
+    """4차(실패 유형별 백오프 적용) — 완료 기준을 스케줄러 레벨에서 확인한다."""
+
+    class _AlwaysFailingReader:
+        def __init__(self):
+            self.call_count = 0
+
+        def extract(self, path: str) -> str:
+            self.call_count += 1
+            raise RuntimeError("추출 실패(시뮬레이션)")
+
+    class _OfficeBusyReader:
+        def __init__(self):
+            self.call_count = 0
+
+        def extract(self, path: str) -> str:
+            self.call_count += 1
+            from knowmate.secure.office_guard import OfficeBusyError
+            raise OfficeBusyError("점유 중(시뮬레이션)")
+
+    def test_same_problem_file_not_reprocessed_next_cycle(self, tmp_path: Path):
+        """완료 기준 1: 같은 문제 파일이 매 사이클마다 실행되지 않음 —
+        생산자 검사가 큐에 넣기 전에 걸러 추출기 자체가 호출되지 않는다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        target = folder / "broken.xlsx"
+        target.write_bytes(b"fake xlsx content")
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        state_file = tmp_path / "state.json"
+        failure_file = tmp_path / "index_failure.json"
+        config = _make_config(str(folder))
+        extractor = self._AlwaysFailingReader()
+
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=extractor, state_file=state_file,
+            purge_meta_file=tmp_path / "purge_meta.json", failure_file=failure_file,
+        )
+        worker.run()
+        assert extractor.call_count == 1
+
+        worker.run()  # 같은 사이클 간격(백오프 창 안) — 추출기가 다시 호출되면 안 됨
+        assert extractor.call_count == 1
+
+    def test_changed_file_retried_immediately_even_within_backoff_window(self, tmp_path: Path):
+        """완료 기준 2: 파일이 변경되면 즉시 다시 시도 가능."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        target = folder / "broken.xlsx"
+        target.write_bytes(b"fake xlsx content")
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        state_file = tmp_path / "state.json"
+        failure_file = tmp_path / "index_failure.json"
+        config = _make_config(str(folder))
+        extractor = self._AlwaysFailingReader()
+
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=extractor, state_file=state_file,
+            purge_meta_file=tmp_path / "purge_meta.json", failure_file=failure_file,
+        )
+        worker.run()
+        assert extractor.call_count == 1
+
+        target.write_bytes(b"different content, different size!!")  # mtime·size 변경
+        worker.run()  # 백오프 창 안이어도(clock 미이동) 즉시 재시도돼야 함
+        assert extractor.call_count == 2
+
+    def test_retried_after_24_hours(self, tmp_path: Path):
+        """완료 기준: 영구적인 무시가 아니라 재시도 시점만 조정 — 결국 재시도된다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        target = folder / "broken.xlsx"
+        target.write_bytes(b"fake xlsx content")
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        state_file = tmp_path / "state.json"
+        failure_file = tmp_path / "index_failure.json"
+        config = _make_config(str(folder))
+        extractor = self._AlwaysFailingReader()
+        clock = _MutableClock()
+
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=extractor, state_file=state_file,
+            purge_meta_file=tmp_path / "purge_meta.json", failure_file=failure_file,
+            get_now=clock,
+        )
+        worker.run()
+        assert extractor.call_count == 1
+
+        clock.advance(24 * 3600.0 + 1.0)  # 24시간 + 1초
+        worker.run()
+        assert extractor.call_count == 2
+
+    def test_temporary_busy_retried_after_10_minutes(self, tmp_path: Path):
+        """완료 기준: 다른 사용자가 잠깐 열었던 파일은 나중에 자동 복구."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        target = folder / "busy.doc"
+        target.write_bytes(b"fake doc content")
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        state_file = tmp_path / "state.json"
+        failure_file = tmp_path / "index_failure.json"
+        config = _make_config(str(folder))
+        extractor = self._OfficeBusyReader()
+        clock = _MutableClock()
+
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=extractor, state_file=state_file,
+            purge_meta_file=tmp_path / "purge_meta.json", failure_file=failure_file,
+            get_now=clock,
+        )
+        worker.run()
+        assert extractor.call_count == 1
+
+        clock.advance(601.0)  # 10분 1초 — TEMPORARY_BUSY 최대 대기(300+300초) 이후
+        worker.run()
+        assert extractor.call_count == 2
+
+    def test_overlapping_watch_folders_second_enqueue_blocked_by_consumer_check(self, tmp_path: Path):
+        """완료 기준 1의 극단 케이스: watch_folders가 겹쳐 같은 파일이 두 번
+        enqueue돼도, 소비자 쪽 재확인이 두 번째 처리를 막는다(생산자는 사이클
+        시작 스냅샷이라 이 케이스를 못 잡는다 — 4차 설계의 핵심 근거)."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        target = folder / "broken.xlsx"
+        target.write_bytes(b"fake xlsx content")
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        state_file = tmp_path / "state.json"
+        failure_file = tmp_path / "index_failure.json"
+        # watch_folders가 폴더 자체와 그 하위를 모두 가리켜 같은 파일이 두 번 스캔됨
+        config = {
+            "collector": {"watch_folders": [str(folder), str(folder)], "idle_seconds": 60},
+            "cleanup": {"dry_run": True, "max_delete_ratio": 0.30},
+            "chunking": {"chunk_size": 400, "overlap": 80},
+        }
+        extractor = self._AlwaysFailingReader()
+
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=extractor, state_file=state_file,
+            purge_meta_file=tmp_path / "purge_meta.json", failure_file=failure_file,
+        )
+        worker.run()
+
+        # 첫 번째 처리가 실패를 기록한 뒤, 같은 사이클의 두 번째 enqueue는
+        # 소비자 재확인에 걸려 처리되지 않아야 한다(생산자 스냅샷은 사이클 시작
+        # 시점이라 첫 번째 실패를 아직 모른다).
+        assert extractor.call_count == 1
+
+    def test_backoff_disabled_retries_every_cycle(self, tmp_path: Path):
+        """enabled: false면 4차 도입 전(매 사이클 재시도)과 동일하게 동작한다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        target = folder / "broken.xlsx"
+        target.write_bytes(b"fake xlsx content")
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        state_file = tmp_path / "state.json"
+        failure_file = tmp_path / "index_failure.json"
+        config = _make_config(str(folder))
+        config["collector"]["failure_backoff"] = {"enabled": False}
+        extractor = self._AlwaysFailingReader()
+
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=extractor, state_file=state_file,
+            purge_meta_file=tmp_path / "purge_meta.json", failure_file=failure_file,
+        )
+        worker.run()
+        assert extractor.call_count == 1
+        worker.run()
+        assert extractor.call_count == 2
+
+    def test_success_after_backoff_window_clears_record_and_stops_deferring(self, tmp_path: Path):
+        """완료 기준: 정상 처리되면 실패 기록 삭제 — 백오프 창을 벗어나 재시도해
+        성공하면 그 이후로는 더 이상 건너뛰지 않는다."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+        from knowmate.secure.fake_reader import FakeReader
+        from knowmate.collector import failure_state
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        target = folder / "flaky.txt"
+        target.write_bytes(b"content")
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        state_file = tmp_path / "state.json"
+        failure_file = tmp_path / "index_failure.json"
+        config = _make_config(str(folder))
+        clock = _MutableClock()
+
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=self._AlwaysFailingReader(),
+            state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json",
+            failure_file=failure_file, get_now=clock,
+        )
+        worker.run()
+        clock.advance(2 * 24 * 3600.0)
+
+        success_extractor = FakeReader()
+        worker2 = CollectorWorker(
+            config=config, indexer=indexer, extractor=success_extractor, state_file=state_file,
+            purge_meta_file=tmp_path / "purge_meta2.json", failure_file=failure_file,
+            get_now=clock,
+        )
+        worker2.run()
+        assert str(target) not in failure_state.load_failures(failure_file)
+
+        # 기록이 지워졌으므로 다음 사이클(clock 미이동)에도 정상적으로 재시도(재확인)된다
+        worker2.run()
 
 
 class TestMaxDeleteRatioFailClosed:
