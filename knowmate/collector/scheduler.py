@@ -11,7 +11,7 @@ from typing import Callable, TYPE_CHECKING
 from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal
 
 from knowmate.collector.cleanup import CleanupManager
-from knowmate.collector.scanner import get_scope, iter_scan_folder
+from knowmate.collector.scanner import get_scope, iter_scan_folder, normalize_path_key
 from knowmate.collector.state import load_state, save_state
 from knowmate.secure import com_stage
 from knowmate.secure.office_guard import OfficeBusyError
@@ -375,6 +375,10 @@ class CollectorWorker(QThread):
         overlap = int(chunk_cfg.get("overlap", 80))
         max_file_size_mb = float(chunk_cfg.get("max_file_size_mb", 30.0))
         max_chunks_per_file = int(chunk_cfg.get("max_chunks_per_file", 500))
+        raw_exclude_files = collector_cfg.get("exclude_files", [])
+        exclude_files = frozenset(
+            normalize_path_key(p) for p in raw_exclude_files if isinstance(p, str)
+        )
         xlsx_max_rows_per_sheet = int(chunk_cfg.get("xlsx_max_rows_per_sheet", 2000))
 
         # 유휴가 이 임계를 넘으면 DRM/SSO 세션이 만료됐을 가능성이 크다고 보고,
@@ -482,6 +486,7 @@ class CollectorWorker(QThread):
                         folder,
                         max_file_size_mb=max_file_size_mb,
                         cancel_check=lambda: self._cancelled,
+                        exclude_files=exclude_files,
                     ):
                         if self._cancelled:
                             break

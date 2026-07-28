@@ -26,6 +26,7 @@ search:
   rerank_enabled: false
 collector:
   watch_folders: []        # 배포 기본값은 비움. 앱의 [폴더 관리]에서 사용자별로 지정
+  exclude_files: []        # 5차: [확인 필요한 문서] 화면에서 사용자가 인덱싱 제외한 절대경로 목록
   idle_enabled: true       # 유휴 시간 경과 시 자동 인덱싱 여부
   idle_seconds: 60
   drm_idle_threshold_sec: 480  # 이 시간(초) 이상 유휴면 DRM/SSO 세션 만료로 보고

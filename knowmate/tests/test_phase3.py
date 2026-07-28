@@ -8,7 +8,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from knowmate.collector.state import load_state, save_state
-from knowmate.collector.scanner import scan_folder, classify_changes, get_scope
+from knowmate.collector.scanner import scan_folder, classify_changes, get_scope, normalize_path_key
 from knowmate.collector.cleanup import CleanupManager, CleanupReport
 
 _HAS_PYQT6 = bool(importlib.util.find_spec("PyQt6"))
@@ -148,6 +148,27 @@ class TestScanner:
     def test_get_scope_unc_shared(self):
         """get_scope: UNC 경로 -> shared."""
         assert get_scope("//server/share/file.docx") == "shared"
+
+    def test_scan_folder_excludes_configured_files(self, tmp_path: Path):
+        """5차: exclude_files에 있는 파일은 열거 결과에서 아예 빠진다."""
+        excluded = tmp_path / "temp_backup.xlsx"
+        excluded.write_bytes(b"x")
+        kept = tmp_path / "keep.xlsx"
+        kept.write_bytes(b"x")
+
+        result = scan_folder(tmp_path, exclude_files=frozenset({normalize_path_key(str(excluded))}))
+        names = {Path(k).name for k in result}
+        assert "temp_backup.xlsx" not in names
+        assert "keep.xlsx" in names
+
+    def test_scan_folder_exclude_ignores_case(self, tmp_path: Path):
+        """exclude_files 비교는 대소문자 차이에 영향받지 않는다(Windows 경로 관례)."""
+        excluded = tmp_path / "Report.XLSX"
+        excluded.write_bytes(b"x")
+        mixed_case_key = normalize_path_key(str(excluded).upper())
+
+        result = scan_folder(tmp_path, exclude_files=frozenset({mixed_case_key}))
+        assert not any(Path(k).name == "Report.XLSX" for k in result)
 
 
 # ============================================================

@@ -249,6 +249,18 @@ class Bridge(QObject):
             return "ok"
         return "not_found"
 
+    @pyqtSlot(str, result=str)
+    def revealFile(self, path: str) -> str:
+        """[확인 필요한 문서] 화면의 「파일 위치 열기」— 탐색기에서 해당 파일을
+        선택된 상태로 연다(파일 자체를 실행하지 않는다). 결과를 문자열로 반환."""
+        import pathlib
+        import subprocess
+        p = pathlib.Path(path)
+        if not p.exists():
+            return "not_found"
+        subprocess.Popen(["explorer", "/select,", str(p)])
+        return "ok"
+
     # ------------------------------------------------------------------
     # 수집기 슬롯
     # ------------------------------------------------------------------
@@ -341,6 +353,158 @@ class Bridge(QObject):
 
         self._local_count, self._shared_count, self._mail_count = local_count, shared_count, mail_count
         return local_count, shared_count, mail_count, last_indexed
+
+    # ------------------------------------------------------------------
+    # 실패 파일 관리 (5차: [확인 필요한 문서] 화면)
+    # ------------------------------------------------------------------
+
+    _FAIL_KIND_BADGE = {
+        "TEMPORARY_BUSY":       ("사용 중", "b-info"),
+        "OPEN_TIMEOUT":         ("열기 시간초과", "b-warn"),
+        "READ_TIMEOUT":         ("읽기 시간초과", "b-warn"),
+        "NEEDS_USER_ACTION":    ("조치 필요", "b-action"),
+        "FILE_CHANGED":         ("변경 감지", "b-gray"),
+        "UNKNOWN_TRANSIENT":    ("원인 미확인", "b-gray"),
+    }
+    _FAIL_STAGE_LABEL = {
+        "dispatch": "오피스 실행",
+        "open": "파일 열기",
+        "sheets": "데이터 읽기",
+        "cell_read": "데이터 읽기",
+        "read": "본문 읽기",
+    }
+
+    @pyqtSlot(result=str)
+    def getFailures(self) -> str:
+        """실패 이력 + 인덱싱 제외 목록을 병합해 카드 JSON 배열로 반환한다.
+
+        시각·잔여시간 계산은 클라이언트(JS)가 epoch 초를 받아 로컬 시각 기준으로
+        표시한다 — 표시 형식(오늘/어제/N일 전 등)은 UI 관심사라 여기선 원시값만 준다.
+        """
+        from knowmate.collector import failure_state
+        from knowmate.config import get_config, get_data_dir
+        from knowmate.collector.scanner import normalize_path_key
+
+        collector_cfg = get_config().get("collector", {})
+        excluded_raw = collector_cfg.get("exclude_files", [])
+        excluded_keys = {normalize_path_key(p) for p in excluded_raw if isinstance(p, str)}
+
+        failure_file = getattr(self._worker, "_failure_file", None) or (get_data_dir() / "index_failure.json")
+        records = failure_state.load_failures(failure_file)
+        policy = failure_state.BackoffPolicy.from_config(collector_cfg)
+        now = self._get_now()
+
+        cards = []
+        for path, rec in records.items():
+            badge_label, badge_class = self._FAIL_KIND_BADGE.get(rec.kind, ("원인 미확인", "b-gray"))
+            stage_label = self._FAIL_STAGE_LABEL.get(rec.stage or "", "-")
+            is_excluded = normalize_path_key(path) in excluded_keys
+            next_retry_ts = None
+            if not is_excluded and not rec.force_retry:
+                wait = failure_state.backoff_seconds(rec, path, policy)
+                next_retry_ts = rec.last_failed_ts + wait
+            cards.append({
+                "path": path,
+                "name": os.path.basename(path),
+                "dir": os.path.dirname(path),
+                "kind": rec.kind,
+                "badge_label": badge_label,
+                "badge_class": badge_class,
+                "stage_label": stage_label,
+                "consecutive_failures": rec.consecutive_failures,
+                "last_failed_ts": rec.last_failed_ts,
+                "next_retry_ts": next_retry_ts,
+                "excluded": is_excluded,
+            })
+        # 제외됐지만 실패 기록이 이미 지워진 파일(오래 전 실패 후 자연 정리)도
+        # 목록에서 사라지면 안 되므로 exclude_files에만 있는 경로도 카드로 만든다.
+        seen_keys = {normalize_path_key(p) for p in records}
+        for raw in excluded_raw:
+            if not isinstance(raw, str) or normalize_path_key(raw) in seen_keys:
+                continue
+            cards.append({
+                "path": raw, "name": os.path.basename(raw), "dir": os.path.dirname(raw),
+                "kind": "UNKNOWN_TRANSIENT", "badge_label": "원인 미확인", "badge_class": "b-gray",
+                "stage_label": "-", "consecutive_failures": 0, "last_failed_ts": None,
+                "next_retry_ts": None, "excluded": True,
+            })
+        cards.sort(key=lambda c: (c["excluded"], -(c["last_failed_ts"] or 0)))
+        return json.dumps(cards, ensure_ascii=False)
+
+    @pyqtSlot(str, result=str)
+    def retryFile(self, path: str) -> str:
+        """파일 1건에 대해 「지금 다시 시도」— 이번 사이클만 백오프를 무시하게
+        force_retry를 세우고 재인덱싱 사이클을 시작한다. 이력은 보존된다."""
+        if self._worker is None:
+            self.indexAlert.emit("수집기가 초기화되지 않았습니다.")
+            return "error"
+        if self._worker.isRunning():
+            self.indexAlert.emit("인덱싱이 이미 진행 중입니다.")
+            return "busy"
+
+        from knowmate.collector import failure_state
+        failure_file = getattr(self._worker, "_failure_file", None)
+        if failure_file is None:
+            return "error"
+        records = failure_state.load_failures(failure_file)
+        found = failure_state.request_retry_one(records, path)
+        if found:
+            failure_state.save_failures(failure_file, records)
+        self._worker.start()
+        return "ok" if found else "not_found"
+
+    @pyqtSlot(str, result=str)
+    def excludeFile(self, path: str) -> str:
+        """파일을 collector.exclude_files에 추가하고, 이미 인덱싱된 청크가
+        있으면 즉시 삭제한다(사용자 확정 요청 — 다음 사이클을 기다리지 않는다)."""
+        from knowmate.config import get_config, update_exclude_files
+        from knowmate.collector.scanner import normalize_path_key
+        from knowmate.collector.state import load_state, save_state
+
+        folders: list[str] = get_config().get("collector", {}).get("exclude_files", [])
+        key = normalize_path_key(path)
+        if not any(normalize_path_key(f) == key for f in folders):
+            folders.append(path)
+            update_exclude_files(folders)
+
+        if self._worker is not None:
+            try:
+                if getattr(self._worker, "_indexer", None) is not None:
+                    safe = path.replace("'", "''")
+                    self._worker._indexer.table.delete(f"file_path = '{safe}'")
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning("[exclude] 청크 삭제 실패: %s (%s)", path, exc)
+            state_file = getattr(self._worker, "_state_file", None)
+            if state_file is not None:
+                state = load_state(state_file)
+                if state.pop(path, None) is not None:
+                    save_state(state_file, state)
+        return "ok"
+
+    @pyqtSlot(str, result=str)
+    def unexcludeFile(self, path: str) -> str:
+        """collector.exclude_files에서 파일을 제거한다(제외 해제).
+
+        다음 스캔 사이클부터 다시 대상이 된다 — 백오프는 별도 판정(실패 이력이
+        남아 있으면 그 정책을 그대로 따른다. 즉시 재시도가 필요하면 retryFile 사용)."""
+        from knowmate.config import get_config, update_exclude_files
+        from knowmate.collector.scanner import normalize_path_key
+
+        folders: list[str] = get_config().get("collector", {}).get("exclude_files", [])
+        key = normalize_path_key(path)
+        folders = [f for f in folders if normalize_path_key(f) != key]
+        update_exclude_files(folders)
+        return "ok"
+
+    def _get_now(self) -> float:
+        """failure_state 계산용 현재 시각(초). 워커가 있으면 그 시계를 따른다
+        (테스트에서 워커 시계를 고정해 검증하는 경우와 표시값이 어긋나지 않도록)."""
+        get_now = getattr(self._worker, "_get_now", None)
+        if callable(get_now):
+            return get_now()
+        import time
+        return time.time()
 
     def set_worker(self, worker) -> None:
         """단일 수집기 워커를 등록하고 시그널을 바인딩한다 (수동·유휴 인덱싱 공유)."""

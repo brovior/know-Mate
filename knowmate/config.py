@@ -92,6 +92,13 @@ def update_watch_folders(folders: list[str]) -> None:
     _save_config(cfg)
 
 
+def update_exclude_files(paths: list[str]) -> None:
+    """collector.exclude_files를 갱신하고 config.yaml에 저장한다."""
+    cfg = get_config()
+    cfg.setdefault("collector", {})["exclude_files"] = paths
+    _save_config(cfg)
+
+
 def update_settings(patch: dict[str, Any]) -> None:
     """설정 UI에서 받은 patch를 config에 병합하고 저장한다.
 

@@ -209,6 +209,59 @@ class TestNoteFailure:
 
 
 # ============================================================
+# request_retry_one (5차: 파일 단위 「지금 다시 시도」)
+# ============================================================
+
+class TestRequestRetryOne:
+    def test_sets_force_retry_on_target_only(self):
+        records = {}
+        failure_state.note_failure(
+            records, "a.xlsx", failure_state.KIND_UNKNOWN_TRANSIENT, None, None,
+            mtime=100.0, size=10, now=1000.0,
+        )
+        failure_state.note_failure(
+            records, "b.xlsx", failure_state.KIND_UNKNOWN_TRANSIENT, None, None,
+            mtime=100.0, size=10, now=1000.0,
+        )
+        found = failure_state.request_retry_one(records, "a.xlsx")
+        assert found is True
+        assert records["a.xlsx"].force_retry is True
+        assert records["b.xlsx"].force_retry is False
+
+    def test_preserves_consecutive_failures(self):
+        records = {}
+        for i in range(5):
+            failure_state.note_failure(
+                records, "a.xlsx", failure_state.KIND_UNKNOWN_TRANSIENT, None, None,
+                mtime=100.0, size=10, now=1000.0 + i,
+            )
+        failure_state.request_retry_one(records, "a.xlsx")
+        assert records["a.xlsx"].consecutive_failures == 5
+
+    def test_unknown_path_returns_false(self):
+        records = {}
+        found = failure_state.request_retry_one(records, "nope.xlsx")
+        assert found is False
+        assert records == {}
+
+    def test_bypasses_backoff_in_should_defer(self):
+        records = {}
+        failure_state.note_failure(
+            records, "a.xlsx", failure_state.KIND_NEEDS_USER_ACTION, "open", None,
+            mtime=100.0, size=10, now=1000.0,
+        )
+        policy = failure_state.BackoffPolicy()
+        # 백오프 창 안(같은 시각)이면 원래는 건너뛰어야 한다
+        assert failure_state.should_defer(
+            records["a.xlsx"], "a.xlsx", 100.0, 10, 1000.0, policy
+        ) is True
+        failure_state.request_retry_one(records, "a.xlsx")
+        assert failure_state.should_defer(
+            records["a.xlsx"], "a.xlsx", 100.0, 10, 1000.0, policy
+        ) is False
+
+
+# ============================================================
 # prune
 # ============================================================
 
