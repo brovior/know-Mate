@@ -61,6 +61,13 @@ _XL_ALERTS_OFF = False
 _XL_REPAIR_FILE = 1          # xlRepairFile — 손상 파일을 복구 모드로 연다(복구 확인창 대신)
 _XL_UPDATE_LINKS_NEVER = 0   # 외부 링크를 갱신하지 않음(네트워크 대기·갱신 확인창 방지)
 
+# 한 번의 COM 왕복으로 읽을 최대 행 수. 셀 단위로 읽으면 셀마다 프로세스 간 마샬링이
+# 일어나 1000행×20열이면 왕복이 2만 번인데, Range 단위로 읽으면 블록당 1번이다.
+# 시트 전체를 한 번에 올리지 않고 블록으로 나누는 건 대형 시트의 순간 메모리 때문.
+# config `chunking.xlsx_block_rows`로 조정 가능하며, 이 값은 그 설정이 없거나
+# 비정상(0·음수)일 때의 폴백이다.
+_DEFAULT_XL_BLOCK_ROWS = 1000
+
 # 암호 보호 문서용 더미 암호. 빈 문자열이나 미지정이면 Office가 **암호 입력창**을 띄우고,
 # 백그라운드라 아무도 답할 수 없어 그대로 멈춘다(워치독 강제 종료 → 세이프모드 루프의
 # 또 다른 진입점). 틀린 암호를 미리 주면 프롬프트 없이 즉시 실패하고, 보호되지 않은
@@ -80,6 +87,32 @@ def _com_missing():
         return pythoncom.Missing
     except ImportError:
         return None
+
+
+def _normalize_range_values(values, n_rows: int, n_cols: int) -> tuple:
+    """`Range.Value`의 반환값을 항상 (행, 열) 2차원 튜플로 정규화한다.
+
+    pywin32는 범위 모양에 따라 다른 형태를 돌려주는 함정이 있다:
+    - 1×1 범위 → **2차원 튜플이 아니라 스칼라 하나**
+    - 그 외 → 튜플의 튜플(행 단위)
+
+    1×N·N×1도 방어적으로 처리한다(드라이버·Office 버전에 따라 1차원으로 올 수 있어,
+    그때 행/열 방향을 범위 모양(n_rows/n_cols)으로 복원한다). 여기서 잘못 펴면
+    셀 값이 엉뚱한 행에 붙어 인덱스 내용이 조용히 오염되므로 명시적으로 다룬다.
+    """
+    if not isinstance(values, (tuple, list)):
+        return ((values,),)  # 1×1 스칼라
+    if not values:
+        return ()
+    if isinstance(values[0], (tuple, list)):
+        return tuple(values)  # 이미 2차원
+    # 1차원으로 온 경우 — 요청한 범위 모양으로 행/열 방향을 판단
+    if n_rows == 1:
+        return (tuple(values),)          # 1행 N열
+    if n_cols == 1:
+        return tuple((v,) for v in values)  # N행 1열
+    # 모양을 알 수 없는 예외적 형태 — 한 행으로 취급(값 유실보다 낫다)
+    return (tuple(values),)
 
 
 def _close_quietly(timer: com_stage.StageTimer, obj, method_name: str, *args) -> None:
@@ -227,14 +260,59 @@ class WordComReader:
 class ExcelComReader:
     """xls 파일을 COM(Excel)으로 파싱하는 리더. 스레드별 싱글톤을 사용한다."""
 
+    def __init__(self, block_rows: int | None = None) -> None:
+        """block_rows: 한 번의 COM 왕복으로 읽을 행 수(config `chunking.xlsx_block_rows`).
+
+        None·0·음수 같은 비정상 값은 조용히 기본값으로 폴백한다 — config는 사용자가
+        직접 편집할 수 있어, 잘못된 값 하나로 인덱싱 전체가 죽으면 안 된다(fail-safe).
+        """
+        self._block_rows = (
+            _DEFAULT_XL_BLOCK_ROWS
+            if not isinstance(block_rows, int) or isinstance(block_rows, bool) or block_rows < 1
+            else block_rows
+        )
+
+    def _read_sheet_lines(self, sheet) -> list[str]:
+        """시트 하나를 **범위 단위**로 읽어 탭 구분 텍스트 줄 리스트를 반환한다.
+
+        이전에는 셀마다 `cell.Value`로 COM 왕복을 했는데(1000행×20열이면 2만 번),
+        `Range.Value`는 지정한 사각 범위를 왕복 1번으로 가져온다. 시트가 커도 순간
+        메모리가 튀지 않도록 `self._block_rows` 행씩 나눠 읽는다.
+
+        출력 포맷은 `plain_reader`의 openpyxl·xlrd 경로와 **동일해야** 한다
+        (탭 구분, 빈 행 스킵) — 세 경로가 같은 인덱스에 들어가므로 포맷이 갈리면
+        검색 품질이 경로에 따라 달라진다.
+        """
+        used = sheet.UsedRange
+        # UsedRange는 A1에서 시작한다는 보장이 없다(예: C5부터 데이터가 있는 시트).
+        first_row = int(used.Row)
+        first_col = int(used.Column)
+        n_rows = int(used.Rows.Count)
+        n_cols = int(used.Columns.Count)
+
+        sheet_lines: list[str] = []
+        for start in range(0, n_rows, self._block_rows):
+            block_rows = min(self._block_rows, n_rows - start)
+            r1 = first_row + start
+            r2 = r1 + block_rows - 1
+            c1 = first_col
+            c2 = first_col + n_cols - 1
+            values = sheet.Range(sheet.Cells(r1, c1), sheet.Cells(r2, c2)).Value
+            for row_values in _normalize_range_values(values, block_rows, n_cols):
+                row_text = "\t".join(str(v) if v is not None else "" for v in row_values)
+                if row_text.strip():
+                    sheet_lines.append(row_text)
+        return sheet_lines
+
     def parse(self, path: str) -> str:
         """xls 파일을 열어 시트 전체를 탭 구분 텍스트로 반환한다.
 
         단계(dispatch/open/sheets/cell_read/close)별 소요시간을 계측한다 — DRM
-        문서 등에서 어느 단계가 hang의 원인인지(Open 자체인지, 셀 순회인지)를
+        문서 등에서 어느 단계가 hang의 원인인지(Open 자체인지, 셀 읽기인지)를
         로그 한 줄로 구분할 수 있어야 한다는 요구(COM 처리 안정화). 시트 목록
         조회(sheets)와 셀 읽기(cell_read)를 별도 단계로 나누기 위해, `wb.Sheets`를
-        먼저 리스트로 materialize한 뒤 셀 순회를 시작한다.
+        먼저 리스트로 materialize한 뒤 셀 읽기를 시작한다. 셀 읽기 자체는
+        `_read_sheet_lines`가 범위 단위(블록)로 처리한다.
         """
         timer = com_stage.StageTimer(path)
         wb = None
@@ -268,13 +346,7 @@ class ExcelComReader:
             lines: list[str] = []
             with timer.stage(com_stage.STAGE_CELL_READ):
                 for sheet in sheets:
-                    sheet_lines: list[str] = []
-                    used = sheet.UsedRange
-                    for row in used.Rows:
-                        cells = [str(cell.Value) if cell.Value is not None else "" for cell in row.Cells]
-                        row_text = "\t".join(cells)
-                        if row_text.strip():
-                            sheet_lines.append(row_text)
+                    sheet_lines = self._read_sheet_lines(sheet)
                     if sheet_lines:
                         lines.append(f"=== 시트: {sheet.Name} ===")
                         lines.extend(sheet_lines)
@@ -366,9 +438,6 @@ class PowerPointComReader:
             timer.log_summary()
 
 
-_word_reader = WordComReader()
-_excel_reader = ExcelComReader()
-_ppt_reader = PowerPointComReader()
 
 
 def quit_com_apps() -> None:
@@ -406,6 +475,17 @@ def quit_com_apps() -> None:
 class ComReader:
     """확장자를 보고 Word/Excel/PowerPoint COM 리더로 라우팅하는 TextExtractor 구현체."""
 
+    def __init__(self, xlsx_block_rows: int | None = None) -> None:
+        """xlsx_block_rows: Excel 범위 읽기 블록 크기(config `chunking.xlsx_block_rows`).
+
+        리더 3개를 인스턴스 속성으로 보유한다(이전에는 모듈 레벨 싱글톤). 리더 객체는
+        무상태라 인스턴스화 비용이 없고, 진짜 재사용 대상인 COM 앱은 `_tls`에 따로
+        보관되므로 싱글톤을 없애도 Office 프로세스 재사용에는 영향이 없다.
+        """
+        self._word = WordComReader()
+        self._excel = ExcelComReader(block_rows=xlsx_block_rows)
+        self._ppt = PowerPointComReader()
+
     def extract(self, path: str) -> str:
         """확장자에 따라 적합한 COM 리더로 파일을 파싱해 텍스트를 반환한다.
 
@@ -414,9 +494,9 @@ class ComReader:
         """
         ext = Path(path).suffix.lower()
         if ext in (".doc", ".docx"):
-            return _word_reader.parse(path)
+            return self._word.parse(path)
         if ext in (".xls", ".xlsx"):
-            return _excel_reader.parse(path)
+            return self._excel.parse(path)
         if ext in (".ppt", ".pptx"):
-            return _ppt_reader.parse(path)
+            return self._ppt.parse(path)
         raise ValueError(f"ComReader가 지원하지 않는 확장자: {ext!r} ({path})")

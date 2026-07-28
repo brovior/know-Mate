@@ -7,6 +7,9 @@ from knowmate.secure.crypto import FakeCryptoManager, get_crypto_manager
 
 _HAS_XLRD = bool(importlib.util.find_spec("xlrd"))
 
+# COM 라우팅 테스트에서 AutoReader가 ComReader에 넘긴 생성자 인자를 담는다.
+captured_kwargs: dict = {}
+
 
 def _fake_embed_client() -> EmbeddingClient:
     """테스트용 fake EmbeddingClient를 반환한다."""
@@ -250,6 +253,9 @@ class TestAutoReader:
         captured = {}
 
         class _FakeCom:
+            def __init__(self, xlsx_block_rows=None):
+                captured_kwargs["xlsx_block_rows"] = xlsx_block_rows
+
             def extract(self, path):
                 captured["path"] = path
                 return "COM_RESULT"
@@ -561,6 +567,9 @@ class TestAutoReaderOle2Fallback:
         captured = {}
 
         class _FakeCom:
+            def __init__(self, xlsx_block_rows=None):
+                captured_kwargs["xlsx_block_rows"] = xlsx_block_rows
+
             def extract(self, path):
                 captured["path"] = path
                 return "COM_RESULT"
@@ -585,6 +594,9 @@ class TestAutoReaderOle2Fallback:
         captured = {}
 
         class _FakeCom:
+            def __init__(self, xlsx_block_rows=None):
+                captured_kwargs["xlsx_block_rows"] = xlsx_block_rows
+
             def extract(self, path):
                 captured["path"] = path
                 return "COM_RESULT"
@@ -602,6 +614,9 @@ class TestAutoReaderOle2Fallback:
         from knowmate.secure import AutoReader
 
         class _FakeCom:
+            def __init__(self, xlsx_block_rows=None):
+                captured_kwargs["xlsx_block_rows"] = xlsx_block_rows
+
             def extract(self, path):
                 return "COM_RESULT"
 

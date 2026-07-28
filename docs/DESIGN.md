@@ -127,6 +127,26 @@ class WordComReader:
 ```
 > **매번 Quit() 하는 방식 절대 사용 금지.**
 
+**Excel 셀 읽기 — 범위 단위 일괄 읽기 (`chunking.xlsx_block_rows`, 기본 1000)**
+
+COM 호출은 프로세스 간 마샬링이라 왕복 1회가 수십~수백 µs다. 셀마다 `cell.Value`를 읽으면
+1000행 × 20열 시트에서 왕복이 2만 번 발생해 `cell_read` 단계가 지배적 비용이 된다
+(`com_timeout_per_mb_sec: 20`이라는 큰 여유가 필요했던 이유). `ExcelComReader`는
+`sheet.Range(sheet.Cells(r1,c1), sheet.Cells(r2,c2)).Value`로 **블록당 왕복 1회**로 읽는다.
+한 번에 전부 올리면 순간 메모리가 커지므로 `xlsx_block_rows`(기본 1000)행 단위로 분할한다.
+
+- **`.Value` 사용, `.Value2` 금지** — Value2는 날짜를 일련번호(45730.0)로 돌려줘
+  `rag/date_filter.py`의 날짜 기반 검색 품질을 떨어뜨린다. 성능 이득은 왕복 제거에서
+  거의 다 나오므로 `.Value`로 충분하다(출력은 기존 `str(cell.Value)`와 동일).
+- **pywin32 `Range.Value`는 1×1 범위에서 2차원 튜플이 아니라 스칼라를 반환**한다(대표적 함정).
+  `_normalize_range_values()`가 1×N·N×1까지 포함해 항상 (행, 열) 2차원으로 맞춘다.
+- 설정값은 `secure/` 관례대로 **주입**한다(`get_extractor(mode, xlsx_block_rows=...)` →
+  `AutoReader` → `ComReader` → `ExcelComReader`). `secure/`는 전역 `get_config()`를
+  직접 조회하지 않는다. 잘못된 값(0·음수·비정수)은 1000으로 폴백한다(fail-safe).
+
+> **후속 과제**: `com_reader.py`가 약 490줄로 300줄 규칙을 초과한다. Word/Excel/PPT 리더
+> 3개를 별도 모듈로 분리하는 리팩터링을 별건으로 진행할 것.
+
 **Office 점유 가드 (`secure/office_guard.py`)**
 
 COM 자동화는 대상 Office 프로세스가 이미 떠 있으면 그 인스턴스에 붙는다(사용자당 1 인스턴스). 백그라운드

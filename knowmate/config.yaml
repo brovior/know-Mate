@@ -15,6 +15,11 @@ chunking:
   max_file_size_mb: 30        # 1단: 이 크기 초과 파일은 파싱 전에 제외
   xlsx_max_rows_per_sheet: 2000  # 2단: xlsx 시트당 행 수 초과 시 메타 청크 1개로 대체
   max_chunks_per_file: 500    # 3단: 모든 형식 공통 최대 청크 수 (최후 안전망)
+  xlsx_block_rows: 1000       # COM(구형 xls·DRM) 경로에서 Excel 셀을 한 번에 읽을 행 수.
+                              # 셀 단위로 읽으면 셀마다 COM 왕복이 일어나 대형 시트가
+                              # 매우 느리다 — 범위 단위로 묶어 왕복을 블록당 1회로 줄인다.
+                              # 크게 잡을수록 왕복이 줄지만 순간 메모리가 늘어난다.
+                              # 비우거나 잘못된 값이면 1000으로 폴백.
 search:
   top_k_max: 10
   score_threshold: 0.3

@@ -188,7 +188,10 @@ class MainWindow(QMainWindow):
                 batch_size=batch_size,
                 crypto=crypto,
             )
-            self._extractor = get_extractor(cfg.get("extractor", "fake"))
+            self._extractor = get_extractor(
+                cfg.get("extractor", "fake"),
+                xlsx_block_rows=chunking.get("xlsx_block_rows"),
+            )
 
             # 단일 워커를 생성해 bridge에 연결한다 (수동·유휴 인덱싱 공유)
             self._make_worker()
