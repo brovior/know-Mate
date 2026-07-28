@@ -42,6 +42,20 @@ collector:
   # 강제 재확인한다. 일시적 실패는 이 간격만큼 재시도를 늦춘다.
   purge_force_reconcile_sec: 86400  # 24시간 — 스킵이 계속돼도 이 주기로 강제 1회 실행
   purge_backoff_sec: 1800           # 30분 — purge 일시 실패 후 재시도 대기
+  # 파일별 실패 백오프(4차) — index_failure.json에 기록된 실패 유형·연속 횟수에
+  # 따라 문제 파일을 매 사이클(유휴 idle_seconds마다) 다시 열지 않고 재시도 시점을
+  # 미룬다. 영구 무시가 아니라 시점 조정뿐이며, 파일이 변경되거나 수동 재인덱싱하면
+  # 즉시 다시 시도된다. enabled: false로 끄면 이 기능 도입 전(매 사이클 재시도)과
+  # 동일하게 동작한다(비상 스위치).
+  failure_backoff:
+    enabled: true
+    temporary_busy_sec: 300          # 다른 사용자 사용중: 5분 base(+지터로 5~10분)
+    timeout_ladder_sec: [1800, 21600, 86400]  # Open/셀읽기 시간초과: 1회 30분→2회 6시간→3회+ 24시간
+    unknown_ladder_sec: [1800, 21600, 86400]  # 원인 불명 오류: 위와 동일 사다리(실측 후 별도 조정 가능)
+    file_changed_sec: 0              # 처리 도중 파일 변경: 다음 사이클 즉시 재시도
+    needs_user_action_max_sec: 604800  # 손상/암호 등 사용자 조치 필요: 파일 변경·수동
+                                        # 요청 시에만 재시도하되, 7일마다 안전하게 재확인
+                                        # (영구 무시 방지 — 세이프모드 루프 사건 재발 방지)
 cleanup:
   dry_run: true
   max_delete_ratio: 0.3

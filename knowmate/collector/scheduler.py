@@ -116,7 +116,8 @@ class CollectorWorker(QThread):
     indexing_needed = pyqtSignal(str)
 
     def __init__(self, config, indexer, extractor, state_file=None, email_indexer=None,
-                 parent=None, get_idle_seconds=None, purge_meta_file=None, failure_file=None):
+                 parent=None, get_idle_seconds=None, purge_meta_file=None, failure_file=None,
+                 get_now=None):
         """수집기 워커를 초기화한다.
 
         get_idle_seconds: () -> float, 현재 OS 유휴 경과초 조회(테스트 주입용,
@@ -129,6 +130,9 @@ class CollectorWorker(QThread):
         failure_file: 파일별 실패 이력 sidecar 경로(테스트 주입용, 기본
             %APPDATA%/AegisDesk/index_failure.json). index_state.json과 분리된
             별도 파일 — 3차(실패 원인 분류 및 기록), 기록만 하고 동작은 바꾸지 않는다.
+        get_now: () -> float, 현재 시각(epoch, 테스트 주입용, 기본 time.time). 4차
+            백오프 판정(failure_state.should_defer)에 쓴다 — 테스트가 "24시간 뒤엔
+            재시도된다"를 실제로 24시간 기다리지 않고 검증할 수 있어야 한다.
         """
         super().__init__(parent)
         self._config = config
@@ -140,6 +144,7 @@ class CollectorWorker(QThread):
             from knowmate.collector.idle_util import get_idle_seconds as _default
             get_idle_seconds = _default
         self._get_idle_seconds = get_idle_seconds
+        self._get_now = get_now or time.time
         from knowmate.config import get_data_dir
         default_state_file = get_data_dir() / "index_state.json"
         self._state_file = state_file or default_state_file
@@ -410,6 +415,7 @@ class CollectorWorker(QThread):
             logger.info("[failure] 사용자 재시도 요청 — 실패 기록 초기화 (%d건)", len(failures))
             failures = {}
         self._retry_requested = False
+        backoff_policy = failure_state.BackoffPolicy.from_config(collector_cfg)
 
         # ── 스캔·인덱싱 파이프라인 (하이브리드) ──────────────────────────
         # 생산자 스레드: 폴더를 walk 하며 신규/변경 파일을 큐에 넣는다(os.walk+stat만).
@@ -429,7 +435,14 @@ class CollectorWorker(QThread):
         task_queue: "_queue.PriorityQueue" = _queue.PriorityQueue()
         _SENTINEL = None
         _seq = itertools.count()
-        producer_state = {"total": None, "seen": set(), "drm_deferred": 0, "drm_skip_logged": False}
+        producer_state = {"total": None, "seen": set(), "drm_deferred": 0, "drm_skip_logged": False, "backoff_deferred": 0}
+        # 생산자는 별도 스레드이고 소비자가 같은 failures dict를 실시간으로 갱신하므로,
+        # 락 없이 공유하면 경합이다. 사이클 시작 시점의 얕은 복사를 생산자에게 주면
+        # 경합이 사라지는 대신 생산자의 시야가 그 시점에 고정된다 — 그래서 소비자
+        # 쪽의 should_defer 재확인(아래)이 권위 있는 최종 판단이 된다(4차 설계 참고:
+        # watch_folders가 겹치면 같은 파일이 두 번 enqueue될 수 있는데, 그 두 번째는
+        # 생산자 스냅샷만으로는 못 걸러내고 소비자 검사만 잡을 수 있다).
+        failures_snapshot = dict(failures)
 
         # COM 추출 행오버 워치독 (base<=0이면 비활성)
         from knowmate.collector.com_watchdog import ComWatchdog
@@ -470,6 +483,15 @@ class CollectorWorker(QThread):
                             action = "modified"
                         else:
                             continue  # 변경 없음 → 인덱싱 대상 아님
+                        # 4차: 백오프 판정을 DRM 유휴 검사보다 먼저 한다 — 여기서 걸러야
+                        # 큐 삽입·Office 기동·워치독 무장 비용이 전부 발생하지 않는다.
+                        # 사이클 시작 시점 스냅샷 기준(경합 회피) — 최종 판단은 소비자 쪽.
+                        if failure_state.should_defer(
+                            failures_snapshot.get(path), path, meta.get("mtime", 0.0),
+                            meta.get("size", 0), self._get_now(), backoff_policy,
+                        ):
+                            producer_state["backoff_deferred"] += 1
+                            continue
                         # 실시간 유휴 판정: 값싼 유휴 조회(_get_idle_seconds)를 먼저 하고,
                         # 임계를 넘었을 때만 파일 시그니처(_is_drm_suspected, 파일 읽기)를
                         # 확인한다. 사이클 시작 1회가 아니라 파일마다 현재 유휴를 보므로,
@@ -521,6 +543,7 @@ class CollectorWorker(QThread):
         deferred = []
         unreadable = []
         changed_during = []  # 추출 도중 파일이 바뀌어 이번 사이클에 인덱싱하지 않은 경로들
+        consumer_backoff_deferred = 0  # 소비자 재확인이 처리 직전에 걸러낸 건수(4차)
 
         while True:
             _sort_key, _seq_no, task = task_queue.get()
@@ -535,6 +558,23 @@ class CollectorWorker(QThread):
                 save_state(self._state_file, state)
                 failure_state.save_failures(self._failure_file, failures)
                 return
+
+            # 4차: 소비자 쪽 재확인 — 권위 있는 최종 판단(생산자는 사이클 시작 시점
+            # 스냅샷이라 그 사이 상태가 바뀌었을 수 있다. 특히 watch_folders가 겹쳐
+            # 같은 파일이 두 번 enqueue된 경우, 첫 처리가 실패해 기록이 생기면 두
+            # 번째는 이 재확인만이 걸러낼 수 있다). Office 기동 전에 걸러야 비용이
+            # 안 든다.
+            _rec = failures.get(task.path)
+            if failure_state.should_defer(
+                _rec, task.path, task.mtime, task.size, self._get_now(), backoff_policy,
+            ):
+                consumer_backoff_deferred += 1
+                logger.debug(
+                    "[failure] 백오프로 건너뜀(%s): %s",
+                    failure_state.describe_wait(_rec, task.path, self._get_now(), backoff_policy),
+                    task.path,
+                )
+                continue
 
             filename = Path(task.path).name
             done += 1
@@ -583,7 +623,7 @@ class CollectorWorker(QThread):
                     changed_during.append(task.path)
                     failure_state.note_failure(
                         failures, task.path, failure_state.KIND_FILE_CHANGED, None, None,
-                        task.mtime, task.size, time.time(),
+                        task.mtime, task.size, self._get_now(),
                     )
                     continue
 
@@ -631,7 +671,7 @@ class CollectorWorker(QThread):
                 )
                 failure_state.note_failure(
                     failures, task.path, kind, _wd_fired_stage or _failed_stage, error_code,
-                    task.mtime, task.size, time.time(),
+                    task.mtime, task.size, self._get_now(),
                 )
             except UnreadableFormatError as exc:
                 # OOXML 확장자이나 zip 아님(DRM 래핑·손상 등)에 COM도 불가한 경우.
@@ -644,7 +684,7 @@ class CollectorWorker(QThread):
                 )
                 failure_state.note_failure(
                     failures, task.path, kind, _wd_fired_stage or _failed_stage, error_code,
-                    task.mtime, task.size, time.time(),
+                    task.mtime, task.size, self._get_now(),
                 )
             except Exception as exc:
                 logger.error("파일 처리 실패 (건너뜀): %s - %s", task.path, exc)
@@ -655,7 +695,7 @@ class CollectorWorker(QThread):
                 )
                 failure_state.note_failure(
                     failures, task.path, kind, _wd_fired_stage or _failed_stage, error_code,
-                    task.mtime, task.size, time.time(),
+                    task.mtime, task.size, self._get_now(),
                 )
 
         # 생산자 스레드 정리 (정상 종료 시 이미 끝나 있음)
@@ -765,6 +805,9 @@ class CollectorWorker(QThread):
         com_timeout_count = watchdog.timeout_count if watchdog is not None else 0
         if com_timeout_count:
             summary += f" / COM 시간초과 강제해제 {com_timeout_count}건"
+        backoff_deferred_total = producer_state.get("backoff_deferred", 0) + consumer_backoff_deferred
+        if backoff_deferred_total:
+            summary += f" / 재시도 대기 {backoff_deferred_total}건"
         if failed:
             logger.warning("실패 파일 목록: %s", failed)
         if deferred:
@@ -788,6 +831,12 @@ class CollectorWorker(QThread):
                 "COM 추출 행오버 %d건을 타임아웃으로 강제 해제(해당 파일은 실패·다음 사이클 재시도) "
                 "[단계별: %s]",
                 com_timeout_count, dict(stage_counts),
+            )
+        if backoff_deferred_total:
+            logger.info(
+                "[failure] 백오프로 건너뜀 %d건(생산자 %d + 소비자 %d) [분류별: %s]",
+                backoff_deferred_total, producer_state.get("backoff_deferred", 0),
+                consumer_backoff_deferred, failure_summary,
             )
         # 문서·메일 개수를 바꿀 수 있는 변경이 하나도 없었으면(유휴 방치 중 대부분의
         # 사이클) bridge가 건수 재계산(DB projection 조회)을 건너뛸 수 있게 표시한다
