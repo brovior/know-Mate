@@ -20,8 +20,14 @@ htmlcov/
 
 # 런타임 상태 (APPDATA에 저장되지만 혹시 로컬에 생기면 제외)
 index_state.json
+index_state.meta.json
+index_failure.json
 threads.json
 *.tmp
+
+# 데이터 폴더가 프로젝트 루트에 잘못 생성된 경우(테스트 CWD 실수 등, 실제 위치는
+# %APPDATA%/AegisDesk) — 인덱스·키·로그를 통째로 제외한다.
+/AegisDesk/
 
 # LanceDB 인덱스 (APPDATA에 저장되지만 프로젝트 내 생성 방지)
 *.lance/
