@@ -472,15 +472,27 @@ hard_exit 주입) 사외 단위 테스트가 가능하다.
 횟수로 재시도를 늦추거나 파일을 건너뛰는 정책은 바로 아래 "실패 백오프"(4차)에서
 구현한다.
 
-**분류 6종** (`failure_state.classify`): `TEMPORARY_BUSY`(Office 점유·COM
+**분류 8종** (`failure_state.classify`): `TEMPORARY_BUSY`(Office 점유·COM
 RPC_E_CALL_REJECTED류) · `OPEN_TIMEOUT`(워치독 발화, 단계가 dispatch/open) ·
-`READ_TIMEOUT`(워치독 발화, 단계가 sheets/cell_read/read) · `NEEDS_USER_ACTION`
-(`UnreadableFormatError` — DRM 래핑·손상 추정) · `FILE_CHANGED`(처리 중 mtime·size
-변경 감지) · `UNKNOWN_TRANSIENT`(나머지 전부, 기본값). COM 오류 코드만으로 실제 원인을
-100% 확정할 수 없다(암호·손상 문서가 더미 암호로 즉시 실패하는 현재 구현상 일반 COM
-오류와 코드로 구분되지 않는다) — 그래서 확실한 것만 분류하고 나머지는 `UNKNOWN_TRANSIENT`로
+`READ_TIMEOUT`(워치독 발화, 단계가 sheets/cell_read/read) · `OPEN_ERROR`(6a — 워치독
+**미**발화 COM 오류, `failed_stage`가 dispatch/open) · `READ_ERROR`(6a — 워치독 미발화,
+`failed_stage`가 sheets/cell_read/read) · `NEEDS_USER_ACTION`(`UnreadableFormatError`
+— DRM 래핑·손상 추정) · `FILE_CHANGED`(처리 중 mtime·size 변경 감지) ·
+`UNKNOWN_TRANSIENT`(나머지 전부, 기본값). COM 오류 코드만으로 실제 원인을 100% 확정할
+수 없다(암호·손상 문서가 더미 암호로 즉시 실패하는 현재 구현상 일반 COM 오류와 코드로
+구분되지 않는다) — 그래서 확실한 것만 분류하고 나머지는 `UNKNOWN_TRANSIENT`로
 떨어뜨리되, `last_error_code`(HRESULT)는 그대로 보존해 실측 로그가 쌓이면 분류를 넓힐
 근거로 쓴다.
+
+**6a 이전에는 `failed_stage`를 받고도 쓰지 않았다** — `com_stage.take_last_failed_stage()`
+결과가 `classify()`에 인자로 전달되고는 있었지만 함수 본문 어디에서도 참조되지 않아,
+워치독이 발화하지 않은 일반 COM 오류(가장 흔한 케이스)는 전부 `UNKNOWN_TRANSIENT`로
+떨어졌다(6단계 설계 리뷰에서 AST로 확인). 6a가 이 배관의 마지막 한 줄을 이어
+`OPEN_ERROR`/`READ_ERROR`로 분리한다. 암호 보호 OOXML·DRM 래핑을 컨테이너 내부 증거로
+세분하는 것은 **6b로 이연**됐다 — CFB 디렉터리는 FAT 체인이라 8바이트 매직만으로는
+불충분하고(설계 리뷰 B-2), 판별 I/O가 COM 워치독 해제 이후 실행돼 SMB·DRM 드라이브에서
+수집기 QThread에 새 행오버 경로를 만들 수 있다(리뷰 M-3). 근거: `docs/ai-workflow/
+architecture.md` A-0003.
 
 **연계**: 워치독의 `ComWatchdog.disarm()`이 이번 파일에서 실제로 발화했는지(발화했다면
 어느 단계인지)를 반환하도록 확장했고, `com_stage.take_last_failed_stage()`가 COM 파싱
@@ -514,10 +526,24 @@ request_failure_retry()` — `bridge.startReindex`·트레이 [재인덱싱]만 
 | 분류 | 대기 | 비고 |
 |---|---|---|
 | `TEMPORARY_BUSY` | 5~10분(고정, 지터 포함) | 연속 횟수와 무관 — 하루 종일 열어둬도 계속 5~10분마다 재확인(escalation 금지) |
-| `OPEN_TIMEOUT`·`READ_TIMEOUT` | 30분 → 6시간 → 24시간 | 연속 실패 횟수(사다리보다 크면 마지막 칸 고정) |
-| `UNKNOWN_TRANSIENT` | 30분 → 6시간 → 24시간 | 별도 config 키(`unknown_ladder_sec`) — 실측 후 독립 조정 가능 |
+| `OPEN_TIMEOUT`·`READ_TIMEOUT`·`OPEN_ERROR`·`READ_ERROR` | 30분 → 6시간 → **7일**(3회째부터 승격) | 연속 실패 횟수. 6a부터 사다리는 30분·6시간 2단뿐이고, 3회째는 `escalation_action_at` 임계에 걸려 아래 `NEEDS_USER_ACTION` 상한을 재사용한다(기존 24시간 칸은 제거) |
+| `UNKNOWN_TRANSIENT` | 위와 동일 | 별도 config 키(`unknown_ladder_sec`) — 실측 후 독립 조정 가능 |
 | `NEEDS_USER_ACTION` | 시간 기반 재시도 없음 + **7일 안전밸브** | 파일 변경·수동 요청 시 즉시. 7일 상한은 스펙 밖 추가 — 세이프모드 루프 사건처럼 "우리가 만든 일시적 상태 때문에 멀쩡한 파일이 영구히 안 읽히는" 사고를 코드로 막는다 |
 | `FILE_CHANGED` | 0초 | mtime이 이미 바뀌어 기록이 스스로 무효화됨 |
+
+**6a: "반복 중"/"조치 필요" 표시는 대기 시간과 다른 축이다** (`escalation_state()`,
+`config.yaml › collector.failure_backoff.escalation_repeat_at/escalation_action_at`,
+기본 2/3). 연속 실패 횟수만 보는 단일 함수이며 `kind`와 무관하다 — [확인 필요한
+문서] 화면(5차)과 백오프 계산(`backoff_seconds()`)이 **반드시 이 함수 하나만** 호출해,
+같은 기록을 다르게 판정하는 일이 없게 한다.
+
+다만 **대기 시간은 원인별 고정 정책이 승격 사다리보다 우선한다** — `TEMPORARY_BUSY`·
+`FILE_CHANGED`·`NEEDS_USER_ACTION`은 연속 실패가 몇 회든 위 표의 고정값을 그대로 쓴다.
+그렇지 않으면 파일을 3번 연속 열어둔 사용자(`TEMPORARY_BUSY`)의 재시도가 "3회 = 7일
+대기" 사다리를 타 버려, 파일을 닫아도 최대 7일을 기다리는 회귀가 생긴다(6단계 설계
+리뷰 3차 M-2 — "반복 승격은 원인과 무관"이라는 원칙과 "TEMPORARY_BUSY는 항상
+5~10분"이라는 원칙이 충돌했던 것을 이렇게 정리했다). 즉 **표시는 모든 원인에 공통,
+대기는 원인별로 다르다.**
 
 `TEMPORARY_BUSY`의 지터는 `hashlib.sha256(경로)` 기반 결정적 값이다(파이썬 내장
 `hash()`는 프로세스마다 솔트가 달라 재시작 시 값이 바뀌므로 쓸 수 없다) — 여러 파일의

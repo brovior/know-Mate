@@ -51,13 +51,22 @@ collector:
   # 동일하게 동작한다(비상 스위치).
   failure_backoff:
     enabled: true
-    temporary_busy_sec: 300          # 다른 사용자 사용중: 5분 base(+지터로 5~10분)
-    timeout_ladder_sec: [1800, 21600, 86400]  # Open/셀읽기 시간초과: 1회 30분→2회 6시간→3회+ 24시간
-    unknown_ladder_sec: [1800, 21600, 86400]  # 원인 불명 오류: 위와 동일 사다리(실측 후 별도 조정 가능)
-    file_changed_sec: 0              # 처리 도중 파일 변경: 다음 사이클 즉시 재시도
-    needs_user_action_max_sec: 604800  # 손상/암호 등 사용자 조치 필요: 파일 변경·수동
-                                        # 요청 시에만 재시도하되, 7일마다 안전하게 재확인
-                                        # (영구 무시 방지 — 세이프모드 루프 사건 재발 방지)
+    temporary_busy_sec: 300          # 다른 사용자 사용중: 항상 5분 base(+지터로 5~10분).
+                                      # 반복 승격(아래 escalation_*)과 무관하게 고정 — 사용자가
+                                      # 파일을 닫으면 곧 해소되므로 며칠씩 대기시키면 안 됨(6a)
+    timeout_ladder_sec: [1800, 21600]  # Open/읽기 오류·시간초과: 1회 30분→2회 6시간.
+                                        # 3회째부터는 escalation_action_at에 걸려
+                                        # needs_user_action_max_sec(아래, 기본 7일)로 승격
+    unknown_ladder_sec: [1800, 21600]  # 원인 불명 오류: 위와 동일 사다리(실측 후 별도 조정 가능)
+    file_changed_sec: 0              # 처리 도중 파일 변경: 항상 다음 사이클 즉시 재시도(고정)
+    needs_user_action_max_sec: 604800  # 손상/암호 등 사용자 조치 필요: 항상 이 값(고정).
+                                        # 파일 변경·수동 요청 시 즉시 재시도, 그 외엔 7일마다
+                                        # 안전하게 재확인(영구 무시 방지 — 세이프모드 루프 재발 방지).
+                                        # timeout/unknown 사다리가 3회째에 승격될 때도 이 값을 재사용
+    escalation_repeat_at: 2   # 이 회차부터 화면에 "반복 중" 표시(대기 시간은 안 바뀜)
+    escalation_action_at: 3   # 이 회차부터 화면에 "조치 필요" 표시 + 대기가 위 7일로 승격
+                               # (TEMPORARY_BUSY·FILE_CHANGED·NEEDS_USER_ACTION은 표시만
+                               # 승격되고 대기는 위 고정값 유지 — 6a, 3차 리뷰 M-2)
 cleanup:
   dry_run: true
   max_delete_ratio: 0.3

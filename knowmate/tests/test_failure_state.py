@@ -105,6 +105,49 @@ class TestClassify:
         kind, _ = failure_state.classify(_OfficeBusyError("busy"), watchdog_stage="open")
         assert kind == failure_state.KIND_OPEN_TIMEOUT
 
+    # -- 6a: failed_stage 사용 (이전엔 인자로 받고도 본문에서 무시됨) --
+
+    def test_failed_stage_open_without_watchdog_is_open_error(self):
+        kind, _ = failure_state.classify(RuntimeError("x"), failed_stage="open")
+        assert kind == failure_state.KIND_OPEN_ERROR
+
+    def test_failed_stage_dispatch_without_watchdog_is_open_error(self):
+        kind, _ = failure_state.classify(RuntimeError("x"), failed_stage="dispatch")
+        assert kind == failure_state.KIND_OPEN_ERROR
+
+    def test_failed_stage_read_without_watchdog_is_read_error(self):
+        kind, _ = failure_state.classify(RuntimeError("x"), failed_stage="read")
+        assert kind == failure_state.KIND_READ_ERROR
+
+    def test_failed_stage_cell_read_without_watchdog_is_read_error(self):
+        kind, _ = failure_state.classify(RuntimeError("x"), failed_stage="cell_read")
+        assert kind == failure_state.KIND_READ_ERROR
+
+    def test_no_failed_stage_still_falls_back_to_unknown(self):
+        """failed_stage가 아예 없으면(예: COM 아닌 다른 실패) 기존처럼 폴백 버킷으로 간다."""
+        kind, _ = failure_state.classify(RuntimeError("x"))
+        assert kind == failure_state.KIND_UNKNOWN_TRANSIENT
+
+    def test_unmapped_failed_stage_falls_back_to_unknown(self):
+        """정규화 테이블에 없는 단계 이름은 추측하지 않고 폴백한다."""
+        kind, _ = failure_state.classify(RuntimeError("x"), failed_stage="close")
+        assert kind == failure_state.KIND_UNKNOWN_TRANSIENT
+
+    def test_watchdog_stage_takes_priority_over_failed_stage(self):
+        """워치독이 발화했으면 failed_stage와 무관하게 타임아웃 분류가 우선한다."""
+        kind, _ = failure_state.classify(
+            RuntimeError("x"), watchdog_stage="open", failed_stage="read"
+        )
+        assert kind == failure_state.KIND_OPEN_TIMEOUT
+
+    def test_office_busy_takes_priority_over_failed_stage(self):
+        kind, _ = failure_state.classify(_OfficeBusyError("busy"), failed_stage="open")
+        assert kind == failure_state.KIND_TEMPORARY_BUSY
+
+    def test_unreadable_format_takes_priority_over_failed_stage(self):
+        kind, _ = failure_state.classify(_UnreadableFormatError("bad"), failed_stage="open")
+        assert kind == failure_state.KIND_NEEDS_USER_ACTION
+
 
 # ============================================================
 # note_failure / note_success — 연속 실패 누적·리셋
@@ -158,6 +201,36 @@ class TestNoteFailure:
         )
         assert records["a.xlsx"].consecutive_failures == 1
         assert records["a.xlsx"].kind == failure_state.KIND_OPEN_TIMEOUT
+
+    def test_same_kind_different_normalized_stage_resets_to_one(self):
+        """6a(A-0003 §4): 연속성 키는 (kind, normalized_stage)다. dispatch와 open은 둘 다
+        "open"으로 정규화되므로 이 둘 사이는 리셋되지 않지만(다음 테스트 참고), 서로 다른
+        normalized_stage(open vs read)로 바뀌면 kind가 같아도 리셋돼야 한다."""
+        records = {}
+        for _ in range(3):
+            failure_state.note_failure(
+                records, "a.xlsx", failure_state.KIND_UNKNOWN_TRANSIENT, "open", None,
+                mtime=100.0, size=10, now=1000.0,
+            )
+        assert records["a.xlsx"].consecutive_failures == 3
+        failure_state.note_failure(
+            records, "a.xlsx", failure_state.KIND_UNKNOWN_TRANSIENT, "read", None,
+            mtime=100.0, size=10, now=2000.0,
+        )
+        assert records["a.xlsx"].consecutive_failures == 1
+
+    def test_dispatch_and_open_stage_normalize_to_same_key(self):
+        """dispatch → open은 같은 normalized_stage("open")이므로 리셋되지 않고 누적된다."""
+        records = {}
+        failure_state.note_failure(
+            records, "a.xlsx", failure_state.KIND_OPEN_ERROR, "dispatch", None,
+            mtime=100.0, size=10, now=1000.0,
+        )
+        failure_state.note_failure(
+            records, "a.xlsx", failure_state.KIND_OPEN_ERROR, "open", None,
+            mtime=100.0, size=10, now=1001.0,
+        )
+        assert records["a.xlsx"].consecutive_failures == 2
 
     def test_mtime_change_resets_to_one(self):
         records = {}
@@ -334,6 +407,40 @@ class TestLoadSaveFailures:
         assert not f.with_suffix(".tmp").exists()
         assert f.exists()
 
+    def test_source_changed_alias_normalizes_to_file_changed(self, tmp_path: Path):
+        """A-0003 §6: SOURCE_CHANGED로 수동 편집된 sidecar도 폐기하지 않고
+        FILE_CHANGED로 정규화한다(개명하지 않기로 확정했지만 하위호환은 유지)."""
+        f = tmp_path / "index_failure.json"
+        f.write_text(json.dumps({
+            "schema_version": 1,
+            "files": {
+                "a.xlsx": {
+                    "mtime": 100.0, "size": 10, "kind": "SOURCE_CHANGED", "stage": None,
+                    "consecutive_failures": 1, "last_failed_ts": 1000.0,
+                    "last_error_code": None, "strategy_version": failure_state.READ_STRATEGY_VERSION,
+                    "force_retry": False,
+                }
+            },
+        }), encoding="utf-8")
+        loaded = failure_state.load_failures(f)
+        assert loaded["a.xlsx"].kind == failure_state.KIND_FILE_CHANGED
+
+    def test_new_6a_kinds_survive_roundtrip(self, tmp_path: Path):
+        f = tmp_path / "index_failure.json"
+        records = {}
+        failure_state.note_failure(
+            records, "a.xlsx", failure_state.KIND_OPEN_ERROR, "dispatch", None,
+            mtime=100.0, size=10, now=1000.0,
+        )
+        failure_state.note_failure(
+            records, "b.xlsx", failure_state.KIND_READ_ERROR, "read", None,
+            mtime=100.0, size=10, now=1000.0,
+        )
+        failure_state.save_failures(f, records)
+        loaded = failure_state.load_failures(f)
+        assert loaded["a.xlsx"].kind == failure_state.KIND_OPEN_ERROR
+        assert loaded["b.xlsx"].kind == failure_state.KIND_READ_ERROR
+
     def test_load_discards_record_with_stale_strategy_version(self, tmp_path: Path):
         f = tmp_path / "index_failure.json"
         payload = {
@@ -441,7 +548,7 @@ class TestBackoffPolicyFromConfig:
         policy = failure_state.BackoffPolicy.from_config({})
         assert policy.enabled is True
         assert policy.temporary_busy_sec == 300.0
-        assert policy.timeout_ladder_sec == (1800.0, 21600.0, 86400.0)
+        assert policy.timeout_ladder_sec == (1800.0, 21600.0)
         assert policy.needs_user_action_max_sec == 7 * 24 * 3600.0
 
     def test_defaults_when_section_wrong_type(self):
@@ -489,19 +596,19 @@ class TestBackoffPolicyFromConfig:
         policy = failure_state.BackoffPolicy.from_config({
             "failure_backoff": {"timeout_ladder_sec": []}
         })
-        assert policy.timeout_ladder_sec == (1800.0, 21600.0, 86400.0)
+        assert policy.timeout_ladder_sec == (1800.0, 21600.0)
 
     def test_ladder_with_invalid_item_falls_back_entirely(self):
         policy = failure_state.BackoffPolicy.from_config({
             "failure_backoff": {"timeout_ladder_sec": [60.0, "bad", 120.0]}
         })
-        assert policy.timeout_ladder_sec == (1800.0, 21600.0, 86400.0)
+        assert policy.timeout_ladder_sec == (1800.0, 21600.0)
 
     def test_ladder_not_a_list_falls_back(self):
         policy = failure_state.BackoffPolicy.from_config({
             "failure_backoff": {"timeout_ladder_sec": "1800,21600"}
         })
-        assert policy.timeout_ladder_sec == (1800.0, 21600.0, 86400.0)
+        assert policy.timeout_ladder_sec == (1800.0, 21600.0)
 
     def test_zero_seconds_is_valid_not_a_fallback(self):
         """file_changed_sec는 0이 정상값이다 — 0이라고 기본값으로 폴백하면 안 된다."""
@@ -521,6 +628,72 @@ def _rec(kind, consecutive=1, last_failed_ts=1000.0, mtime=100.0, size=10, stage
         consecutive_failures=consecutive, last_failed_ts=last_failed_ts,
         last_error_code=None,
     )
+
+
+class TestEscalationState:
+    """6a: 단일 진실원(A-0003 §5 — 2차 리뷰 M-2). UI(bridge)와 백오프가 이 함수만
+    호출해야 같은 레코드에 다른 판정이 나오는 사고를 막는다."""
+
+    def test_below_repeat_threshold_is_normal(self):
+        policy = failure_state.BackoffPolicy()
+        rec = _rec(failure_state.KIND_OPEN_ERROR, consecutive=1)
+        assert failure_state.escalation_state(rec, policy) == failure_state.ESCALATION_NORMAL
+
+    def test_at_repeat_threshold_is_repeated(self):
+        policy = failure_state.BackoffPolicy()
+        rec = _rec(failure_state.KIND_OPEN_ERROR, consecutive=2)
+        assert failure_state.escalation_state(rec, policy) == failure_state.ESCALATION_REPEATED
+
+    def test_at_action_threshold_is_needs_action(self):
+        policy = failure_state.BackoffPolicy()
+        rec = _rec(failure_state.KIND_OPEN_ERROR, consecutive=3)
+        assert failure_state.escalation_state(rec, policy) == failure_state.ESCALATION_NEEDS_ACTION
+
+    def test_far_past_action_threshold_stays_needs_action(self):
+        policy = failure_state.BackoffPolicy()
+        rec = _rec(failure_state.KIND_OPEN_ERROR, consecutive=1000)
+        assert failure_state.escalation_state(rec, policy) == failure_state.ESCALATION_NEEDS_ACTION
+
+    def test_kind_independent(self):
+        """승격은 kind와 무관하게 순수 카운트만 본다 — TEMPORARY_BUSY도 예외 없이 표시는 승격."""
+        policy = failure_state.BackoffPolicy()
+        for kind in (
+            failure_state.KIND_TEMPORARY_BUSY, failure_state.KIND_OPEN_ERROR,
+            failure_state.KIND_UNKNOWN_TRANSIENT, failure_state.KIND_NEEDS_USER_ACTION,
+        ):
+            rec = _rec(kind, consecutive=3)
+            assert failure_state.escalation_state(rec, policy) == failure_state.ESCALATION_NEEDS_ACTION
+
+    def test_custom_thresholds_from_config(self):
+        policy = failure_state.BackoffPolicy.from_config({
+            "failure_backoff": {"escalation_repeat_at": 5, "escalation_action_at": 10}
+        })
+        assert failure_state.escalation_state(_rec("X", consecutive=4), policy) == failure_state.ESCALATION_NORMAL
+        assert failure_state.escalation_state(_rec("X", consecutive=5), policy) == failure_state.ESCALATION_REPEATED
+        assert failure_state.escalation_state(_rec("X", consecutive=10), policy) == failure_state.ESCALATION_NEEDS_ACTION
+
+    def test_invalid_pair_reversed_falls_back_to_default(self):
+        """repeat_at >= action_at는 무효 — 기본값(2, 3)으로 폴백한다(2차 리뷰 M-2)."""
+        policy = failure_state.BackoffPolicy.from_config({
+            "failure_backoff": {"escalation_repeat_at": 5, "escalation_action_at": 3}
+        })
+        assert policy.escalation_repeat_at == 2
+        assert policy.escalation_action_at == 3
+
+    def test_invalid_pair_equal_falls_back_to_default(self):
+        policy = failure_state.BackoffPolicy.from_config({
+            "failure_backoff": {"escalation_repeat_at": 3, "escalation_action_at": 3}
+        })
+        assert policy.escalation_repeat_at == 2
+        assert policy.escalation_action_at == 3
+
+    def test_non_positive_or_non_int_falls_back_to_default(self):
+        for bad in (0, -1, 1.5, True, "3"):
+            policy = failure_state.BackoffPolicy.from_config({
+                "failure_backoff": {"escalation_repeat_at": bad, "escalation_action_at": 3}
+            })
+            assert policy.escalation_repeat_at == 2
+            assert policy.escalation_action_at == 3
 
 
 class TestBackoffSeconds:
@@ -548,6 +721,36 @@ class TestBackoffSeconds:
         )
         assert w_low == w_high
 
+    def test_temporary_busy_stays_5_to_10min_even_past_escalation_action_at(self):
+        """6a 3차 리뷰 M-2 회귀 방어 — 가장 중요한 케이스.
+
+        사용자가 파일을 3번 연속 열어둔 상태로 실패하면 escalation_state는
+        NEEDS_ACTION(3회)이 되어 화면엔 "조치 필요"가 뜨지만, 대기 시간은
+        여전히 5~10분이어야 한다. 원인별 고정 정책 우선순위가 없으면 이
+        경우 7일 사다리를 타 버려 "파일을 닫아도 최대 7일 대기"라는, 애초에
+        막으려던 회귀보다 훨씬 나쁜 상황이 된다."""
+        policy = failure_state.BackoffPolicy()
+        rec = _rec(failure_state.KIND_TEMPORARY_BUSY, consecutive=5)
+        assert failure_state.escalation_state(rec, policy) == failure_state.ESCALATION_NEEDS_ACTION
+        wait = failure_state.backoff_seconds(rec, "/x/a.xlsx", policy)
+        assert 300.0 <= wait <= 600.0
+
+    def test_file_changed_stays_immediate_past_escalation_action_at(self):
+        policy = failure_state.BackoffPolicy()
+        rec = _rec(failure_state.KIND_FILE_CHANGED, consecutive=10)
+        assert failure_state.backoff_seconds(rec, "/x.xlsx", policy) == 0.0
+
+    def test_needs_user_action_unaffected_by_escalation(self):
+        """이미 7일 고정값을 쓰므로 승격 임계와 상관없이 항상 동일해야 한다."""
+        policy = failure_state.BackoffPolicy()
+        w1 = failure_state.backoff_seconds(
+            _rec(failure_state.KIND_NEEDS_USER_ACTION, consecutive=1), "/x.xlsx", policy,
+        )
+        w5 = failure_state.backoff_seconds(
+            _rec(failure_state.KIND_NEEDS_USER_ACTION, consecutive=5), "/x.xlsx", policy,
+        )
+        assert w1 == w5 == 7 * 24 * 3600.0
+
     def test_open_timeout_ladder_first_failure(self):
         policy = failure_state.BackoffPolicy()
         rec = _rec(failure_state.KIND_OPEN_TIMEOUT, consecutive=1)
@@ -558,11 +761,29 @@ class TestBackoffSeconds:
         rec = _rec(failure_state.KIND_OPEN_TIMEOUT, consecutive=2)
         assert failure_state.backoff_seconds(rec, "/x.xlsx", policy) == 21600.0
 
-    def test_open_timeout_ladder_third_and_beyond(self):
+    def test_open_timeout_ladder_third_and_beyond_escalates_to_7_days(self):
+        """6a·사용자 결정(안 B): 3회째부터 escalation_action_at에 걸려 사다리가 아니라
+        needs_user_action_max_sec(기본 7일)로 승격된다 — 옛 24시간 3번째 칸은 제거됐다."""
         policy = failure_state.BackoffPolicy()
         for consecutive in (3, 4, 10, 1000):
             rec = _rec(failure_state.KIND_OPEN_TIMEOUT, consecutive=consecutive)
-            assert failure_state.backoff_seconds(rec, "/x.xlsx", policy) == 86400.0
+            assert failure_state.backoff_seconds(rec, "/x.xlsx", policy) == 7 * 24 * 3600.0
+
+    def test_open_error_kind_uses_same_ladder_and_escalation(self):
+        """6a 신규 kind(OPEN_ERROR)도 OPEN_TIMEOUT과 동일한 사다리·승격을 탄다."""
+        policy = failure_state.BackoffPolicy()
+        assert failure_state.backoff_seconds(
+            _rec(failure_state.KIND_OPEN_ERROR, consecutive=1), "/x.xlsx", policy,
+        ) == 1800.0
+        assert failure_state.backoff_seconds(
+            _rec(failure_state.KIND_OPEN_ERROR, consecutive=3), "/x.xlsx", policy,
+        ) == 7 * 24 * 3600.0
+
+    def test_read_error_kind_uses_same_ladder(self):
+        policy = failure_state.BackoffPolicy()
+        assert failure_state.backoff_seconds(
+            _rec(failure_state.KIND_READ_ERROR, consecutive=1), "/x.xlsx", policy,
+        ) == 1800.0
 
     def test_read_timeout_uses_same_ladder(self):
         policy = failure_state.BackoffPolicy()
@@ -579,7 +800,7 @@ class TestBackoffSeconds:
         ) == 21600.0
         assert failure_state.backoff_seconds(
             _rec(failure_state.KIND_UNKNOWN_TRANSIENT, consecutive=3), "/x.xlsx", policy,
-        ) == 86400.0
+        ) == 7 * 24 * 3600.0
 
     def test_file_changed_is_zero(self):
         policy = failure_state.BackoffPolicy()
@@ -592,9 +813,16 @@ class TestBackoffSeconds:
         assert failure_state.backoff_seconds(rec, "/x.xlsx", policy) == 7 * 24 * 3600.0
 
     def test_custom_ladder_from_policy(self):
+        """승격 임계(기본 action_at=3) 전 회차에서는 커스텀 사다리 값이 그대로 쓰인다."""
         policy = failure_state.BackoffPolicy(timeout_ladder_sec=(60.0, 120.0))
-        rec = _rec(failure_state.KIND_OPEN_TIMEOUT, consecutive=5)
+        rec = _rec(failure_state.KIND_OPEN_TIMEOUT, consecutive=2)
         assert failure_state.backoff_seconds(rec, "/x.xlsx", policy) == 120.0
+
+    def test_custom_ladder_still_escalates_past_action_at(self):
+        """사다리를 아무리 늘려도(길이 5) escalation_action_at(기본 3)에서 승격이 우선한다."""
+        policy = failure_state.BackoffPolicy(timeout_ladder_sec=(60.0, 120.0, 180.0, 240.0, 300.0))
+        rec = _rec(failure_state.KIND_OPEN_TIMEOUT, consecutive=5)
+        assert failure_state.backoff_seconds(rec, "/x.xlsx", policy) == 7 * 24 * 3600.0
 
 
 # ============================================================

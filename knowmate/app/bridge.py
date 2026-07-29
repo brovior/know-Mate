@@ -362,6 +362,8 @@ class Bridge(QObject):
         "TEMPORARY_BUSY":       ("사용 중", "b-info"),
         "OPEN_TIMEOUT":         ("열기 시간초과", "b-warn"),
         "READ_TIMEOUT":         ("읽기 시간초과", "b-warn"),
+        "OPEN_ERROR":           ("열기 오류", "b-warn"),
+        "READ_ERROR":           ("읽기 오류", "b-warn"),
         "NEEDS_USER_ACTION":    ("조치 필요", "b-action"),
         "FILE_CHANGED":         ("변경 감지", "b-gray"),
         "UNKNOWN_TRANSIENT":    ("원인 미확인", "b-gray"),
@@ -415,6 +417,10 @@ class Bridge(QObject):
                 "last_failed_ts": rec.last_failed_ts,
                 "next_retry_ts": next_retry_ts,
                 "excluded": is_excluded,
+                # 6a: "반복 중"/"조치 필요"는 kind와 독립적인 단일 판정
+                # (failure_state.escalation_state) — UI·백오프가 같은 함수를
+                # 공유해 판정이 갈리지 않는다(2차 리뷰 M-2).
+                "escalation": failure_state.escalation_state(rec, policy),
             })
         # 제외됐지만 실패 기록이 이미 지워진 파일(오래 전 실패 후 자연 정리)도
         # 목록에서 사라지면 안 되므로 exclude_files에만 있는 경로도 카드로 만든다.
@@ -426,7 +432,7 @@ class Bridge(QObject):
                 "path": raw, "name": os.path.basename(raw), "dir": os.path.dirname(raw),
                 "kind": "UNKNOWN_TRANSIENT", "badge_label": "원인 미확인", "badge_class": "b-gray",
                 "stage_label": "-", "consecutive_failures": 0, "last_failed_ts": None,
-                "next_retry_ts": None, "excluded": True,
+                "next_retry_ts": None, "excluded": True, "escalation": "NORMAL",
             })
         cards.sort(key=lambda c: (c["excluded"], -(c["last_failed_ts"] or 0)))
         return json.dumps(cards, ensure_ascii=False)
