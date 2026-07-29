@@ -469,9 +469,16 @@ function renderFolderList(folders) {
   (folders || []).forEach(path => {
     const row = document.createElement("div");
     row.style.cssText = "display:flex;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #2a2a2a;font-size:13px;";
+    // 경로를 인라인 onclick 문자열에 넣지 않는다 — escHtml은 HTML 특수문자만 다루고
+    // JS 문자열 이스케이프(역슬래시·작은따옴표)는 하지 않아, Windows 경로나 작은따옴표가
+    // 든 폴더명("Kim's docs")이 그대로 깨지거나 코드로 실행될 수 있다. 리스너로 실제
+    // 문자열을 클로저에 담아 전달한다.
     row.innerHTML =
-      `<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${escHtml(path)}</span>` +
-      `<button onclick="removeFolder(this,'${escHtml(path)}')" style="background:none;border:none;color:#888;cursor:pointer;font-size:16px;padding:0 4px;">✕</button>`;
+      `<span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"></span>` +
+      `<button style="background:none;border:none;color:#888;cursor:pointer;font-size:16px;padding:0 4px;">✕</button>`;
+    row.firstElementChild.textContent = path;
+    const removeBtn = row.lastElementChild;
+    removeBtn.addEventListener("click", () => removeFolder(removeBtn, path));
     list.appendChild(row);
   });
 }
@@ -834,6 +841,25 @@ function renderFailuresPanel() {
     return;
   }
   body.innerHTML = visible.map(_renderFailCard).join("");
+  _bindFailCardActions(body, visible);
+}
+
+// data-act → 실행할 함수. 경로는 HTML을 거치지 않고 카드 객체에서 직접 꺼내
+// 클로저로 전달하므로, 경로에 역슬래시·작은따옴표가 있어도 원본 그대로 넘어간다.
+const _FAIL_ACTIONS = {
+  retry: (path) => retryFailureFile(path),
+  reveal: (path) => revealFailureFile(path),
+  exclude: (path) => excludeFailureFile(path),
+  unexclude: (path) => unexcludeFailureFile(path),
+};
+
+function _bindFailCardActions(body, visible) {
+  body.querySelectorAll("button[data-act]").forEach(btn => {
+    const card = visible[Number(btn.dataset.idx)];
+    const handler = _FAIL_ACTIONS[btn.dataset.act];
+    if (!card || !handler) return;
+    btn.addEventListener("click", () => handler(card.path));
+  });
 }
 
 function _failFilterLabel(cat) {
@@ -866,8 +892,14 @@ function _formatFailWait(nextTs) {
   return `${minutes}분 후`;
 }
 
-function _renderFailCard(card) {
-  const pathEsc = escHtml(card.path).replace(/'/g, "\\'");
+function _renderFailCard(card, index) {
+  // 경로는 HTML에 넣지 않는다 — data-idx로 배열 위치만 넘기고, 실제 문자열은
+  // _bindFailCardActions가 클로저로 잡아 전달한다. 인라인 onclick에 경로를
+  // 문자열로 끼워 넣으면 Windows 경로(C:\Users\...)의 역슬래시가 JS 이스케이프로
+  // 해석돼 값이 깨지고(\t→탭, \U→U), 작은따옴표가 든 이름은 문자열을 조기
+  // 종료시켜 임의 코드 실행까지 가능하다.
+  const act = (name, label, cls) =>
+    `<button class="${cls}" data-act="${name}" data-idx="${index}">${label}</button>`;
   if (card.excluded) {
     return `
       <div class="f-card excluded">
@@ -883,8 +915,8 @@ function _renderFailCard(card) {
           <span class="k">다음 재시도</span><span class="next none">사용자가 제외함</span>
         </div>
         <div class="f-actions">
-          <button class="f-btn primary" onclick="unexcludeFailureFile('${pathEsc}')">제외 해제</button>
-          <button class="f-btn" onclick="revealFailureFile('${pathEsc}')">🗀 파일 위치 열기</button>
+          ${act("unexclude", "제외 해제", "f-btn primary")}
+          ${act("reveal", "🗀 파일 위치 열기", "f-btn")}
         </div>
       </div>`;
   }
@@ -906,9 +938,9 @@ function _renderFailCard(card) {
         <span class="k">다음 재시도</span><span class="next">${waitLabel}</span>
       </div>
       <div class="f-actions">
-        <button class="f-btn primary" onclick="retryFailureFile('${pathEsc}')">⟳ 지금 다시 시도</button>
-        <button class="f-btn" onclick="revealFailureFile('${pathEsc}')">🗀 파일 위치 열기</button>
-        <button class="f-btn danger spacer" onclick="excludeFailureFile('${pathEsc}')">인덱싱 제외</button>
+        ${act("retry", "⟳ 지금 다시 시도", "f-btn primary")}
+        ${act("reveal", "🗀 파일 위치 열기", "f-btn")}
+        ${act("exclude", "인덱싱 제외", "f-btn danger spacer")}
       </div>
     </div>`;
 }
