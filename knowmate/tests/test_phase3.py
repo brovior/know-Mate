@@ -551,6 +551,40 @@ class TestComRestart:
 
         assert spy.call_count == 2
 
+    def test_restart_passes_configured_grace_sec(self, tmp_path: Path):
+        """com_quit_grace_sec 설정값이 com_restart_fn(grace_sec=...)로 전달된다
+        (레이스 완화 유예 — quit_com_apps가 이 값을 실제로 쓴다)."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.secure.fake_reader import FakeReader
+        from knowmate.collector.scheduler import CollectorWorker
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        for i in range(3):
+            (folder / f"file{i}.doc").write_bytes(b"legacy doc content")
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        config = {
+            "collector": {
+                "watch_folders": [str(folder)],
+                "idle_seconds": 60,
+                "com_restart_every_n_files": 3,
+                "com_quit_grace_sec": 2.5,
+            },
+            "cleanup": {"dry_run": True, "max_delete_ratio": 0.30},
+            "chunking": {"chunk_size": 400, "overlap": 80},
+        }
+        spy = MagicMock()
+        worker = CollectorWorker(
+            config=config, indexer=indexer, extractor=FakeReader(),
+            state_file=tmp_path / "state.json", com_restart_fn=spy,
+        )
+        worker.run()
+
+        spy.assert_called_once_with(grace_sec=2.5)
+
     def test_restart_disabled_when_zero(self, tmp_path: Path):
         """com_restart_every_n_files=0 -> 재기동 안 함."""
         folder = tmp_path / "docs"

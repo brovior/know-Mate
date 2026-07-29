@@ -440,16 +440,34 @@ class PowerPointComReader:
 
 
 
-def quit_com_apps() -> None:
+def quit_com_apps(grace_sec: float = 5.0, wait_fn=None) -> None:
     """현재 스레드의 COM 앱들을 Quit하고 thread-local을 비운다.
 
     COM 객체는 생성한 스레드에서만 Quit할 수 있으므로(STA),
     반드시 COM 앱을 생성한 워커 스레드 내부에서 호출해야 한다.
     누수된 WINWORD/EXCEL/POWERPNT 프로세스를 정리한다.
 
-    Quit이 실패해 남은 '우리 소유' 프로세스는 강제 종료해 좀비가 다음
-    사이클의 가드를 오작동시키지 않게 한다(자기 감지 스킵 방지).
+    `app.Quit()`은 종료를 요청할 뿐 즉시 반환한다 — 실제 종료(임시파일·애드인
+    정리 등)까지는 수 초 걸릴 수 있어, 반환 직후 바로 프로세스를 조회하면
+    스스로 꺼지는 중인 것까지 매번 강제 종료로 오판했다(레이스). `grace_sec`
+    만큼 실제 종료를 기다린 뒤, 그래도 남은 '우리 소유' 프로세스만 강제
+    종료한다 — 좀비가 다음 사이클의 가드를 오작동시키지 않게 한다(자기 감지
+    스킵 방지). 강제 종료는 Office에 세이프모드 유발 표식을 남기므로, 유예를
+    주는 것만으로 이 표식 생성 자체를 줄일 수 있다.
+
+    Quit() 전 `gc.collect()`를 1회 호출한다 — 파이썬 쪽에서 COM 래퍼 참조를
+    깜빡 놓지 않고 있어(순환 참조 등) Office가 "아직 누가 쓰고 있다"고 보고
+    스스로 종료하지 못하는 경우를 미리 제거한다. 이 라인이 있어도 여전히
+    유예를 다 쓰고 강제 종료가 반복된다면, 원인은 레이스가 아니라 어딘가
+    COM 참조를 명시적으로 놓지 않는 코드가 있다는 신호다 — `대기 Ns` 로그로
+    운영 중 구분한다.
+
+    grace_sec=0이면 대기 없이 기존 동작(즉시 강제종료)과 동일하다(비상 스위치).
+    wait_fn: 테스트 주입용(기본 `office_guard.wait_for_owned_exit`).
     """
+    import gc
+    gc.collect()
+
     for attr in ("word", "excel", "ppt"):
         app = getattr(_tls, attr, None)
         if app is None:
@@ -462,12 +480,25 @@ def quit_com_apps() -> None:
 
     # 우리가 띄운 인스턴스 중 Quit 후에도 남아있으면 강제 종료 + 소유 목록 비움
     try:
-        from knowmate.secure.office_guard import (
-            clear_owned_pids,
-            terminate_owned_office_processes,
-        )
-        owned = clear_owned_pids()
-        terminate_owned_office_processes(owned)
+        from knowmate.secure import office_guard
+        owned = office_guard.clear_owned_pids()
+        if not owned:
+            return
+        if wait_fn is None:
+            wait_fn = office_guard.wait_for_owned_exit
+        if grace_sec > 0:
+            still_alive, elapsed = wait_fn(owned, grace_sec)
+        else:
+            still_alive, elapsed = owned, 0.0
+        exited = len(owned) - len(still_alive)
+        if exited:
+            logger.info("[com] Office 정상 종료 확인: %d개 (대기 %.1f초)", exited, elapsed)
+        if still_alive:
+            logger.warning(
+                "[com] 유예 %.0f초 초과 — 강제 종료: %s (대기 %.1f초)",
+                grace_sec, sorted(still_alive), elapsed,
+            )
+            office_guard.terminate_owned_office_processes(still_alive)
     except Exception as exc:
         logger.debug("COM 소유 프로세스 정리 실패(무시): %s", exc)
 

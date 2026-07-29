@@ -251,6 +251,68 @@ def terminate_stuck_office(exe: str) -> int:
     return len(targets)
 
 
+_SYNCHRONIZE = 0x00100000
+_WAIT_OBJECT_0 = 0x00000000
+
+
+def wait_for_owned_exit(owned: set, timeout_sec: float) -> tuple[set, float]:
+    """owned PID들이 스스로 종료하기를 최대 timeout_sec초 기다린다.
+
+    `Quit()`은 종료를 "요청"할 뿐 즉시 반환하므로, 반환 직후 프로세스 목록을
+    조회하면 아직 정리 중인(임시파일·애드인 정리 등) Office가 거의 항상 살아있는
+    것으로 잡혀 불필요하게 강제 종료된다(레이스). `OpenProcess`+`WaitForSingleObject`로
+    커널이 실제 종료를 알려줄 때까지 대기해, 스스로 꺼지면 유예 시간을 다 쓰지
+    않고 즉시 반환한다.
+
+    한 PID라도 이 시점에 `OpenProcess`가 실패하면(권한 문제 등 드문 경우 제외,
+    보통은 **이미 종료됨을 의미**) 폴링으로 5초를 기다리지 않는다 — 대신 프로세스
+    열거를 1회만 호출해 정말 살아있는지 확인한다(열거 자체가 실패하면 판단 불가로
+    보수적으로 "살아있음" 취급 — 기존 즉시 강제종료 동작과 동일하게 안전한 방향).
+
+    반환: (유예 종료 후에도 남아있는 PID 집합, 실제 대기한 시간(초)) — 후자는
+    로그로 남겨 "레이스였는지(빠르게 종료) vs 다른 원인인지(매번 유예 소진)"를
+    운영 중 구분할 수 있게 한다.
+    """
+    if not owned or sys.platform != "win32":
+        return set(owned), 0.0
+
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    t0 = time.monotonic()
+
+    handles: dict[int, int] = {}
+    no_handle: set = set()
+    for pid in owned:
+        handle = kernel32.OpenProcess(_SYNCHRONIZE, False, pid)
+        if handle:
+            handles[pid] = handle
+        else:
+            no_handle.add(pid)
+
+    deadline = t0 + timeout_sec
+    unresolved: set = set()
+    for pid, handle in handles.items():
+        remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+        try:
+            result = kernel32.WaitForSingleObject(handle, remaining_ms)
+            if result != _WAIT_OBJECT_0:
+                unresolved.add(pid)
+        finally:
+            kernel32.CloseHandle(handle)
+
+    still_alive = set(unresolved)
+    if no_handle:
+        procs = _enumerate_processes()
+        if procs is None:
+            # 판단 불가 → 기존 즉시 강제종료 동작과 동일하게 보수적으로 취급
+            still_alive |= no_handle
+        else:
+            still_alive |= {pid for (name, pid) in procs if pid in no_handle and name in _OFFICE_EXES}
+
+    return still_alive, time.monotonic() - t0
+
+
 def terminate_owned_office_processes(owned: set) -> None:
     """owned PID 중 아직 살아있고 여전히 Office 실행 파일인 것만 강제 종료한다.
 
