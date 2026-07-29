@@ -212,7 +212,7 @@ class CollectorWorker(QThread):
                 # COM 앱 Quit은 반드시 생성 스레드(여기)에서 수행해야 한다(STA)
                 try:
                     from knowmate.secure.com_reader import quit_com_apps
-                    quit_com_apps()
+                    quit_com_apps(grace_sec=getattr(self, "_com_quit_grace_sec", 5.0))
                 except Exception:
                     pass
                 import pythoncom  # type: ignore
@@ -403,6 +403,11 @@ class CollectorWorker(QThread):
         # 재기동(quit_com_apps)해 장시간 사이클에서의 핸들·메모리 누수를 완화한다.
         # 워치독(반응적, 행오버 시 kill)과 달리 이건 선제적 예방책. 0 이하면 비활성.
         com_restart_every = int(collector_cfg.get("com_restart_every_n_files", 30))
+
+        # Quit() 후 실제 종료를 기다리는 유예 시간 — 반환 즉시 강제종료하면
+        # 스스로 정리 중인 Office까지 매번 강제종료로 오판해 세이프모드 표식이
+        # 반복 생성된다(레이스). 0이면 대기 없이 기존 동작(즉시 강제종료).
+        self._com_quit_grace_sec = float(collector_cfg.get("com_quit_grace_sec", 5.0))
 
         # purge(제거된 폴더 청크 정리) 스킵/강제 reconciliation 판정 — 설계
         # docs/ai-workflow/architecture.md § A-0002. op_sig는 이번 사이클의 watch_folders
@@ -733,7 +738,7 @@ class CollectorWorker(QThread):
                 com_since_restart += 1
                 if com_restart_every > 0 and com_since_restart >= com_restart_every:
                     try:
-                        self._com_restart_fn()
+                        self._com_restart_fn(grace_sec=self._com_quit_grace_sec)
                         restart_count += 1
                         logger.info(
                             "[collector] COM Office 주기 재기동: %d개 COM 파일 처리 후",

@@ -73,12 +73,24 @@ python knowmate\app\main.py    # 또는 run.bat
 ### 포터블 빌드 (배포)
 
 ```bash
-# pyinstaller 설치 후, config 템플릿의 base_url을 실제 사내 IP로 채운 뒤
-build.bat
+# config 템플릿의 base_url을 실제 사내 IP로 채운 뒤
+# (pyinstaller는 requirements.txt에 고정 버전으로 포함돼 있다)
+build.bat          # 클린 빌드 — 배포용 (기본값)
+build.bat fast     # 캐시 재사용 — 개발 중 반복 확인용, 배포 금지
+
 # → dist\AegisDesk\ 생성 (AegisDesk.exe + _internal 폴더).
+# 빌드 직후 AegisDesk.exe --selftest 가 자동 실행돼 번들 누락을 검사한다
+# (실패하면 배포 중단 + dist\selftest.log 에 상세). 다만 이 점검은 '파일이
+# 번들에 있는지'만 보므로, 배포 전 실제로 한 번 띄워 흰 화면이 없는지 확인할 것.
 # 이 폴더를 통째로 zip으로 압축해 테스터에게 배포 (exe 단독 배포 불가).
 # 배포 가이드: docs/BETA_GUIDE.md
 ```
+
+빌드 기본값이 '클린'인 이유: 배포용 결과물이라 PyInstaller 증분 캐시가 stale해져
+깨진 exe가 테스터에게 나가는 비용이 빌드 시간보다 크다. 반복 확인이 필요할 때만
+`fast`로 명시한다. `dist\`는 두 모드 모두 항상 지운다 — PyInstaller는 덮어쓸 뿐
+이전 빌드에만 있던 파일을 지우지 않아, 남기면 불필요한 DLL·구 UI 파일이 배포
+zip에 섞인다.
 
 ---
 

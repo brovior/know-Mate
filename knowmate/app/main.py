@@ -401,6 +401,14 @@ def main() -> None:
     from knowmate.version import __version__
     from knowmate.config import get_config
 
+    # 빌드 자체 점검 모드 — 창을 띄우지 않고 번들 구성만 확인하고 종료 코드로 알린다.
+    # build.bat이 빌드 직후 자동 실행해 배포 전 게이트로 쓴다(--windowed 빌드는
+    # 콘솔이 없어 종료 코드가 유일하게 신뢰할 수 있는 전달 수단).
+    # QApplication 생성 전에 처리해야 한다 — 점검 목적상 GUI를 띄우면 안 된다.
+    if "--selftest" in sys.argv:
+        from knowmate.app.selftest import run_selftest
+        sys.exit(run_selftest())
+
     cfg = get_config()
     _init_logging(cfg.get("log_level", "INFO"))
     _install_exception_hook()
