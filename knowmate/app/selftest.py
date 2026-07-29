@@ -16,10 +16,14 @@ pytest가 담당하므로 여기서 중복하지 않는다:
   5. lancedb 번들 버전 — 검증 범위 밖 버전이 섞였는지
   6. 로그 폴더 쓰기 가능 여부 — 실패 시 진단 수단 자체를 잃는다
 
-**결과 전달**: 종료 코드(0=통과, 1=실패)와 stderr 출력. `--windowed` exe는
-stdout/stderr가 어디에도 안 붙지만 **종료 코드는 그대로 전달**되므로
-build.bat이 `errorlevel`로 판정할 수 있다. 사람이 원인을 보려면 리다이렉트
-(`AegisDesk.exe --selftest 2> out.txt`)하면 된다.
+**결과 전달**: ① 종료 코드(0=통과, 1=실패) ② 보고서 파일
+(`%APPDATA%/AegisDesk/logs/selftest.log`) ③ stderr(있을 때만).
+
+보고서 파일이 **정본**이다. `--windowed` 빌드에서는 `sys.stderr`가 `None`일 수
+있어(콘솔이 없고 리다이렉트도 없을 때) stderr에만 의존하면 결과를 못 볼 뿐
+아니라 출력 시도 자체가 예외로 터져 **통과인데 실패로 뒤집히는** 문제가 있었다.
+그래서 stderr 출력은 전부 가드하고, 판정 결과는 항상 파일로 남긴다.
+리다이렉트(`... --selftest 2> out.txt`)를 쓰면 stderr로도 그대로 나온다.
 
 **한계(중요)**: 이 점검은 *번들 구성*만 본다 — 파일이 있고 import가 되는지.
 WebEngine이 실제로 페이지를 렌더링하는지는 창을 띄워야만 알 수 있으므로
@@ -118,11 +122,53 @@ def _check_log_dir_writable(failures: list[str]) -> None:
         failures.append(f"로그 폴더 쓰기 불가: {type(exc).__name__}: {exc}")
 
 
-def run_selftest() -> int:
+def _echo_stderr(lines: list[str]) -> None:
+    """가능하면 stderr로도 출력한다 — **실패해도 조용히 무시한다**.
+
+    `--windowed` PyInstaller 빌드는 콘솔이 없어 `sys.stderr`가 `None`일 수 있다
+    (리다이렉트를 걸면 실제 핸들이 붙는다). 가드 없이 `print(file=sys.stderr)`를
+    하면 `AttributeError`가 나 **점검은 통과했는데 종료 코드만 1로 뒤집히는**
+    오판이 생긴다 — 판정 결과가 출력 수단 유무에 좌우되면 안 된다.
+    """
+    stream = getattr(sys, "stderr", None)
+    if stream is None:
+        return
+    try:
+        for line in lines:
+            print(line, file=stream)
+    except Exception:
+        pass
+
+
+def _default_report_path():
+    """보고서 기본 경로(`%APPDATA%/AegisDesk/logs/selftest.log`)를 반환한다."""
+    from knowmate.config import get_data_dir
+    return get_data_dir() / "logs" / "selftest.log"
+
+
+def _write_report(lines: list[str], report_path) -> str | None:
+    """판정 결과를 파일로 남긴다. 실패하면 사유 문자열을 반환한다(예외 전파 없음).
+
+    보고서 기록 실패가 **점검 결과 자체를 바꾸면 안 된다** — 종료 코드는 점검
+    결과만으로 정해지고, 여기서는 "어디에 남겼는지/왜 못 남겼는지"만 알린다.
+    """
+    try:
+        path = Path(report_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return None
+    except Exception as exc:
+        return f"{type(exc).__name__}: {exc}"
+
+
+def run_selftest(report_path=None) -> int:
     """번들 자체 점검을 수행하고 종료 코드를 반환한다(0=통과, 1=실패).
 
     각 점검은 독립적으로 실행해 **한 항목이 실패해도 나머지를 계속 확인한다**
     — 빌드 담당자가 한 번에 모든 누락을 보고 고칠 수 있도록.
+
+    report_path: 판정 결과를 남길 파일(기본 `%APPDATA%/AegisDesk/logs/selftest.log`).
+        테스트가 임시 경로를 주입해 실제 앱 데이터 폴더를 건드리지 않게 한다.
     """
     failures: list[str] = []
     checks = (
@@ -139,18 +185,31 @@ def run_selftest() -> int:
             failures.append(f"[{label}] 점검 중 예외: {type(exc).__name__}: {exc}")
 
     frozen = bool(getattr(sys, "frozen", False))
-    print(f"[selftest] frozen={frozen} platform={sys.platform}", file=sys.stderr)
+    lines = [f"[selftest] frozen={frozen} platform={sys.platform}"]
     if failures:
-        print(f"[selftest] 실패 {len(failures)}건:", file=sys.stderr)
-        for item in failures:
-            print(f"  - {item}", file=sys.stderr)
-        return 1
+        lines.append(f"[selftest] 실패 {len(failures)}건:")
+        lines.extend(f"  - {item}" for item in failures)
+    else:
+        lines.append("[selftest] 전체 통과")
+        if not frozen:
+            lines.append(
+                "[selftest] 주의: frozen이 아닌 소스 실행에서 돌았다 — "
+                "번들 누락 검증은 exe로 실행해야 의미가 있다."
+            )
 
-    print("[selftest] 전체 통과", file=sys.stderr)
-    if not frozen:
-        print(
-            "[selftest] 주의: frozen이 아닌 소스 실행에서 돌았다 — "
-            "번들 누락 검증은 exe로 실행해야 의미가 있다.",
-            file=sys.stderr,
+    if report_path is None:
+        try:
+            report_path = _default_report_path()
+        except Exception as exc:
+            report_path = None
+            lines.append(f"[selftest] 보고서 경로 확인 실패: {type(exc).__name__}: {exc}")
+
+    if report_path is not None:
+        write_error = _write_report(lines, report_path)
+        lines.append(
+            f"[selftest] 보고서 기록 실패({write_error})" if write_error
+            else f"[selftest] 보고서: {report_path}"
         )
-    return 0
+
+    _echo_stderr(lines)
+    return 1 if failures else 0

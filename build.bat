@@ -89,6 +89,7 @@ if errorlevel 1 (
     if exist "dist\selftest.log" type "dist\selftest.log"
     echo.
     echo         상세: dist\selftest.log
+    echo         (정본 보고서: %%APPDATA%%\AegisDesk\logs\selftest.log)
     pause
     exit /b 1
 )
