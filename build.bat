@@ -1,5 +1,20 @@
 @echo off
 setlocal enabledelayedexpansion
+
+REM 이 파일은 UTF-8(BOM 없음)로 저장돼 있다. cmd는 배치 파일을 '현재 콘솔
+REM 코드페이지'로 해석하므로, 콘솔이 949(한국어 Windows 기본)인 상태에서
+REM 실행하면 아래 한글 메시지가 전부 깨진다 — 특히 탐색기에서 .bat을
+REM 더블클릭하면 새 콘솔이 시스템 기본값으로 열려 항상 이 상황이 된다.
+REM 그래서 스크립트가 스스로 65001(UTF-8)로 맞추고, 끝나면 원래 값으로
+REM 돌려놓는다(다른 도구가 949를 기대할 수 있으므로).
+REM 참고: 한글이 든 REM 주석은 화면에 출력되지 않아 파싱에 영향이 없다
+REM (UTF-8 한글 바이트는 모두 0x80 이상이라 cmd 메타문자와 충돌하지 않는다).
+set "_ORIG_CP="
+for /f "tokens=2 delims=:" %%c in ('chcp 2^>nul') do (
+    for /f "tokens=1 delims= " %%d in ("%%c") do set "_ORIG_CP=%%d"
+)
+chcp 65001 >nul 2>&1
+
 REM Aegis Desk 포터블 빌드 스크립트 — 사내 PC에서 실행
 REM
 REM 사용법:
@@ -27,6 +42,7 @@ if /i "%~1"=="fast" set "BUILD_MODE=fast"
 
 if not exist ".venv\Scripts\python.exe" (
     echo [오류] .venv 가 없습니다. 먼저 가상환경을 만들고 requirements.txt 를 설치하세요.
+    call :restore_cp
     pause
     exit /b 1
 )
@@ -45,6 +61,7 @@ for /f "delims=" %%v in ('.venv\Scripts\python.exe -m PyInstaller --version 2^>n
 if not defined ACTUAL_PYI (
     echo [오류] PyInstaller 가 .venv 에 없습니다.
     echo         .venv\Scripts\python.exe -m pip install -r requirements.txt
+    call :restore_cp
     pause
     exit /b 1
 )
@@ -74,6 +91,7 @@ echo === PyInstaller 빌드 시작 ^(%BUILD_MODE%^) ===
 
 if errorlevel 1 (
     echo [오류] 빌드 실패. 위 로그를 확인하세요.
+    call :restore_cp
     pause
     exit /b 1
 )
@@ -90,6 +108,7 @@ if errorlevel 1 (
     echo.
     echo         상세: dist\selftest.log
     echo         (정본 보고서: %%APPDATA%%\AegisDesk\logs\selftest.log)
+    call :restore_cp
     pause
     exit /b 1
 )
@@ -110,4 +129,14 @@ echo        화면을 그리는지는 창을 띄워야만 알 수 있으므로, 
 echo        dist\AegisDesk\AegisDesk.exe 를 직접 실행해 흰 화면 없이 뜨는지
 echo        한 번 확인하세요.
 pause
+call :restore_cp
 endlocal
+exit /b 0
+
+REM ── 콘솔 코드페이지 복원 ──────────────────────────────────────────────
+REM 스크립트가 65001로 바꿔놓은 것을 원래대로 되돌린다. 값을 못 읽었으면
+REM (locale에 따라 chcp 출력 형식이 다를 수 있음) 아무 것도 하지 않는다 —
+REM 복원 실패가 빌드 결과에 영향을 주지는 않는다.
+:restore_cp
+if defined _ORIG_CP chcp %_ORIG_CP% >nul 2>&1
+exit /b 0

@@ -1,0 +1,8 @@
+# Windows 배치 파일은 반드시 CRLF로 체크아웃돼야 한다.
+# cmd.exe는 LF 전용 .bat에서 라벨(:label)·goto·괄호 블록 파싱이 어긋나는 알려진
+# 문제가 있어, 플랫폼 자동 변환에 맡기지 않고 여기서 고정한다.
+*.bat text eol=crlf
+
+# .spec(PyInstaller)·셸 스크립트는 LF 유지
+*.spec text eol=lf
+*.sh   text eol=lf

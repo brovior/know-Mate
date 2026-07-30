@@ -16,9 +16,13 @@
 또한 **연결을 재사용할 때 vs 새로 맺을 때**, **유휴 후 재사용할 때**를 나눠 측정해
 "COM 추출로 수십 초 노는 동안 연결이 죽어서 매번 새로 맺는가"를 직접 확인한다.
 
-사용법 (사내 PC):
-    PYTHONUTF8=1 .venv\\Scripts\\python.exe scripts\\diag_embed_latency.py
-    PYTHONUTF8=1 .venv\\Scripts\\python.exe scripts\\diag_embed_latency.py --idle 90
+사용법 (Windows cmd):
+    .venv\\Scripts\\python.exe scripts\\diag_embed_latency.py
+    .venv\\Scripts\\python.exe scripts\\diag_embed_latency.py --idle 0     # 유휴 대기 생략
+
+`PYTHONUTF8=1 <명령>` 형태로 안내하던 것을 걷어냈다 — 그건 bash 문법이라 cmd에서는
+`PYTHONUTF8=1`을 프로그램 이름으로 알아듣고 "내부 또는 외부 명령이 아닙니다"로 끝난다.
+게다가 파일을 읽는 코드가 모두 `encoding="utf-8"`을 명시하므로 이 변수 자체가 불필요하다.
 
 config.yaml(%APPDATA%/AegisDesk/config.yaml)의 embedding 설정을 그대로 읽으므로
 앱과 동일한 주소·헤더·키로 호출한다. 문서 내용은 보내지 않고 짧은 더미 문장만
