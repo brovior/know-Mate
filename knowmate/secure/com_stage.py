@@ -32,6 +32,11 @@ STAGE_CELL_READ = "cell_read"  # (Excel) 셀 데이터 읽기
 STAGE_READ = "read"            # (Word/PPT) 본문 읽기 — 시트/셀 구분이 없는 포맷
 STAGE_CLOSE = "close"          # 문서 닫기
 
+# 이 시간을 넘는 파싱은 단계 요약을 INFO로 올린다(기본은 DEBUG). COM 경로 파일은
+# 정상이어도 수 초가 걸리므로, "느리다"의 기준을 넉넉히 잡아 정상 파일이 로그를
+# 채우지 않게 한다. 실기 실측에서 문제가 된 DRM ppt는 수십 초대였다.
+SLOW_COM_PARSE_LOG_SEC = 10.0
+
 _lock = threading.Lock()
 # 현재 진행 중인 단계(워커 스레드가 쓰고, 워치독 타이머 스레드가 읽는다).
 _current: dict = {"stage": None, "path": None, "started_at": None}
@@ -116,7 +121,17 @@ class StageTimer:
     def __init__(self, path: str) -> None:
         self._path = path
         self._durations: dict[str, float] = {}
+        self._notes: dict[str, str] = {}
         self.failed_stage: str | None = None
+
+    def note(self, name: str, value) -> None:
+        """단계 요약에 붙일 부가 수치를 기록한다(건수·최대값 등).
+
+        `read=12.30s`만으로는 "슬라이드가 많아서 느린 것"과 "특정 슬라이드 하나가
+        멈춘 것"을 구분할 수 없어서 필요하다. **수치·건수만** 넣는다 — 셀 값이나
+        본문은 절대 넣지 않는다(원칙7).
+        """
+        self._notes[name] = f"{value:.2f}s" if isinstance(value, float) else str(value)
 
     def stage(self, name: str):
         """단계 진입~이탈을 계측하는 컨텍스트 매니저.
@@ -136,14 +151,32 @@ class StageTimer:
             with _lock:
                 _last_failed_stage = name
 
+    def total_seconds(self) -> float:
+        """계측된 모든 단계의 합(초)."""
+        return sum(self._durations.values())
+
     def summary(self) -> str:
-        """단계별 소요시간 + 실패 단계를 로그 한 줄로 요약한다. 셀 값·본문 없음."""
+        """단계별 소요시간 + 부가 수치 + 실패 단계를 로그 한 줄로 요약한다.
+
+        셀 값·본문 없음(원칙7).
+        """
         parts = " ".join(f"{name}={dur:.2f}s" for name, dur in self._durations.items())
+        if self._notes:
+            parts += " [" + " ".join(f"{k}={v}" for k, v in self._notes.items()) + "]"
         if self.failed_stage:
             return f"{parts} (실패단계={self.failed_stage})"
         return parts
 
     def log_summary(self, level: int = logging.DEBUG) -> None:
+        """단계 요약을 남긴다. 느린 파싱은 level 인자와 무관하게 INFO로 올린다.
+
+        기본이 DEBUG여서 실기 로그(기본 레벨 INFO)에는 이 줄이 **한 건도 남지
+        않았다** — 단계 계측을 넣어 뒀는데도 "DRM ppt의 open 시간이 실행마다 크게
+        흔들린다"를 로그로 확인할 수 없었던 이유다. 느린 건만 올리면 정상 파일로
+        로그가 넘치지 않으면서 흔들리는 파일의 분포를 모을 수 있다.
+        """
+        if self.total_seconds() >= SLOW_COM_PARSE_LOG_SEC:
+            level = max(level, logging.INFO)
         logger.log(level, "[com] 단계별 소요: %s <%s>", self.summary(), self._path)
 
 

@@ -456,6 +456,14 @@ class Bridge(QObject):
         found = failure_state.request_retry_one(records, path)
         if found:
             failure_state.save_failures(failure_file, records)
+        # 요청 자체를 남긴다 — 버튼을 눌렀다는 사실이 로그에 없어서, 재처리가
+        # 사용자 요청 때문인지 백오프 만료 때문인지 실기에서 판정할 수 없었다.
+        # 소비자 쪽 "실패 파일 재시도(사용자 요청)" 로그와 짝을 이룬다.
+        import logging
+        logging.getLogger(__name__).info(
+            "[failure] 사용자 「지금 다시 시도」 요청 (기록 %s): %s",
+            "있음" if found else "없음", path,
+        )
         self._worker.start()
         return "ok" if found else "not_found"
 
