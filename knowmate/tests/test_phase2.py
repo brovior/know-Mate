@@ -479,8 +479,15 @@ class TestProxyBypass:
                 self.host = host
                 self.port = port
                 self.request_count = 0
+                self.connect_count = 0
                 self.last_request: dict | None = None
                 holder["conn"] = self
+
+            def connect(self):
+                # 실제 http.client.HTTPConnection에 있는 메서드. _get_connection이
+                # 연결 수립 시간만 따로 재기 위해 명시적으로 호출한다(느린 임베딩
+                # 호출의 원인이 '연결 수립'인지 '서버 응답'인지 가르기 위함).
+                self.connect_count += 1
 
             def request(self, method, path, body=None, headers=None):
                 self.request_count += 1
@@ -501,6 +508,7 @@ class TestProxyBypass:
         conn = holder["conn"]
         assert conn.host == "intra"                          # base_url에서 직접 연결 (프록시 미경유)
         assert conn.request_count == 2                        # 같은 연결 객체로 2회 요청 = 재사용됨
+        assert conn.connect_count == 1                        # 연결 수립은 1회만 = keep-alive 유지
         req = conn.last_request
         assert req["method"] == "POST"
         assert req["path"] == "/v1/embeddings"
@@ -529,3 +537,145 @@ class TestProxyBypass:
         assert captured["url"] == "http://intra/v1/chat/completions"
         assert captured["headers"]["authorization"] == "Bearer dummy"
         assert captured["headers"]["host"] == "llm.internal"
+
+
+class TestSlowEmbedCallLogging:
+    """느린 임베딩 호출의 구간별 계측(embedding._log_if_slow) 검증.
+
+    배경: 사내 실측에서 3청크 파일도 임베딩에 21.93초가 걸렸으나, 같은 PC에서
+    돌린 진단 스크립트는 전 시나리오가 0.21초 미만이었다. 네트워크·서버가 아니라
+    앱 실행 맥락에서만 느려진다는 뜻이라, 앱 안에서 connect/ttfb/read를 갈라
+    기록하게 했다. 이 테스트는 그 로그가 실제로 나오는지(그리고 정상 호출에는
+    안 나오는지)를 고정한다.
+    """
+
+    def _make_client_with_fake_conn(self, monkeypatch, sleep_in: str | None = None,
+                                    delay: float = 0.0):
+        """FakeConn을 심은 EmbeddingClient를 만든다.
+
+        sleep_in: "connect" | "request" | "read" — 해당 구간에서만 delay초 지연.
+        """
+        import http.client
+        import json
+        import time as _t
+
+        from knowmate.rag.embedding import EmbeddingClient, VECTOR_DIM
+
+        body = {"data": [{"embedding": [0.0] * VECTOR_DIM}]}
+
+        class FakeResp:
+            status = 200
+            def read(self):
+                if sleep_in == "read":
+                    _t.sleep(delay)
+                return json.dumps(body).encode("utf-8")
+
+        class FakeConn:
+            def __init__(self, host, port, timeout=None):
+                pass
+            def connect(self):
+                if sleep_in == "connect":
+                    _t.sleep(delay)
+            def request(self, method, path, body=None, headers=None):
+                if sleep_in == "request":
+                    _t.sleep(delay)
+            def getresponse(self):
+                return FakeResp()
+
+        monkeypatch.setattr(http.client, "HTTPConnection", FakeConn)
+        return EmbeddingClient(base_url="http://intra", host_header="h", api_key="k")
+
+    def test_fast_call_logs_nothing(self, monkeypatch, caplog):
+        """정상(빠른) 호출은 로그를 남기지 않는다 — 로그 오염 방지."""
+        import logging
+        client = self._make_client_with_fake_conn(monkeypatch)
+        with caplog.at_level(logging.WARNING, logger="knowmate.rag.embedding"):
+            client.embed(["hi"])
+        assert "느린 호출" not in caplog.text
+
+    def test_slow_call_logs_breakdown(self, monkeypatch, caplog):
+        """임계를 넘으면 구간별 내역을 WARNING으로 남긴다."""
+        import logging
+        from knowmate.rag import embedding
+
+        monkeypatch.setattr(embedding, "SLOW_EMBED_CALL_LOG_SEC", 0.05)
+        client = self._make_client_with_fake_conn(monkeypatch, sleep_in="request", delay=0.12)
+
+        with caplog.at_level(logging.WARNING, logger="knowmate.rag.embedding"):
+            client.embed(["hi"])
+
+        assert "느린 호출" in caplog.text
+        assert "connect=" in caplog.text and "ttfb=" in caplog.text and "read=" in caplog.text
+
+    def test_connect_time_attributed_to_connect_not_ttfb(self, monkeypatch, caplog):
+        """연결 수립 지연이 connect 구간에 기록된다 — 이 구분이 진단의 핵심이라
+        ttfb로 새면(예: 명시적 connect() 없이 request()가 연결까지 하면) 원인을
+        '서버가 느리다'로 오판하게 된다."""
+        import logging, re
+        from knowmate.rag import embedding
+
+        monkeypatch.setattr(embedding, "SLOW_EMBED_CALL_LOG_SEC", 0.05)
+        client = self._make_client_with_fake_conn(monkeypatch, sleep_in="connect", delay=0.12)
+
+        with caplog.at_level(logging.WARNING, logger="knowmate.rag.embedding"):
+            client.embed(["hi"])
+
+        m = re.search(r"connect=([\d.]+) ttfb=([\d.]+)", caplog.text)
+        assert m, caplog.text
+        connect_sec, ttfb_sec = float(m.group(1)), float(m.group(2))
+        assert connect_sec >= 0.10, f"connect에 잡혀야 함: {connect_sec}"
+        assert ttfb_sec < 0.05, f"ttfb로 새면 안 됨: {ttfb_sec}"
+
+    def test_reused_connection_reports_zero_connect(self, monkeypatch, caplog):
+        """두 번째 호출은 연결을 재사용하므로 connect=0.00으로 기록된다."""
+        import logging, re
+        from knowmate.rag import embedding
+
+        monkeypatch.setattr(embedding, "SLOW_EMBED_CALL_LOG_SEC", 0.05)
+        client = self._make_client_with_fake_conn(monkeypatch, sleep_in="request", delay=0.12)
+        client.embed(["first"])           # 연결 수립
+        caplog.clear()
+
+        with caplog.at_level(logging.WARNING, logger="knowmate.rag.embedding"):
+            client.embed(["second"])
+
+        m = re.search(r"connect=([\d.]+)", caplog.text)
+        assert m and float(m.group(1)) == 0.0, caplog.text
+
+    def test_retry_is_logged_at_warning(self, monkeypatch, caplog):
+        """연결 재시도가 WARNING으로 보인다 — 이전에는 DEBUG라 기본 로그 레벨
+        (INFO)에서 안 보여, 재시도가 느린 호출의 원인인지 확인할 수 없었다."""
+        import http.client
+        import json
+        import logging
+
+        from knowmate.rag.embedding import EmbeddingClient, VECTOR_DIM
+
+        body = {"data": [{"embedding": [0.0] * VECTOR_DIM}]}
+        state = {"attempts": 0}
+
+        class FakeResp:
+            status = 200
+            def read(self):
+                return json.dumps(body).encode("utf-8")
+
+        class FakeConn:
+            def __init__(self, host, port, timeout=None):
+                pass
+            def connect(self):
+                state["attempts"] += 1
+                if state["attempts"] == 1:
+                    raise OSError("연결 끊김(시뮬레이션)")
+            def request(self, method, path, body=None, headers=None):
+                pass
+            def getresponse(self):
+                return FakeResp()
+
+        monkeypatch.setattr(http.client, "HTTPConnection", FakeConn)
+        client = EmbeddingClient(base_url="http://intra", host_header="h", api_key="k")
+
+        with caplog.at_level(logging.WARNING, logger="knowmate.rag.embedding"):
+            out = client.embed(["hi"])   # 1회 실패 후 재시도로 성공
+
+        assert len(out) == 1
+        assert "연결 재시도" in caplog.text
