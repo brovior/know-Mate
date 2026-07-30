@@ -1,79 +1,41 @@
 # CLAUDE.md — Aegis Desk
-> Phase 1~4 완료, Phase 5a(메일) 완료, 5c(포터블 빌드) 완료 · 베타 배포 단계 | 2026-07-21
-> 제품명: **Aegis Desk (이지스 데스크)** — 구 KnowMate. 버전 `knowmate/version.py` (현재 0.9.0-beta2).
-> 데이터 폴더 `%APPDATA%/AegisDesk` (구 KnowMate 폴더는 최초 실행 시 자동 이전). config.yaml·index·logs·km.key·index_state.json 모두 여기 위치.
 
-## 모델 사용 정책
+> **개인 PC용 사내 지식 AI 비서 데스크톱 앱.** PyQt6 + QWebEngineView 셸 위 멀티 에이전트 구조 + 로컬 RAG.
+> 제품명 **Aegis Desk (이지스 데스크)** — 구 KnowMate. 버전 `knowmate/version.py`. 데이터 폴더 `%APPDATA%/AegisDesk`.
+> 현재 **베타 배포 단계** (Phase 1~4 · 5a · 5c 완료, 5b 예정).
 
-- **분석·설계·계획 수립**: Opus 이상 모델 허용.
-- **리뷰(설계 리뷰·코드 리뷰·GPT 리뷰 처리)**: 반드시 Opus 이상 모델로 수행한다. **Sonnet은 리뷰 작업 참여 금지.** 현재 모델이 Sonnet인 상태에서 리뷰 요청이 오면 먼저 사용자에게 Opus 계열 전환(`/model`)을 안내하고, 전환 후 진행한다.
-- **실제 코드 작성·구현**: Sonnet 사용. 구현 착수 시점에 현재 모델이 Opus 계열이면 사용자에게 Sonnet 전환(`/model`)을 먼저 안내할 것.
-- **예외**: 동시성(스레드), 보안(crypto), 대규모 리팩터링 등 고위험 구현은 사용자 판단으로 상위 모델 허용.
-- 참고: `/model opusplan`은 계획=Opus / 실행=Sonnet을 자동 전환한다.
+이 파일은 **작업 규칙만** 담는다. 배경 정보는 필요할 때 아래 문서를 읽는다.
 
-## 수정노트 관리 (`docs/UPDATE_NOTES.md`)
+| 필요한 것 | 문서 |
+|---|---|
+| **문서 지도 (전체 목록)** · 런타임 구조 · 디렉토리 | `docs/ARCHITECTURE.md` |
+| **리뷰를 거친 확정 설계 (정본)** | `docs/ai-workflow/requirements.md` (R-) · `architecture.md` (A-) · `adr/` · `reviews/` |
+| 설계 결정 근거 | `docs/DESIGN.md` · `docs/RAG_ARCHITECTURE.md` · `docs/EMAIL_DESIGN.md` |
+| 진행 단계 · 남은 과제 · 5b 결론 | `docs/ROADMAP.md` |
+| OS · 패키지 · 버전 고정 · 빌드/배포 | `docs/ENVIRONMENT.md` |
+| 모델 사용 정책 · 수정노트 작성법 | `docs/WORKFLOW.md` |
+| 화면 사양 · 룩앤필 | `UI_SPEC.md` · `knowmate/app/ui/mockup.html` |
+| 테스터 배포 · 수정노트 | `docs/BETA_GUIDE.md` · `docs/UPDATE_NOTES.md` |
 
-**코드(기능·버그수정) 변경을 커밋할 때마다 반드시 함께 갱신한다.** 문서만 고치는 커밋(오타, 서식)은 대상 아님.
+**이미 리뷰를 거친 주제를 다시 건드릴 때는 `docs/ai-workflow/`를 먼저 읽는다.** 요구·설계와 그 리뷰 이력이 거기 있어서, 한 번 기각된 접근을 되풀이하지 않을 수 있다. 현재 등록된 것:
 
-- 오늘 날짜(요일 포함, 예: `## 2026-07-21 (화)`) 섹션이 이미 있으면 그 아래에 항목만 추가. 없으면 파일 맨 위(최신이 위)에 새 섹션을 만든다.
-- 날짜 형식은 `## YYYY-MM-DD (요일)` — 요일은 반드시 함께 적는다(베타 테스터가 "무슨 요일에 뭐가 바뀌었는지"를 보는 용도).
-- 한 줄은 **사용자(테스터) 관점 요약** 1문장. 커밋 메시지를 그대로 붙여넣지 말고 "무엇이 바뀌어 사용자에게 뭐가 달라지는지"로 쓴다. 내부 리팩터링·테스트 추가처럼 사용자에게 안 보이는 변경은 생략 가능.
-- 버전이 올라간 날은 섹션 제목에 버전을 함께 적는다: `## 2026-07-21 (화) — v0.9.0-beta2`.
-- 베타 시작일은 2026-07-16(목) — 파일 상단에 고정.
+| ID | 주제 | 상태 |
+|---|---|---|
+| R-0001 / A-0001 / ADR-0001 | 트레이 [종료]가 반드시 프로세스를 끝낸다 — 명시적 quit | Approved / Accepted |
+| R-0002 / A-0002 / ADR-0002 | 유휴 사이클의 전체 테이블 로드 제거 — 컬럼 projection + 조건부 스킵 | Approved / Accepted |
+| R-0003 / A-0003 | 반복 Open 실패가 `UNKNOWN_TRANSIENT`에 머물지 않게 — 원인축·누적축 분리 | **Draft** (GPT 리뷰 3회 반영, 6a 구현·배포됨 / 6b 보류) |
 
-## 프로젝트 개요
-
-**개인 PC용 사내 지식 AI 비서 데스크톱 앱.** PyQt6 + QWebEngineView 셸 위에서 여러 에이전트가 구동되는 멀티 에이전트 구조. Phase 1~4 완료(RAG 지식검색), 5a 완료(Knox `.mysingle` + 표준 `.eml` 메일 인덱싱), 5c 완료(PyInstaller 포터블 빌드). 현재 소수 대상 **베타 배포 단계**. 5b(공용 벡터DB)는 SMB 위 LanceDB 직접 실행 불가로 "로컬 캐시 복사" 방식 확정, 착수 예정.
-
-핵심 시나리오: "작년 A설비 알람 폭주 때 처리 절차 찾아줘" → 로컬 문서·메일 의미 검색 → 요약 답변 + 출처 제시.
-
----
-
-## 아키텍처
-
-```
-PyQt6 + QWebEngineView
-  ├─ HTML/JS UI (index.html / app.js / styles.css)
-  │    └─ QWebChannel 브리지 (bridge.py)
-  ├─ AgentRegistry
-  │    ├─ knowledge_agent  ← RAG 지식검색 (완료)
-  │    └─ mes_agent        ← stub ("준비 중")
-  ├─ RAG 파이프라인
-  │    ├─ Indexer       → chunker → embedding → LanceDB chunks 테이블
-  │    ├─ EmailIndexer  → chunker → embedding → LanceDB emails 테이블 (Knox 메일)
-  │    └─ Retriever → 벡터검색(chunks+emails 병합) → 권한필터 → 샌드위치배열 → LLM
-  └─ CollectorWorker (QThread)
-       ├─ Scanner(scandir) → 생산자 스레드 → 큐 → 소비자(추출·임베딩·저장)  ← 스캔·인덱싱 파이프라인
-       │                     TextExtractor → Indexer, CleanupManager
-       └─ MailScanner(scandir) → parse_mail_file(.mysingle/.eml) → EmailIndexer (orphan 정리 없음)
-```
-
-- **UI 셸 상주**: 닫기(X) 시 시스템 트레이로 숨김(설정으로 종료 전환 가능). 유휴 시 자동 인덱싱(설정으로 on/off·주기 조정).
-- **설정 패널**(⚙): 연결(LLM/임베딩 주소)·검색(엄격도·문서수)·인덱싱(유휴·메일·파일크기·정리삭제)·동작(닫기·로그레벨) + 연결 테스트. `bridge.getSettings/saveSettings/testConnection/openConfigFile`.
-- **파일 로깅**: `%APPDATA%/AegisDesk/logs/aegisdesk.log` (Rotating 5MB×3) + 전역 excepthook.
+> R-0003·A-0003이 아직 `Draft`인 것은 **의도된 상태가 아니라 갱신 누락**이다. 6a는 구현·배포까지 끝났고 6b는 실측 데이터 대기로 보류 중이니, 이 주제를 다음에 손댈 때 상태 문언을 실제에 맞게 정리한다.
 
 ---
 
-## 디렉토리 구조
+## 작업 전 확인 (2가지)
 
-```
-AegisDesk.spec · build.bat      # PyInstaller 포터블 빌드 (onedir) · 사내 원클릭 빌드
-knowmate/
- ├─ app/          main.py · bridge.py · threads.py · ui/
- ├─ agents/       base.py · registry.py · knowledge_agent.py · mes_agent.py
- ├─ rag/          indexer.py · email_indexer.py · retriever.py · embedding.py · chunker.py
- ├─ collector/    scanner.py · mail_scanner.py · cleanup.py · state.py · scheduler.py
- ├─ secure/       base.py · plain_reader.py · com_reader.py · fake_reader.py
- │                mysingle_reader.py · crypto.py · signature.py · text_util.py
- ├─ llm/          client.py
- ├─ version.py    # __version__ (릴리스마다 갱신)
- ├─ config.py     # config.yaml 로더 (번들 템플릿 → %APPDATA% 시드, watch_folders만 초기화)
- ├─ config.yaml   # 배포 기본값 템플릿 (설정 추가 시 여기에만). 실사용본은 %APPDATA%/AegisDesk/config.yaml
- └─ tests/        test_phase1~4.py · test_mysingle.py · fixtures/sample.mysingle
-scripts/          diag_search.py · inspect_index.py · test_shared_db.py(5b 사전검증)
-```
-
-참고 문서: `UI_SPEC.md`(루트, 화면 사양) · `app/ui/mockup.html`(룩앤필) · `docs/DESIGN.md`(설계 결정) · `docs/EMAIL_DESIGN.md`(메일 인덱싱) · `docs/BETA_GUIDE.md`(테스터 배포 가이드) · `docs/UPDATE_NOTES.md`(베타 수정노트, 요일별)
+1. **모델**: 설계·리뷰는 **Opus 이상 필수**(Sonnet 금지 — 먼저 `/model` 전환을 요청할 것), 구현은 Sonnet.
+   전문은 `docs/WORKFLOW.md`.
+2. **수정노트**: 코드(기능·버그수정) 변경 커밋에는 **항상 `docs/UPDATE_NOTES.md`를 함께 갱신**한다.
+   오늘 날짜 `## YYYY-MM-DD (요일)` 섹션에 사용자 관점 1문장. 문서만 고치는 커밋은 제외.
+   형식 규칙은 `docs/WORKFLOW.md`.
 
 ---
 
@@ -97,38 +59,9 @@ scripts/          diag_search.py · inspect_index.py · test_shared_db.py(5b 사
 
 9. **scopes 빈 배열이면 전체 검색 fallback 금지.** JS 1차 + knowledge_agent 2차 차단.
 
-10. **LanceDB API**: `optimize()` 사용 (`compact_files()` deprecated 금지). **전체 테이블 로드 금지** — 필요한 컬럼만 `table.search().select([...]).to_arrow()`로 projection한 뒤 `.to_pandas()`로 변환한다(`table.to_pandas()` 직접 호출 및 `select()` 없는 `table.to_arrow()` 모두 금지 — 벡터·암호화 원문까지 전부 메모리에 올라간다. 유휴 자동 인덱싱처럼 반복 호출되는 경로에서 특히 치명적이었다, bridge.py 상주 메모리 사고 참고).
+10. **LanceDB API**: `optimize()` 사용(`compact_files()` deprecated 금지). **전체 테이블 로드 금지** — 필요한 컬럼만 `table.search().select([...]).to_arrow()`로 projection한 뒤 `.to_pandas()`로 변환한다. `table.to_pandas()` 직접 호출과 `select()` 없는 `table.to_arrow()`는 둘 다 금지(벡터·암호화 원문까지 전부 메모리에 올라간다). 근거·사고 경위는 `docs/ai-workflow/adr/ADR-0002-purge-projection-and-skip.md` · R-0002/A-0002.
 
----
-
-## 구현 단계
-
-| Phase | 내용 | 상태 |
-|---|---|---|
-| 1 | UI 셸 + 에이전트 골격 | ✅ 완료 |
-| 2 | RAG 파이프라인 (chunker/embedding/indexer/retriever) | ✅ 완료 |
-| 3 | 수집기 (증분스캔 + orphan정리 + 스케줄러) | ✅ 완료 |
-| 4 | 보안 모듈 (COM 싱글톤 + AES-GCM + DPAPI) | ✅ 완료 |
-| 5a | 메일 인덱싱 (`.mysingle` Knox + `.eml` 표준) | ✅ 완료 |
-| 5c | PyInstaller 포터블 빌드(onedir) + 파일 로깅·버전·설정 패널·트레이 상주 | ✅ 완료 |
-| 베타 | 소수 테스터 배포 (`docs/BETA_GUIDE.md`) | 🔄 진행 |
-| 5b | 공용 벡터DB (로컬 캐시 복사 방식) | 🔲 예정 |
-
-> **5b 결론**: SMB 위에서 LanceDB 직접 읽기/쓰기 불가(RustPanic, `scripts/test_shared_db.py`로 확인). → 마스터가 로컬 인덱싱 후 공용 폴더로 **복사 배포**, 사용자는 파트 최상위 `_aegisdesk/`를 상위 탐색으로 발견해 **로컬 캐시로 복사 후 읽기**. 검색은 지정 폴더 범위로 접두 필터.
-> **Outlook PST/.msg**: COM/전용 파서 필요, COM 보안 정책 선결 검증 후 착수. 상세는 `docs/EMAIL_DESIGN.md` §8.
-> **날짜 기반 검색 필터**: ✅ 완료. `rag/date_filter.py`(규칙기반 한국어 파서)로 질의의 "지난주/3월/25주차" 등을
-> 기간으로 변환해 chunks(`mtime`)·emails(`mail_date_ts`) 검색에 적용. 상세는 `docs/DESIGN.md` §검색 파라미터.
-> **차후 과제**: 추출·임베딩 병렬화(P3), batch_size 튜닝(P4), 기간 나열형 전용 정렬 모드(v2).
-
----
-
-## 환경
-
-- **OS**: Windows 10/11 · **Python**: 3.11
-- **임베딩 운영 모드**: 반드시 `mode: api` (config 기본값도 api). `local` 모드는 폐쇄망에서 모델 다운로드 불가로 무한 대기 발생.
-- **패키지**: PyQt6, PyQt6-WebEngine, lancedb, pyarrow, pywin32, cryptography, PyMuPDF, python-docx, openpyxl, xlrd, python-pptx, pytest, pyinstaller(빌드). **버전 고정 2개**: `lancedb==0.34.0`(purge projection 실측), `pyinstaller==6.21.0`(번들 구성이 버전마다 달라짐 — 특히 QtWebEngine 리소스 누락은 증상이 '흰 화면'). 둘 다 범위가 아니라 정확히 고정하며, 올릴 때는 실측·클린빌드 검증 후 갱신한다.
-- **배포**: `build.bat`(클린, 배포용) / `build.bat fast`(캐시 재사용, 배포 금지) → `dist/AegisDesk/`(exe + `_internal` 폴더) 를 통째로 zip 배포. exe만 단독 배포 불가. 빌드 직후 `AegisDesk.exe --selftest`가 자동 실행돼 번들 누락(리소스·WebEngine 프로세스·지연 import·lancedb 버전·로그 폴더)을 검사하고, 실패 시 배포를 중단한다 — 다만 '파일 존재'만 보므로 흰 화면 여부는 사람이 한 번 띄워 확인해야 한다.
-- **네트워크 드라이브**: 일반 SMB(K: 등)는 정상. EFSS2 DRM 드라이브(M: 등)는 화이트리스트 프로세스만 접근 가능해 인덱싱 불가. 나스카 DRM 문서는 SSO 로그인 유지 중에만 복호화.
+11. **임베딩은 `mode: api`로만 운영한다.** `local`은 폐쇄망에서 모델 다운로드 불가로 무한 대기.
 
 ---
 
@@ -137,7 +70,7 @@ scripts/          diag_search.py · inspect_index.py · test_shared_db.py(5b 사
 - 함수는 단일 책임. 파일 300줄 초과 시 분리 제안.
 - 모든 public 함수에 타입 힌트 + 한 줄 docstring.
 - 예외는 삼키지 않는다. 수집기는 파일 1건 실패가 사이클 전체를 멈추지 않도록 건별 try/except.
-- 설정값 하드코딩 금지 — 전부 config.yaml.
+- 설정값 하드코딩 금지 — 전부 config.yaml (설정 추가는 번들 템플릿 `knowmate/config.yaml`에만).
 - UI 작업 시 `UI_SPEC.md` · `mockup.html` 먼저 읽고, 스펙과 다른 판단 필요 시 먼저 묻는다.
 - 로그 레벨: DEBUG(흐름 추적) / INFO(정상 결과) / WARNING(복구 가능) / ERROR(즉시 확인).
 
