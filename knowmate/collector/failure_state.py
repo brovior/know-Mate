@@ -314,6 +314,37 @@ def should_defer(
     return now < rec.last_failed_ts + wait
 
 
+def retry_reason(
+    rec: FailureRecord | None,
+    file_path: str,
+    mtime: float,
+    size: int,
+    now: float,
+    policy: BackoffPolicy,
+) -> str | None:
+    """실패 기록이 있는 파일을 **왜 지금 처리하는지** 한 단어로 반환한다.
+
+    `should_defer`가 False를 반환한 이유를 그대로 되짚는다 — 판정 순서가 갈라지면
+    로그가 거짓말을 하므로 조건과 순서를 should_defer와 정확히 일치시킨다.
+
+    실기 검증에서 이게 없어 판정이 막혔다: [지금 다시 시도] 버튼을 눌러 파일이
+    실제로 재처리되는 것은 확인했지만, 마침 첫 실패로부터 2시간 12분이 지나 있어
+    **백오프가 자연 만료된 것과 구분할 수 없었다.** 두 경로는 코드가 다르므로
+    (force_retry 플래그 vs 경과 시간) 어느 쪽이 동작한 것인지 반드시 구분돼야 한다.
+
+    기록이 없으면 None — 설명할 실패가 애초에 없다는 뜻이라 로그도 남기지 않는다.
+    """
+    if rec is None:
+        return None
+    if not policy.enabled:
+        return "정책 비활성"
+    if rec.mtime != mtime or rec.size != size:
+        return "파일 변경"
+    if rec.force_retry:
+        return "사용자 요청"
+    return "대기 만료"
+
+
 def describe_wait(rec: FailureRecord, file_path: str, now: float, policy: BackoffPolicy) -> str:
     """로그에 붙일 "N시간 M분 후 재시도" 형태의 한 줄을 반환한다(경로·내용 없음)."""
     wait = backoff_seconds(rec, file_path, policy)

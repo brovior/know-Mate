@@ -896,3 +896,65 @@ class TestDescribeWait:
         rec = _rec(failure_state.KIND_OPEN_TIMEOUT, last_failed_ts=1000.0)
         desc = failure_state.describe_wait(rec, "/secret/path/a.xlsx", 1000.0, policy)
         assert "secret" not in desc and "a.xlsx" not in desc
+
+
+class TestRetryReason:
+    """실패 기록이 있는 파일을 왜 지금 처리하는지 — 실기 검증에서 [지금 다시 시도]
+    버튼을 눌러 재처리된 것과, 첫 실패 후 2시간 12분이 지나 백오프가 자연 만료된
+    것을 구분할 수 없었다. 두 경로는 코드가 달라 반드시 구분돼야 한다.
+
+    판정 순서는 should_defer와 정확히 일치해야 한다 — 갈라지면 로그가 거짓말을 한다.
+    """
+
+    def test_no_record_returns_none(self):
+        assert failure_state.retry_reason(
+            None, "/x.ppt", 100.0, 10, 2000.0, failure_state.BackoffPolicy(),
+        ) is None
+
+    def test_force_retry_is_user_request(self):
+        rec = _rec(failure_state.KIND_OPEN_ERROR)
+        rec = failure_state.FailureRecord(**{**rec.__dict__, "force_retry": True})
+        assert failure_state.retry_reason(
+            rec, "/x.ppt", 100.0, 10, 1001.0, failure_state.BackoffPolicy(),
+        ) == "사용자 요청"
+
+    def test_expired_backoff_is_wait_expiry(self):
+        rec = _rec(failure_state.KIND_OPEN_ERROR)
+        assert failure_state.retry_reason(
+            rec, "/x.ppt", 100.0, 10, 1_000_000.0, failure_state.BackoffPolicy(),
+        ) == "대기 만료"
+
+    def test_changed_file_wins_over_force_retry(self):
+        """파일 변경이 force_retry보다 먼저 판정돼야 한다(should_defer와 같은 순서)."""
+        rec = _rec(failure_state.KIND_OPEN_ERROR)
+        rec = failure_state.FailureRecord(**{**rec.__dict__, "force_retry": True})
+        assert failure_state.retry_reason(
+            rec, "/x.ppt", 999.0, 10, 1001.0, failure_state.BackoffPolicy(),
+        ) == "파일 변경"
+
+    def test_size_change_also_detected(self):
+        rec = _rec(failure_state.KIND_OPEN_ERROR)
+        assert failure_state.retry_reason(
+            rec, "/x.ppt", 100.0, 99, 1001.0, failure_state.BackoffPolicy(),
+        ) == "파일 변경"
+
+    def test_disabled_policy_reported_as_such(self):
+        rec = _rec(failure_state.KIND_OPEN_ERROR)
+        assert failure_state.retry_reason(
+            rec, "/x.ppt", 100.0, 10, 1001.0, failure_state.BackoffPolicy(enabled=False),
+        ) == "정책 비활성"
+
+    def test_reason_agrees_with_should_defer_on_every_branch(self):
+        """should_defer가 False(처리)일 때 retry_reason은 항상 이유를 내놔야 하고,
+        True(건너뜀)일 때만 '대기 만료'가 거짓이 된다 — 두 함수의 순서 일치 검증."""
+        policy = failure_state.BackoffPolicy()
+        base = _rec(failure_state.KIND_OPEN_ERROR)
+        cases = [
+            (base, 100.0, 10, 1_000_000.0),                                    # 만료
+            (failure_state.FailureRecord(**{**base.__dict__, "force_retry": True}),
+             100.0, 10, 1001.0),                                               # 사용자 요청
+            (base, 555.0, 10, 1001.0),                                         # 파일 변경
+        ]
+        for rec, mtime, size, now in cases:
+            assert not failure_state.should_defer(rec, "/x.ppt", mtime, size, now, policy)
+            assert failure_state.retry_reason(rec, "/x.ppt", mtime, size, now, policy)

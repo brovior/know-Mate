@@ -604,6 +604,19 @@ class CollectorWorker(QThread):
                 )
                 continue
 
+            # 실패 기록이 있는데도 처리하는 경우, 그 이유를 INFO로 남긴다 —
+            # "사용자 요청"과 "대기 만료"를 구분하려는 것이 목적이다(실기에서
+            # [지금 다시 시도] 검증이 백오프 자연 만료와 겹쳐 판정 불가였다).
+            # 생산자가 아니라 소비자에만 두어 파일 1건당 한 줄만 남게 한다.
+            if _rec is not None:
+                logger.info(
+                    "[failure] 실패 파일 재시도(%s, 연속 %d회, %s): %s",
+                    failure_state.retry_reason(
+                        _rec, task.path, task.mtime, task.size, self._get_now(), backoff_policy,
+                    ),
+                    _rec.consecutive_failures, _rec.kind, task.path,
+                )
+
             filename = Path(task.path).name
             done += 1
             # 생산자 완료 시 확정 total(>0), 진행 중이면 -2(총계 미정)

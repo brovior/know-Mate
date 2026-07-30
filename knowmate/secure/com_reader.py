@@ -8,6 +8,7 @@ _ThreadLocalComApps를 통해 스레드별로 독립적인 COM 앱 인스턴스�
 """
 import logging
 import threading
+import time
 from pathlib import Path
 
 from knowmate.secure import com_stage
@@ -411,6 +412,11 @@ class PowerPointComReader:
         """ppt 파일을 열어 슬라이드 텍스트를 반환한다 (표·그룹 도형 포함).
 
         단계(dispatch/open/read/close)별 소요시간을 계측한다(COM 처리 안정화).
+
+        슬라이드 순회는 건수·최대 1건 소요시간을 함께 남긴다: 실기에서 DRM ppt의
+        전체 처리시간이 실행마다 크게 흔들리는데, `read` 합계만으로는 "슬라이드가
+        많아서"와 "특정 슬라이드 하나에서 멈춰서"를 구분할 수 없다. 대응이 완전히
+        달라지는 구분이라(사전 판별 vs 순회 방식 교체) 계측이 선행돼야 한다.
         """
         timer = com_stage.StageTimer(path)
         prs = None
@@ -421,13 +427,23 @@ class PowerPointComReader:
                 prs = ppt.Presentations.Open(str(Path(path).resolve()), ReadOnly=True, WithWindow=False)
             with timer.stage(com_stage.STAGE_READ):
                 slides: list[str] = []
+                slide_count = 0
+                slowest_slide = 0.0
                 for slide in prs.Slides:
+                    # 슬라이드마다 com_stage.begin()을 다시 부르지는 않는다 — 그러면
+                    # 단계 시작시각이 갱신돼 워치독이 보는 "몇 초째 멈췄는지"가
+                    # 초기화되고, 한 슬라이드에서 멈춘 행오버를 놓친다.
+                    _t0 = time.monotonic()
                     texts: list[str] = []
                     for shape in slide.Shapes:
                         texts.extend(_ppt_shape_texts(shape))
+                    slowest_slide = max(slowest_slide, time.monotonic() - _t0)
+                    slide_count += 1
                     texts = [t for t in texts if t.strip()]
                     if texts:
                         slides.append("\n".join(texts))
+                timer.note("슬라이드", slide_count)
+                timer.note("최장슬라이드", slowest_slide)
             return "\n\n".join(slides)
         except Exception:
             _tls.ppt = None

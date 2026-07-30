@@ -142,6 +142,89 @@ class TestStageTimer:
         assert any("open=" in m and "/docs/salary.xlsx" in m for m in messages)
 
 
+class TestStageNotes:
+    """부가 수치(건수·최장 1건) — `read=12.30s` 합계만으로는 "슬라이드가 많아서"와
+    "특정 슬라이드에서 멈춰서"를 구분할 수 없어 추가했다."""
+
+    def test_note_int_appears_in_summary(self):
+        timer = com_stage.StageTimer("/x.pptx")
+        with timer.stage(com_stage.STAGE_READ):
+            pass
+        timer.note("슬라이드", 42)
+        assert "슬라이드=42" in timer.summary()
+
+    def test_note_float_formatted_as_seconds(self):
+        timer = com_stage.StageTimer("/x.pptx")
+        timer.note("최장슬라이드", 3.14159)
+        assert "최장슬라이드=3.14s" in timer.summary()
+
+    def test_notes_do_not_hide_failed_stage(self):
+        timer = com_stage.StageTimer("/x.pptx")
+        with pytest.raises(ValueError):
+            with timer.stage(com_stage.STAGE_READ):
+                raise ValueError("순회 실패")
+        timer.note("슬라이드", 3)
+        summary = timer.summary()
+        assert "슬라이드=3" in summary and "실패단계=read" in summary
+
+    def test_summary_without_notes_unchanged(self):
+        """수치를 안 붙이면 대괄호 자체가 안 나와야 한다(기존 로그 형태 유지)."""
+        timer = com_stage.StageTimer("/x.xlsx")
+        with timer.stage(com_stage.STAGE_OPEN):
+            pass
+        assert "[" not in timer.summary()
+
+
+class TestSlowParsePromotedToInfo:
+    """단계 요약 기본 레벨이 DEBUG라 실기 로그(INFO)에 한 건도 남지 않았던 문제.
+    느린 파싱만 INFO로 올려, 정상 파일로 로그가 넘치지 않게 한다."""
+
+    def _timer_with_total(self, seconds: float):
+        timer = com_stage.StageTimer("/docs/deck.pptx")
+        timer._durations[com_stage.STAGE_OPEN] = seconds
+        return timer
+
+    def test_fast_parse_stays_debug(self, caplog):
+        import logging
+        timer = self._timer_with_total(0.5)
+        with caplog.at_level(logging.INFO, logger="knowmate.secure.com_stage"):
+            timer.log_summary()
+        assert caplog.records == []
+
+    def test_slow_parse_promoted_to_info(self, caplog):
+        import logging
+        timer = self._timer_with_total(com_stage.SLOW_COM_PARSE_LOG_SEC + 1.0)
+        with caplog.at_level(logging.INFO, logger="knowmate.secure.com_stage"):
+            timer.log_summary()
+        assert len(caplog.records) == 1
+        assert caplog.records[0].levelno == logging.INFO
+        assert "open=" in caplog.records[0].message
+
+    def test_explicit_higher_level_is_not_downgraded(self, caplog):
+        """호출부가 WARNING을 지정했으면 승격이 그것을 끌어내리면 안 된다."""
+        import logging
+        timer = self._timer_with_total(com_stage.SLOW_COM_PARSE_LOG_SEC + 1.0)
+        with caplog.at_level(logging.INFO, logger="knowmate.secure.com_stage"):
+            timer.log_summary(level=logging.WARNING)
+        assert caplog.records[0].levelno == logging.WARNING
+
+    def test_slow_failing_parse_also_promoted(self, caplog):
+        """실패한 파싱도 느리면 승격돼야 한다 — 시간초과로 끝난 DRM ppt의 단계
+        분포가 바로 이번에 필요한 데이터다."""
+        import logging
+        timer = self._timer_with_total(com_stage.SLOW_COM_PARSE_LOG_SEC + 1.0)
+        timer.failed_stage = com_stage.STAGE_OPEN
+        with caplog.at_level(logging.INFO, logger="knowmate.secure.com_stage"):
+            timer.log_summary()
+        assert [r.levelno for r in caplog.records] == [logging.INFO]
+        assert "실패단계=open" in caplog.records[0].message
+
+    def test_total_seconds_sums_stages(self):
+        timer = com_stage.StageTimer("/x.pptx")
+        timer._durations.update({"dispatch": 1.0, "open": 2.5, "read": 0.5})
+        assert timer.total_seconds() == pytest.approx(4.0)
+
+
 class TestTakeLastFailedStage:
     """3차(실패 원인 분류 및 기록) — 스케줄러가 실패 단계를 읽어갈 통로."""
 
