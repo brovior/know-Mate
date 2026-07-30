@@ -3,8 +3,12 @@
 실제 config·임베딩 클라이언트·LanceDB로 쿼리를 돌려, 어느 단계에서
 결과가 0이 되는지(원시 히트 / 점수 / threshold / scope)를 단계별로 출력한다.
 
-사용법:
-    PYTHONUTF8=1 .venv/Scripts/python.exe scripts/diag_search.py "검색할 질문"
+사용법 (Windows cmd):
+    .venv\\Scripts\\python.exe scripts\\diag_search.py "검색할 질문"
+
+`PYTHONUTF8=1 <명령>` 형태로 안내하던 것을 걷어냈다 — 그건 bash 문법이라 cmd에서는
+`PYTHONUTF8=1`을 프로그램 이름으로 알아듣고 "내부 또는 외부 명령이 아닙니다"로 끝난다.
+게다가 파일을 읽는 코드가 모두 `encoding="utf-8"`을 명시하므로 이 변수 자체가 불필요하다.
 """
 import os
 import sys
