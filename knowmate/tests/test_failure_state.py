@@ -203,7 +203,7 @@ class TestNoteFailure:
         assert records["a.xlsx"].kind == failure_state.KIND_OPEN_TIMEOUT
 
     def test_same_kind_different_normalized_stage_resets_to_one(self):
-        """6a(A-0003 §4): 연속성 키는 (kind, normalized_stage)다. dispatch와 open은 둘 다
+        """6a: 연속성 키는 (kind, normalized_stage)다. dispatch와 open은 둘 다
         "open"으로 정규화되므로 이 둘 사이는 리셋되지 않지만(다음 테스트 참고), 서로 다른
         normalized_stage(open vs read)로 바뀌면 kind가 같아도 리셋돼야 한다."""
         records = {}
@@ -408,7 +408,7 @@ class TestLoadSaveFailures:
         assert f.exists()
 
     def test_source_changed_alias_normalizes_to_file_changed(self, tmp_path: Path):
-        """A-0003 §6: SOURCE_CHANGED로 수동 편집된 sidecar도 폐기하지 않고
+        """SOURCE_CHANGED로 수동 편집된 sidecar도 폐기하지 않고
         FILE_CHANGED로 정규화한다(개명하지 않기로 확정했지만 하위호환은 유지)."""
         f = tmp_path / "index_failure.json"
         f.write_text(json.dumps({
@@ -631,7 +631,7 @@ def _rec(kind, consecutive=1, last_failed_ts=1000.0, mtime=100.0, size=10, stage
 
 
 class TestEscalationState:
-    """6a: 단일 진실원(A-0003 §5 — 2차 리뷰 M-2). UI(bridge)와 백오프가 이 함수만
+    """6a 상태 판정의 단일 진실원. UI(bridge)와 백오프가 이 함수만
     호출해야 같은 레코드에 다른 판정이 나오는 사고를 막는다."""
 
     def test_below_repeat_threshold_is_normal(self):

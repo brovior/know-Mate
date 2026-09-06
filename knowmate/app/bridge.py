@@ -308,9 +308,9 @@ class Bridge(QObject):
         이전에는 `table.to_arrow().to_pandas()`로 chunks·emails 테이블 **전체**
         (1024차원 벡터·AES 암호화 원문 포함)를 로드했다 — 유휴 자동 인덱싱이 60초마다
         도는 동안 변경 파일이 0건이어도 매번 호출돼, 상주 메모리가 유휴 방치 중에도
-        계속 쌓이는 원인이었다(A-0002가 purge에서 고친 것과 동일한 안티패턴이 다른
+        계속 쌓이는 원인이었다(purge 경량화에서 고친 것과 동일한 안티패턴이 다른
         위치에 있었음). 필요한 건 고유 file_path/mail_uid 개수와 최근 인덱싱 시각뿐이라
-        `search().select([...])`로 projection한다(ADR-0002에서 실측 검증된 방식과 동일).
+        `search().select([...])`로 projection한다(purge 경량화에서 실측 검증된 방식과 동일).
 
         want_last_indexed: True면 chunks 테이블에서 최근 인덱싱 시각도 함께 계산한다
             (getIndexStatus는 필요, 완료 콜백은 datetime.now()를 쓰므로 불필요).

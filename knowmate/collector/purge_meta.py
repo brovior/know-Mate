@@ -4,9 +4,9 @@
 해결하기 위해, "이번 사이클에 purge를 실제로 실행해야 하는가"를 이 모듈이 판정한다.
 판정 순서는 **차단 → 백오프 → 성공 스킵 → 실행**(억제 판정이 성공 스킵보다 항상 먼저) —
 실패 직후 reconciled_sig가 해제되지 않으면 백오프가 성공 스킵에 가려 무력화되는 결함이
-있었다(설계 리뷰 3~4차에서 발견).
+있었다.
 
-설계: docs/ai-workflow/architecture.md § A-0002, docs/ai-workflow/adr/ADR-0002-purge-projection-and-skip.md
+설계 근거: docs/DESIGN.md의 purge 조회 경량화 항목.
 """
 from __future__ import annotations
 

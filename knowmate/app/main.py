@@ -271,7 +271,7 @@ class MainWindow(QMainWindow):
 
         이전에는 이벤트 루프 종료를 Qt의 암묵 규칙(quitOnLastWindowClosed)에만 의존해,
         창이 트레이로 숨겨진 상태에서는 "보이는 창이 닫히는" 사건이 없어 app.exec()가
-        영영 반환되지 않고 프로세스가 잔존했다(설계 ADR-0001). 이제 main()에서
+        영영 반환되지 않고 프로세스가 잔존했다. 이제 main()에서
         setQuitOnLastWindowClosed(False)로 암묵 종료를 끄고, 이 메서드 마지막의 최종
         판정(finalize_shutdown)이 창 가시성과 무관하게 항상 종료를 완수한다.
 
@@ -431,7 +431,7 @@ def main() -> None:
     app.setApplicationName("Aegis Desk")
     # 트레이 상주 앱 표준 관용구: 창이 트레이로 숨겨진 상태(hide())에서는 "보이는 창이
     # 닫히는" 사건 자체가 없어 기본값(True)으로는 lastWindowClosed가 오지 않아
-    # app.exec()가 반환되지 않는다(종료 프로세스 잔존의 원인 — 설계 ADR-0001). 종료는
+    # app.exec()가 반환되지 않는다(종료 프로세스 잔존의 원인). 종료는
     # 전적으로 MainWindow._shutdown()의 명시적 quit()/hard_exit 판정에 맡긴다.
     app.setQuitOnLastWindowClosed(False)
     if APP_ICON.exists():

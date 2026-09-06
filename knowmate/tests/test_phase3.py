@@ -1188,7 +1188,7 @@ class TestPurgeRemovedFolders:
 
 class TestPurgeMetaIntegration:
     """유휴 방치 중(변경 0건) purge DB 조회가 실제로 스킵되는지, 구성 변경 시
-    즉시 재실행되는지를 full-cycle(run())로 검증한다(설계 A-0002 AC-2)."""
+    즉시 재실행되는지를 full-cycle(run())로 검증한다."""
 
     def _make_worker_with_meta(self, tmp_path: Path, indexer, watch_folder: str, meta_file: Path):
         from knowmate.secure.fake_reader import FakeReader
@@ -2444,7 +2444,7 @@ class TestStopWorker:
 
 class TestFinalizeShutdown:
     """종료 최종 판정 — 워커 비실행 확인 시 quit, 실행 중·판정 불가 시 hard_exit.
-    quit과 hard_exit는 정확히 하나만 호출되어야 한다(설계 A-0001/ADR-0001)."""
+    quit과 hard_exit는 정확히 하나만 호출되어야 한다."""
 
     class _FakeWorker:
         def __init__(self, running=False, raise_on_is_running=False):

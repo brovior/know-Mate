@@ -1,6 +1,6 @@
 """purge_meta 모듈 pytest 테스트 — 순수 함수라 PyQt6·LanceDB 없이 사외 전체 통과.
 
-설계: docs/ai-workflow/architecture.md § A-0002
+설계 근거: docs/DESIGN.md의 purge 조회 경량화 항목.
 """
 from pathlib import Path
 

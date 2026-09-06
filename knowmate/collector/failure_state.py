@@ -59,7 +59,7 @@ _ALL_KINDS = frozenset({
 })
 
 # SOURCE_CHANGED(설계 초안 검토 중 잠깐 고려됐던 이름)로 수동 편집된 sidecar가
-# 있어도 폐기하지 않고 FILE_CHANGED로 정규화한다(A-0003 §6 — 개명하지 않기로
+# 있어도 폐기하지 않고 FILE_CHANGED로 정규화한다(개명하지 않기로
 # 확정했지만, 외부 편집 대비 하위호환만 유지).
 _KIND_ALIASES = {"SOURCE_CHANGED": KIND_FILE_CHANGED}
 
@@ -70,7 +70,7 @@ _READ_STAGES = frozenset({"sheets", "cell_read", "read"})
 
 
 def _normalize_stage(stage: str | None) -> str | None:
-    """원시 단계 이름을 "open"/"read"로 정규화한다(연속성 판정·A-0003 §4 참고).
+    """원시 단계 이름을 "open"/"read"로 정규화한다.
 
     OPEN_ERROR·OPEN_TIMEOUT은 항상 _OPEN_STAGES에서만, READ_ERROR·READ_TIMEOUT은
     항상 _READ_STAGES에서만 나오므로 현재는 kind만으로도 이미 같은 구분이 되지만,
@@ -117,7 +117,7 @@ _DEFAULT_NEEDS_USER_ACTION_MAX_SEC = 7 * 24 * 3600.0        # 7일 안전밸브
 # TEMPORARY_BUSY 지터 폭 — base(300초) + 0~이 값 만큼 가산해 5~10분 범위를 만든다.
 _TEMPORARY_BUSY_JITTER_SEC = 300.0
 
-# 승격 상태(6a·A-0003 §5) — UI 표시("반복 중"/"조치 필요")와 백오프 사다리 길이
+# 승격 상태(6a) — UI 표시("반복 중"/"조치 필요")와 백오프 사다리 길이
 # 초과 시 상한(needs_user_action_max_sec)을 이 임계로 판정한다. 사용자 결정(안 B):
 # "3회 이상 → 사용자 조치 필요"는 대기 시간까지 의미하므로, 사다리는 2단(30분·6시간)
 # 까지만 두고 3회차부터 escalation_state가 NEEDS_ACTION으로 승격시켜
@@ -236,7 +236,7 @@ def _path_jitter_fraction(file_path: str) -> float:
 
 
 def escalation_state(rec: FailureRecord, policy: BackoffPolicy) -> str:
-    """연속 실패 횟수만으로 3상태를 판정하는 단일 진실원(A-0003 §5 — 2차 리뷰 M-2).
+    """연속 실패 횟수만으로 3상태를 판정하는 단일 진실원.
 
     UI(`bridge.py`)와 백오프(`backoff_seconds`)가 **모두 이 함수만** 호출한다.
     임계를 여러 호출부가 각자 해석하면 같은 레코드를 서로 다르게 판정할 위험이
@@ -260,7 +260,7 @@ def backoff_seconds(rec: FailureRecord, file_path: str, policy: BackoffPolicy) -
     UNKNOWN_TRANSIENT)만 승격 사다리(`escalation_state`)를 탄다.
 
     UI 상태(`escalation_state`)는 이 함수와 무관하게 모든 kind에 공통 적용된다
-    — "표시"와 "대기"가 서로 다른 축이라는 것이 A-0003 §1·§5의 핵심이다.
+    — "표시"와 "대기"는 서로 다른 축이다.
     """
     if rec.kind == KIND_TEMPORARY_BUSY:
         jitter = _path_jitter_fraction(file_path) * _TEMPORARY_BUSY_JITTER_SEC
@@ -530,7 +530,7 @@ def note_failure(
     독립적이어야 한다) 1로 리셋한다. 분류까지 같아야 누적하지 않으면, 예를 들어
     사용자가 파일을 하루 종일 열어둬 TEMPORARY_BUSY가 여러 번 쌓인 뒤 우연히
     시간초과가 1번 나면 consecutive가 크게 이어받아 곧장 긴 백오프로 튀는 오류가
-    생긴다. 단계까지 비교하는 것은 A-0003 §4(6a) — 현재는 kind가 이미 단계를
+    생긴다. 단계까지 비교하는 것은 6a의 연속성 규칙이다. 현재는 kind가 이미 단계를
     함의하지만(OPEN_ERROR는 항상 open류 단계), 미래에 kind와 단계가 분리될 경우를
     대비한 안전망이다.
     """

@@ -409,8 +409,8 @@ class CollectorWorker(QThread):
         # 반복 생성된다(레이스). 0이면 대기 없이 기존 동작(즉시 강제종료).
         self._com_quit_grace_sec = float(collector_cfg.get("com_quit_grace_sec", 5.0))
 
-        # purge(제거된 폴더 청크 정리) 스킵/강제 reconciliation 판정 — 설계
-        # docs/ai-workflow/architecture.md § A-0002. op_sig는 이번 사이클의 watch_folders
+        # purge(제거된 폴더 청크 정리) 스킵/강제 reconciliation 판정.
+        # op_sig는 이번 사이클의 watch_folders
         # 구성·dry_run·max_delete_ratio로 결정되며, 변경 0건 + 동일 op_sig + 마지막 성공
         # purge 후 강제주기 미경과면 DB 조회 없이 스킵한다(유휴 방치 중 매분 전체 로드 방지).
         # 삭제 안전장치가 아니므로(언제 실행할지만 좌우) 무효 값은 기본값으로 폴백(fail-open).
