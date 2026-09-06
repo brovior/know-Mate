@@ -69,7 +69,7 @@ class TestParseMysingle:
             "<html><body>본문</body></html>\r\n"
         )
         p = tmp_path / "no_uid.mysingle"
-        p.write_text(content, encoding="utf-8")
+        p.write_bytes(content.encode("utf-8"))  # write_text는 Windows에서 CRLF를 깨뜨린다
         from knowmate.secure.mysingle_reader import parse_mysingle
         result = parse_mysingle(str(p))
         assert result["mail_uid"] == "knox:<fallback-id@company.com>"
@@ -84,7 +84,7 @@ class TestParseMysingle:
             "--B\r\nContent-Type: image/gif\r\n\r\nGIF\r\n--B--\r\n"
         )
         p = tmp_path / "empty.mysingle"
-        p.write_text(content, encoding="utf-8")
+        p.write_bytes(content.encode("utf-8"))  # write_text는 Windows에서 CRLF를 깨뜨린다
         from knowmate.secure.mysingle_reader import parse_mysingle
         with pytest.raises(ValueError):
             parse_mysingle(str(p))
@@ -259,7 +259,7 @@ class TestEmlSupport:
         """.eml은 source_type='eml', mail_uid는 eml: 접두를 가진다."""
         from knowmate.secure.mysingle_reader import parse_mail_file
         p = tmp_path / "mail.eml"
-        p.write_text(_EML_SAMPLE, encoding="utf-8")
+        p.write_bytes(_EML_SAMPLE.encode("utf-8"))  # write_text는 Windows에서 CRLF를 깨뜨린다
         r = parse_mail_file(str(p))
         assert r["source_type"] == "eml"
         assert r["mail_uid"] == "eml:<eml-test-001@company.com>"

@@ -48,9 +48,11 @@ class TestBeginClearSnapshot:
 
     def test_elapsed_grows_over_time(self):
         com_stage.begin(com_stage.STAGE_CELL_READ, "/big.xlsx")
-        time.sleep(0.02)
+        # Windows의 time.monotonic()은 해상도가 약 15.6ms라 20ms를 자도
+        # 16ms로 측정된다. 충분히 자고 여유를 둬야 해상도에 걸리지 않는다.
+        time.sleep(0.1)
         _stage, _path, elapsed = com_stage.snapshot()
-        assert elapsed >= 0.02
+        assert elapsed >= 0.05
 
 
 class TestCurrentStageName:

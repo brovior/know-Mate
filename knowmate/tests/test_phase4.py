@@ -122,7 +122,11 @@ class TestIndexerWithCrypto:
         indexer.index_file(path="C:/sample/test.txt", text=text, mtime=1000.0, scope="local")
         df = indexer.table.to_arrow().to_pandas()
         assert len(df) >= 1
-        expected_chunks = chunk_text(text, "txt")
+        # index_file은 본문 앞에 "파일명:/경로:" 메타 헤더를 붙인 뒤 청킹한다.
+        # 헤더 형식이 바뀌면 이 기대값도 함께 고쳐야 한다.
+        indexed_path = Path("C:/sample/test.txt")
+        meta_header = "파일명: {}\n경로: {}\n\n".format(indexed_path.name, indexed_path.parent)
+        expected_chunks = chunk_text(meta_header + text, "txt")
         stored_texts = sorted(df["text"].tolist())
         expected_sorted = sorted(expected_chunks)
         assert stored_texts == expected_sorted
