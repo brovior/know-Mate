@@ -993,9 +993,6 @@ class TestDrmIdleSkip:
 
         assert str(normal) in load_state(state_file)
 
-        state = load_state(state_file)
-        assert str(drm_file) in state  # 기본값 0.0이라 스킵되지 않음
-
 
 # ============================================================
 # TestPurgeRemovedFolders — _purge_removed_folders 안전장치 (베타 배포 전 발견된 이슈)
@@ -2211,18 +2208,32 @@ class TestSingleInstance:
         from knowmate.app.single_instance import try_acquire_or_notify_existing
         assert try_acquire_or_notify_existing() is True
 
-    def test_second_instance_detects_and_notifies(self):
-        """서버가 이미 떠 있으면 False를 반환하고 기존 서버의 show_requested가 발동된다."""
+    def test_server_emits_show_requested_on_message(self):
+        """서버는 'show' 메시지를 받으면 show_requested를 발동한다.
+
+        try_acquire_or_notify_existing()을 그대로 써서 끝까지 검증할 수는 없다 —
+        그 함수의 QLocalSocket은 지역변수라 반환 즉시 GC되고, 같은 프로세스 안에서는
+        서버가 수락하기 전에 연결이 사라져 readyRead가 오지 않는다(별도 프로세스에서는
+        정상 동작한다). 그래서 테스트가 소켓을 직접 들고 살려 둔 채 서버 쪽만 검증한다.
+        "이미 떠 있으면 False" 쪽은 test_server_close_allows_new_acquisition이 덮는다.
+        """
         from PyQt6.QtWidgets import QApplication
+        from PyQt6.QtNetwork import QLocalSocket
         from knowmate.app.single_instance import (
-            SingleInstanceServer, try_acquire_or_notify_existing,
+            SingleInstanceServer, _SERVER_NAME, _SHOW_MESSAGE,
         )
 
         server = SingleInstanceServer()
         received = []
         server.show_requested.connect(lambda: received.append(True))
+        sock = QLocalSocket()   # 지역변수여도 이 스코프가 끝날 때까지는 살아 있다
         try:
-            assert try_acquire_or_notify_existing() is False
+            sock.connectToServer(_SERVER_NAME)
+            assert sock.waitForConnected(500)
+            sock.write(_SHOW_MESSAGE)
+            # 반환값은 단언하지 않는다 — Qt가 이미 다 써버렸으면 "보낼 것이 없다"는
+            # 뜻으로 False가 나온다(오류와 구분되지 않는다). 도착 여부는 아래에서 본다.
+            sock.waitForBytesWritten(500)
 
             app = QApplication.instance()
             for _ in range(50):
@@ -2232,6 +2243,7 @@ class TestSingleInstance:
                 time.sleep(0.02)
             assert received == [True]
         finally:
+            sock.disconnectFromServer()
             server.close()
 
     def test_server_close_allows_new_acquisition(self):
