@@ -54,7 +54,7 @@ knowmate/
  ├─ config.yaml   # 배포 기본값 템플릿 (설정 추가 시 여기에만). 실사용본은 %APPDATA%/AegisDesk/config.yaml
  └─ tests/        test_phase1~4.py · 기능별 test_*.py · fixtures/sample.mysingle
 scripts/          diag_search.py(검색 0건 진단) · diag_embed_latency.py(임베딩 구간 분해)
-                  inspect_index.py · test_shared_db.py(5b 사전검증) · ai_workflow/
+                  inspect_index.py · test_shared_db.py(5b 사전검증)
 ```
 
 > `secure/com_stage.py`는 COM/win32를 import하지 않는 **순수 파이썬**이라 `collector/com_watchdog.py`가 직접 import해도 원칙3을 어기지 않는다. 이 예외의 근거는 해당 파일 docstring에 있다.
@@ -67,7 +67,8 @@ scripts/          diag_search.py(검색 0건 진단) · diag_embed_latency.py(�
 
 | 문서 | 내용 |
 |---|---|
-| `CLAUDE.md` | 에이전트 작업 규칙 (핵심 원칙·코딩 규칙) — 정본 |
+| `CLAUDE.md` | 공통 개발 계약(불변식·코드 변경 규칙) — 정본 |
+| `AGENTS.md` | Codex와 개발 에이전트용 진입 지침 — `CLAUDE.md`로 위임 |
 | `docs/ARCHITECTURE.md` | 이 문서 — 런타임 구조·디렉토리·문서 지도 |
 | `docs/WORKFLOW.md` | 모델 사용 정책·수정노트 작성 규칙 |
 | `docs/ENVIRONMENT.md` | 환경·패키지·버전 고정·배포·네트워크 드라이브 |
@@ -78,27 +79,9 @@ scripts/          diag_search.py(검색 0건 진단) · diag_embed_latency.py(�
 | 문서 | 내용 |
 |---|---|
 | `docs/DESIGN.md` | **설계 결정 상세 (정본)** — 스키마·파서·워치독·실패 백오프 등 |
-| `docs/RAG_ARCHITECTURE.md` | RAG 파이프라인 상세 |
 | `docs/EMAIL_DESIGN.md` | 메일 인덱싱 (Knox `.mysingle` · `.eml`) |
-| `docs/SUMMARY.md` | 프로젝트 요약 |
 | `docs/ISSUE_B_query_async.md` | 질의 비동기화 검토 기록 |
-
-### 설계 리뷰 (ai-dev-workflow) — 리뷰를 거친 확정 설계의 정본
-
-| 문서 | 내용 |
-|---|---|
-| `docs/ai-workflow/requirements.md` | **요구 정본** — R-0001 트레이 종료 · R-0002 purge 경량화 · R-0003 실패 분류 정교화 |
-| `docs/ai-workflow/architecture.md` | **설계 정본** — A-0001 종료 모델 · A-0002 컬럼 projection · A-0003 실패 분류/승격 |
-| `docs/ai-workflow/adr/` | ADR-0001 명시적 quit · ADR-0002 purge projection |
-| `docs/ai-workflow/reviews/` | GPT 리뷰 원문 + 항목별 수용/기각 처리 기록 |
-| `docs/ai-workflow/implementation-plan.md` | 구현 분할 계획 |
-| `docs/ai-workflow/prompts/gpt-architect-reviewer.md` | 리뷰어 프롬프트 |
-| `docs/ai-workflow/context-manifest.txt` · `forbidden-patterns.txt` | 리뷰에 넘길 소스 범위 · 금지 패턴 |
-| `.github/workflows/gpt-design-review.yml` · `scripts/ai_workflow/gpt_review.py` | 리뷰 실행(채널 B / PC 즉시 실행) |
-
-> ⚠️ CLAUDE.md의 자동 주입 블록은 `docs/ai-workflow/README.md`를 "정본·상세"로 안내하지만 **그 파일은 이 저장소에 없다**(주입 템플릿이 가정하는 파일). 규약 정본은 `brovior/ai-dev-workflow`이고, 이 저장소에서 실제로 봐야 할 것은 위 표의 파일들이다.
-
-> R/A 블록에는 상태(`Approved`/`Accepted`)와 **리뷰 이력**이 함께 적혀 있다. 같은 주제를 다시 건드릴 때는 `docs/DESIGN.md`가 아니라 **여기를 먼저** 읽는다 — 리뷰에서 한 번 기각된 접근을 되풀이하지 않기 위한 것이다.
+| `knowmate/secure/README.md` | Windows·보안 의존 코드 운영 및 사내 검증 안내 |
 
 ### 화면 · 배포
 

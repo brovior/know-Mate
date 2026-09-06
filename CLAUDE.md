@@ -1,98 +1,118 @@
 # CLAUDE.md — Aegis Desk
 
-> **개인 PC용 사내 지식 AI 비서 데스크톱 앱.** PyQt6 + QWebEngineView 셸 위 멀티 에이전트 구조 + 로컬 RAG.
-> 제품명 **Aegis Desk (이지스 데스크)** — 구 KnowMate. 버전 `knowmate/version.py`. 데이터 폴더 `%APPDATA%/AegisDesk`.
-> 현재 **베타 배포 단계** (Phase 1~4 · 5a · 5c 완료, 5b 예정).
+이 파일은 Claude Code와 개발자가 이 저장소에서 작업할 때 따르는 **공통 개발 계약**이다.
+매 세션 반드시 필요한 규칙만 두고, 구조·설계·운영 상세는 관련 문서로 위임한다.
 
-이 파일은 **작업 규칙만** 담는다. 배경 정보는 필요할 때 아래 문서를 읽는다.
+**충돌 시 우선순위**:
+`이 파일의 불변식(§2)` > `이 파일의 나머지` > `docs/dev/` 작업 지침
+> `UI_SPEC.md`와 `docs/DESIGN.md` 등 위임 문서 > `README.md`와 배포 안내 > 코드 주석
 
-| 필요한 것 | 문서 |
+---
+
+## 0. 작업 시작 전
+
+- 현재 단계와 다음 과제는 [`docs/ROADMAP.md`](docs/ROADMAP.md)를 먼저 확인한다.
+- 문서를 작성하거나 개편할 때는
+  [`docs/dev/document_guidelines.md`](docs/dev/document_guidelines.md)를 따른다.
+- 사용자에게 답할 때는 [`docs/dev/response_style.md`](docs/dev/response_style.md)의
+  결론 우선·간결한 표현 원칙을 따른다.
+- 코드의 기능이나 동작을 바꾸면 같은 변경에서 [`docs/UPDATE_NOTES.md`](docs/UPDATE_NOTES.md)를
+  갱신한다. 문서만 고치는 변경은 제외한다. 형식은 [`docs/WORKFLOW.md`](docs/WORKFLOW.md)를 따른다.
+- 기존 작업 트리가 깨끗하지 않으면 사용자 변경을 보존하고, 요청과 무관한 파일은 수정하지 않는다.
+
+---
+
+## 1. 프로젝트가 하는 일
+
+**Aegis Desk(구 KnowMate)**는 Windows 개인 PC에서 사내 문서와 메일을 검색하는 데스크톱 지식
+비서다. PyQt6·QWebEngineView UI에서 질문을 받으며, 로컬 LanceDB의 문서·메일 청크를 검색한 뒤
+사내 LLM API로 답변과 출처를 만든다.
+
+- 지원 문서: `docx`, `xlsx`, `pptx`, `pdf`, `txt`, `doc`, `xls`, `ppt`
+- 지원 메일: Knox `.mysingle`, 표준 `.eml`
+- 데이터 위치: `%APPDATA%/AegisDesk`
+- 버전 정본: `knowmate/version.py`
+- 현재 상태: Phase 1~4·5a·5c 완료, 베타 배포 중, 공용 벡터DB(5b) 예정
+
+---
+
+## 2. 불변식 — 위반하면 안 되는 규칙
+
+### 2-1. 보안과 데이터
+
+- LanceDB `text` 컬럼의 원문은 반드시 **AES-256-GCM**으로 암호화해 저장한다. 키는 Windows
+  DPAPI로 보호한다.
+- 복호화한 평문과 문서·메일 본문을 파일이나 로그에 남기지 않는다. 로그에는 경로·건수·소요시간만
+  기록한다.
+- COM·DPAPI 등 Windows 보안 의존 코드는 `knowmate/secure/`에 격리한다. 다른 패키지에서
+  `win32com`이나 `win32crypt`를 직접 import하지 않는다.
+- 개인 PC는 공용 벡터DB에 절대 쓰지 않는다.
+
+### 2-2. 검색과 저장소
+
+- 에이전트는 `handle(query: str, context: dict) -> list[Block]` 인터페이스로만 UI와 통신한다.
+  UI에 에이전트별 응답 분기 로직을 넣지 않는다.
+- 임베딩 모델과 차원은 `knowmate/rag/embedding.py`의 상수로 고정한다. 현재 벡터 차원은 1024이며,
+  모델이나 인덱싱 포맷을 바꾸면 인덱스 버전을 올려 전체 재인덱싱한다.
+- 운영 임베딩 모드는 `api`만 사용한다. `local` 모드는 폐쇄망에서 모델 다운로드를 시도할 수 있다.
+- 검색 범위 `scopes`가 비어 있으면 전체 검색으로 되돌아가지 않는다. UI와
+  `knowledge_agent` 양쪽에서 차단한다.
+- LanceDB 조회는 필요한 컬럼만 `table.search().select([...]).to_arrow()`로 가져온다.
+  `table.to_pandas()`와 `select()` 없는 전체 `to_arrow()` 호출은 금지한다.
+- LanceDB 정리는 `optimize()`를 사용한다. 폐기된 `compact_files()`를 사용하지 않는다.
+
+### 2-3. 수집기와 실행 환경
+
+- 수집기는 QThread 워커에서 실행한다. LanceDB 파일 잠금 충돌을 일으킬 수 있는
+  `multiprocessing`은 사용하지 않는다.
+- 파일 하나의 추출 실패가 전체 인덱싱 사이클을 중단하지 않도록 파일 단위로 예외를 격리한다.
+- `extractor: fake | plain | auto` 전환은 설정 한 곳에서 유지한다. 사외 환경에서는 fake 모드로
+  전체 테스트가 통과해야 한다.
+- 설정값을 코드에 중복 하드코딩하지 않는다. 배포 기본값은 `knowmate/config.yaml`에만 추가하고,
+  실행 중 설정은 `%APPDATA%/AegisDesk/config.yaml`을 사용한다.
+
+---
+
+## 3. 코드 변경 규칙
+
+- 코드를 쓰거나 검토할 때는
+  [`docs/dev/karpathy_guidelines.md`](docs/dev/karpathy_guidelines.md)의 전제 명시·최소 구현·외과적
+  수정·검증 기준 원칙을 따른다. 이 파일의 §2 불변식과 충돌하면 §2를 우선한다.
+- 요청에 필요한 범위만 수정하고, 무관한 리팩터링이나 포매팅을 섞지 않는다.
+- 함수는 한 가지 책임만 갖게 한다. 파일이 300줄을 넘으면 책임 분리를 검토한다.
+- 모든 public 함수와 클래스에 타입 힌트와 한 줄 docstring을 작성한다.
+- 예외를 조용히 삼키지 않는다. 복구 가능한 실패는 적절한 로그와 상태로 남긴다.
+- UI를 바꾸기 전에는 [`UI_SPEC.md`](UI_SPEC.md)와 `knowmate/app/ui/mockup.html`을 확인한다.
+- 로그 수준은 `DEBUG`(흐름), `INFO`(정상 결과), `WARNING`(복구 가능), `ERROR`(즉시 확인)로 구분한다.
+- 코드 변경 후 `pytest knowmate/tests -v`를 실행한다. Windows·Office·사내망이 필요한 검증은 실행
+  가능 여부와 미검증 범위를 결과에 명시한다.
+
+---
+
+## 4. 위임 문서
+
+| 필요한 정보 | 정본 |
 |---|---|
-| **문서 지도 (전체 목록)** · 런타임 구조 · 디렉토리 | `docs/ARCHITECTURE.md` |
-| **리뷰를 거친 확정 설계 (정본)** | `docs/ai-workflow/requirements.md` (R-) · `architecture.md` (A-) · `adr/` · `reviews/` |
-| 설계 결정 근거 | `docs/DESIGN.md` · `docs/RAG_ARCHITECTURE.md` · `docs/EMAIL_DESIGN.md` |
-| 진행 단계 · 남은 과제 · 5b 결론 | `docs/ROADMAP.md` |
-| OS · 패키지 · 버전 고정 · 빌드/배포 | `docs/ENVIRONMENT.md` |
-| 모델 사용 정책 · 수정노트 작성법 | `docs/WORKFLOW.md` |
-| 화면 사양 · 룩앤필 | `UI_SPEC.md` · `knowmate/app/ui/mockup.html` |
-| 테스터 배포 · 수정노트 | `docs/BETA_GUIDE.md` · `docs/UPDATE_NOTES.md` |
+| 문서 작성·개편 방식 | [`docs/dev/document_guidelines.md`](docs/dev/document_guidelines.md) |
+| 코드 작성·검토 태도 | [`docs/dev/karpathy_guidelines.md`](docs/dev/karpathy_guidelines.md) |
+| 사용자 응답 방식 | [`docs/dev/response_style.md`](docs/dev/response_style.md) |
+| 런타임 구조·디렉토리·문서 지도 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
+| 상세 설계 결정·실패 처리·LanceDB 운용 | [`docs/DESIGN.md`](docs/DESIGN.md) |
+| 메일 파싱·저장·검색 계약 | [`docs/EMAIL_DESIGN.md`](docs/EMAIL_DESIGN.md) |
+| 현재 단계·남은 과제·보류 사유 | [`docs/ROADMAP.md`](docs/ROADMAP.md) |
+| 개발·배포 환경과 버전 고정 | [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md) |
+| 화면 동작과 시각 규칙 | [`UI_SPEC.md`](UI_SPEC.md) |
+| 베타 배포와 사용자 안내 | [`docs/BETA_GUIDE.md`](docs/BETA_GUIDE.md) |
+| 사용자 관점 변경 이력 | [`docs/UPDATE_NOTES.md`](docs/UPDATE_NOTES.md) |
+| 수정노트 작성 규칙 | [`docs/WORKFLOW.md`](docs/WORKFLOW.md) |
+| 쿼리 비동기화 보류 설계 | [`docs/ISSUE_B_query_async.md`](docs/ISSUE_B_query_async.md) |
+| 보안 패키지 운영·수동 검증 | [`knowmate/secure/README.md`](knowmate/secure/README.md) |
 
-**이미 리뷰를 거친 주제를 다시 건드릴 때는 `docs/ai-workflow/`를 먼저 읽는다.** 요구·설계와 그 리뷰 이력이 거기 있어서, 한 번 기각된 접근을 되풀이하지 않을 수 있다. 현재 등록된 것:
-
-| ID | 주제 | 상태 |
-|---|---|---|
-| R-0001 / A-0001 / ADR-0001 | 트레이 [종료]가 반드시 프로세스를 끝낸다 — 명시적 quit | Approved / Accepted |
-| R-0002 / A-0002 / ADR-0002 | 유휴 사이클의 전체 테이블 로드 제거 — 컬럼 projection + 조건부 스킵 | Approved / Accepted |
-| R-0003 / A-0003 | 반복 Open 실패가 `UNKNOWN_TRANSIENT`에 머물지 않게 — 원인축·누적축 분리 | **Draft** (GPT 리뷰 3회 반영, 6a 구현·배포됨 / 6b 보류) |
-
-> R-0003·A-0003이 아직 `Draft`인 것은 **의도된 상태가 아니라 갱신 누락**이다. 6a는 구현·배포까지 끝났고 6b는 실측 데이터 대기로 보류 중이니, 이 주제를 다음에 손댈 때 상태 문언을 실제에 맞게 정리한다.
-
----
-
-## 작업 전 확인 (2가지)
-
-1. **모델**: 설계·리뷰는 **Opus 이상 필수**(Sonnet 금지 — 먼저 `/model` 전환을 요청할 것), 구현은 Sonnet.
-   전문은 `docs/WORKFLOW.md`.
-2. **수정노트**: 코드(기능·버그수정) 변경 커밋에는 **항상 `docs/UPDATE_NOTES.md`를 함께 갱신**한다.
-   오늘 날짜 `## YYYY-MM-DD (요일)` 섹션에 사용자 관점 1문장. 문서만 고치는 커밋은 제외.
-   형식 규칙은 `docs/WORKFLOW.md`.
+`docs/ai-workflow/` 기반 설계 원장과 자동 GPT 리뷰 절차는 폐지됐다. 과거 판단이 필요하면 Git
+이력에서 확인하고, 현행 계약의 근거로 직접 인용하지 않는다.
 
 ---
 
-## 핵심 원칙 (위반 금지)
-
-1. **에이전트 인터페이스**: `handle(query: str, context: dict) -> list[Block]` 하나로만 통신. UI에 에이전트별 분기 로직 금지.
-
-2. **임베딩 모델·차원은 `rag/embedding.py` 상수로 고정** (`VECTOR_DIM = 1024`). 모델 변경 시 전체 재인덱싱 필수.
-
-3. **보안 의존 코드는 `secure/` 밖으로 나가지 않는다.** COM/DPAPI를 다른 모듈에서 직접 import 금지.
-
-4. **mock 전환은 config 한 줄.** `extractor: fake | plain | auto`. fake 모드로 사외 전체 테스트 통과해야 함.
-
-5. **벡터DB 원문(`text` 컬럼)은 반드시 AES-256-GCM 암호화 저장.** 복호화 평문을 파일·로그에 남기지 않는다.
-
-6. **공용 벡터DB에 개인 PC는 절대 쓰기하지 않는다.**
-
-7. **로그에 문서·메일 본문 출력 금지.** 경로·건수·소요시간만.
-
-8. **수집기는 QThread 워커에서만 실행.** multiprocessing 금지 (LanceDB 파일 락 충돌).
-
-9. **scopes 빈 배열이면 전체 검색 fallback 금지.** JS 1차 + knowledge_agent 2차 차단.
-
-10. **LanceDB API**: `optimize()` 사용(`compact_files()` deprecated 금지). **전체 테이블 로드 금지** — 필요한 컬럼만 `table.search().select([...]).to_arrow()`로 projection한 뒤 `.to_pandas()`로 변환한다. `table.to_pandas()` 직접 호출과 `select()` 없는 `table.to_arrow()`는 둘 다 금지(벡터·암호화 원문까지 전부 메모리에 올라간다). 근거·사고 경위는 `docs/ai-workflow/adr/ADR-0002-purge-projection-and-skip.md` · R-0002/A-0002.
-
-11. **임베딩은 `mode: api`로만 운영한다.** `local`은 폐쇄망에서 모델 다운로드 불가로 무한 대기.
-
----
-
-## 코딩 규칙
-
-- 함수는 단일 책임. 파일 300줄 초과 시 분리 제안.
-- 모든 public 함수에 타입 힌트 + 한 줄 docstring.
-- 예외는 삼키지 않는다. 수집기는 파일 1건 실패가 사이클 전체를 멈추지 않도록 건별 try/except.
-- 설정값 하드코딩 금지 — 전부 config.yaml (설정 추가는 번들 템플릿 `knowmate/config.yaml`에만).
-- UI 작업 시 `UI_SPEC.md` · `mockup.html` 먼저 읽고, 스펙과 다른 판단 필요 시 먼저 묻는다.
-- 로그 레벨: DEBUG(흐름 추적) / INFO(정상 결과) / WARNING(복구 가능) / ERROR(즉시 확인).
-
-<!-- ai-dev-workflow:review-recipe (init_project.py가 자동 주입·갱신 — 이 블록은 직접 수정하지 말 것) -->
-## 설계 리뷰 요청 처리 (ai-dev-workflow)
-
-> ⚠️ **모델 규칙 (필수)**: 이 설계·리뷰 워크플로(Chief Architect 판단)는 **반드시 Opus 이상 모델**로
-> 수행한다. **현재 세션이 Sonnet 이하이면, 리뷰·설계 작업을 시작하기 전에 사용자에게 "Opus 이상으로
-> 모델을 변경해 달라"고 먼저 요청**하고, 변경 전까지 진행하지 않는다. (설계 확정 후의 코딩·구현은 Sonnet도 허용.)
-
-사용자가 "설계 리뷰" / "GPT 리뷰" / "리뷰 받아줘" 등을 요청하면 — **네가 직접 리뷰하지 말고** 아래대로 한다:
-
-1. 리뷰 대상 설계를 `docs/ai-workflow/`(architecture.md·requirements.md·adr/ 등)에 작성·갱신한다.
-2. 새 브랜치로 커밋·푸시한다.
-3. base=main으로 **설계 PR을 연다.**
-   → `.github/workflows/gpt-design-review.yml`(채널 B)가 자동으로 **GPT 독립 리뷰**를 PR 코멘트로 단다
-   (repo Secret `OPENAI_API_KEY` 필요 — 없으면 무해 skip).
-4. 리뷰가 달리면 항목별 수용/기각을 판단·반영하고 `docs/ai-workflow/reviews/`에 처리 기록을 남긴다.
-
-핵심: **"리뷰 요청 = 설계 PR 열기"** 이며, 리뷰는 GitHub Action이 GPT를 호출해 수행한다(에이전트가 직접 하지 않음). 워크플로는 이미 이 저장소에 설정돼 있으니 새로 만들지 않는다.
-
-- **PC 즉시 실행**(API 키 환경변수 있을 때): `python scripts/ai_workflow/gpt_review.py <문서> [--source <dir>]`
-- **정액 구독만 있을 때**(채널 C): 위 명령에 `--emit`을 붙여 나온 파일을 ChatGPT에 붙여넣는다.
-- 정본·상세: `docs/ai-workflow/README.md` (규약 정본은 `brovior/ai-dev-workflow`).
-<!-- /ai-dev-workflow:review-recipe -->
+<tone_preference>
+답변은 결론부터 짧고 쉽게 작성한다. 세부 구현과 긴 근거는 사용자가 요청할 때 덧붙인다.
+</tone_preference>

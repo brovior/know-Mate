@@ -220,7 +220,7 @@ watch_folders에서 빠진 폴더의 청크를 DB `file_path` 기준으로 정�
 ① `watch_folders`가 비면 즉시 스킵(빈 목록을 "전부 삭제"로 오판 방지) ② dry_run이면 state·DB 모두 불변
 ③ 삭제 대상이 `max_delete_ratio` 초과 시 차단 + UI 알림.
 
-**purge 조회 경량화 + 조건부 스킵** (`collector/purge_meta.py`, 설계 A-0002/ADR-0002, 2026-07-24):
+**purge 조회 경량화 + 조건부 스킵** (`collector/purge_meta.py`, 2026-07-24):
 유휴 자동 인덱싱이 기본 60초마다 반복되는데, `_purge_removed_folders`가 매 사이클 chunks 테이블
 **전체**(1024차원 벡터 + AES 암호화 원문 포함)를 `to_arrow().to_pandas()`로 로드해, 변경 파일이
 0건이어도 매분 수십 MB를 할당/해제했다(베타에서 exe 메모리 70MB 도달 관측 — 인덱스가 커지면
@@ -359,7 +359,7 @@ DRM 문서는 스킵된다(COM Open 실패/로그인 모달 대기로 사이클�
 곳의 실패가 이후 정리를 건너뛰지 않게) 처리한다. 로직은 PyQt6 비의존으로 분리해(worker 덕타이핑,
 hard_exit 주입) 사외 단위 테스트가 가능하다.
 
-**암묵 종료 의존 제거 (설계 A-0001/ADR-0001, 2026-07-24)**: 위 `stop_worker` 에스컬레이션은
+**암묵 종료 의존 제거 (2026-07-24)**: 위 `stop_worker` 에스컬레이션은
 "워커가 실행 중일 때"만 진입하는 안전망이라, 인덱싱이 돌지 않는 **유휴 상태에서의 트레이 [종료]**
 (실사용의 대부분)는 커버하지 못했다. 원인은 이벤트 루프 종료를 Qt 기본값
 `quitOnLastWindowClosed=True`에만 의존한 것 — 이 규칙은 "마지막으로 **보이는** 창이 닫힐 때"만
@@ -490,9 +490,8 @@ RPC_E_CALL_REJECTED류) · `OPEN_TIMEOUT`(워치독 발화, 단계가 dispatch/o
 떨어졌다(6단계 설계 리뷰에서 AST로 확인). 6a가 이 배관의 마지막 한 줄을 이어
 `OPEN_ERROR`/`READ_ERROR`로 분리한다. 암호 보호 OOXML·DRM 래핑을 컨테이너 내부 증거로
 세분하는 것은 **6b로 이연**됐다 — CFB 디렉터리는 FAT 체인이라 8바이트 매직만으로는
-불충분하고(설계 리뷰 B-2), 판별 I/O가 COM 워치독 해제 이후 실행돼 SMB·DRM 드라이브에서
-수집기 QThread에 새 행오버 경로를 만들 수 있다(리뷰 M-3). 근거: `docs/ai-workflow/
-architecture.md` A-0003.
+불충분하고, 판별 I/O가 COM 워치독 해제 이후 실행돼 SMB·DRM 드라이브에서
+수집기 QThread에 새 행오버 경로를 만들 수 있다.
 
 **연계**: 워치독의 `ComWatchdog.disarm()`이 이번 파일에서 실제로 발화했는지(발화했다면
 어느 단계인지)를 반환하도록 확장했고, `com_stage.take_last_failed_stage()`가 COM 파싱

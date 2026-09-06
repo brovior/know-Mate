@@ -92,4 +92,4 @@
 ## 관련
 - 선행: 이슈 #4의 2a·2b·2c(프록시 우회·모드 정정) — 비동기로 돌렸을 때 실제
   LLM 응답이 와야 end-to-end 검증 가능
-- 원 출처: `IMPROVEMENT.MD` 1b, `CLAUDE.md` 5장 원칙8(QThread 워커 + pyqtSignal)
+- 현재 구현 제약: `bridge.sendQuery`의 동기 실행과 `CLAUDE.md` 원칙8(QThread 워커)
