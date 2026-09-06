@@ -1,6 +1,7 @@
 """지식검색 에이전트 — Phase 2 RAG 파이프라인 연결 (실패 시 mock fallback)."""
 import logging
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -164,11 +165,13 @@ class KnowledgeAgent:
         if not scopes:
             return [{"type": "text", "content": "검색 범위를 하나 이상 선택해주세요. (내 PC 문서 또는 공유 폴더)"}]
 
+        retrieve_t0 = time.perf_counter()
         try:
             chunks = pipeline["retriever"].search(query, scopes=scopes)
         except Exception as exc:
             logger.warning("검색 실패: %s", exc)
             chunks = []
+        retrieve_sec = time.perf_counter() - retrieve_t0
 
         def _chunk_context(c: dict) -> str:
             text = c.get("text", "")
@@ -186,7 +189,17 @@ class KnowledgeAgent:
                 return f"[문서] 파일명: {p.name} | 폴더: {p.parent.name}\n" + text
             return text
 
+        llm_t0 = time.perf_counter()
         answer_text = pipeline["llm"].answer(query, [_chunk_context(c) for c in chunks])
+        llm_sec = time.perf_counter() - llm_t0
+
+        # 질의 한 건당 한 줄. 검색(임베딩+벡터검색)과 LLM 생성 중 어디가 체감
+        # 지연의 대부분인지 이 값 없이는 가를 수 없다. 질의문과 본문은 남기지
+        # 않는다 — 길이와 건수만 기록한다(CLAUDE.md §2-1).
+        logger.info(
+            "[query] 총 %.2fs: retrieve=%.2fs llm=%.2fs (query_len=%d hits=%d)",
+            retrieve_sec + llm_sec, retrieve_sec, llm_sec, len(query), len(chunks),
+        )
 
         blocks: list[Block] = [TextBlock(type="text", content=answer_text)]
 

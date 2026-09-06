@@ -2,6 +2,7 @@
 import getpass
 import logging
 import re
+import time
 from typing import Any
 
 import pandas as pd
@@ -65,7 +66,9 @@ class Retriever:
         self, query: str, scopes: list[str] | None = None
     ) -> list[dict[str, Any]]:
         """쿼리를 벡터 검색해 권한 필터·복호화·샌드위치 배열 후 청크 dict 리스트를 반환한다."""
+        t0 = time.perf_counter()
         vec = self._embed.embed([query])[0]
+        embed_sec = time.perf_counter() - t0
 
         # 질의에서 날짜 범위 파싱 ("지난주", "3월", "25주차" 등) — 매칭 없으면 None
         date_range = parse_date_range_ko(query)
@@ -121,13 +124,19 @@ class Retriever:
             except Exception as exc:
                 logger.warning("[emails] 메일 검색 실패, 문서 결과만 반환: %s", exc)
 
-        if not chunks_rows:
-            return []
-
-        if self._rerank_enabled:
+        if self._rerank_enabled and chunks_rows:
             chunks_rows = self._rerank(chunks_rows, query)
 
-        logger.info("검색 결과: query_len=%d hits=%d", len(query), len(chunks_rows))
+        # search에는 테이블 조회·권한 필터·복호화가 모두 들어간다. 히트 0건도
+        # 로그를 남긴다 — "결과가 없다"는 신고가 느린 것인지 안 맞는 것인지
+        # 구분하려면 그 경우의 소요시간이 특히 필요하다.
+        search_sec = time.perf_counter() - t0 - embed_sec
+        logger.info(
+            "검색 결과: query_len=%d hits=%d embed=%.2fs search=%.2fs",
+            len(query), len(chunks_rows), embed_sec, search_sec,
+        )
+        if not chunks_rows:
+            return []
         return self._sandwich(chunks_rows)
 
     def _search_table(
