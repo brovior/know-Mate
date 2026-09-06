@@ -2,7 +2,7 @@
 
 > CLAUDE.md에서 분리. 진행 상태가 바뀌면 이 파일을 갱신한다.
 
-## 현재 위치 (2026-07-30 기준)
+## 현재 위치 (2026-09-06 기준)
 
 Phase 1~4 완료(RAG 지식검색), 5a 완료(Knox `.mysingle` + 표준 `.eml` 메일 인덱싱),
 5c 완료(PyInstaller 포터블 빌드). 현재 소수 대상 **베타 배포 단계**.
@@ -37,7 +37,22 @@ Phase 1~4 완료(RAG 지식검색), 5a 완료(Knox `.mysingle` + 표준 `.eml` �
   기간으로 변환해 chunks(`mtime`)·emails(`mail_date_ts`) 검색에 적용. 상세는 `docs/DESIGN.md` §검색 파라미터.
 - **차후 과제**: 추출·임베딩 병렬화(P3), batch_size 튜닝(P4), 기간 나열형 전용 정렬 모드(v2).
 
-## 미해결 · 실측 대기 (2026-07-30)
+## 확정된 결함 (2026-09-06)
+
+성능 분석([`PERF_ANALYSIS.md`](PERF_ANALYSIS.md))을 Codex와 교차검증하다 발견한 코드 결함.
+성능 문제가 아니라 **결과 누락·데이터 문제**라 성능 작업보다 앞선다. 재현 테스트는
+`knowmate/tests/test_known_defects.py`에 xfail strict로 있다 — 고치면 XPASS로 실패한다.
+
+- **[#81](https://github.com/brovior/know-Mate/issues/81) 재인덱싱 순서**: 옛 청크를 먼저
+  soft delete하고 새 내용을 나중에 만든다. (a) 성공 시 state가 새 ID로 덮여 죽은 행이 영구
+  누적되고 `optimize()`도 지우지 못한다. (b) 실패 시 그 시점부터 문서가 검색에서 사라지고,
+  재시도가 30분→6시간→7일로 밀려 최대 7일간 누락된다. **(b)가 우선.**
+- **[#82](https://github.com/brovior/know-Mate/issues/82) 메일 스캔 절단 순서**:
+  `scan_mail_folders`가 DB 상태 확인 전에 mtime 상위 `max_mails_per_scan`건으로 자른다.
+  메일이 그 수를 넘으면 오래된 메일이 후보에 들어오지 못해 영구 미인덱싱된다.
+  실제 피해 여부는 로그의 `[mail_scanner] 스캔 완료: 전체=N` 확인 필요.
+
+## 미해결 · 실측 대기 (2026-09-06)
 
 계측은 들어갔고 **판정할 데이터를 기다리는 중**인 항목들. 원인을 모른 상태에서 되돌리지 않는다.
 
@@ -51,4 +66,9 @@ Phase 1~4 완료(RAG 지식검색), 5a 완료(Knox `.mysingle` + 표준 `.eml` �
 - **6b (PASSWORD_PROTECTED / DRM_DENIED 판별)**: 6a가 남기는 `last_error_code` 실측 데이터
   대기로 보류. 2차 리뷰에서 "컨테이너 판별 probe I/O는 워치독 해제 후 실행돼 새 행오버
   경로가 된다"는 지적을 받아 6a에서 분리했다.
+- **성능 개선 전반**: 개선 여지 조사([`PERF_ANALYSIS.md`](PERF_ANALYSIS.md))는 교차검증에서
+  근거가 반박됐다([`PERF_ANALYSIS_REVIEW.md`](PERF_ANALYSIS_REVIEW.md)). 착수 전에 이 리포트를
+  먼저 읽는다. 질의 경로 계측(`[query] 총 N초: retrieve= llm=`)을 넣어 다음 빌드부터 데이터가
+  쌓인다 — 검색과 LLM 중 어디가 체감 지연인지 갈린 뒤에 순서를 정한다. 규모 판정(벡터 인덱스
+  필요 여부)은 `scripts/inspect_index.py`의 청크 수로 한다.
 - **DRM 추출 텍스트의 벡터DB 저장 컴플라이언스**: 코드 아님, 사내 확인 필요. `docs/DESIGN.md` 참고.

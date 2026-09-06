@@ -4,7 +4,7 @@
 > 최종 상태: **`CRITICALS_REMAIN`** · 3라운드 · 2026-09-06
 > 검토자: Claude Opus 5 (1M context) / Codex `gpt-5.x` via codex-cli 0.153.4, effort `high`
 > **문서는 고치지 않았다. 이 리포트는 지적 목록이다.**
-> 재현 테스트: `knowmate/tests/test_known_defects.py` (§5)
+> 재현 테스트: `knowmate/tests/test_known_defects.py` (§5) · 등록된 이슈: #81, #82
 
 ## 0. 결론 먼저
 
@@ -25,8 +25,8 @@
 | ID | 제목 | 제기 | 심각도 | 처리 |
 |---|---|---|---|---|
 | X-C1 | 메일 조회 횟수 오산(1000회→500회) + 벌크 dict가 오히려 느려질 수 있음 | X | critical | 합의 수용 |
-| X-C2 | 500건 절단이 DB 확인 전에 일어나 오래된 메일이 영구히 굶는다 | X | critical | 합의 수용 |
-| X-C3 | 수정 문서 tombstone 영구 누적 + 인덱싱 실패 시 마지막 정상본 손실 | X | critical | 합의 수용 |
+| X-C2 | 500건 절단이 DB 확인 전에 일어나 오래된 메일이 영구히 굶는다 | X | critical | 합의 수용 · 이슈 [#82](https://github.com/brovior/know-Mate/issues/82) |
+| X-C3 | 수정 문서 tombstone 영구 누적 + 인덱싱 실패 시 마지막 정상본 손실 | X | critical | 합의 수용 · 이슈 [#81](https://github.com/brovior/know-Mate/issues/81) |
 | C-C1 | §2-1 스냅샷 dict가 `mail_uid` 중복제거를 깨뜨린다 | C | critical | 합의 수용 |
 | C-C2 | §3-1이 자기 제약("쓰기 단일 스레드")을 위반한다 | C | critical | 합의 수용 |
 | C-C3 | §2-1/2-2 비용 귀인·최악 케이스가 반대로 짚혔다 | C | critical | 합의 수용 |
@@ -80,6 +80,8 @@ Codex가 반박했고 Claude가 코드로 확인해 수용했다.
 
 ### X-C2 — 500건 절단이 DB 확인 전에 일어난다
 
+> 이슈: [#82](https://github.com/brovior/know-Mate/issues/82)
+
 `scan_mail_folders`는 모든 메일을 mtime 내림차순으로 정렬한 뒤 **DB 상태를 보기 전에**
 `found[:max_per_scan]`으로 자른다. 메일이 500건을 넘으면 매 사이클 같은 최신 500건만
 조회·스킵되고, 더 오래된 미인덱싱 메일은 후보에 들어오지 못한다.
@@ -91,6 +93,8 @@ Codex가 반박했고 Claude가 코드로 확인해 수용했다.
 > 500건 초과 데이터에서 모든 메일이 유한 사이클 안에 인덱싱되는 테스트를 먼저 요구한다.
 
 ### X-C3 — 수정 문서 tombstone 누적과 실패 시 정상본 손실
+
+> 이슈: [#81](https://github.com/brovior/know-Mate/issues/81)
 
 수정 파일 처리는 `delete_chunks(old_ids)` → `index_file()` → `state[path]`를 새 ID로 덮는
 순서다. `delete_chunks`의 1차 호출은 물리 삭제 없이 `is_deleted=true, miss_count=1`만 찍는다.
