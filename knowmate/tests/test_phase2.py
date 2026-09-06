@@ -211,6 +211,23 @@ class TestIndexerFake:
         df2 = indexer.table.to_arrow().to_pandas()
         assert len(df2[df2["chunk_id"].isin(ids)]) == 0
 
+    def test_delete_chunks_permanently_deletes_immediately(self, tmp_path: Path):
+        """교체 완료 청크는 soft delete 단계 없이 즉시 물리 삭제한다."""
+        from knowmate.rag.indexer import Indexer
+
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=_fake_embed_client())
+        ids = indexer.index_file(
+            path="C:/sample/test.docx",
+            text=FakeReader().extract("sample.docx"),
+            mtime=1000.0,
+            scope="local",
+        )
+
+        indexer.delete_chunks_permanently(ids)
+
+        df = indexer.table.to_arrow().to_pandas()
+        assert len(df[df["chunk_id"].isin(ids)]) == 0
+
     def test_reopen_existing_table(self, tmp_path: Path):
         """같은 db_path로 두 번 Indexer를 생성해도 오류가 없어야 한다 (앱 재시작 시나리오)."""
         from knowmate.rag.indexer import Indexer

@@ -328,6 +328,21 @@ def _make_worker(tmp_path: Path, watch_folder: str):
     return worker, indexer, state_file
 
 
+def _make_worker_for_indexer(tmp_path: Path, watch_folder: str, indexer):
+    """기존 Indexer와 state 파일을 재사용하는 CollectorWorker를 반환한다."""
+    from knowmate.collector.scheduler import CollectorWorker
+    from knowmate.secure.fake_reader import FakeReader
+
+    return CollectorWorker(
+        config=_make_config(watch_folder),
+        indexer=indexer,
+        extractor=FakeReader(),
+        state_file=tmp_path / "state.json",
+        purge_meta_file=tmp_path / "purge_meta.json",
+        failure_file=tmp_path / "index_failure.json",
+    )
+
+
 class TestCollectorWorker:
     def test_new_file_indexed(self, tmp_path: Path):
         """파일 생성 후 run() -> state에 chunk_ids 존재."""
@@ -381,6 +396,85 @@ class TestCollectorWorker:
         new_ids = set(state2[str(f)]["chunk_ids"])
         # 재인덱싱 후 chunk_ids가 갱신됨
         assert len(new_ids) >= 1
+
+    def test_modified_file_removes_replaced_chunks(self, tmp_path: Path):
+        """재인덱싱 성공 후 기존 청크를 즉시 물리 삭제한다."""
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        target = folder / "doc.txt"
+        target.write_text("첫 번째 내용 " * 50, encoding="utf-8")
+
+        worker, indexer, state_file = _make_worker(tmp_path, str(folder))
+        worker.run()
+        replaced_ids = set()
+
+        for revision in range(2, 7):
+            replaced_ids.update(load_state(state_file)[str(target)]["chunk_ids"])
+            target.write_text(f"{revision}번째로 바뀐 내용 " * 60, encoding="utf-8")
+            _make_worker_for_indexer(tmp_path, str(folder), indexer).run()
+
+        entry = load_state(state_file)[str(target)]
+        rows = indexer.table.search().select(["chunk_id"]).limit(1_000_000).to_arrow().to_pandas()
+        remaining_ids = set(rows["chunk_id"])
+        assert replaced_ids.isdisjoint(remaining_ids)
+        assert set(entry["chunk_ids"]) == remaining_ids
+        assert "pending_delete_chunk_ids" not in entry
+
+    def test_failed_reindex_keeps_previous_chunks_active(self, tmp_path: Path):
+        """새 임베딩이 실패하면 기존 정상 청크를 검색 가능 상태로 유지한다."""
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        target = folder / "doc.txt"
+        target.write_text("정상 내용 " * 50, encoding="utf-8")
+
+        worker, indexer, state_file = _make_worker(tmp_path, str(folder))
+        worker.run()
+        old_ids = set(load_state(state_file)[str(target)]["chunk_ids"])
+
+        target.write_text("실패할 새 내용 " * 60, encoding="utf-8")
+        original_embed = indexer._embed.embed
+        indexer._embed.embed = MagicMock(side_effect=RuntimeError("임베딩 실패"))
+        _make_worker_for_indexer(tmp_path, str(folder), indexer).run()
+        indexer._embed.embed = original_embed
+
+        entry = load_state(state_file)[str(target)]
+        rows = (
+            indexer.table.search()
+            .select(["chunk_id", "is_deleted"])
+            .limit(1_000_000)
+            .to_arrow()
+            .to_pandas()
+        )
+        active_ids = set(rows.loc[~rows["is_deleted"], "chunk_id"])
+        assert set(entry["chunk_ids"]) == old_ids
+        assert old_ids.issubset(active_ids)
+
+    def test_pending_replaced_chunks_are_retried_next_cycle(self, tmp_path: Path):
+        """기존 청크 삭제 실패를 state에 남기고 다음 사이클에 다시 삭제한다."""
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        target = folder / "doc.txt"
+        target.write_text("첫 번째 내용 " * 50, encoding="utf-8")
+
+        worker, indexer, state_file = _make_worker(tmp_path, str(folder))
+        worker.run()
+        old_ids = set(load_state(state_file)[str(target)]["chunk_ids"])
+        permanent_delete = indexer.delete_chunks_permanently
+
+        target.write_text("두 번째로 바뀐 내용 " * 60, encoding="utf-8")
+        indexer.delete_chunks_permanently = MagicMock(side_effect=RuntimeError("DB 삭제 실패"))
+        _make_worker_for_indexer(tmp_path, str(folder), indexer).run()
+
+        failed_entry = load_state(state_file)[str(target)]
+        assert set(failed_entry["pending_delete_chunk_ids"]) == old_ids
+
+        indexer.delete_chunks_permanently = permanent_delete
+        _make_worker_for_indexer(tmp_path, str(folder), indexer).run()
+
+        retried_entry = load_state(state_file)[str(target)]
+        rows = indexer.table.search().select(["chunk_id"]).limit(1_000_000).to_arrow().to_pandas()
+        assert "pending_delete_chunk_ids" not in retried_entry
+        assert old_ids.isdisjoint(set(rows["chunk_id"]))
 
     def test_deleted_file_orphan_soft_delete(self, tmp_path: Path):
         """파일 삭제 후 run() -> orphan soft delete (dry_run=False)."""

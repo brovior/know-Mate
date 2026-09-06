@@ -58,6 +58,14 @@ SCHEMA = pa.schema([
 파일 재발견   → miss_count=0, is_deleted=false, deleted_at=""
 ```
 
+**수정 문서 교체 동작**
+
+수정된 문서는 새 청크 저장에 성공한 뒤 기존 청크를 즉시 물리 삭제한다. 삭제 전에 기존
+`chunk_ids`를 state의 `pending_delete_chunk_ids`로 원자적 저장하며, 삭제가 실패하면 이 목록을
+유지해 다음 수집 사이클 시작 시 다시 삭제한다. 새 청크 생성이 실패한 경우에는 state와 기존
+활성 청크를 변경하지 않는다. 이 교체 경로는 파일 미발견 여부를 재확인하는 위의 2단계 soft
+delete와 분리한다.
+
 ---
 
 ## 청킹 파라미터 (`config.yaml › chunking`)

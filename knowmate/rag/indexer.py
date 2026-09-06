@@ -198,6 +198,15 @@ class Indexer:
             self._table.delete(f"chunk_id IN ({hd_list})")
             logger.info("물리 삭제(2차): %d건", len(hard_delete_ids))
 
+    def delete_chunks_permanently(self, chunk_ids: list[str]) -> None:
+        """교체가 완료된 기존 chunk_id 목록을 즉시 물리 삭제한다."""
+        if not chunk_ids:
+            return
+
+        id_list = ", ".join(f"'{cid}'" for cid in chunk_ids)
+        self._table.delete(f"chunk_id IN ({id_list})")
+        logger.info("교체된 기존 청크 물리 삭제: %d건", len(chunk_ids))
+
     def optimize(self) -> None:
         """LanceDB optimize()로 삭제 데이터를 정리한다 (compact_files() 사용 금지)."""
         self._table.optimize()

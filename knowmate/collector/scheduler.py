@@ -434,6 +434,28 @@ class CollectorWorker(QThread):
 
         state = load_state(self._state_file)
 
+        # 재인덱싱은 새 청크를 먼저 저장하고 기존 청크를 지운다. 이전 사이클에서
+        # 기존 청크 삭제가 실패했다면 state에 남긴 ID를 스캔 전에 다시 정리한다.
+        pending_changed = False
+        for path, entry in state.items():
+            if not isinstance(entry, dict):
+                continue
+            pending_ids = entry.get("pending_delete_chunk_ids", [])
+            if not pending_ids:
+                continue
+            try:
+                self._indexer.delete_chunks_permanently(pending_ids)
+            except Exception as exc:
+                logger.warning(
+                    "[collector] 보류된 기존 청크 삭제 실패 — 다음 사이클 재시도: %s (%s)",
+                    path, exc,
+                )
+            else:
+                entry.pop("pending_delete_chunk_ids", None)
+                pending_changed = True
+        if pending_changed:
+            save_state(self._state_file, state)
+
         from knowmate.collector import failure_state
         failures = failure_state.load_failures(self._failure_file)
         if self._retry_requested:
@@ -673,25 +695,23 @@ class CollectorWorker(QThread):
 
                 scope = get_scope(task.path)
 
-                if task.action == "modified":
-                    old_ids = state.get(task.path, {}).get("chunk_ids", [])
-                    if old_ids:
-                        logger.debug("[단계3] 기존 청크 삭제: %d개", len(old_ids))
-                        self._indexer.delete_chunks(old_ids)
+                previous = state.get(task.path, {})
+                old_ids = previous.get("chunk_ids", []) if task.action == "modified" else []
+                pending_ids = previous.get("pending_delete_chunk_ids", [])
 
-                logger.debug("[단계4] 임베딩·저장 시작: %s", task.path)
+                logger.debug("[단계3] 임베딩·저장 시작: %s", task.path)
                 chunk_ids = self._indexer.index_file(
                     path=task.path,
                     text=text,
                     mtime=stat.st_mtime,
                     scope=scope,
                 )
-                logger.debug("[단계5] 임베딩·저장 완료: %s -> %d청크", task.path, len(chunk_ids))
+                logger.debug("[단계4] 임베딩·저장 완료: %s -> %d청크", task.path, len(chunk_ids))
                 from knowmate.rag.indexer import DOC_INDEX_VERSION
                 # 다음 사이클 큐 우선순위 힌트용 — COM 경유 파일이었는지 기록
                 # (실제 추출 경로와 무관하게 확장자·zip 서명으로 분류하는 저비용 재확인).
                 method = _classify_extract_method(task.path)
-                state[task.path] = {
+                new_entry = {
                     "mtime": stat.st_mtime,
                     "size": stat.st_size,
                     "indexed_at": datetime.now(timezone.utc).isoformat(),
@@ -699,6 +719,25 @@ class CollectorWorker(QThread):
                     "index_version": DOC_INDEX_VERSION,
                     "method": method,
                 }
+                delete_ids = list(dict.fromkeys([*pending_ids, *old_ids]))
+                if delete_ids:
+                    new_entry["pending_delete_chunk_ids"] = delete_ids
+                state[task.path] = new_entry
+
+                # 새 청크와 정리 대상을 먼저 원자적으로 기록한다. 이후 삭제나 앱 종료가
+                # 실패해도 다음 사이클이 기존 청크 ID를 잃지 않는다.
+                if delete_ids:
+                    save_state(self._state_file, state)
+                    try:
+                        self._indexer.delete_chunks_permanently(delete_ids)
+                    except Exception as exc:
+                        logger.warning(
+                            "[collector] 기존 청크 삭제 실패 — 다음 사이클 재시도: %s (%s)",
+                            task.path, exc,
+                        )
+                    else:
+                        new_entry.pop("pending_delete_chunk_ids", None)
+                        save_state(self._state_file, state)
                 logger.info(
                     "[%s] %s -> %d청크 (extract=%.2fs)",
                     task.action, task.path, len(chunk_ids), extract_sec,
