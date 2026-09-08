@@ -156,6 +156,37 @@ class TestEmailIndexer:
         ei = EmailIndexer(db_path=tmp_path, embed_client=_fake_embed())
         assert not ei.is_indexed("knox:UNKNOWN", 999.0)
 
+    def test_is_indexed_projects_only_required_columns(self):
+        """중복 확인은 벡터·암호문 없이 mtime과 버전 메타만 조회한다."""
+        import pyarrow as pa
+        from knowmate.rag.email_indexer import EMAIL_INDEX_VERSION, EmailIndexer
+
+        class Query:
+            selected = None
+
+            def where(self, _expr):
+                return self
+
+            def select(self, columns):
+                self.selected = columns
+                return self
+
+            def limit(self, _count):
+                return self
+
+            def to_arrow(self):
+                return pa.table({
+                    "mtime": [1000.0],
+                    "source_meta": [json.dumps({"_index_version": EMAIL_INDEX_VERSION})],
+                })
+
+        query = Query()
+        indexer = object.__new__(EmailIndexer)
+        indexer.table = types.SimpleNamespace(search=lambda: query)
+
+        assert indexer.is_indexed("knox:TEST001", 1000.0)
+        assert query.selected == ["mtime", "source_meta"]
+
     def test_delete_mail_chunks(self, tmp_path):
         """delete_mail_chunks 후 is_indexed가 False가 된다."""
         from knowmate.rag.email_indexer import EmailIndexer
@@ -238,6 +269,82 @@ class TestMailScanner:
         results = scan_mail_folders([str(tmp_path)], max_per_scan=3)
         assert [Path(item["path"]).stem for item in results] == ["a", "b", "c"]
         assert all(item["size"] == 4 for item in results)
+
+    def test_changed_state_is_saved_once_and_steady_cache_is_not_rewritten(
+        self, tmp_path, monkeypatch,
+    ):
+        """전체 성공 캐시는 변경 사이클 끝에 한 번만 쓰고 정상 사이클엔 다시 쓰지 않는다."""
+        from knowmate.collector import mail_scanner
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        _write_mail(watch / "mail.mysingle", uid="2026062600444444", msgid="save-once")
+        indexer = self._fake_mail_indexer(monkeypatch)
+        state_file = tmp_path / "mail_scan_state.json"
+        failure_file = tmp_path / "mail_index_failure.json"
+        cfg = {"mail": {"max_mails_per_scan": 1, "batch_commit_every": 1}}
+        real_save = mail_scanner.save_mail_scan_state
+        save_calls = []
+        failure_save_calls = []
+
+        def recording_save(path, state):
+            save_calls.append(path)
+            return real_save(path, state)
+
+        def recording_failure_save(path, failures):
+            failure_save_calls.append(path)
+            return True
+
+        monkeypatch.setattr(mail_scanner, "save_mail_scan_state", recording_save)
+        monkeypatch.setattr(
+            mail_scanner.failure_state, "save_failures", recording_failure_save,
+        )
+        mail_scanner.run_mail_scan(
+            [str(watch)], indexer, cfg,
+            state_file=state_file, failure_file=failure_file,
+        )
+        assert save_calls == [state_file]
+        assert failure_save_calls == []
+
+        save_calls.clear()
+        mail_scanner.run_mail_scan(
+            [str(watch)], indexer, cfg,
+            state_file=state_file, failure_file=failure_file,
+        )
+        assert save_calls == []
+        assert failure_save_calls == []
+
+    def test_inaccessible_root_keeps_mail_failure_history(self, tmp_path, monkeypatch):
+        """메일 폴더가 일시적으로 끊겨도 누적 실패 횟수와 백오프 기록을 보존한다."""
+        from knowmate.collector import failure_state
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        missing_root = tmp_path / "disconnected"
+        failed_path = str(missing_root / "mail.mysingle")
+        failure_file = tmp_path / "mail_index_failure.json"
+        failures = {}
+        failure_state.note_failure(
+            failures, failed_path, failure_state.KIND_UNKNOWN_TRANSIENT, "parse", None,
+            1000.0, 100, 2000.0,
+        )
+        failure_state.save_failures(failure_file, failures)
+
+        run_mail_scan(
+            [str(missing_root)], self._fake_mail_indexer(monkeypatch),
+            {"mail": {"max_mails_per_scan": 1}},
+            state_file=tmp_path / "mail_scan_state.json", failure_file=failure_file,
+        )
+        assert failed_path in failure_state.load_failures(failure_file)
+
+    def test_only_windows_lock_errors_use_short_busy_backoff(self):
+        """영구 권한·일반 I/O 오류는 5~10분 고정 재시도로 오분류하지 않는다."""
+        from knowmate.collector import failure_state
+        from knowmate.collector.mail_scanner import _mail_os_failure_kind
+
+        locked = OSError("sharing violation")
+        locked.winerror = 32
+        assert _mail_os_failure_kind(locked) == failure_state.KIND_TEMPORARY_BUSY
+        assert _mail_os_failure_kind(PermissionError("denied")) == failure_state.KIND_UNKNOWN_TRANSIENT
 
     def test_failed_mail_releases_cursor_for_later_mail_next_cycle(self, tmp_path, monkeypatch):
         """한도 1에서 첫 메일 실패 후 다음 사이클은 뒤 정상 메일을 처리한다."""

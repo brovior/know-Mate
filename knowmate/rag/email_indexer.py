@@ -197,6 +197,7 @@ class EmailIndexer:
             df = (
                 self.table.search()
                 .where(f"mail_uid = '{mail_uid}' AND is_deleted = false")
+                .select(["mtime", "source_meta"])
                 .limit(1)
                 .to_arrow()
                 .to_pandas()

@@ -95,7 +95,7 @@ def run_mail_scan(
 
     mail_cfg = cfg.get("mail", {})
     max_per_scan = max(int(mail_cfg.get("max_mails_per_scan", 500)), 0)
-    batch_every = max(int(mail_cfg.get("batch_commit_every", 50)), 1)
+    progress_every = max(int(mail_cfg.get("batch_commit_every", 50)), 1)
     extensions = mail_cfg.get("extensions", _DEFAULT_MAIL_EXTS)
     now_fn = get_now or time.time
 
@@ -119,8 +119,9 @@ def run_mail_scan(
             # 같은 EmailIndexer 인스턴스의 다음 유휴 사이클은 새 캐시를 사용할 수 있다.
             email_indexer.table_was_recreated = False
     failures = failure_state.load_failures(failure_file)
+    failures_dirty = False
     if retry_failures:
-        failure_state.request_retry_all(failures)
+        failures_dirty = failure_state.request_retry_all(failures) > 0
     policy = failure_state.BackoffPolicy.from_config(cfg.get("collector", {}))
     candidates = scan_mail_folders(watch_folders, max_per_scan, extensions)
 
@@ -129,7 +130,9 @@ def run_mail_scan(
     roots_accessible = bool(watch_folders) and all(Path(folder).is_dir() for folder in watch_folders)
     seen_keys = {normalize_path_key(item["path"]) for item in candidates}
     pruned = prune_missing_files(state, seen_keys) if roots_accessible else 0
-    failure_state.prune(failures)
+    failure_pruned = failure_state.prune(failures) if roots_accessible else 0
+    state_dirty = pruned > 0
+    failures_dirty = failures_dirty or failure_pruned > 0
 
     indexed_count = 0
     skipped_count = 0
@@ -137,26 +140,21 @@ def run_mail_scan(
     migrate_count = 0
     migrate_logged = False
 
-    def persist() -> None:
-        """상태·커서와 실패 이력을 각각 원자 저장한다."""
-        save_mail_scan_state(state_file, state)
-        failure_state.save_failures(failure_file, failures)
-
     for item in _candidates_from_cursor(candidates, state.get("cursor")):
         path = item["path"]
         key = normalize_path_key(path)
         cached = state["files"].get(key)
         if cache_matches(cached, item):
-            failure_state.note_success(failures, path)
+            if path in failures:
+                failure_state.note_success(failures, path)
+                failures_dirty = True
             skipped_count += 1
-            set_cursor(state, item)
             continue
 
         if failure_state.should_defer(
             failures.get(path), path, item["mtime"], item["size"], now_fn(), policy,
         ):
             skipped_count += 1
-            set_cursor(state, item)
             continue
 
         if attempted_count >= max_per_scan:
@@ -175,13 +173,15 @@ def run_mail_scan(
                 failures, path, failure_state.KIND_NEEDS_USER_ACTION, "parse", None,
                 item["mtime"], item["size"], now_fn(),
             )
+            failures_dirty = True
             skipped_count += 1
         except OSError as exc:
             logger.warning("[mail_scanner] 파일 접근 실패, 다음 기회에 재시도: %s (%s)", path, exc)
             failure_state.note_failure(
-                failures, path, failure_state.KIND_TEMPORARY_BUSY, "parse", None,
+                failures, path, _mail_os_failure_kind(exc), "parse", None,
                 item["mtime"], item["size"], now_fn(),
             )
+            failures_dirty = True
             skipped_count += 1
         except Exception as exc:
             logger.warning("[mail_scanner] 파싱 실패, 다음 기회에 재시도: %s (%s)", path, exc)
@@ -189,18 +189,25 @@ def run_mail_scan(
                 failures, path, failure_state.KIND_UNKNOWN_TRANSIENT, "parse", None,
                 item["mtime"], item["size"], now_fn(),
             )
+            failures_dirty = True
             skipped_count += 1
         else:
             try:
                 if email_indexer.is_indexed(parsed["mail_uid"], item["mtime"]):
                     cache_success(state, item, parsed["mail_uid"])
-                    failure_state.note_success(failures, path)
+                    state_dirty = True
+                    if path in failures:
+                        failure_state.note_success(failures, path)
+                        failures_dirty = True
                     email_indexer.table_is_empty = False
                     skipped_count += 1
                 else:
                     chunk_ids = email_indexer.index_mail(parsed, item["mtime"])
                     cache_success(state, item, parsed["mail_uid"])
-                    failure_state.note_success(failures, path)
+                    state_dirty = True
+                    if path in failures:
+                        failure_state.note_success(failures, path)
+                        failures_dirty = True
                     email_indexer.table_is_empty = False
                     indexed_count += 1
                     migrate_count += int(is_migration)
@@ -214,15 +221,19 @@ def run_mail_scan(
                     failures, path, failure_state.KIND_UNKNOWN_TRANSIENT, "index", None,
                     item["mtime"], item["size"], now_fn(),
                 )
+                failures_dirty = True
                 skipped_count += 1
 
         set_cursor(state, item)
-        if attempted_count % batch_every == 0:
-            persist()
+        state_dirty = True
+        if attempted_count % progress_every == 0:
             if on_progress:
                 on_progress(attempted_count, len(candidates), Path(path).name)
 
-    persist()
+    if state_dirty:
+        save_mail_scan_state(state_file, state)
+    if failures_dirty:
+        failure_state.save_failures(failure_file, failures)
     if migrate_count:
         logger.info("[mail_scanner] 포맷 마이그레이션 완료: 재인덱싱=%d건", migrate_count)
     logger.info(
@@ -252,3 +263,10 @@ def _email_index_version() -> str:
     """순환 의존 없이 현재 메일 인덱스 버전을 읽는다."""
     from knowmate.rag.email_indexer import EMAIL_INDEX_VERSION
     return EMAIL_INDEX_VERSION
+
+
+def _mail_os_failure_kind(exc: OSError) -> str:
+    """확실한 Windows 공유·잠금 오류만 짧은 재시도 대상으로 분류한다."""
+    if getattr(exc, "winerror", None) in {32, 33}:
+        return failure_state.KIND_TEMPORARY_BUSY
+    return failure_state.KIND_UNKNOWN_TRANSIENT

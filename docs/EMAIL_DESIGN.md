@@ -213,7 +213,7 @@ mail:
   - .mysingle
   - .eml
   max_mails_per_scan: 500  # 스캔당 실제 처리 시도 상한 (파싱·DB 확인·인덱싱)
-  batch_commit_every: 50   # state 중간 저장 주기
+  batch_commit_every: 50   # 진행률 알림 주기 (기존 설정 키명 유지)
 ```
 
 `watch_folders`를 공유 — `extensions`에 지정된 확장자를 감지해 자동으로 메일 파이프라인으로 라우팅.
