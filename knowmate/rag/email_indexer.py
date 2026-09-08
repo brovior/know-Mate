@@ -86,7 +86,7 @@ _MIGRATION_DEFAULT_SQL = {
 }
 
 
-def _migrate_emails_schema(db, table):
+def _migrate_emails_schema(db, table) -> tuple[object, bool]:
     """기존 emails 테이블에 EMAIL_SCHEMA 대비 누락된 스칼라 컬럼을 채운다.
 
     v3에서 mail_date_ts(float64)가 추가됐으나, 그 이전에 생성된 테이블은 이 컬럼이
@@ -101,7 +101,7 @@ def _migrate_emails_schema(db, table):
         existing = set(table.schema.names)
     except Exception as exc:
         logger.warning("[email_indexer] 스키마 조회 실패, 마이그레이션 생략: %s", exc)
-        return table
+        return table, False
 
     to_add: dict[str, str] = {}
     unsupported: list[str] = []
@@ -115,7 +115,7 @@ def _migrate_emails_schema(db, table):
             to_add[field.name] = default_sql
 
     if not to_add and not unsupported:
-        return table  # 최신 스키마 — 변경 없음
+        return table, False  # 최신 스키마 — 변경 없음
 
     if to_add:
         try:
@@ -131,7 +131,7 @@ def _migrate_emails_schema(db, table):
                 db.drop_table(EMAIL_TABLE_NAME)
             except Exception:
                 pass
-            return db.create_table(EMAIL_TABLE_NAME, schema=EMAIL_SCHEMA)
+            return db.create_table(EMAIL_TABLE_NAME, schema=EMAIL_SCHEMA), True
 
     if unsupported:
         logger.error(
@@ -142,17 +142,21 @@ def _migrate_emails_schema(db, table):
             db.drop_table(EMAIL_TABLE_NAME)
         except Exception:
             pass
-        return db.create_table(EMAIL_TABLE_NAME, schema=EMAIL_SCHEMA)
+        return db.create_table(EMAIL_TABLE_NAME, schema=EMAIL_SCHEMA), True
 
-    return table
+    return table, False
 
 
-def get_or_create_emails_table(db):
-    """emails 테이블이 없으면 생성, 있으면 open 후 스키마 마이그레이션해 반환한다."""
+def get_or_create_emails_table(db, *, with_status: bool = False):
+    """emails 테이블을 열거나 생성하고, 요청 시 재생성 여부도 반환한다."""
     if EMAIL_TABLE_NAME in db.table_names():
         table = db.open_table(EMAIL_TABLE_NAME)
-        return _migrate_emails_schema(db, table)
-    return db.create_table(EMAIL_TABLE_NAME, schema=EMAIL_SCHEMA)
+        result, recreated = _migrate_emails_schema(db, table)
+    else:
+        result, recreated = db.create_table(EMAIL_TABLE_NAME, schema=EMAIL_SCHEMA), True
+    if with_status:
+        return result, recreated
+    return result
 
 
 class EmailIndexer:
@@ -180,7 +184,11 @@ class EmailIndexer:
             self._crypto = crypto
 
         db = lancedb.connect(str(db_path))
-        self.table = get_or_create_emails_table(db)
+        self.table, self.table_was_recreated = get_or_create_emails_table(db, with_status=True)
+        try:
+            self.table_is_empty = self.table.count_rows() == 0
+        except Exception:
+            self.table_is_empty = False
 
     def is_indexed(self, mail_uid: str, mtime: float) -> bool:
         """동일 mail_uid + mtime + 인덱스 버전이 모두 일치하면 True를 반환한다."""

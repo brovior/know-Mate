@@ -458,7 +458,8 @@ class CollectorWorker(QThread):
 
         from knowmate.collector import failure_state
         failures = failure_state.load_failures(self._failure_file)
-        if self._retry_requested:
+        retry_requested = self._retry_requested
+        if retry_requested:
             n = failure_state.request_retry_all(failures)
             logger.info("[failure] 사용자 재시도 요청 — 이번 사이클 백오프 무시 (%d건, 이력 보존)", n)
         self._retry_requested = False
@@ -884,6 +885,7 @@ class CollectorWorker(QThread):
                 mail_indexed, _ = run_mail_scan(
                     watch_folders, self._email_indexer, self._config,
                     on_progress=lambda cur, tot, fn: self.progress.emit(cur, tot, fn),
+                    retry_failures=retry_requested,
                 )
             except Exception as exc:
                 logger.error("[mail_scanner] 메일 스캔 실패: %s", exc)

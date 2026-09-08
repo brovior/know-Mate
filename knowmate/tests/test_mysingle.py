@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from pathlib import Path
 
@@ -18,6 +19,14 @@ FIXTURES = Path(__file__).parent / "fixtures"
 def _fake_embed() -> EmbeddingClient:
     """테스트용 fake 임베딩 클라이언트를 반환한다."""
     return EmbeddingClient(base_url="", host_header="", fake=True)
+
+
+def _write_mail(dest: Path, uid: str, msgid: str) -> None:
+    """sample.mysingle의 고유 ID만 바꿔 서로 다른 메일 파일을 만든다."""
+    raw = (FIXTURES / "sample.mysingle").read_bytes()
+    raw = raw.replace(b"2026062600000001", uid.encode())
+    raw = raw.replace(b"<test-001@company.com>", f"<{msgid}@company.com>".encode())
+    dest.write_bytes(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -191,13 +200,15 @@ class TestMailScanner:
         assert len(results) == 1
         assert results[0]["path"].endswith(".mysingle")
 
-    def test_scan_respects_max(self, tmp_path):
-        """max_per_scan 제한이 적용된다."""
-        for i in range(5):
-            (tmp_path / f"m{i}.mysingle").write_bytes(b"test")
+    def test_scan_returns_all_candidates_with_size_and_stable_order(self, tmp_path):
+        """후보는 한도와 무관하게 전부 반환하고 mtime·경로 순으로 정렬한다."""
+        for name in ("b", "a", "c"):
+            (tmp_path / f"{name}.mysingle").write_bytes(b"test")
+            os.utime(tmp_path / f"{name}.mysingle", (1_000, 1_000))
         from knowmate.collector.mail_scanner import scan_mail_folders
         results = scan_mail_folders([str(tmp_path)], max_per_scan=3)
-        assert len(results) == 3
+        assert [Path(item["path"]).stem for item in results] == ["a", "b", "c"]
+        assert all(item["size"] == 4 for item in results)
 
     @pytest.mark.skipif(not _HAS_LANCEDB, reason="lancedb 미설치")
     def test_run_mail_scan_indexes_new(self, tmp_path):
@@ -211,7 +222,11 @@ class TestMailScanner:
 
         ei = EmailIndexer(db_path=tmp_path / "db", embed_client=_fake_embed())
         cfg = {"mail": {"max_mails_per_scan": 100, "batch_commit_every": 10}}
-        cnt, _ = run_mail_scan([str(dest.parent)], ei, cfg)
+        cnt, _ = run_mail_scan(
+            [str(dest.parent)], ei, cfg,
+            state_file=tmp_path / "mail_scan_state.json",
+            failure_file=tmp_path / "mail_index_failure.json",
+        )
         assert cnt == 1
 
     @pytest.mark.skipif(not _HAS_LANCEDB, reason="lancedb 미설치")
@@ -227,10 +242,92 @@ class TestMailScanner:
         ei = EmailIndexer(db_path=tmp_path / "db", embed_client=_fake_embed())
         cfg = {"mail": {"max_mails_per_scan": 100, "batch_commit_every": 10}}
 
-        run_mail_scan([str(dest.parent)], ei, cfg)           # 1차
-        cnt2, skipped = run_mail_scan([str(dest.parent)], ei, cfg)  # 2차
+        state_file = tmp_path / "mail_scan_state.json"
+        failure_file = tmp_path / "mail_index_failure.json"
+        run_mail_scan([str(dest.parent)], ei, cfg, state_file=state_file, failure_file=failure_file)
+        cnt2, skipped = run_mail_scan([str(dest.parent)], ei, cfg, state_file=state_file, failure_file=failure_file)
         assert cnt2 == 0
         assert skipped == 1
+
+    @pytest.mark.skipif(not _HAS_LANCEDB, reason="lancedb 미설치")
+    def test_scan_limit_is_attempt_budget_and_cursor_reaches_all_mail(self, tmp_path):
+        """한도 밖 메일도 다음 사이클의 커서 순환으로 인덱싱된다 (#82)."""
+        from knowmate.collector.mail_scanner import run_mail_scan
+        from knowmate.rag.email_indexer import EmailIndexer
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        for i, (name, ts) in enumerate(
+            [("new", 3_000_000_000), ("mid", 2_000_000_000), ("old", 1_000_000_000)]
+        ):
+            path = watch / f"{name}.mysingle"
+            _write_mail(path, uid=f"2026062600{i:06d}", msgid=f"mail-{name}")
+            os.utime(path, (ts, ts))
+
+        indexer = EmailIndexer(db_path=tmp_path / "db", embed_client=_fake_embed())
+        cfg = {"mail": {"max_mails_per_scan": 2, "batch_commit_every": 1}}
+        state_file = tmp_path / "mail_scan_state.json"
+        failure_file = tmp_path / "mail_index_failure.json"
+
+        first_indexed, _ = run_mail_scan(
+            [str(watch)], indexer, cfg, state_file=state_file, failure_file=failure_file,
+        )
+        assert first_indexed == 2
+        second_indexed, _ = run_mail_scan(
+            [str(watch)], indexer, cfg, state_file=state_file, failure_file=failure_file,
+        )
+        assert second_indexed == 1
+        df = indexer.table.search().select(["source_file"]).limit(100).to_arrow().to_pandas()
+        assert {Path(p).stem for p in df["source_file"].unique()} == {"new", "mid", "old"}
+
+    @pytest.mark.skipif(not _HAS_LANCEDB, reason="lancedb 미설치")
+    def test_success_cache_avoids_db_check_on_later_cycle(self, tmp_path):
+        """성공 캐시 적중 메일은 이후 사이클에서 is_indexed를 호출하지 않는다."""
+        from knowmate.collector.mail_scanner import run_mail_scan
+        from knowmate.rag.email_indexer import EmailIndexer
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        _write_mail(watch / "mail.mysingle", uid="2026062600999999", msgid="cached")
+        indexer = EmailIndexer(db_path=tmp_path / "db", embed_client=_fake_embed())
+        cfg = {"mail": {"max_mails_per_scan": 1, "batch_commit_every": 1}}
+        state_file = tmp_path / "mail_scan_state.json"
+        failure_file = tmp_path / "mail_index_failure.json"
+        run_mail_scan([str(watch)], indexer, cfg, state_file=state_file, failure_file=failure_file)
+
+        def fail_if_called(*_args):
+            raise AssertionError("성공 캐시가 DB 확인을 막아야 함")
+
+        indexer.is_indexed = fail_if_called
+        indexed, skipped = run_mail_scan(
+            [str(watch)], indexer, cfg, state_file=state_file, failure_file=failure_file,
+        )
+        assert (indexed, skipped) == (0, 1)
+
+    @pytest.mark.skipif(not _HAS_LANCEDB, reason="lancedb 미설치")
+    def test_parse_failure_does_not_starve_later_mail(self, tmp_path):
+        """실패 메일도 커서를 전진시켜 같은 사이클의 뒤 메일을 처리한다."""
+        from knowmate.collector.mail_scanner import run_mail_scan
+        from knowmate.rag.email_indexer import EmailIndexer
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        broken = watch / "broken.mysingle"
+        broken.write_bytes(b"MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n--B--\r\n")
+        valid = watch / "valid.mysingle"
+        _write_mail(valid, uid="2026062600888888", msgid="valid")
+        os.utime(broken, (2_000, 2_000))
+        os.utime(valid, (1_000, 1_000))
+
+        indexer = EmailIndexer(db_path=tmp_path / "db", embed_client=_fake_embed())
+        cfg = {"mail": {"max_mails_per_scan": 2, "batch_commit_every": 1}}
+        indexed, _ = run_mail_scan(
+            [str(watch)], indexer, cfg,
+            state_file=tmp_path / "mail_scan_state.json",
+            failure_file=tmp_path / "mail_index_failure.json",
+            get_now=lambda: 100.0,
+        )
+        assert indexed == 1
 
     def test_mail_disabled_check(self):
         """mail.enabled=false이면 스캔 분기에 진입하지 않는다."""

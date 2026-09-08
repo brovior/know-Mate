@@ -70,9 +70,9 @@ Outlook은 그 위에 얹는다. 스키마는 **Outlook까지 고려한 풀 스�
 | 4 | `message_id` (RFC, 소스 간 공통) | (향후) 소스 간 dedup |
 | 5 | `attach_sha256` | (향후) 동일 첨부 중복 방지 |
 
-`is_indexed(mail_uid, mtime)`는 위 1·2·3을 모두 만족해야 "이미 인덱싱됨"으로 스킵한다. 스캔 단계에선
-`mail_scanner._source_index_state`가 `source_file`+`mtime`+버전으로 사전 분류(indexed/stale_version/
-new_or_changed)해 파싱 비용을 절약한다.
+`is_indexed(mail_uid, mtime)`는 위 1·2·3을 모두 만족해야 "이미 인덱싱됨"으로 스킵한다. 스캔 단계는
+`mail_scan_state.json`의 `source_file`+`mtime`+size+버전 성공 캐시를 먼저 확인해 정상 메일의 DB 조회와
+파싱을 피한다. 캐시가 없는 기존 설치는 사이클당 처리 한도 안에서만 `is_indexed`로 점진적으로 캐시를 만든다.
 
 `mail_uid` 정규화: Knox → `knox:{UniqueID}`, eml → `eml:{Message-ID}`, Outlook → `outlook:{EntryID}` (소스 접두사로 통일).
 
@@ -212,7 +212,7 @@ mail:
   extensions:              # 인덱싱할 메일 확장자
   - .mysingle
   - .eml
-  max_mails_per_scan: 500  # 스캔당 처리 상한 (최신 mtime 순)
+  max_mails_per_scan: 500  # 스캔당 실제 처리 시도 상한 (파싱·DB 확인·인덱싱)
   batch_commit_every: 50   # state 중간 저장 주기
 ```
 

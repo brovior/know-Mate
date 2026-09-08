@@ -5,6 +5,9 @@
 > 검토자: Claude Opus 5 (1M context) / Codex `gpt-5.x` via codex-cli 0.153.4, effort `high`
 > **문서는 고치지 않았다. 이 리포트는 지적 목록이다.**
 > 재현 테스트: `knowmate/tests/test_known_defects.py` (§5) · 등록된 이슈: #81, #82
+>
+> 2026-09-08 상태: #81·#82는 수정 완료됐으며, #82 회귀 테스트는
+> `knowmate/tests/test_mysingle.py`로 옮겼다. 아래 내용은 발견 당시의 분석 기록이다.
 
 ## 0. 결론 먼저
 

@@ -40,17 +40,17 @@ Phase 1~4 완료(RAG 지식검색), 5a 완료(Knox `.mysingle` + 표준 `.eml` �
 ## 확정된 결함 (2026-09-06)
 
 성능 분석([`PERF_ANALYSIS.md`](PERF_ANALYSIS.md))을 Codex와 교차검증하다 발견한 코드 결함.
-성능 문제가 아니라 **결과 누락·데이터 문제**라 성능 작업보다 앞선다. 미수정 결함의 재현
-테스트는 `knowmate/tests/test_known_defects.py`에 xfail strict로 있다.
+성능 문제가 아니라 **결과 누락·데이터 문제**라 성능 작업보다 앞서 수정했다. 회귀 테스트는
+각 기능 테스트 파일로 옮겨 일반 테스트로 유지한다.
 
 - **✅ [#81](https://github.com/brovior/know-Mate/issues/81) 재인덱싱 순서 수정 완료**: 새 청크를
   먼저 저장하고 기존 청크를 물리 삭제하도록 변경했다. 삭제 실패 시 기존 ID를 state의
   `pending_delete_chunk_ids`에 보존해 다음 수집 사이클에서 재시도한다. 회귀 테스트는
   `test_phase2.py`와 `test_phase3.py`로 옮겼다.
-- **[#82](https://github.com/brovior/know-Mate/issues/82) 메일 스캔 절단 순서**:
-  `scan_mail_folders`가 DB 상태 확인 전에 mtime 상위 `max_mails_per_scan`건으로 자른다.
-  메일이 그 수를 넘으면 오래된 메일이 후보에 들어오지 못해 영구 미인덱싱된다.
-  실제 피해 여부는 로그의 `[mail_scanner] 스캔 완료: 전체=N` 확인 필요.
+- **✅ [#82](https://github.com/brovior/know-Mate/issues/82) 메일 스캔 절단 순서 수정 완료**:
+  모든 메일 후보를 순환 커서로 훑고, 실제 파싱·DB 확인·인덱싱 시도만
+  `max_mails_per_scan`으로 제한한다. 성공 캐시와 실패 백오프를 별도 sidecar에
+  저장해, 한도를 넘는 오래된 메일도 다음 사이클에서 빠짐없이 처리한다.
 
 ## 미해결 · 실측 대기 (2026-09-06)
 
