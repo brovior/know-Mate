@@ -7,6 +7,8 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -191,6 +193,33 @@ class TestEmailIndexer:
 # ---------------------------------------------------------------------------
 
 class TestMailScanner:
+    @staticmethod
+    def _fake_mail_indexer(monkeypatch, *, recreated: bool = False, empty: bool = False, fail_index: bool = False):
+        """LanceDB 없이 스캐너 상태 전이만 검증하는 인덱서 더블을 만든다."""
+        monkeypatch.setitem(
+            sys.modules, "knowmate.rag.email_indexer", types.SimpleNamespace(EMAIL_INDEX_VERSION="3"),
+        )
+
+        class FakeIndexer:
+            table_was_recreated = recreated
+            table_is_empty = empty
+
+            def __init__(self):
+                self.is_indexed_calls = 0
+                self.indexed: set[tuple[str, float]] = set()
+
+            def is_indexed(self, mail_uid: str, mtime: float) -> bool:
+                self.is_indexed_calls += 1
+                return (mail_uid, mtime) in self.indexed
+
+            def index_mail(self, parsed: dict, mtime: float) -> list[str]:
+                if fail_index:
+                    raise KeyboardInterrupt("중단 재현")
+                self.indexed.add((parsed["mail_uid"], mtime))
+                return ["chunk"]
+
+        return FakeIndexer()
+
     def test_scan_finds_mysingle(self, tmp_path):
         """scan_mail_folders가 .mysingle 파일을 탐지한다."""
         (tmp_path / "a.mysingle").write_bytes(b"test")
@@ -209,6 +238,88 @@ class TestMailScanner:
         results = scan_mail_folders([str(tmp_path)], max_per_scan=3)
         assert [Path(item["path"]).stem for item in results] == ["a", "b", "c"]
         assert all(item["size"] == 4 for item in results)
+
+    def test_failed_mail_releases_cursor_for_later_mail_next_cycle(self, tmp_path, monkeypatch):
+        """한도 1에서 첫 메일 실패 후 다음 사이클은 뒤 정상 메일을 처리한다."""
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        broken = watch / "broken.mysingle"
+        broken.write_bytes(b"MIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=B\r\n\r\n--B--\r\n")
+        valid = watch / "valid.mysingle"
+        _write_mail(valid, uid="2026062600777777", msgid="valid-after-failure")
+        os.utime(broken, (2_000, 2_000))
+        os.utime(valid, (1_000, 1_000))
+        indexer = self._fake_mail_indexer(monkeypatch)
+        state_file = tmp_path / "mail_scan_state.json"
+        failure_file = tmp_path / "mail_index_failure.json"
+        cfg = {"mail": {"max_mails_per_scan": 1, "batch_commit_every": 1}}
+
+        assert run_mail_scan(
+            [str(watch)], indexer, cfg, state_file=state_file, failure_file=failure_file,
+            get_now=lambda: 100.0,
+        ) == (0, 1)
+        second_indexed, _ = run_mail_scan(
+            [str(watch)], indexer, cfg, state_file=state_file, failure_file=failure_file,
+            get_now=lambda: 100.0,
+        )
+        assert second_indexed == 1
+
+    def test_recreated_table_clears_cache_before_interruption(self, tmp_path, monkeypatch):
+        """재생성 후 첫 DB 저장 중단 전에도 이전 성공 캐시는 이미 디스크에서 제거된다."""
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        path = watch / "mail.mysingle"
+        _write_mail(path, uid="2026062600666666", msgid="recreated")
+        state_file = tmp_path / "mail_scan_state.json"
+        state_file.write_text(json.dumps({
+            "schema_version": 1,
+            "cursor": None,
+            "files": {
+                "stale": {
+                    "path": str(path), "mtime": path.stat().st_mtime, "size": path.stat().st_size,
+                    "mail_uid": "knox:old", "index_version": "3",
+                },
+            },
+        }), encoding="utf-8")
+        indexer = self._fake_mail_indexer(monkeypatch, recreated=True, empty=True, fail_index=True)
+        cfg = {"mail": {"max_mails_per_scan": 1, "batch_commit_every": 1}}
+
+        with pytest.raises(KeyboardInterrupt):
+            run_mail_scan(
+                [str(watch)], indexer, cfg, state_file=state_file,
+                failure_file=tmp_path / "mail_index_failure.json",
+            )
+        assert json.loads(state_file.read_text(encoding="utf-8"))["files"] == {}
+        assert not indexer.table_was_recreated
+
+        recovered = self._fake_mail_indexer(monkeypatch)
+        assert run_mail_scan(
+            [str(watch)], recovered, cfg, state_file=state_file,
+            failure_file=tmp_path / "mail_index_failure.json",
+        ) == (1, 0)
+        assert recovered.is_indexed_calls == 1
+
+    def test_recreated_table_defers_scan_when_cache_clear_cannot_save(self, tmp_path, monkeypatch):
+        """빈 캐시를 확정하지 못하면 재생성된 DB에 어떤 메일도 쓰지 않는다."""
+        from knowmate.collector import mail_scanner
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        _write_mail(watch / "mail.mysingle", uid="2026062600555555", msgid="save-failure")
+        indexer = self._fake_mail_indexer(monkeypatch, recreated=True, empty=True)
+        monkeypatch.setattr(mail_scanner, "save_mail_scan_state", lambda *_args: False)
+
+        assert mail_scanner.run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 1}},
+            state_file=tmp_path / "mail_scan_state.json",
+            failure_file=tmp_path / "mail_index_failure.json",
+        ) == (0, 0)
+        assert indexer.is_indexed_calls == 0
+        assert indexer.table_was_recreated
 
     @pytest.mark.skipif(not _HAS_LANCEDB, reason="lancedb 미설치")
     def test_run_mail_scan_indexes_new(self, tmp_path):

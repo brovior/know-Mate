@@ -91,7 +91,6 @@ def run_mail_scan(
     성공 캐시 적중과 백오프 대기는 예산을 쓰지 않는다. 상태가 없는 기존 설치는
     매 사이클 최대 N건만 ``is_indexed``로 확인해 캐시를 점진적으로 구축한다.
     """
-    from knowmate.config import get_data_dir
     from knowmate.secure.mysingle_reader import parse_mail_file
 
     mail_cfg = cfg.get("mail", {})
@@ -100,15 +99,25 @@ def run_mail_scan(
     extensions = mail_cfg.get("extensions", _DEFAULT_MAIL_EXTS)
     now_fn = get_now or time.time
 
-    data_dir = get_data_dir()
-    state_file = state_file or data_dir / "mail_scan_state.json"
-    failure_file = failure_file or data_dir / "mail_index_failure.json"
+    if state_file is None or failure_file is None:
+        from knowmate.config import get_data_dir
+        data_dir = get_data_dir()
+        state_file = state_file or data_dir / "mail_scan_state.json"
+        failure_file = failure_file or data_dir / "mail_index_failure.json"
     table_was_recreated = bool(getattr(email_indexer, "table_was_recreated", False))
     invalidate_cache = table_was_recreated or bool(getattr(email_indexer, "table_is_empty", False))
-    if table_was_recreated:
-        # 같은 EmailIndexer 인스턴스의 다음 유휴 사이클은 새 캐시를 사용할 수 있다.
-        email_indexer.table_was_recreated = False
     state = load_mail_scan_state(state_file, invalidate_cache=invalidate_cache)
+    if invalidate_cache:
+        # DB가 비어 있거나 재생성됐다는 사실을 메모리 플래그만으로 소비하면 안 된다.
+        # 첫 DB 저장 뒤 상태 저장 전에 프로세스가 종료되면, 다음 시작에서 이전 성공
+        # 캐시가 되살아 빈 DB를 정상으로 오인할 수 있다. 따라서 어떤 메일을 열거나
+        # DB를 건드리기 전에 빈 상태를 먼저 디스크에 확정한다.
+        if not save_mail_scan_state(state_file, state):
+            logger.error("[mail_scanner] 캐시 무효화 상태를 저장하지 못해 이번 메일 스캔을 연기합니다")
+            return 0, 0
+        if table_was_recreated:
+            # 같은 EmailIndexer 인스턴스의 다음 유휴 사이클은 새 캐시를 사용할 수 있다.
+            email_indexer.table_was_recreated = False
     failures = failure_state.load_failures(failure_file)
     if retry_failures:
         failure_state.request_retry_all(failures)
