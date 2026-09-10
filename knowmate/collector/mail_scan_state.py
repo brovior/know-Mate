@@ -11,6 +11,7 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
+_UID_RESOLUTION_CACHE_VERSION = 2
 
 
 def normalize_path_key(path: str) -> str:
@@ -65,6 +66,7 @@ def cache_matches(entry: dict[str, Any] | None, item: dict[str, Any]) -> bool:
         return False
     return (
         entry.get("index_version") == _email_index_version()
+        and entry.get("uid_resolution_version") == _UID_RESOLUTION_CACHE_VERSION
         and entry.get("mtime") == item["mtime"]
         and entry.get("size") == item["size"]
         and isinstance(entry.get("mail_uid"), str)
@@ -80,6 +82,9 @@ def cache_success(state: dict[str, Any], item: dict[str, Any], mail_uid: str) ->
         "size": item["size"],
         "mail_uid": mail_uid,
         "index_version": _email_index_version(),
+        # v2는 같은 UID의 서로 다른 본문을 한 세대로 잘못 캐시했던 이전 항목을
+        # 한 번 재검증한다. 본문이나 본문 해시는 상태 파일에 저장하지 않는다.
+        "uid_resolution_version": _UID_RESOLUTION_CACHE_VERSION,
     }
 
 

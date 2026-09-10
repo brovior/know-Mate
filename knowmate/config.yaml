@@ -88,6 +88,6 @@ mail:
   - .mysingle
   - .eml
   max_mails_per_scan: 500  # 스캔당 실제 처리 시도 상한 (파싱·DB 확인·인덱싱)
-  batch_commit_every: 50   # 진행률 알림 주기 (기존 설정 키명 유지)
+  batch_commit_every: 50   # 최종 결과 기반 진행률 알림 최소 간격(성공 캐시·백오프 skip 제외)
 ui:
   close_action: tray       # 닫기(X) 버튼 동작: tray(트레이로 숨김) | quit(앱 종료)

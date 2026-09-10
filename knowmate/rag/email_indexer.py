@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -12,7 +12,11 @@ from typing import Any, Callable
 import pyarrow as pa
 
 from knowmate.rag.chunker import chunk_text
-from knowmate.rag.embedding import EmbeddingClient, VECTOR_DIM
+from knowmate.rag.embedding import (
+    EmbeddingClient,
+    EmbeddingContentError,
+    VECTOR_DIM,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +83,25 @@ class PendingMailDeleteError(RuntimeError):
         super().__init__("새 메일 청크 저장 뒤 기존 청크 삭제에 실패했습니다")
         self.chunk_ids = chunk_ids
         self.__cause__ = cause
+
+
+@dataclass
+class MailIndexJob:
+    """메일 하나의 독립 청킹 결과와 교차메일 임베딩 작업 상태다."""
+
+    parsed: dict[str, Any]
+    mtime: float
+    check: MailIndexCheck
+    chunks: list[str]
+    vectors: list[list[float] | None] = field(default_factory=list)
+    content_error: EmbeddingContentError | None = None
+
+
+@dataclass
+class MailEmbeddingResult:
+    """교차메일 임베딩의 격리 실패와 중단 원인을 전달한다."""
+
+    blocking_error: Exception | None = None
 
 
 def _parse_mail_date_ts(mail_date: str) -> float:
@@ -277,72 +300,15 @@ class EmailIndexer:
             raise RuntimeError("메일 기존 청크 상태를 확인하지 못했습니다")
         if check.state is MailIndexState.CURRENT:
             return []
+        job = self.prepare_mail(parsed, mtime, check)
+        result = self.embed_mail_jobs([job])
+        if job.content_error:
+            raise job.content_error
+        if result.blocking_error:
+            raise result.blocking_error
+        chunk_ids = self.commit_mail_job(job, on_progress)
 
-        # 메타데이터 헤더를 본문 앞에 붙여 발신인·날짜·수신인 기반 검색 지원
-        meta_header = (
-            f"제목: {parsed.get('subject', '')}\n"
-            f"발신: {parsed.get('sender', '')}\n"
-            f"수신: {parsed.get('recipients', '')}\n"
-            f"날짜: {parsed.get('mail_date', '')}\n\n"
-        )
-        body_text: str = meta_header + parsed["body_text"]
-        chunks = chunk_text(body_text, "txt", self._chunk_size, self._overlap)
-        if not chunks:
-            return []
-
-        indexed_at = datetime.now(timezone.utc).isoformat()
-        total = len(chunks)
-        chunk_ids: list[str] = []
-        rows: list[dict[str, Any]] = []
-        mail_date_ts = _parse_mail_date_ts(parsed.get("mail_date", ""))
-
-        for batch_start in range(0, total, self._batch_size):
-            batch = chunks[batch_start: batch_start + self._batch_size]
-            vectors = self._embed.embed(batch)
-            if len(vectors) != len(batch):
-                raise RuntimeError(
-                    f"임베딩 결과 수 불일치: 요청={len(batch)}, 응답={len(vectors)}"
-                )
-
-            for i, (chunk_text_val, vector) in enumerate(zip(batch, vectors, strict=True)):
-                global_idx = batch_start + i
-                cid = str(uuid.uuid4())
-                chunk_ids.append(cid)
-                rows.append({
-                    "chunk_id":        cid,
-                    "scope":           "local",
-                    "indexed_at":      indexed_at,
-                    "chunk_index":     global_idx,
-                    "chunk_total":     total,
-                    "text":            self._crypto.encrypt(chunk_text_val),
-                    "vector":          [float(v) for v in vector],
-                    "is_deleted":      False,
-                    "deleted_at":      "",
-                    "miss_count":      0,
-                    "mtime":           mtime,
-                    "mail_uid":        parsed["mail_uid"],
-                    "source_type":     parsed.get("source_type", "knox"),
-                    "message_id":      parsed["message_id"],
-                    "subject":         parsed["subject"],
-                    "sender":          parsed["sender"],
-                    "recipients":      parsed["recipients"],
-                    "mail_date":       parsed["mail_date"],
-                    "mail_date_ts":    mail_date_ts,
-                    "thread_ref":      parsed["thread_ref"],
-                    "source_file":     parsed["source_file"],
-                    "chunk_origin":    "body",
-                    "attach_filename": "",
-                    "attach_sha256":   "",
-                    "source_meta":     _inject_version(parsed["source_meta"]),
-                })
-
-            if on_progress:
-                on_progress(batch_start + len(batch), total)
-
-        # 모든 청크의 임베딩·행 생성이 끝난 뒤 한 번만 추가한다. 이 전에는 기존 행을 건드리지 않는다.
-        self.table.add(rows)
-
-        if delete_old and check.state is MailIndexState.STALE and check.old_chunk_ids:
+        if delete_old and job.chunks and check.state is MailIndexState.STALE and check.old_chunk_ids:
             try:
                 self.delete_chunk_ids(check.old_chunk_ids)
             except Exception as exc:
@@ -352,6 +318,108 @@ class EmailIndexer:
             "[email_indexer] 인덱싱 완료: uid=%s chunks=%d",
             parsed["mail_uid"][:30], len(chunk_ids),
         )
+        return chunk_ids
+
+    def prepare_mail(self, parsed: dict[str, Any], mtime: float, check: MailIndexCheck) -> MailIndexJob:
+        """메일별 메타헤더·청킹을 독립적으로 끝내고 교차메일 임베딩 작업을 만든다."""
+        meta_header = (
+            f"제목: {parsed.get('subject', '')}\n"
+            f"발신: {parsed.get('sender', '')}\n"
+            f"수신: {parsed.get('recipients', '')}\n"
+            f"날짜: {parsed.get('mail_date', '')}\n\n"
+        )
+        chunks = chunk_text(meta_header + parsed["body_text"], "txt", self._chunk_size, self._overlap)
+        return MailIndexJob(
+            parsed=parsed,
+            mtime=mtime,
+            check=check,
+            chunks=chunks,
+            vectors=[None] * len(chunks),
+        )
+
+    def embed_mail_jobs(self, jobs: list[MailIndexJob]) -> MailEmbeddingResult:
+        """여러 메일 청크를 batch_size 단위로 임베딩하고 결과를 원래 job에 되돌린다."""
+        result = MailEmbeddingResult()
+        refs = [(job, index) for job in jobs for index in range(len(job.chunks))]
+        for start in range(0, len(refs), self._batch_size):
+            if not self._embed_refs_with_content_isolation(refs[start:start + self._batch_size], result):
+                break
+        return result
+
+    def _embed_refs_with_content_isolation(
+        self, refs: list[tuple[MailIndexJob, int]], result: MailEmbeddingResult,
+    ) -> bool:
+        """ContentError만 이분화하고 transient·protocol 오류면 해당 사이클을 중단한다."""
+        if not refs:
+            return True
+        try:
+            vectors = self._embed.embed([job.chunks[index] for job, index in refs])
+            if len(vectors) != len(refs):
+                raise RuntimeError(f"임베딩 결과 수 불일치: 요청={len(refs)}, 응답={len(vectors)}")
+        except EmbeddingContentError as exc:
+            if len(refs) == 1:
+                refs[0][0].content_error = exc
+                return True
+            middle = len(refs) // 2
+            return (
+                self._embed_refs_with_content_isolation(refs[:middle], result)
+                and self._embed_refs_with_content_isolation(refs[middle:], result)
+            )
+        except Exception as exc:
+            result.blocking_error = exc
+            return False
+        for (job, index), vector in zip(refs, vectors, strict=True):
+            job.vectors[index] = vector
+        return True
+
+    def commit_mail_job(
+        self, job: MailIndexJob, on_progress: Callable[[int, int], None] | None = None,
+    ) -> list[str]:
+        """모든 청크 벡터가 준비된 메일 하나만 새 행으로 원자적 추가를 시도한다."""
+        if job.content_error or any(vector is None for vector in job.vectors):
+            raise RuntimeError("메일 전체 청크 임베딩이 완료되지 않았습니다")
+        if not job.chunks:
+            return []
+
+        parsed = job.parsed
+        indexed_at = datetime.now(timezone.utc).isoformat()
+        mail_date_ts = _parse_mail_date_ts(parsed.get("mail_date", ""))
+        chunk_ids = [str(uuid.uuid4()) for _ in job.chunks]
+        rows: list[dict[str, Any]] = []
+        for index, (chunk_text_value, vector, chunk_id) in enumerate(
+            zip(job.chunks, job.vectors, chunk_ids, strict=True)
+        ):
+            rows.append({
+                "chunk_id": chunk_id,
+                "scope": "local",
+                "indexed_at": indexed_at,
+                "chunk_index": index,
+                "chunk_total": len(job.chunks),
+                "text": self._crypto.encrypt(chunk_text_value),
+                "vector": [float(value) for value in vector],
+                "is_deleted": False,
+                "deleted_at": "",
+                "miss_count": 0,
+                "mtime": job.mtime,
+                "mail_uid": parsed["mail_uid"],
+                "source_type": parsed.get("source_type", "knox"),
+                "message_id": parsed["message_id"],
+                "subject": parsed["subject"],
+                "sender": parsed["sender"],
+                "recipients": parsed["recipients"],
+                "mail_date": parsed["mail_date"],
+                "mail_date_ts": mail_date_ts,
+                "thread_ref": parsed["thread_ref"],
+                "source_file": parsed["source_file"],
+                "chunk_origin": "body",
+                "attach_filename": "",
+                "attach_sha256": "",
+                "source_meta": _inject_version(parsed["source_meta"]),
+            })
+        self.table.add(rows)
+        if on_progress:
+            on_progress(len(rows), len(rows))
+        logger.info("[email_indexer] 인덱싱 완료: uid=%s chunks=%d", parsed["mail_uid"][:30], len(rows))
         return chunk_ids
 
     def delete_mail_chunks(self, mail_uid: str) -> None:

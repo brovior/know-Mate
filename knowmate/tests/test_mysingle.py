@@ -303,6 +303,22 @@ class TestEmailIndexer:
 
 class TestMailScanner:
     @staticmethod
+    def _sample_parsed_for_scan(path: str, uid: str, body_text: str) -> dict:
+        """파일 파싱을 대체하는 교차메일 배치 테스트용 최소 메일을 만든다."""
+        return {
+            "mail_uid": uid,
+            "message_id": f"<{uid}@test>",
+            "subject": "test",
+            "sender": "a@test",
+            "recipients": "b@test",
+            "mail_date": "2026-09-09",
+            "thread_ref": "",
+            "body_text": body_text,
+            "source_file": path,
+            "source_meta": "{}",
+        }
+
+    @staticmethod
     def _fake_mail_indexer(monkeypatch, *, recreated: bool = False, empty: bool = False, fail_index: bool = False):
         """LanceDB 없이 스캐너 상태 전이만 검증하는 인덱서 더블을 만든다."""
         monkeypatch.setitem(
@@ -823,6 +839,598 @@ class TestMailScanner:
             get_now=lambda: 100.0,
         )
         assert indexed == 1
+
+    @pytest.mark.skipif(not _HAS_LANCEDB, reason="lancedb 미설치")
+    def test_cross_mail_embedding_uses_32_chunk_batches(self, tmp_path, monkeypatch):
+        """65개 단일 청크 메일은 메일 경계를 넘어 32개씩 세 번 임베딩한다."""
+        from knowmate.collector.mail_scanner import run_mail_scan
+        from knowmate.rag.email_indexer import EmailIndexer
+        from knowmate.rag.embedding import VECTOR_DIM
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        for index in range(65):
+            (watch / f"{index:03d}.mysingle").write_bytes(b"x")
+
+        def parse(path: str) -> dict:
+            index = int(Path(path).stem)
+            return self._sample_parsed_for_scan(path, f"knox:{index}", f"mail-{index}")
+
+        monkeypatch.setattr("knowmate.secure.mysingle_reader.parse_mail_file", parse)
+
+        class RecordingEmbed:
+            def __init__(self):
+                self.calls = []
+
+            def embed(self, texts):
+                self.calls.append(list(texts))
+                return [[0.0] * VECTOR_DIM for _ in texts]
+
+        embed = RecordingEmbed()
+        indexer = EmailIndexer(tmp_path / "db", embed, batch_size=32)
+        indexed, _ = run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 65}},
+            state_file=tmp_path / "state.json", failure_file=tmp_path / "failures.json",
+        )
+        assert indexed == 65
+        assert [len(call) for call in embed.calls] == [32, 32, 1]
+
+    @pytest.mark.skipif(not _HAS_LANCEDB, reason="lancedb 미설치")
+    def test_streaming_window_fills_batch_before_flushing(self, tmp_path, monkeypatch):
+        """32 미만 메일 둘은 다음 메일까지 받아 32개 API batch를 먼저 채운다."""
+        from knowmate.collector.mail_scanner import run_mail_scan
+        from knowmate.rag.email_indexer import EmailIndexer
+        from knowmate.rag.embedding import VECTOR_DIM
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        for name in ("a", "b"):
+            (watch / f"{name}.mysingle").write_bytes(b"x")
+        body = ("x" * 99 + "\n") * 18
+        monkeypatch.setattr(
+            "knowmate.secure.mysingle_reader.parse_mail_file",
+            lambda path: self._sample_parsed_for_scan(path, f"knox:{Path(path).stem}", body),
+        )
+
+        class RecordingEmbed:
+            def __init__(self):
+                self.calls = []
+
+            def embed(self, texts):
+                self.calls.append(len(texts))
+                return [[0.0] * VECTOR_DIM for _ in texts]
+
+        embed = RecordingEmbed()
+        indexer = EmailIndexer(tmp_path / "db", embed, chunk_size=100, overlap=0, batch_size=32)
+        indexed, _ = run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 2}},
+            state_file=tmp_path / "state.json", failure_file=tmp_path / "failures.json",
+        )
+        assert indexed == 2
+        assert embed.calls[0] == 32
+
+    @pytest.mark.skipif(not _HAS_LANCEDB, reason="lancedb 미설치")
+    def test_streaming_window_never_accumulates_500_mail_jobs(self, tmp_path, monkeypatch):
+        """500개 단일 청크 메일도 최대 32개 작업만 가진 윈도우로 순차 확정한다."""
+        from knowmate.collector.mail_scanner import run_mail_scan
+        from knowmate.rag.email_indexer import EmailIndexer
+        from knowmate.rag.embedding import VECTOR_DIM
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        for index in range(500):
+            (watch / f"{index:03d}.mysingle").write_bytes(b"x")
+        monkeypatch.setattr(
+            "knowmate.secure.mysingle_reader.parse_mail_file",
+            lambda path: self._sample_parsed_for_scan(path, f"knox:{Path(path).stem}", "body"),
+        )
+
+        class GoodEmbed:
+            def embed(self, texts):
+                return [[0.0] * VECTOR_DIM for _ in texts]
+
+        indexer = EmailIndexer(tmp_path / "db", GoodEmbed(), batch_size=32)
+        windows = []
+        original_embed_mail_jobs = indexer.embed_mail_jobs
+
+        def record_window(jobs):
+            windows.append((len(jobs), sum(len(job.chunks) for job in jobs)))
+            return original_embed_mail_jobs(jobs)
+
+        indexer.embed_mail_jobs = record_window
+        indexed, _ = run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 500}},
+            state_file=tmp_path / "state.json", failure_file=tmp_path / "failures.json",
+        )
+        assert indexed == 500
+        assert len(windows) == 16
+        assert max(job_count for job_count, _ in windows) == 32
+        assert max(chunk_count for _, chunk_count in windows) == 32
+
+    @pytest.mark.skipif(not _HAS_LANCEDB, reason="lancedb 미설치")
+    def test_duplicate_uid_has_one_generation_and_stays_cached(self, tmp_path, monkeypatch):
+        """서로 다른 복사본은 커서 순서와 무관하게 한 번만 저장하고 다음 주기에 안정적이다."""
+        from knowmate.collector.mail_scanner import run_mail_scan
+        from knowmate.rag.email_indexer import EmailIndexer
+        from knowmate.rag.embedding import VECTOR_DIM
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        first = watch / "old.mysingle"
+        second = watch / "new.mysingle"
+        first.write_bytes(b"x")
+        second.write_bytes(b"x")
+        os.utime(first, (1_000, 1_000))
+        os.utime(second, (2_000, 2_000))
+        monkeypatch.setattr(
+            "knowmate.secure.mysingle_reader.parse_mail_file",
+            lambda path: self._sample_parsed_for_scan(path, "knox:immutable", "same body"),
+        )
+
+        class RecordingEmbed:
+            def __init__(self):
+                self.calls = 0
+
+            def embed(self, texts):
+                self.calls += 1
+                return [[0.0] * VECTOR_DIM for _ in texts]
+
+        embed = RecordingEmbed()
+        indexer = EmailIndexer(tmp_path / "db", embed, batch_size=32)
+        state_file = tmp_path / "state.json"
+        failure_file = tmp_path / "failures.json"
+        assert run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 2}},
+            state_file=state_file, failure_file=failure_file,
+        ) == (1, 1)
+        assert indexer.table.count_rows() == 1
+        assert embed.calls == 1
+        assert run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 2}},
+            state_file=state_file, failure_file=failure_file,
+        ) == (0, 2)
+        assert indexer.table.count_rows() == 1
+        assert embed.calls == 1
+
+    @pytest.mark.skipif(not _HAS_LANCEDB, reason="lancedb 미설치")
+    def test_duplicate_uid_after_completed_window_uses_existing_generation(self, tmp_path, monkeypatch):
+        """앞 윈도우에서 확정한 UID의 뒤 복사본은 DB 재확인·새 세대를 만들지 않는다."""
+        from knowmate.collector.mail_scanner import run_mail_scan
+        from knowmate.rag.email_indexer import EmailIndexer
+        from knowmate.rag.embedding import VECTOR_DIM
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        for index in range(33):
+            (watch / f"{index:03d}.mysingle").write_bytes(b"x")
+
+        def parse(path: str) -> dict:
+            index = int(Path(path).stem)
+            uid = "knox:duplicate" if index in {0, 32} else f"knox:{index}"
+            return self._sample_parsed_for_scan(path, uid, f"mail-{index}")
+
+        monkeypatch.setattr("knowmate.secure.mysingle_reader.parse_mail_file", parse)
+
+        class RecordingEmbed:
+            def __init__(self):
+                self.calls = 0
+
+            def embed(self, texts):
+                self.calls += 1
+                return [[0.0] * VECTOR_DIM for _ in texts]
+
+        embed = RecordingEmbed()
+        indexer = EmailIndexer(tmp_path / "db", embed, batch_size=32)
+        seen_uids = []
+        real_get_index_state = indexer.get_index_state
+
+        def record_index_state(mail_uid, mtime):
+            seen_uids.append(mail_uid)
+            return real_get_index_state(mail_uid, mtime)
+
+        indexer.get_index_state = record_index_state
+        state_file = tmp_path / "state.json"
+        failure_file = tmp_path / "failures.json"
+        assert run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 33}},
+            state_file=state_file, failure_file=failure_file,
+        ) == (32, 1)
+        assert seen_uids.count("knox:duplicate") == 1
+        assert indexer.table.count_rows() == 32
+        assert embed.calls == 1
+
+        # 두 경로 모두 성공 캐시가 생겼으므로 다음 사이클은 파일을 열거나 DB를 조회하지 않는다.
+        seen_uids.clear()
+        assert run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 33}},
+            state_file=state_file, failure_file=failure_file,
+        ) == (0, 33)
+        assert seen_uids == []
+        assert indexer.table.count_rows() == 32
+        assert embed.calls == 1
+
+    @pytest.mark.parametrize("old_first", [True, False])
+    @pytest.mark.skipif(not _HAS_LANCEDB, reason="lancedb 미설치")
+    def test_changed_duplicate_uid_selects_newer_content_regardless_of_cursor(
+        self, tmp_path, monkeypatch, old_first,
+    ):
+        """같은 UID라도 새 본문은 old CURRENT·커서 순서와 무관하게 안전 교체한다."""
+        from knowmate.collector.mail_scan_state import normalize_path_key
+        from knowmate.collector.mail_scanner import run_mail_scan
+        from knowmate.rag.email_indexer import EmailIndexer
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        old_path = watch / "old.mysingle"
+        new_path = watch / "new.mysingle"
+        old_path.write_bytes(b"old")
+        new_path.write_bytes(b"new")
+        os.utime(old_path, (1_000, 1_000))
+        os.utime(new_path, (2_000, 2_000))
+        uid = "knox:changed-duplicate"
+
+        indexer = EmailIndexer(tmp_path / "db", _fake_embed(), batch_size=32)
+        indexer.index_mail(self._sample_parsed_for_scan(str(old_path), uid, "old body"), 1_000.0)
+
+        def parse(path: str) -> dict:
+            body = "new body" if Path(path).name == "new.mysingle" else "old body"
+            return self._sample_parsed_for_scan(path, uid, body)
+
+        monkeypatch.setattr("knowmate.secure.mysingle_reader.parse_mail_file", parse)
+        state_file = tmp_path / "state.json"
+        if old_first:
+            # 정렬상 newest인 new를 직전에 처리한 것처럼 두면 다음 순환은 old부터 시작한다.
+            state_file.write_text(json.dumps({
+                "schema_version": 1,
+                "cursor": {"mtime": 2_000.0, "path": normalize_path_key(str(new_path))},
+                "files": {},
+                "pending_deletes": [],
+            }), encoding="utf-8")
+
+        assert run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 2}},
+            state_file=state_file, failure_file=tmp_path / "failures.json",
+        ) == (1, 1)
+        rows = indexer.table.search().select(["mail_uid", "mtime", "source_file", "text"]).to_arrow().to_pylist()
+        assert [{key: row[key] for key in ("mail_uid", "mtime", "source_file")} for row in rows] == [
+            {"mail_uid": uid, "mtime": 2_000.0, "source_file": str(new_path)},
+        ]
+        assert "new body" in rows[0]["text"] and "old body" not in rows[0]["text"]
+
+        # old/new 양쪽은 shadow/current로 캐시되므로 다음 스캔은 DB 상태 조회 없이 안정적이다.
+        indexer.get_index_state = lambda *_args: pytest.fail("resolved UID cache must skip DB state")
+        assert run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 2}},
+            state_file=state_file, failure_file=tmp_path / "failures.json",
+        ) == (0, 2)
+        assert indexer.table.count_rows() == 1
+
+    @pytest.mark.skipif(not _HAS_LANCEDB, reason="lancedb 미설치")
+    def test_pending_changed_duplicate_uid_replaces_only_after_prior_generation_finalizes(
+        self, tmp_path, monkeypatch,
+    ):
+        """배치 대기 중 발견된 새 본문도 순차 확정해 최종 active generation은 하나다."""
+        from knowmate.collector.mail_scan_state import normalize_path_key
+        from knowmate.collector.mail_scanner import run_mail_scan
+        from knowmate.rag.email_indexer import EmailIndexer
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        old_path = watch / "old.mysingle"
+        new_path = watch / "new.mysingle"
+        old_path.write_bytes(b"old")
+        new_path.write_bytes(b"new")
+        os.utime(old_path, (1_000, 1_000))
+        os.utime(new_path, (2_000, 2_000))
+        uid = "knox:pending-changed"
+        monkeypatch.setattr(
+            "knowmate.secure.mysingle_reader.parse_mail_file",
+            lambda path: self._sample_parsed_for_scan(
+                path, uid, "new body" if Path(path).name == "new.mysingle" else "old body",
+            ),
+        )
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({
+            "schema_version": 1,
+            "cursor": {"mtime": 2_000.0, "path": normalize_path_key(str(new_path))},
+            "files": {},
+            "pending_deletes": [],
+        }), encoding="utf-8")
+        indexer = EmailIndexer(tmp_path / "db", _fake_embed(), batch_size=32)
+
+        assert run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 2}},
+            state_file=state_file, failure_file=tmp_path / "failures.json",
+        ) == (2, 0)
+        rows = indexer.table.search().select(["mtime", "source_file", "text"]).to_arrow().to_pylist()
+        assert [{key: row[key] for key in ("mtime", "source_file")} for row in rows] == [
+            {"mtime": 2_000.0, "source_file": str(new_path)},
+        ]
+        assert "new body" in rows[0]["text"] and "old body" not in rows[0]["text"]
+        assert run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 2}},
+            state_file=state_file, failure_file=tmp_path / "failures.json",
+        ) == (0, 2)
+
+    @pytest.mark.skipif(not _HAS_LANCEDB, reason="lancedb 미설치")
+    def test_content_failure_isolates_one_mail_and_continues_later_chunks(self, tmp_path, monkeypatch):
+        """중간 ContentError는 이분 격리하고 그 뒤 메일을 계속 저장한다."""
+        from knowmate.collector import failure_state
+        from knowmate.collector.mail_scanner import run_mail_scan
+        from knowmate.rag.email_indexer import EmailIndexer
+        from knowmate.rag.embedding import EmbeddingContentError, VECTOR_DIM
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        for index in range(32):
+            (watch / f"{index:03d}.mysingle").write_bytes(b"x")
+
+        def parse(path: str) -> dict:
+            index = int(Path(path).stem)
+            body = "BAD-CHUNK" if index == 15 else f"body-{index}"
+            return self._sample_parsed_for_scan(path, f"knox:{index}", body)
+
+        monkeypatch.setattr("knowmate.secure.mysingle_reader.parse_mail_file", parse)
+
+        class SelectiveEmbed:
+            def __init__(self):
+                self.calls = 0
+
+            def embed(self, texts):
+                self.calls += 1
+                if any("BAD-CHUNK" in text for text in texts):
+                    raise EmbeddingContentError("bad input")
+                return [[0.0] * VECTOR_DIM for _ in texts]
+
+        embed = SelectiveEmbed()
+        indexer = EmailIndexer(tmp_path / "db", embed, batch_size=32)
+        failure_file = tmp_path / "failures.json"
+        indexed, _ = run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 32}},
+            state_file=tmp_path / "state.json", failure_file=failure_file,
+        )
+        rows = indexer.table.search().select(["mail_uid"]).to_arrow().to_pylist()
+        assert indexed == 31
+        assert "knox:15" not in {row["mail_uid"] for row in rows}
+        assert str(watch / "015.mysingle") in failure_state.load_failures(failure_file)
+        assert embed.calls > 1
+
+    @pytest.mark.skipif(not _HAS_LANCEDB, reason="lancedb 미설치")
+    def test_multiple_content_failures_only_defer_their_owners(self, tmp_path, monkeypatch):
+        """여러 불량 청크도 각 소유 메일만 실패시키고 나머지는 계속 저장한다."""
+        from knowmate.collector import failure_state
+        from knowmate.collector.mail_scanner import run_mail_scan
+        from knowmate.rag.email_indexer import EmailIndexer
+        from knowmate.rag.embedding import EmbeddingContentError, VECTOR_DIM
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        for index in range(33):
+            (watch / f"{index:03d}.mysingle").write_bytes(b"x")
+
+        def parse(path: str) -> dict:
+            index = int(Path(path).stem)
+            body = "BAD-CHUNK" if index in {8, 24} else f"body-{index}"
+            return self._sample_parsed_for_scan(path, f"knox:{index}", body)
+
+        monkeypatch.setattr("knowmate.secure.mysingle_reader.parse_mail_file", parse)
+
+        class SelectiveEmbed:
+            def embed(self, texts):
+                if any("BAD-CHUNK" in text for text in texts):
+                    raise EmbeddingContentError("bad input")
+                return [[0.0] * VECTOR_DIM for _ in texts]
+
+        indexer = EmailIndexer(tmp_path / "db", SelectiveEmbed(), batch_size=32)
+        failure_file = tmp_path / "failures.json"
+        indexed, _ = run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 33}},
+            state_file=tmp_path / "state.json", failure_file=failure_file,
+        )
+        stored_uids = {row["mail_uid"] for row in indexer.table.search().select(["mail_uid"]).to_arrow().to_pylist()}
+        assert indexed == 31
+        assert {"knox:8", "knox:24"}.isdisjoint(stored_uids)
+        failures = failure_state.load_failures(failure_file)
+        assert str(watch / "008.mysingle") in failures
+        assert str(watch / "024.mysingle") in failures
+
+    @pytest.mark.skipif(not _HAS_LANCEDB, reason="lancedb 미설치")
+    def test_multi_batch_mail_content_failure_has_no_partial_db_rows(self, tmp_path):
+        """여러 batch에 걸친 한 메일도 청크 하나가 실패하면 DB에 부분 저장하지 않는다."""
+        from knowmate.rag.email_indexer import EmailIndexer, MailIndexCheck, MailIndexState
+        from knowmate.rag.embedding import EmbeddingContentError, VECTOR_DIM
+
+        class SelectiveEmbed:
+            def embed(self, texts):
+                if any("BAD-CHUNK" in text for text in texts):
+                    raise EmbeddingContentError("bad input")
+                return [[0.0] * VECTOR_DIM for _ in texts]
+
+        indexer = EmailIndexer(tmp_path / "db", SelectiveEmbed(), chunk_size=100, overlap=0, batch_size=32)
+        parsed = self._sample_parsed_for_scan("/data/long.mysingle", "knox:long", "x" * 3400 + "BAD-CHUNK")
+        job = indexer.prepare_mail(parsed, 1000.0, MailIndexCheck(MailIndexState.MISSING))
+        assert len(job.chunks) > 32
+        indexer.embed_mail_jobs([job])
+        assert job.content_error is not None
+        with pytest.raises(RuntimeError, match="완료되지"):
+            indexer.commit_mail_job(job)
+        assert indexer.table.count_rows() == 0
+
+    @pytest.mark.parametrize("error_class", ["transient", "protocol"])
+    @pytest.mark.skipif(not _HAS_LANCEDB, reason="lancedb 미설치")
+    def test_non_content_error_does_not_split_embedding_batch(self, tmp_path, monkeypatch, error_class):
+        """transient·protocol 오류는 32청크 batch를 이분 분할하지 않는다."""
+        from knowmate.collector.mail_scanner import run_mail_scan
+        from knowmate.rag.email_indexer import EmailIndexer
+        from knowmate.rag.embedding import EmbeddingProtocolError, EmbeddingTransientError
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        for index in range(32):
+            (watch / f"{index:03d}.mysingle").write_bytes(b"x")
+        monkeypatch.setattr(
+            "knowmate.secure.mysingle_reader.parse_mail_file",
+            lambda path: self._sample_parsed_for_scan(path, f"knox:{Path(path).stem}", "body"),
+        )
+        error = EmbeddingTransientError("busy") if error_class == "transient" else EmbeddingProtocolError("schema")
+
+        class FailingEmbed:
+            def __init__(self):
+                self.calls = 0
+
+            def embed(self, _texts):
+                self.calls += 1
+                raise error
+
+        embed = FailingEmbed()
+        indexer = EmailIndexer(tmp_path / "db", embed, batch_size=32)
+        indexed, skipped = run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 32}},
+            state_file=tmp_path / "state.json", failure_file=tmp_path / "failures.json",
+        )
+        assert (indexed, skipped) == (0, 32)
+        assert embed.calls == 1
+
+    @pytest.mark.skipif(not _HAS_LANCEDB, reason="lancedb 미설치")
+    def test_completed_window_survives_later_transient_error(self, tmp_path, monkeypatch):
+        """앞 32개 윈도우는 다음 윈도우의 전역 오류 뒤에도 저장 상태를 유지한다."""
+        from knowmate.collector.mail_scanner import run_mail_scan
+        from knowmate.rag.email_indexer import EmailIndexer
+        from knowmate.rag.embedding import EmbeddingTransientError, VECTOR_DIM
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        for index in range(64):
+            (watch / f"{index:03d}.mysingle").write_bytes(b"x")
+        monkeypatch.setattr(
+            "knowmate.secure.mysingle_reader.parse_mail_file",
+            lambda path: self._sample_parsed_for_scan(path, f"knox:{Path(path).stem}", "body"),
+        )
+
+        class FailsSecondWindow:
+            def __init__(self):
+                self.calls = 0
+
+            def embed(self, texts):
+                self.calls += 1
+                if self.calls == 2:
+                    raise EmbeddingTransientError("busy")
+                return [[0.0] * VECTOR_DIM for _ in texts]
+
+        embed = FailsSecondWindow()
+        indexer = EmailIndexer(tmp_path / "db", embed, batch_size=32)
+        indexed, skipped = run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 64}},
+            state_file=tmp_path / "state.json", failure_file=tmp_path / "failures.json",
+        )
+        assert (indexed, skipped) == (32, 32)
+        assert indexer.table.count_rows() == 32
+        assert embed.calls == 2
+
+    @pytest.mark.skipif(not _HAS_LANCEDB, reason="lancedb 미설치")
+    def test_one_mail_add_failure_does_not_block_other_ready_mail(self, tmp_path, monkeypatch):
+        """메일별 add 실패는 다른 준비 완료 메일의 저장을 막지 않는다."""
+        from knowmate.collector import failure_state
+        from knowmate.collector.mail_scanner import run_mail_scan
+        from knowmate.rag.email_indexer import EmailIndexer
+        from knowmate.rag.embedding import VECTOR_DIM
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        for name in ("a", "b"):
+            (watch / f"{name}.mysingle").write_bytes(b"x")
+        monkeypatch.setattr(
+            "knowmate.secure.mysingle_reader.parse_mail_file",
+            lambda path: self._sample_parsed_for_scan(path, f"knox:{Path(path).stem}", "body"),
+        )
+
+        class GoodEmbed:
+            def embed(self, texts):
+                return [[0.0] * VECTOR_DIM for _ in texts]
+
+        indexer = EmailIndexer(tmp_path / "db", GoodEmbed())
+        original_commit = indexer.commit_mail_job
+
+        def fail_first(job):
+            if job.parsed["mail_uid"] == "knox:a":
+                raise RuntimeError("add failed")
+            return original_commit(job)
+
+        indexer.commit_mail_job = fail_first
+        failure_file = tmp_path / "failures.json"
+        indexed, _ = run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 2}},
+            state_file=tmp_path / "state.json", failure_file=failure_file,
+        )
+        assert indexed == 1
+        assert {row["mail_uid"] for row in indexer.table.search().select(["mail_uid"]).to_arrow().to_pylist()} == {"knox:b"}
+        assert str(watch / "a.mysingle") in failure_state.load_failures(failure_file)
+
+    @pytest.mark.skipif(not _HAS_LANCEDB, reason="lancedb 미설치")
+    def test_progress_reports_only_after_each_mail_is_final(self, tmp_path, monkeypatch):
+        """배치 대기 중에는 진행률을 보내지 않고 commit 뒤에만 source 결과를 알린다."""
+        from knowmate.collector.mail_scanner import run_mail_scan
+        from knowmate.rag.email_indexer import EmailIndexer
+        from knowmate.rag.embedding import VECTOR_DIM
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        for name in ("a", "b"):
+            (watch / f"{name}.mysingle").write_bytes(b"x")
+        monkeypatch.setattr(
+            "knowmate.secure.mysingle_reader.parse_mail_file",
+            lambda path: self._sample_parsed_for_scan(path, f"knox:{Path(path).stem}", "body"),
+        )
+        progress = []
+
+        class CheckingEmbed:
+            def embed(self, texts):
+                assert progress == []
+                return [[0.0] * VECTOR_DIM for _ in texts]
+
+        indexer = EmailIndexer(tmp_path / "db", CheckingEmbed(), batch_size=32)
+
+        def on_progress(current, total, filename):
+            progress.append((current, total, filename, indexer.table.count_rows()))
+
+        assert run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 2, "batch_commit_every": 1}}, on_progress,
+            state_file=tmp_path / "state.json", failure_file=tmp_path / "failures.json",
+        ) == (2, 0)
+        assert [(current, total, rows) for current, total, _name, rows in progress] == [(1, 2, 1), (2, 2, 2)]
+
+    def test_warm_cache_does_not_flood_progress_callbacks(self, tmp_path, monkeypatch):
+        """시도 예산 밖의 대량 성공 캐시는 진행률 callback을 건별로 호출하지 않는다."""
+        from knowmate.collector.mail_scan_state import cache_success, save_mail_scan_state
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        state = {"schema_version": 1, "cursor": None, "files": {}, "pending_deletes": []}
+        for index in range(1_000):
+            path = watch / f"{index:04d}.mysingle"
+            path.write_bytes(b"x")
+            cache_success(
+                state,
+                {"path": str(path), "mtime": path.stat().st_mtime, "size": path.stat().st_size},
+                f"knox:warm-{index}",
+            )
+        state_file = tmp_path / "state.json"
+        save_mail_scan_state(state_file, state)
+        monkeypatch.setattr(
+            "knowmate.secure.mysingle_reader.parse_mail_file",
+            lambda _path: pytest.fail("warm cache must not parse mail files"),
+        )
+        indexer = types.SimpleNamespace(table_was_recreated=False, table_is_empty=False)
+        progress = []
+
+        assert run_mail_scan(
+            [str(watch)], indexer,
+            {"mail": {"max_mails_per_scan": 500, "batch_commit_every": 1}},
+            on_progress=lambda *event: progress.append(event),
+            state_file=state_file, failure_file=tmp_path / "failures.json",
+        ) == (0, 1_000)
+        assert progress == []
 
     def test_mail_disabled_check(self):
         """mail.enabled=false이면 스캔 분기에 진입하지 않는다."""

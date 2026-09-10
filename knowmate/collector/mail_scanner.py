@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import bisect
+import hashlib
+import json
 import logging
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, TYPE_CHECKING
 
@@ -27,6 +30,40 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MAIL_EXTS = [".mysingle", ".eml"]
+
+
+@dataclass
+class _PreparedMail:
+    """메일별 파싱·상태 조회 뒤 교차메일 임베딩을 기다리는 작업이다."""
+
+    item: dict
+    parsed: dict
+    check: object
+    is_migration: bool
+    job: object
+
+
+@dataclass
+class _UidWork:
+    """한 스캔 안에서 같은 mail_uid의 primary와 복사본 결과를 직렬화한다."""
+
+    mail_uid: str
+    fingerprint: str
+    mtime: float
+    primary: _PreparedMail | None
+    aliases: list[dict]
+    outcome: str | None = None
+
+
+def _content_fingerprint(parsed: dict) -> str:
+    """인덱스 결과를 바꾸는 메일 내용을 메모리 안에서만 SHA-256으로 식별한다."""
+    fields = (
+        "message_id", "subject", "sender", "recipients", "mail_date", "thread_ref",
+        "body_text", "source_type", "source_meta",
+    )
+    payload = {field: parsed.get(field, "") for field in fields}
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
 def _iter_mail_files(folder: str, exts: tuple[str, ...]) -> Iterator[tuple[str, float, int]]:
@@ -142,7 +179,227 @@ def run_mail_scan(
     attempted_count = 0
     migrate_count = 0
     migrate_logged = False
+    # 교차메일 배치는 API batch_size만큼만 보관한다. 한 메일 자체가 그보다 큰 경우만
+    # 단일 메일 크기만큼 넘칠 수 있다. 이 제한은 본문/벡터가 500건 스캔 전체에 쌓이는
+    # 것을 막는 동시에, 이미 완료한 앞 윈도우가 뒤의 전역 오류와 독립적으로 확정되게 한다.
+    prepared_window: list[_PreparedMail] = []
+    window_chunk_count = 0
+    uid_work: dict[str, _UidWork] = {}
+    resolved_count = 0
+    reported_count = 0
+    last_resolved_item: dict | None = None
 
+    def report_resolved(item: dict) -> None:
+        """실제 시도한 source의 최종 결과만 제한된 빈도로 진행률에 반영한다."""
+        nonlocal resolved_count, reported_count, last_resolved_item
+        resolved_count += 1
+        last_resolved_item = item
+        if on_progress and resolved_count - reported_count >= progress_every:
+            on_progress(resolved_count, len(candidates), Path(item["path"]).name)
+            reported_count = resolved_count
+
+    def report_final_progress() -> None:
+        """마지막 묶음의 실제 시도가 최종 확정된 뒤 한 번만 진행률을 보낸다."""
+        if on_progress and last_resolved_item is not None and reported_count != resolved_count:
+            on_progress(resolved_count, len(candidates), Path(last_resolved_item["path"]).name)
+
+    def mark_failure(item: dict, stage: str = "index") -> None:
+        """캐시를 만들지 않은 채 source 하나를 다음 주기로 미룬다."""
+        nonlocal failures_dirty, skipped_count
+        failure_state.note_failure(
+            failures, item["path"], failure_state.KIND_UNKNOWN_TRANSIENT, stage, None,
+            item["mtime"], item["size"], now_fn(),
+        )
+        failures_dirty = True
+        skipped_count += 1
+        report_resolved(item)
+
+    def mark_success(item: dict, mail_uid: str) -> None:
+        """primary 성공 뒤에만 alias까지 성공 캐시로 확정한다."""
+        nonlocal state_dirty, failures_dirty
+        path = item["path"]
+        cache_success(state, item, mail_uid)
+        state_dirty = True
+        if path in failures:
+            failure_state.note_success(failures, path)
+            failures_dirty = True
+        email_indexer.table_is_empty = False
+        report_resolved(item)
+
+    def finish_old_delete(pending: _PreparedMail) -> None:
+        """새 세대 저장 후 캡처한 이전 ID만 durable queue를 거쳐 삭제한다."""
+        check = pending.check
+        if check.state.name != "STALE" or not check.old_chunk_ids or not pending.job.chunks:
+            return
+        queue_pending_delete(state, check.old_chunk_ids)
+        if not save_mail_scan_state(state_file, state):
+            logger.error(
+                "[mail_scanner] 기존 메일 청크 삭제 대상을 저장하지 못해 삭제를 연기합니다: %s",
+                pending.item["path"],
+            )
+            return
+        try:
+            deleted_ids = email_indexer.delete_chunk_ids(check.old_chunk_ids)
+        except Exception as exc:
+            logger.warning(
+                "[mail_scanner] 기존 메일 청크 삭제 실패 — 다음 사이클 재시도: %s (%s)",
+                pending.item["path"], exc,
+            )
+        else:
+            clear_pending_delete(state, deleted_ids)
+            save_mail_scan_state(state_file, state)
+
+    def release_job(pending: _PreparedMail) -> None:
+        """완료 윈도우가 본문과 벡터를 붙잡지 않도록 참조를 즉시 해제한다."""
+        pending.job.chunks.clear()
+        pending.job.vectors.clear()
+        pending.job.parsed.clear()
+        pending.parsed.clear()
+
+    def finish_work(work: _UidWork, *, failed: bool) -> None:
+        """UID primary 결과를 확정하고, alias는 같은 결과로 직렬화한다."""
+        nonlocal indexed_count, migrate_count, skipped_count
+        primary = work.primary
+        if primary is None:
+            return
+        if failed:
+            mark_failure(primary.item)
+            aliases = work.aliases
+            work.aliases = []
+            for alias in aliases:
+                mark_failure(alias)
+            work.outcome = "failure"
+            release_job(primary)
+            work.primary = None
+            return
+        try:
+            chunk_ids = email_indexer.commit_mail_job(primary.job)
+        except Exception as exc:
+            logger.warning(
+                "[mail_scanner] 메일 저장 실패, 다음 기회에 재시도: %s (%s)",
+                primary.item["path"], exc,
+            )
+            finish_work(work, failed=True)
+            return
+        mark_success(primary.item, work.mail_uid)
+        indexed_count += 1
+        migrate_count += int(primary.is_migration)
+        finish_old_delete(primary)
+        logger.info(
+            "[mail_scanner] [%s] %s -> %d청크",
+            "MIGRATE" if primary.is_migration else "NEW",
+            Path(primary.item["path"]).name,
+            len(chunk_ids),
+        )
+        aliases = work.aliases
+        work.aliases = []
+        for alias in aliases:
+            mark_success(alias, work.mail_uid)
+            skipped_count += 1
+        work.outcome = "success"
+        release_job(primary)
+        work.primary = None
+
+    def flush_window() -> bool:
+        """현재 윈도우만 embed→메일별 commit한다; global 오류면 False를 반환한다."""
+        nonlocal window_chunk_count
+        if not prepared_window:
+            return True
+        batch_result = email_indexer.embed_mail_jobs([pending.job for pending in prepared_window])
+        for pending in prepared_window:
+            work = uid_work[pending.parsed["mail_uid"]]
+            job = pending.job
+            if getattr(job, "content_error", None) or any(vector is None for vector in job.vectors):
+                reason = getattr(job, "content_error", None) or batch_result.blocking_error
+                logger.warning(
+                    "[mail_scanner] 메일 임베딩 실패, 다음 기회에 재시도: %s (%s)",
+                    pending.item["path"], reason,
+                )
+                finish_work(work, failed=True)
+            else:
+                # 전역 오류가 뒤 batch에서 났어도 이미 완결된 앞 메일은 안전하게 저장한다.
+                finish_work(work, failed=False)
+        prepared_window.clear()
+        window_chunk_count = 0
+        return batch_result.blocking_error is None
+
+    def begin_generation(
+        item: dict, parsed: dict, fingerprint: str, is_migration: bool, work: _UidWork | None = None,
+    ) -> bool:
+        """UID의 선택된 세대를 상태 확인 뒤 즉시 확정하거나 현재 윈도우에 넣는다."""
+        nonlocal indexed_count, migrate_count, skipped_count, window_chunk_count
+        mail_uid = parsed["mail_uid"]
+        if work is None:
+            work = _UidWork(mail_uid, fingerprint, item["mtime"], None, [])
+            uid_work[mail_uid] = work
+        else:
+            work.fingerprint = fingerprint
+            work.mtime = item["mtime"]
+            work.primary = None
+            work.aliases = []
+            work.outcome = None
+
+        check = email_indexer.get_index_state(mail_uid, item["mtime"])
+        if check.state.name == "ERROR":
+            logger.warning("[mail_scanner] DB 상태 조회 실패, 변경하지 않고 연기: %s", item["path"])
+            work.outcome = "failure"
+            mark_failure(item)
+            return True
+        if check.state.name == "CURRENT":
+            work.outcome = "success"
+            mark_success(item, mail_uid)
+            skipped_count += 1
+            return True
+        if hasattr(email_indexer, "prepare_mail"):
+            try:
+                job = email_indexer.prepare_mail(parsed, item["mtime"], check)
+            except Exception:
+                work.outcome = "failure"
+                raise
+            pending = _PreparedMail(item, parsed, check, is_migration, job)
+            work.primary = pending
+            prepared_window.append(pending)
+            window_chunk_count += len(job.chunks)
+            return window_chunk_count < email_indexer._batch_size or flush_window()
+
+        try:
+            chunk_ids = email_indexer.index_mail(
+                parsed, item["mtime"], index_check=check, delete_old=False,
+            )
+        except Exception:
+            work.outcome = "failure"
+            raise
+        mark_success(item, mail_uid)
+        indexed_count += 1
+        migrate_count += int(is_migration)
+        work.outcome = "success"
+        if check.state.name == "STALE" and check.old_chunk_ids:
+            # 새 행과 기존 삭제 대상을 먼저 원자적으로 기록한다. 이후 삭제가 실패하거나
+            # 앱이 종료돼도 다음 사이클에서 정확히 그 ID만 재시도한다.
+            queue_pending_delete(state, check.old_chunk_ids)
+            if not save_mail_scan_state(state_file, state):
+                logger.error(
+                    "[mail_scanner] 기존 메일 청크 삭제 대상을 저장하지 못해 삭제를 연기합니다: %s",
+                    item["path"],
+                )
+            else:
+                try:
+                    deleted_ids = email_indexer.delete_chunk_ids(check.old_chunk_ids)
+                except Exception as exc:
+                    logger.warning(
+                        "[mail_scanner] 기존 메일 청크 삭제 실패 — 다음 사이클 재시도: %s (%s)",
+                        item["path"], exc,
+                    )
+                else:
+                    clear_pending_delete(state, deleted_ids)
+                    save_mail_scan_state(state_file, state)
+        logger.info(
+            "[mail_scanner] [%s] %s -> %d청크",
+            "MIGRATE" if is_migration else "NEW", Path(item["path"]).name, len(chunk_ids),
+        )
+        return True
+
+    stop_after_global_error = False
     for item in _candidates_from_cursor(candidates, state.get("cursor")):
         path = item["path"]
         key = normalize_path_key(path)
@@ -178,6 +435,7 @@ def run_mail_scan(
             )
             failures_dirty = True
             skipped_count += 1
+            report_resolved(item)
         except OSError as exc:
             logger.warning("[mail_scanner] 파일 접근 실패, 다음 기회에 재시도: %s (%s)", path, exc)
             failure_state.note_failure(
@@ -186,6 +444,7 @@ def run_mail_scan(
             )
             failures_dirty = True
             skipped_count += 1
+            report_resolved(item)
         except Exception as exc:
             logger.warning("[mail_scanner] 파싱 실패, 다음 기회에 재시도: %s (%s)", path, exc)
             failure_state.note_failure(
@@ -194,75 +453,49 @@ def run_mail_scan(
             )
             failures_dirty = True
             skipped_count += 1
+            report_resolved(item)
         else:
             try:
-                check = email_indexer.get_index_state(parsed["mail_uid"], item["mtime"])
-                if check.state.name == "ERROR":
-                    logger.warning("[mail_scanner] DB 상태 조회 실패, 변경하지 않고 연기: %s", path)
-                    failure_state.note_failure(
-                        failures, path, failure_state.KIND_UNKNOWN_TRANSIENT, "index", None,
-                        item["mtime"], item["size"], now_fn(),
-                    )
-                    failures_dirty = True
-                    skipped_count += 1
-                elif check.state.name == "CURRENT":
-                    cache_success(state, item, parsed["mail_uid"])
-                    state_dirty = True
-                    if path in failures:
-                        failure_state.note_success(failures, path)
-                        failures_dirty = True
-                    email_indexer.table_is_empty = False
-                    skipped_count += 1
+                mail_uid = parsed["mail_uid"]
+                fingerprint = _content_fingerprint(parsed)
+                work = uid_work.get(mail_uid)
+                if work is None:
+                    if not begin_generation(item, parsed, fingerprint, is_migration):
+                        stop_after_global_error = True
+                elif fingerprint == work.fingerprint or item["mtime"] <= work.mtime:
+                    # 같은 내용은 복사본이고, 다른 내용이라도 더 오래된 source는 현재
+                    # 세대를 되돌릴 수 없다. primary가 끝난 뒤에만 함께 성공 캐시한다.
+                    if work.outcome == "success":
+                        mark_success(item, mail_uid)
+                        skipped_count += 1
+                    elif work.outcome == "failure":
+                        mark_failure(item)
+                    else:
+                        work.aliases.append(item)
                 else:
-                    chunk_ids = email_indexer.index_mail(
-                        parsed, item["mtime"], index_check=check, delete_old=False,
-                    )
-                    cache_success(state, item, parsed["mail_uid"])
-                    state_dirty = True
-                    if path in failures:
-                        failure_state.note_success(failures, path)
-                        failures_dirty = True
-                    email_indexer.table_is_empty = False
-                    indexed_count += 1
-                    migrate_count += int(is_migration)
-                    if check.state.name == "STALE" and check.old_chunk_ids:
-                        # 새 행과 기존 삭제 대상을 먼저 원자적으로 기록한다. 이후 삭제가
-                        # 실패하거나 앱이 종료돼도 다음 사이클에서 정확히 그 ID만 재시도한다.
-                        queue_pending_delete(state, check.old_chunk_ids)
-                        if not save_mail_scan_state(state_file, state):
-                            logger.error(
-                                "[mail_scanner] 기존 메일 청크 삭제 대상을 저장하지 못해 삭제를 연기합니다: %s",
-                                path,
-                            )
-                        else:
-                            try:
-                                deleted_ids = email_indexer.delete_chunk_ids(check.old_chunk_ids)
-                            except Exception as exc:
-                                logger.warning(
-                                    "[mail_scanner] 기존 메일 청크 삭제 실패 — 다음 사이클 재시도: %s (%s)",
-                                    path, exc,
-                                )
-                            else:
-                                clear_pending_delete(state, deleted_ids)
-                                save_mail_scan_state(state_file, state)
-                    logger.info(
-                        "[mail_scanner] [%s] %s -> %d청크",
-                        "MIGRATE" if is_migration else "NEW", Path(path).name, len(chunk_ids),
-                    )
+                    # 동일 UID의 더 새 내용은 앞 세대가 아직 배치 대기 중이어도
+                    # 먼저 최종 결과를 낸 뒤 별도 STALE 교체로 처리한다. 이 강제 flush는
+                    # 드문 충돌에서만 일어나며, 두 세대가 동시에 활성화되지 않게 한다.
+                    if work.outcome is None and not flush_window():
+                        stop_after_global_error = True
+                        mark_failure(item)
+                    if not stop_after_global_error and not begin_generation(
+                        item, parsed, fingerprint, is_migration, work,
+                    ):
+                        stop_after_global_error = True
             except Exception as exc:
                 logger.warning("[mail_scanner] 인덱싱 실패, 다음 기회에 재시도: %s (%s)", path, exc)
-                failure_state.note_failure(
-                    failures, path, failure_state.KIND_UNKNOWN_TRANSIENT, "index", None,
-                    item["mtime"], item["size"], now_fn(),
-                )
-                failures_dirty = True
-                skipped_count += 1
+                mark_failure(item)
 
         set_cursor(state, item)
         state_dirty = True
-        if attempted_count % progress_every == 0:
-            if on_progress:
-                on_progress(attempted_count, len(candidates), Path(path).name)
+        if stop_after_global_error:
+            break
+
+    if not stop_after_global_error:
+        flush_window()
+
+    report_final_progress()
 
     if state_dirty:
         save_mail_scan_state(state_file, state)
