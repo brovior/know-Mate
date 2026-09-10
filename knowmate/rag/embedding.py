@@ -19,6 +19,8 @@ _DUMMY_API_KEY = "dummy"
 # 진단 스크립트 실측(사내 PC)에서 정상 호출은 32청크도 0.15초였으므로, 3초는
 # "확실히 비정상"이면서 정상 호출을 걸러내기에 충분히 여유 있는 값이다.
 SLOW_EMBED_CALL_LOG_SEC = 3.0
+_FLOAT32_MAX = float.fromhex("0x1.fffffep+127")
+_MAX_ERROR_JSON_BYTES = 16 * 1024
 
 # 모델 → 벡터 차원 매핑 (단일 출처). 모델 추가 시 여기만 갱신한다.
 # 모델과 차원은 한 몸이라 따로 두면 desync 되므로 VECTOR_DIM은 여기서 파생한다.
@@ -189,12 +191,7 @@ class EmbeddingClient:
                 read_sec = time.perf_counter() - t0
 
                 if resp.status >= 400:
-                    message = f"임베딩 API 오류 status={resp.status}"
-                    if resp.status in {408, 429} or resp.status >= 500:
-                        raise EmbeddingTransientError(message)
-                    if resp.status in {400, 413, 422}:
-                        raise EmbeddingContentError(message)
-                    raise EmbeddingProtocolError(message)
+                    raise _classify_http_error(resp.status, body_bytes)
                 try:
                     body = json.loads(body_bytes.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -269,6 +266,38 @@ def _vectors_in_request_order(body: object, expected_count: int) -> list[list[fl
     return _validate_vectors(ordered, expected_count)
 
 
+def _classify_http_error(status: int, body_bytes: bytes) -> EmbeddingError:
+    """분할 가능 여부가 확인된 HTTP 오류만 ContentError로 분류한다."""
+    message = f"임베딩 API 오류 status={status}"
+    if status in {408, 429} or status >= 500:
+        return EmbeddingTransientError(message)
+    if status == 413:
+        return EmbeddingContentError(message)
+    if status not in {400, 422}:
+        return EmbeddingProtocolError(message)
+    if len(body_bytes) > _MAX_ERROR_JSON_BYTES:
+        return EmbeddingProtocolError(message)
+    try:
+        body = json.loads(body_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return EmbeddingProtocolError(message)
+    error = body.get("error") if isinstance(body, dict) else None
+    param = error.get("param") if isinstance(error, dict) else None
+    if _is_input_parameter(param):
+        return EmbeddingContentError(message)
+    return EmbeddingProtocolError(message)
+
+
+def _is_input_parameter(param: object) -> bool:
+    """명시적인 input 또는 input[n] 경로만 입력 오류로 인정한다."""
+    if param == "input":
+        return True
+    if not isinstance(param, str) or not param.startswith("input[") or not param.endswith("]"):
+        return False
+    index = param[6:-1]
+    return index.isdecimal()
+
+
 def _validate_vectors(vectors: list[list[float] | None], expected_count: int) -> list[list[float]]:
     """응답 벡터의 개수·차원·수치를 검증해 부분 저장을 막는다."""
     if len(vectors) != expected_count:
@@ -288,8 +317,8 @@ def _validate_vectors(vectors: list[list[float] | None], expected_count: int) ->
             converted = [float(value) for value in vector]
         except (OverflowError, TypeError, ValueError) as exc:
             raise EmbeddingProtocolError(f"임베딩 벡터 값을 변환할 수 없습니다(index={index})") from exc
-        if not all(math.isfinite(value) for value in converted):
-            raise EmbeddingProtocolError(f"임베딩 벡터에 유한하지 않은 값이 있습니다(index={index})")
+        if not all(math.isfinite(value) and abs(value) <= _FLOAT32_MAX for value in converted):
+            raise EmbeddingProtocolError(f"임베딩 벡터 값 범위가 올바르지 않습니다(index={index})")
         checked.append(converted)
     return checked
 

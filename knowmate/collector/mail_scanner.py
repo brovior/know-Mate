@@ -56,6 +56,40 @@ class _UidWork:
     outcome: str | None = None
 
 
+@dataclass
+class _MailScanMetrics:
+    """메일 수집 한 사이클의 저비용 집계 계측값이다."""
+
+    state_load_s: float = 0.0
+    enumerate_filter_sort_s: float = 0.0
+    parse_s: float = 0.0
+    db_check_s: float = 0.0
+    embed_s: float = 0.0
+    commit_s: float = 0.0
+    pending_delete_retry_s: float = 0.0
+    state_persist_s: float = 0.0
+    failure_persist_s: float = 0.0
+    enumerated: int = 0
+    cache_hits: int = 0
+    active_backoff_deferred: int = 0
+    actionable: int = 0
+    attempted: int = 0
+    parsed: int = 0
+    db_current: int = 0
+    db_missing: int = 0
+    db_stale: int = 0
+    db_error: int = 0
+    embedding_input_chunks: int = 0
+    embedding_batches: int = 0
+    embed_calls: int = 0
+    embedding_split_retries: int = 0
+    commits: int = 0
+    failures: int = 0
+    pending_delete_retries: int = 0
+    state_persists: int = 0
+    failure_persists: int = 0
+
+
 def _content_fingerprint(parsed: dict) -> str:
     """인덱스 결과를 바꾸는 메일 내용을 메모리 안에서만 SHA-256으로 식별한다."""
     fields = (
@@ -141,6 +175,7 @@ def _collect_actionable_candidates(
     failures: dict,
     now: float,
     policy: failure_state.BackoffPolicy,
+    metrics: _MailScanMetrics | None = None,
 ) -> tuple[list[dict], set[str], list[str], dict[str, float], int]:
     """한 번의 전체 순회에서 누락 정리용 경로와 실제 처리 후보만 분리한다."""
     exts = _mail_extensions(extensions)
@@ -150,6 +185,8 @@ def _collect_actionable_candidates(
     cached_uid_mtimes: dict[str, float] = {}
     skipped_count = 0
     for item in _iter_scanned_mail_items(watch_folders, exts):
+        if metrics is not None:
+            metrics.enumerated += 1
         seen_keys.add(item["path_key"])
         cached = state["files"].get(item["path_key"])
         if cache_matches(cached, item):
@@ -158,16 +195,22 @@ def _collect_actionable_candidates(
             )
             if item["path"] in failures:
                 cached_failure_paths.append(item["path"])
+            if metrics is not None:
+                metrics.cache_hits += 1
             skipped_count += 1
             continue
         if failure_state.should_defer(
             failures.get(item["path"]), item["path"], item["mtime"], item["size"], now, policy,
         ):
+            if metrics is not None:
+                metrics.active_backoff_deferred += 1
             skipped_count += 1
             continue
         item["cache_entry"] = cached
         actionable.append(item)
     actionable.sort(key=lambda item: (-item["mtime"], item["path_key"]))
+    if metrics is not None:
+        metrics.actionable = len(actionable)
     return actionable, seen_keys, cached_failure_paths, cached_uid_mtimes, skipped_count
 
 
@@ -194,6 +237,8 @@ def run_mail_scan(
     progress_every = max(int(mail_cfg.get("batch_commit_every", 50)), 1)
     extensions = mail_cfg.get("extensions") or _DEFAULT_MAIL_EXTS
     now_fn = get_now or time.time
+    cycle_started = time.perf_counter()
+    metrics = _MailScanMetrics()
 
     if state_file is None or failure_file is None:
         from knowmate.config import get_data_dir
@@ -202,27 +247,49 @@ def run_mail_scan(
         failure_file = failure_file or data_dir / "mail_index_failure.json"
     table_was_recreated = bool(getattr(email_indexer, "table_was_recreated", False))
     invalidate_cache = table_was_recreated or bool(getattr(email_indexer, "table_is_empty", False))
+    state_load_started = time.perf_counter()
     state = load_mail_scan_state(state_file, invalidate_cache=invalidate_cache)
+    metrics.state_load_s = time.perf_counter() - state_load_started
+
+    def save_state() -> bool:
+        """메일 상태 저장 시간을 사이클 집계에 더한다."""
+        started = time.perf_counter()
+        saved = save_mail_scan_state(state_file, state)
+        metrics.state_persist_s += time.perf_counter() - started
+        metrics.state_persists += 1
+        return saved
+
+    def save_failures() -> None:
+        """실패 이력 저장 시간을 사이클 집계에 더한다."""
+        started = time.perf_counter()
+        failure_state.save_failures(failure_file, failures)
+        metrics.failure_persist_s += time.perf_counter() - started
+        metrics.failure_persists += 1
+
     state_dirty = state_needs_save(state)
     if invalidate_cache:
         # DB가 비어 있거나 재생성됐다는 사실을 메모리 플래그만으로 소비하면 안 된다.
         # 첫 DB 저장 뒤 상태 저장 전에 프로세스가 종료되면, 다음 시작에서 이전 성공
         # 캐시가 되살아 빈 DB를 정상으로 오인할 수 있다. 따라서 어떤 메일을 열거나
         # DB를 건드리기 전에 빈 상태를 먼저 디스크에 확정한다.
-        if not save_mail_scan_state(state_file, state):
+        if not save_state():
             logger.error("[mail_scanner] 캐시 무효화 상태를 저장하지 못해 이번 메일 스캔을 연기합니다")
             return 0, 0
         if table_was_recreated:
             # 같은 EmailIndexer 인스턴스의 다음 유휴 사이클은 새 캐시를 사용할 수 있다.
             email_indexer.table_was_recreated = False
+    failure_load_started = time.perf_counter()
     failures = failure_state.load_failures(failure_file)
+    metrics.state_load_s += time.perf_counter() - failure_load_started
     failures_dirty = False
     if retry_failures:
         failures_dirty = failure_state.request_retry_all(failures) > 0
     policy = failure_state.BackoffPolicy.from_config(cfg.get("collector", {}))
+    enumerate_started = time.perf_counter()
     candidates, seen_keys, cached_failure_paths, cached_uid_mtimes, early_skipped_count = _collect_actionable_candidates(
-        watch_folders, extensions, state, failures, now_fn(), policy,
+        watch_folders, extensions, state, failures, now_fn(), policy, metrics,
     )
+    metrics.enumerate_filter_sort_s = time.perf_counter() - enumerate_started
 
     if table_was_recreated:
         logger.info("[mail_scanner] 메일 테이블 재생성 감지 — 성공 캐시를 다시 구축합니다")
@@ -230,7 +297,9 @@ def run_mail_scan(
     pruned = prune_missing_files(state, seen_keys) if roots_accessible else 0
     failure_pruned = failure_state.prune(failures) if roots_accessible else 0
     state_dirty = state_dirty or pruned > 0
-    state_dirty = _retry_pending_deletes(state, email_indexer) or state_dirty
+    pending_delete_started = time.perf_counter()
+    state_dirty = _retry_pending_deletes(state, email_indexer, metrics) or state_dirty
+    metrics.pending_delete_retry_s = time.perf_counter() - pending_delete_started
     failures_dirty = failures_dirty or failure_pruned > 0
     for path in cached_failure_paths:
         failure_state.note_success(failures, path)
@@ -268,6 +337,7 @@ def run_mail_scan(
     def mark_failure(item: dict, stage: str = "index") -> None:
         """캐시를 만들지 않은 채 source 하나를 다음 주기로 미룬다."""
         nonlocal failures_dirty, skipped_count
+        metrics.failures += 1
         failure_state.note_failure(
             failures, item["path"], failure_state.KIND_UNKNOWN_TRANSIENT, stage, None,
             item["mtime"], item["size"], now_fn(),
@@ -294,7 +364,7 @@ def run_mail_scan(
         if check.state.name != "STALE" or not check.old_chunk_ids or not pending.job.chunks:
             return
         queue_pending_delete(state, check.old_chunk_ids)
-        if not save_mail_scan_state(state_file, state):
+        if not save_state():
             logger.error(
                 "[mail_scanner] 기존 메일 청크 삭제 대상을 저장하지 못해 삭제를 연기합니다: %s",
                 pending.item["path"],
@@ -309,7 +379,7 @@ def run_mail_scan(
             )
         else:
             clear_pending_delete(state, deleted_ids)
-            save_mail_scan_state(state_file, state)
+            save_state()
 
     def release_job(pending: _PreparedMail) -> None:
         """완료 윈도우가 본문과 벡터를 붙잡지 않도록 참조를 즉시 해제한다."""
@@ -335,8 +405,11 @@ def run_mail_scan(
             work.primary = None
             return
         try:
+            commit_started = time.perf_counter()
             chunk_ids = email_indexer.commit_mail_job(primary.job)
+            metrics.commit_s += time.perf_counter() - commit_started
         except Exception as exc:
+            metrics.commit_s += time.perf_counter() - commit_started
             logger.warning(
                 "[mail_scanner] 메일 저장 실패, 다음 기회에 재시도: %s (%s)",
                 primary.item["path"], exc,
@@ -345,14 +418,9 @@ def run_mail_scan(
             return
         mark_success(primary.item, work.mail_uid)
         indexed_count += 1
+        metrics.commits += 1
         migrate_count += int(primary.is_migration)
         finish_old_delete(primary)
-        logger.info(
-            "[mail_scanner] [%s] %s -> %d청크",
-            "MIGRATE" if primary.is_migration else "NEW",
-            Path(primary.item["path"]).name,
-            len(chunk_ids),
-        )
         aliases = work.aliases
         work.aliases = []
         for alias in aliases:
@@ -367,7 +435,13 @@ def run_mail_scan(
         nonlocal window_chunk_count
         if not prepared_window:
             return True
+        embed_started = time.perf_counter()
         batch_result = email_indexer.embed_mail_jobs([pending.job for pending in prepared_window])
+        metrics.embed_s += time.perf_counter() - embed_started
+        metrics.embedding_input_chunks += int(getattr(batch_result, "input_chunks", 0))
+        metrics.embedding_batches += int(getattr(batch_result, "batch_count", 0))
+        metrics.embed_calls += int(getattr(batch_result, "embed_calls", 0))
+        metrics.embedding_split_retries += int(getattr(batch_result, "split_retries", 0))
         for pending in prepared_window:
             work = uid_work[pending.parsed["mail_uid"]]
             job = pending.job
@@ -401,7 +475,17 @@ def run_mail_scan(
             work.aliases = []
             work.outcome = None
 
+        db_check_started = time.perf_counter()
         check = email_indexer.get_index_state(mail_uid, item["mtime"])
+        metrics.db_check_s += time.perf_counter() - db_check_started
+        if check.state.name == "CURRENT":
+            metrics.db_current += 1
+        elif check.state.name == "MISSING":
+            metrics.db_missing += 1
+        elif check.state.name == "STALE":
+            metrics.db_stale += 1
+        elif check.state.name == "ERROR":
+            metrics.db_error += 1
         if check.state.name == "ERROR":
             logger.warning("[mail_scanner] DB 상태 조회 실패, 변경하지 않고 연기: %s", item["path"])
             work.outcome = "failure"
@@ -433,13 +517,14 @@ def run_mail_scan(
             raise
         mark_success(item, mail_uid)
         indexed_count += 1
+        metrics.commits += 1
         migrate_count += int(is_migration)
         work.outcome = "success"
         if check.state.name == "STALE" and check.old_chunk_ids:
             # 새 행과 기존 삭제 대상을 먼저 원자적으로 기록한다. 이후 삭제가 실패하거나
             # 앱이 종료돼도 다음 사이클에서 정확히 그 ID만 재시도한다.
             queue_pending_delete(state, check.old_chunk_ids)
-            if not save_mail_scan_state(state_file, state):
+            if not save_state():
                 logger.error(
                     "[mail_scanner] 기존 메일 청크 삭제 대상을 저장하지 못해 삭제를 연기합니다: %s",
                     item["path"],
@@ -454,11 +539,7 @@ def run_mail_scan(
                     )
                 else:
                     clear_pending_delete(state, deleted_ids)
-                    save_mail_scan_state(state_file, state)
-        logger.info(
-            "[mail_scanner] [%s] %s -> %d청크",
-            "MIGRATE" if is_migration else "NEW", Path(item["path"]).name, len(chunk_ids),
-        )
+                    save_state()
         return True
 
     stop_after_global_error = False
@@ -467,6 +548,7 @@ def run_mail_scan(
         if attempted_count >= max_per_scan:
             break
         attempted_count += 1
+        metrics.attempted += 1
         cached = item.get("cache_entry")
         is_migration = isinstance(cached, dict) and cached.get("index_version") != _email_index_version()
         if is_migration and not migrate_logged:
@@ -474,8 +556,13 @@ def run_mail_scan(
             migrate_logged = True
 
         try:
+            parse_started = time.perf_counter()
             parsed = parse_mail_file(path)
+            metrics.parse_s += time.perf_counter() - parse_started
+            metrics.parsed += 1
         except ValueError as exc:
+            metrics.parse_s += time.perf_counter() - parse_started
+            metrics.failures += 1
             logger.warning("[mail_scanner] 파싱 실패, 다음 기회에 재시도: %s (%s)", path, exc)
             failure_state.note_failure(
                 failures, path, failure_state.KIND_NEEDS_USER_ACTION, "parse", None,
@@ -485,6 +572,8 @@ def run_mail_scan(
             skipped_count += 1
             report_resolved(item)
         except OSError as exc:
+            metrics.parse_s += time.perf_counter() - parse_started
+            metrics.failures += 1
             logger.warning("[mail_scanner] 파일 접근 실패, 다음 기회에 재시도: %s (%s)", path, exc)
             failure_state.note_failure(
                 failures, path, _mail_os_failure_kind(exc), "parse", None,
@@ -494,6 +583,8 @@ def run_mail_scan(
             skipped_count += 1
             report_resolved(item)
         except Exception as exc:
+            metrics.parse_s += time.perf_counter() - parse_started
+            metrics.failures += 1
             logger.warning("[mail_scanner] 파싱 실패, 다음 기회에 재시도: %s (%s)", path, exc)
             failure_state.note_failure(
                 failures, path, failure_state.KIND_UNKNOWN_TRANSIENT, "parse", None,
@@ -553,25 +644,42 @@ def run_mail_scan(
     report_final_progress()
 
     if state_dirty:
-        save_mail_scan_state(state_file, state)
+        save_state()
     if failures_dirty:
-        failure_state.save_failures(failure_file, failures)
+        save_failures()
     if migrate_count:
         logger.info("[mail_scanner] 포맷 마이그레이션 완료: 재인덱싱=%d건", migrate_count)
     logger.info(
-        "[mail_scanner] 스캔 완료: 전체=%d 처리후보=%d 시도=%d 인덱싱=%d (마이그레이션=%d) 스킵=%d%s",
-        len(seen_keys), len(candidates), attempted_count, indexed_count, migrate_count, skipped_count,
-        f" 캐시정리={pruned}" if pruned else "",
+        "[mail_scanner] cycle %.3fs: state_load=%.3fs enumerate_filter_sort=%.3fs "
+        "parse=%.3fs db_check=%.3fs embed=%.3fs commit=%.3fs pending_delete=%.3fs "
+        "persist(state=%d/%.3fs failure=%d/%.3fs); files(enumerated=%d cache_hits=%d "
+        "backoff_deferred=%d actionable=%d attempted=%d parsed=%d); db(current=%d missing=%d "
+        "stale=%d error=%d); embed(chunks=%d batches=%d embed_calls=%d split_retries=%d); "
+        "mail(commits=%d failures=%d pending_delete_retries=%d indexed=%d skipped=%d migrations=%d "
+        "cache_pruned=%d)",
+        time.perf_counter() - cycle_started,
+        metrics.state_load_s, metrics.enumerate_filter_sort_s, metrics.parse_s, metrics.db_check_s,
+        metrics.embed_s, metrics.commit_s, metrics.pending_delete_retry_s,
+        metrics.state_persists, metrics.state_persist_s, metrics.failure_persists, metrics.failure_persist_s,
+        metrics.enumerated, metrics.cache_hits, metrics.active_backoff_deferred, metrics.actionable,
+        metrics.attempted, metrics.parsed, metrics.db_current, metrics.db_missing, metrics.db_stale,
+        metrics.db_error, metrics.embedding_input_chunks, metrics.embedding_batches,
+        metrics.embed_calls, metrics.embedding_split_retries, metrics.commits, metrics.failures,
+        metrics.pending_delete_retries, indexed_count, skipped_count, migrate_count, pruned,
     )
     return indexed_count, skipped_count
 
 
-def _retry_pending_deletes(state: dict, email_indexer: "EmailIndexer") -> bool:
+def _retry_pending_deletes(
+    state: dict, email_indexer: "EmailIndexer", metrics: _MailScanMetrics | None = None,
+) -> bool:
     """캐시 적중 여부와 무관하게 이전 교체의 기존 청크 삭제를 다시 시도한다."""
     changed = False
     chunk_ids = state.get("pending_deletes", [])
     if not isinstance(chunk_ids, list) or not chunk_ids:
         return False
+    if metrics is not None:
+        metrics.pending_delete_retries += 1
     try:
         deleted_ids = email_indexer.delete_chunk_ids(chunk_ids)
     except Exception as exc:

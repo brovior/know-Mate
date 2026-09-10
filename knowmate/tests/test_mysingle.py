@@ -266,6 +266,25 @@ class TestEmailIndexer:
         rows = ei.table.search().select(["chunk_id"]).to_arrow().to_pylist()
         assert {row["chunk_id"] for row in rows} == set(old_ids)
 
+    def test_stale_float32_invalid_vector_keeps_old_rows(self, tmp_path):
+        """float32 범위를 넘는 새 벡터는 추가·기존 청크 삭제 전에 거부한다."""
+        from knowmate.rag.email_indexer import EmailIndexer
+        from knowmate.rag.embedding import EmbeddingProtocolError, VECTOR_DIM
+
+        ei = EmailIndexer(db_path=tmp_path, embed_client=_fake_embed())
+        old_ids = ei.index_mail(self._sample_parsed(), mtime=1000.0)
+
+        class InvalidFloat32Embed:
+            def embed(self, texts):
+                return [[1e100] * VECTOR_DIM for _ in texts]
+
+        ei._embed = InvalidFloat32Embed()
+        with pytest.raises(EmbeddingProtocolError, match="범위"):
+            ei.index_mail(self._sample_parsed(), mtime=2000.0)
+
+        rows = ei.table.search().select(["chunk_id"]).to_arrow().to_pylist()
+        assert {row["chunk_id"] for row in rows} == set(old_ids)
+
     def test_stale_add_failure_keeps_old_rows(self, tmp_path):
         """변경 메일 새 행 add 실패는 기존 검색 가능 행을 삭제하지 않는다."""
         from knowmate.rag.email_indexer import EmailIndexer
@@ -1531,7 +1550,7 @@ class TestMailScanner:
             indexer.commit_mail_job(job)
         assert indexer.table.count_rows() == 0
 
-    @pytest.mark.parametrize("error_class", ["transient", "protocol"])
+    @pytest.mark.parametrize("error_class", ["transient", "protocol", "http_config"])
     @pytest.mark.skipif(not _HAS_LANCEDB, reason="lancedb 미설치")
     def test_non_content_error_does_not_split_embedding_batch(self, tmp_path, monkeypatch, error_class):
         """transient·protocol 오류는 32청크 batch를 이분 분할하지 않는다."""
@@ -1547,7 +1566,14 @@ class TestMailScanner:
             "knowmate.secure.mysingle_reader.parse_mail_file",
             lambda path: self._sample_parsed_for_scan(path, f"knox:{Path(path).stem}", "body"),
         )
-        error = EmbeddingTransientError("busy") if error_class == "transient" else EmbeddingProtocolError("schema")
+        if error_class == "transient":
+            error = EmbeddingTransientError("busy")
+        elif error_class == "protocol":
+            error = EmbeddingProtocolError("schema")
+        else:
+            from knowmate.rag.embedding import _classify_http_error
+            error = _classify_http_error(400, b'{"error":{"param":"model","code":"model_not_found"}}')
+            assert isinstance(error, EmbeddingProtocolError)
 
         class FailingEmbed:
             def __init__(self):
@@ -1674,8 +1700,8 @@ class TestMailScanner:
         ) == (2, 0)
         assert [(current, total, rows) for current, total, _name, rows in progress] == [(1, 2, 1), (2, 2, 2)]
 
-    def test_warm_cache_does_not_flood_progress_callbacks(self, tmp_path, monkeypatch):
-        """시도 예산 밖의 대량 성공 캐시는 진행률 callback을 건별로 호출하지 않는다."""
+    def test_warm_cache_does_not_flood_progress_callbacks_or_logs(self, tmp_path, monkeypatch, caplog):
+        """시도 예산 밖의 대량 성공 캐시는 건별 callback·로그를 만들지 않는다."""
         from knowmate.collector.mail_scan_state import cache_success, save_mail_scan_state
         from knowmate.collector.mail_scanner import run_mail_scan
 
@@ -1699,6 +1725,7 @@ class TestMailScanner:
         indexer = types.SimpleNamespace(table_was_recreated=False, table_is_empty=False)
         progress = []
 
+        caplog.set_level("INFO", logger="knowmate.collector.mail_scanner")
         assert run_mail_scan(
             [str(watch)], indexer,
             {"mail": {"max_mails_per_scan": 500, "batch_commit_every": 1}},
@@ -1706,6 +1733,63 @@ class TestMailScanner:
             state_file=state_file, failure_file=tmp_path / "failures.json",
         ) == (0, 1_000)
         assert progress == []
+        cycle_logs = [record for record in caplog.records if "[mail_scanner] cycle" in record.getMessage()]
+        assert len(cycle_logs) == 1
+
+    def test_cycle_metrics_are_aggregate_and_exclude_mail_body(self, tmp_path, monkeypatch, caplog):
+        """사이클 계측은 배치 집계만 남기고 메일 본문은 로그에 남기지 않는다."""
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        for name in ("a", "b"):
+            (watch / f"{name}.mysingle").write_bytes(b"x")
+        secret_body = "SECRET_MAIL_BODY_MUST_NOT_APPEAR"
+        monkeypatch.setattr(
+            "knowmate.secure.mysingle_reader.parse_mail_file",
+            lambda path: self._sample_parsed_for_scan(
+                path, f"knox:{Path(path).stem}", secret_body,
+            ),
+        )
+
+        class MetricsIndexer:
+            table_was_recreated = False
+            table_is_empty = False
+            _batch_size = 4
+
+            def get_index_state(self, _mail_uid, _mtime):
+                return types.SimpleNamespace(
+                    state=types.SimpleNamespace(name="MISSING"), old_chunk_ids=(),
+                )
+
+            def prepare_mail(self, parsed, _mtime, _check):
+                return types.SimpleNamespace(parsed=parsed, chunks=["a", "b"], vectors=[None, None])
+
+            def embed_mail_jobs(self, jobs):
+                for job in jobs:
+                    job.vectors[:] = [[0.0], [0.0]]
+                return types.SimpleNamespace(
+                    blocking_error=None, input_chunks=4, batch_count=1, embed_calls=3, split_retries=1,
+                )
+
+            def commit_mail_job(self, _job):
+                return ["chunk"]
+
+            def delete_chunk_ids(self, _chunk_ids):
+                return ()
+
+        caplog.set_level("INFO", logger="knowmate.collector.mail_scanner")
+        assert run_mail_scan(
+            [str(watch)], MetricsIndexer(), {"mail": {"max_mails_per_scan": 2}},
+            state_file=tmp_path / "state.json", failure_file=tmp_path / "failures.json",
+        ) == (2, 0)
+        cycle_logs = [record.getMessage() for record in caplog.records if "[mail_scanner] cycle" in record.getMessage()]
+        assert len(cycle_logs) == 1
+        assert "files(enumerated=2 cache_hits=0 backoff_deferred=0 actionable=2 attempted=2 parsed=2)" in cycle_logs[0]
+        assert "db(current=0 missing=2 stale=0 error=0)" in cycle_logs[0]
+        assert "embed(chunks=4 batches=1 embed_calls=3 split_retries=1)" in cycle_logs[0]
+        assert "mail(commits=2 failures=0" in cycle_logs[0]
+        assert secret_body not in caplog.text
 
     def test_early_filter_retains_only_actionable_candidates_and_normalizes_once(self, tmp_path, monkeypatch):
         """대량 캐시·백오프는 전수 확인하되 후보 정렬·보관에는 넣지 않는다."""

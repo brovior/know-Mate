@@ -16,6 +16,7 @@ from knowmate.rag.embedding import (
     EmbeddingClient,
     EmbeddingContentError,
     VECTOR_DIM,
+    _validate_vectors,
 )
 
 logger = logging.getLogger(__name__)
@@ -102,6 +103,10 @@ class MailEmbeddingResult:
     """교차메일 임베딩의 격리 실패와 중단 원인을 전달한다."""
 
     blocking_error: Exception | None = None
+    input_chunks: int = 0
+    batch_count: int = 0
+    embed_calls: int = 0
+    split_retries: int = 0
 
 
 def _parse_mail_date_ts(mail_date: str) -> float:
@@ -314,10 +319,6 @@ class EmailIndexer:
             except Exception as exc:
                 raise PendingMailDeleteError(check.old_chunk_ids, exc) from exc
 
-        logger.info(
-            "[email_indexer] 인덱싱 완료: uid=%s chunks=%d",
-            parsed["mail_uid"][:30], len(chunk_ids),
-        )
         return chunk_ids
 
     def prepare_mail(self, parsed: dict[str, Any], mtime: float, check: MailIndexCheck) -> MailIndexJob:
@@ -341,7 +342,9 @@ class EmailIndexer:
         """여러 메일 청크를 batch_size 단위로 임베딩하고 결과를 원래 job에 되돌린다."""
         result = MailEmbeddingResult()
         refs = [(job, index) for job in jobs for index in range(len(job.chunks))]
+        result.input_chunks = len(refs)
         for start in range(0, len(refs), self._batch_size):
+            result.batch_count += 1
             if not self._embed_refs_with_content_isolation(refs[start:start + self._batch_size], result):
                 break
         return result
@@ -353,13 +356,16 @@ class EmailIndexer:
         if not refs:
             return True
         try:
+            result.embed_calls += 1
             vectors = self._embed.embed([job.chunks[index] for job, index in refs])
+            vectors = _validate_vectors(vectors, len(refs))
             if len(vectors) != len(refs):
                 raise RuntimeError(f"임베딩 결과 수 불일치: 요청={len(refs)}, 응답={len(vectors)}")
         except EmbeddingContentError as exc:
             if len(refs) == 1:
                 refs[0][0].content_error = exc
                 return True
+            result.split_retries += 1
             middle = len(refs) // 2
             return (
                 self._embed_refs_with_content_isolation(refs[:middle], result)
@@ -419,7 +425,6 @@ class EmailIndexer:
         self.table.add(rows)
         if on_progress:
             on_progress(len(rows), len(rows))
-        logger.info("[email_indexer] 인덱싱 완료: uid=%s chunks=%d", parsed["mail_uid"][:30], len(rows))
         return chunk_ids
 
     def delete_mail_chunks(self, mail_uid: str) -> None:

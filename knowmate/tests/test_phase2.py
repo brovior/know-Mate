@@ -199,16 +199,44 @@ class TestEmbeddingApiResponse:
                 {"data": [{"index": 0, "embedding": vector}]}, expected_count=1
             )
 
+    def test_response_rejects_finite_value_outside_float32_range(self):
+        """Python float로는 유한해도 float32 저장 범위를 넘으면 저장 전에 거부한다."""
+        from knowmate.rag.embedding import EmbeddingProtocolError, _vectors_in_request_order
+
+        vector = self._vector()
+        vector[0] = 1e100
+        with pytest.raises(EmbeddingProtocolError, match="범위"):
+            _vectors_in_request_order(
+                {"data": [{"index": 0, "embedding": vector}]}, expected_count=1
+            )
+
+    def test_response_accepts_float32_boundary_value(self):
+        """유한한 float32 최대값은 LanceDB 저장 전 검증을 통과한다."""
+        from knowmate.rag.embedding import _vectors_in_request_order
+
+        float32_max = float.fromhex("0x1.fffffep+127")
+        vector = self._vector()
+        vector[0] = float32_max
+        result = _vectors_in_request_order(
+            {"data": [{"index": 0, "embedding": vector}]}, expected_count=1
+        )
+        assert result[0][0] == float32_max
+
     @pytest.mark.parametrize(
-        "status, expected",
+        "status, body, expected",
         [
-            (400, "content"), (413, "content"), (422, "content"),
-            (401, "protocol"), (403, "protocol"), (404, "protocol"),
-            (408, "transient"), (429, "transient"), (503, "transient"),
+            (413, b"not json", "content"),
+            (400, b'{"error":{"param":"input"}}', "content"),
+            (422, b'{"error":{"param":"input[31]"}}', "content"),
+            (400, b'{"error":{"param":"model","code":"model_not_found"}}', "protocol"),
+            (422, b'{"error":{"param":"unknown"}}', "protocol"),
+            (400, b"not json", "protocol"),
+            (401, b"error", "protocol"), (403, b"error", "protocol"), (404, b"error", "protocol"),
+            (408, b"error", "transient"), (429, b"error", "transient"), (503, b"error", "transient"),
         ],
     )
-    def test_http_error_type_avoids_splitting_auth_config_and_timeout(self, status, expected):
-        """콘텐츠 관련 4xx만 분할 대상으로, 인증·설정·타임아웃은 따로 구분한다."""
+    def test_http_error_type_uses_only_explicit_input_signal_for_splitting(self, status, body, expected):
+        """400/422는 명시적 input 신호가 있을 때만 분할 대상으로 분류한다."""
         from knowmate.rag.embedding import (
             EmbeddingClient,
             EmbeddingContentError,
@@ -218,7 +246,7 @@ class TestEmbeddingApiResponse:
 
         class Response:
             def read(self) -> bytes:
-                return b"error"
+                return body
 
         class Connection:
             def request(self, *_args, **_kwargs) -> None:
