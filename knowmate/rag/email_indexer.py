@@ -22,7 +22,7 @@ from knowmate.rag.embedding import (
 logger = logging.getLogger(__name__)
 
 # 인덱싱 포맷 버전 — 변경 시 기존 메일 자동 재인덱싱
-EMAIL_INDEX_VERSION = "3"  # v3: mail_date_ts(epoch) 필드 추가 — 날짜 범위 검색용
+EMAIL_INDEX_VERSION = "4"  # v4: HTML 정제·Knox BOM 파싱 수정 — 기존 메일 재인덱싱
 
 EMAIL_SCHEMA = pa.schema([
     # ── 청크 공통 ──
@@ -283,6 +283,44 @@ class EmailIndexer:
             chunk_ids,
         )
 
+    def get_legacy_path_chunk_ids(self, source_file: str) -> tuple[str, ...]:
+        """BOM 오파싱으로 생긴 같은 파일의 경로 기반 Knox 청크만 찾는다."""
+        legacy_uid = f"knox:{source_file}"
+        safe_uid = legacy_uid.replace("'", "''")
+        safe_source = source_file.replace("'", "''")
+        rows = (
+            self.table.search()
+            .where(
+                f"mail_uid = '{safe_uid}' AND source_file = '{safe_source}' "
+                "AND is_deleted = false"
+            )
+            .select(["chunk_id"])
+            .to_arrow()
+            .to_pylist()
+        )
+        return tuple(
+            row["chunk_id"] for row in rows if isinstance(row.get("chunk_id"), str)
+        )
+
+    def has_current_mail_uid(self, mail_uid: str) -> bool:
+        """mtime와 무관하게 정상 UID의 v4 활성 청크가 하나라도 있는지 확인한다."""
+        import json
+        safe_uid = mail_uid.replace("'", "''")
+        rows = (
+            self.table.search()
+            .where(f"mail_uid = '{safe_uid}' AND is_deleted = false")
+            .select(["source_meta"])
+            .to_arrow()
+            .to_pylist()
+        )
+        for row in rows:
+            try:
+                if json.loads(row.get("source_meta", "{}") or "{}").get("_index_version") == EMAIL_INDEX_VERSION:
+                    return True
+            except (TypeError, json.JSONDecodeError):
+                continue
+        return False
+
     def is_indexed(self, mail_uid: str, mtime: float) -> bool:
         """하위호환용 bool 조회; 새 수집 경로는 ``get_index_state``를 사용한다."""
         return self.get_index_state(mail_uid, mtime).state is MailIndexState.CURRENT
@@ -305,6 +343,10 @@ class EmailIndexer:
             raise RuntimeError("메일 기존 청크 상태를 확인하지 못했습니다")
         if check.state is MailIndexState.CURRENT:
             return []
+        legacy_chunk_ids = ()
+        legacy_uid = f"knox:{parsed['source_file']}"
+        if parsed.get("source_type") == "knox" and parsed["mail_uid"] != legacy_uid:
+            legacy_chunk_ids = self.get_legacy_path_chunk_ids(parsed["source_file"])
         job = self.prepare_mail(parsed, mtime, check)
         result = self.embed_mail_jobs([job])
         if job.content_error:
@@ -313,11 +355,12 @@ class EmailIndexer:
             raise result.blocking_error
         chunk_ids = self.commit_mail_job(job, on_progress)
 
-        if delete_old and job.chunks and check.state is MailIndexState.STALE and check.old_chunk_ids:
+        delete_ids = tuple(dict.fromkeys((*check.old_chunk_ids, *legacy_chunk_ids)))
+        if delete_old and job.chunks and delete_ids:
             try:
-                self.delete_chunk_ids(check.old_chunk_ids)
+                self.delete_chunk_ids(delete_ids)
             except Exception as exc:
-                raise PendingMailDeleteError(check.old_chunk_ids, exc) from exc
+                raise PendingMailDeleteError(delete_ids, exc) from exc
 
         return chunk_ids
 

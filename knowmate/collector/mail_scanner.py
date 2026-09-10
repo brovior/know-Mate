@@ -40,8 +40,17 @@ class _PreparedMail:
     item: dict
     parsed: dict
     check: object
+    legacy_chunk_ids: tuple[str, ...]
     is_migration: bool
     job: object
+
+
+@dataclass
+class _MailAlias:
+    """같은 정상 UID의 복사본과 해당 source에만 묶인 legacy 삭제 대상이다."""
+
+    item: dict
+    legacy_chunk_ids: tuple[str, ...]
 
 
 @dataclass
@@ -52,7 +61,7 @@ class _UidWork:
     fingerprint: str
     mtime: float
     primary: _PreparedMail | None
-    aliases: list[dict]
+    aliases: list[_MailAlias]
     outcome: str | None = None
 
 
@@ -358,28 +367,54 @@ def run_mail_scan(
         email_indexer.table_is_empty = False
         report_resolved(item)
 
-    def finish_old_delete(pending: _PreparedMail) -> None:
-        """새 세대 저장 후 캡처한 이전 ID만 durable queue를 거쳐 삭제한다."""
-        check = pending.check
-        if check.state.name != "STALE" or not check.old_chunk_ids or not pending.job.chunks:
+    def delete_captured_ids(item: dict, chunk_ids: tuple[str, ...]) -> None:
+        """저장 성공이 확인된 기존 ID만 durable queue 뒤에 삭제한다."""
+        if not chunk_ids:
             return
-        queue_pending_delete(state, check.old_chunk_ids)
+        queue_pending_delete(state, chunk_ids)
         if not save_state():
             logger.error(
                 "[mail_scanner] 기존 메일 청크 삭제 대상을 저장하지 못해 삭제를 연기합니다: %s",
-                pending.item["path"],
+                item["path"],
             )
             return
         try:
-            deleted_ids = email_indexer.delete_chunk_ids(check.old_chunk_ids)
+            deleted_ids = email_indexer.delete_chunk_ids(chunk_ids)
         except Exception as exc:
             logger.warning(
                 "[mail_scanner] 기존 메일 청크 삭제 실패 — 다음 사이클 재시도: %s (%s)",
-                pending.item["path"], exc,
+                item["path"], exc,
             )
         else:
             clear_pending_delete(state, deleted_ids)
             save_state()
+
+    def finish_old_delete(pending: _PreparedMail, aliases: list[_MailAlias]) -> None:
+        """새 세대 저장 후 primary·복사본별로 캡처한 이전 ID를 함께 정리한다."""
+        check = pending.check
+        delete_ids = tuple(dict.fromkeys(
+            (*check.old_chunk_ids, *pending.legacy_chunk_ids,
+             *(chunk_id for alias in aliases for chunk_id in alias.legacy_chunk_ids))
+        ))
+        if pending.job.chunks:
+            delete_captured_ids(pending.item, delete_ids)
+
+    def legacy_path_chunk_ids(parsed: dict) -> tuple[str, ...]:
+        """정상 Knox UID가 확정된 같은 파일의 과거 경로 UID만 캡처한다."""
+        legacy_uid = f"knox:{parsed['source_file']}"
+        if (
+            parsed.get("source_type") != "knox"
+            or parsed["mail_uid"] == legacy_uid
+            or not hasattr(email_indexer, "get_legacy_path_chunk_ids")
+        ):
+            return ()
+        return email_indexer.get_legacy_path_chunk_ids(parsed["source_file"])
+
+    def normal_uid_is_current(mail_uid: str, mtime: float) -> bool:
+        """복사본 mtime과 무관하게 정상 UID v4 행이 저장됐는지 확인한다."""
+        if hasattr(email_indexer, "has_current_mail_uid"):
+            return bool(email_indexer.has_current_mail_uid(mail_uid))
+        return email_indexer.get_index_state(mail_uid, mtime).state.name == "CURRENT"
 
     def release_job(pending: _PreparedMail) -> None:
         """완료 윈도우가 본문과 벡터를 붙잡지 않도록 참조를 즉시 해제한다."""
@@ -399,7 +434,7 @@ def run_mail_scan(
             aliases = work.aliases
             work.aliases = []
             for alias in aliases:
-                mark_failure(alias)
+                mark_failure(alias.item)
             work.outcome = "failure"
             release_job(primary)
             work.primary = None
@@ -416,15 +451,19 @@ def run_mail_scan(
             )
             finish_work(work, failed=True)
             return
+        if not chunk_ids:
+            logger.warning("[mail_scanner] 메일 저장 결과가 비어 있어 다음 기회에 재시도: %s", primary.item["path"])
+            finish_work(work, failed=True)
+            return
+        aliases = work.aliases
+        work.aliases = []
+        finish_old_delete(primary, aliases)
         mark_success(primary.item, work.mail_uid)
         indexed_count += 1
         metrics.commits += 1
         migrate_count += int(primary.is_migration)
-        finish_old_delete(primary)
-        aliases = work.aliases
-        work.aliases = []
         for alias in aliases:
-            mark_success(alias, work.mail_uid)
+            mark_success(alias.item, work.mail_uid)
             skipped_count += 1
         work.outcome = "success"
         release_job(primary)
@@ -491,7 +530,17 @@ def run_mail_scan(
             work.outcome = "failure"
             mark_failure(item)
             return True
+        try:
+            legacy_chunk_ids = legacy_path_chunk_ids(parsed)
+        except Exception:
+            # primary를 만들기 전 lookup이 실패하면 빈 work를 남기지 않는다. 같은 UID의
+            # 다음 복사본이 alias로만 쌓여 cycle 끝에 누락되는 것을 막는다.
+            uid_work.pop(mail_uid, None)
+            raise
         if check.state.name == "CURRENT":
+            # DB가 현재 v4 정상 UID 행을 확인했으므로, 이전 실행이 queue 기록 전에
+            # 중단된 경우에도 같은 source의 legacy 행만 안전하게 정리할 수 있다.
+            delete_captured_ids(item, legacy_chunk_ids)
             work.outcome = "success"
             mark_success(item, mail_uid)
             skipped_count += 1
@@ -502,7 +551,7 @@ def run_mail_scan(
             except Exception:
                 work.outcome = "failure"
                 raise
-            pending = _PreparedMail(item, parsed, check, is_migration, job)
+            pending = _PreparedMail(item, parsed, check, legacy_chunk_ids, is_migration, job)
             work.primary = pending
             prepared_window.append(pending)
             window_chunk_count += len(job.chunks)
@@ -515,31 +564,17 @@ def run_mail_scan(
         except Exception:
             work.outcome = "failure"
             raise
+        if not chunk_ids:
+            work.outcome = "failure"
+            mark_failure(item)
+            return True
         mark_success(item, mail_uid)
         indexed_count += 1
         metrics.commits += 1
         migrate_count += int(is_migration)
         work.outcome = "success"
-        if check.state.name == "STALE" and check.old_chunk_ids:
-            # 새 행과 기존 삭제 대상을 먼저 원자적으로 기록한다. 이후 삭제가 실패하거나
-            # 앱이 종료돼도 다음 사이클에서 정확히 그 ID만 재시도한다.
-            queue_pending_delete(state, check.old_chunk_ids)
-            if not save_state():
-                logger.error(
-                    "[mail_scanner] 기존 메일 청크 삭제 대상을 저장하지 못해 삭제를 연기합니다: %s",
-                    item["path"],
-                )
-            else:
-                try:
-                    deleted_ids = email_indexer.delete_chunk_ids(check.old_chunk_ids)
-                except Exception as exc:
-                    logger.warning(
-                        "[mail_scanner] 기존 메일 청크 삭제 실패 — 다음 사이클 재시도: %s (%s)",
-                        item["path"], exc,
-                    )
-                else:
-                    clear_pending_delete(state, deleted_ids)
-                    save_state()
+        delete_ids = tuple(dict.fromkeys((*check.old_chunk_ids, *legacy_chunk_ids)))
+        delete_captured_ids(item, delete_ids)
         return True
 
     stop_after_global_error = False
@@ -604,20 +639,35 @@ def run_mail_scan(
                         # 더 최신(또는 동시각) 복사본은 이번 스캔의 성공 캐시라 파싱 대상에서
                         # 제외됐을 수 있다. 오래된 다른 본문이 그 세대를 되돌리지 않도록
                         # shadow로만 캐시한다. 캐시 본문은 저장하지 않는다.
-                        mark_success(item, mail_uid)
-                        skipped_count += 1
+                        alias_legacy_ids = legacy_path_chunk_ids(parsed)
+                        if not alias_legacy_ids:
+                            mark_success(item, mail_uid)
+                            skipped_count += 1
+                        elif normal_uid_is_current(mail_uid, cached_uid_mtime):
+                            delete_captured_ids(item, alias_legacy_ids)
+                            mark_success(item, mail_uid)
+                            skipped_count += 1
+                        else:
+                            mark_failure(item)
                     elif not begin_generation(item, parsed, fingerprint, is_migration):
                         stop_after_global_error = True
                 elif fingerprint == work.fingerprint or item["mtime"] <= work.mtime:
                     # 같은 내용은 복사본이고, 다른 내용이라도 더 오래된 source는 현재
                     # 세대를 되돌릴 수 없다. primary가 끝난 뒤에만 함께 성공 캐시한다.
                     if work.outcome == "success":
-                        mark_success(item, mail_uid)
-                        skipped_count += 1
+                        alias_legacy_ids = legacy_path_chunk_ids(parsed)
+                        if not alias_legacy_ids:
+                            mark_success(item, mail_uid)
+                            skipped_count += 1
+                        else:
+                            # 같은 cycle의 primary commit이 정상 UID 행 저장을 이미 보장한다.
+                            delete_captured_ids(item, alias_legacy_ids)
+                            mark_success(item, mail_uid)
+                            skipped_count += 1
                     elif work.outcome == "failure":
                         mark_failure(item)
                     else:
-                        work.aliases.append(item)
+                        work.aliases.append(_MailAlias(item, legacy_path_chunk_ids(parsed)))
                 else:
                     # 동일 UID의 더 새 내용은 앞 세대가 아직 배치 대기 중이어도
                     # 먼저 최종 결과를 낸 뒤 별도 STALE 교체로 처리한다. 이 강제 flush는

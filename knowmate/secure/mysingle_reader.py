@@ -40,8 +40,22 @@ class _HTMLStripper(html.parser.HTMLParser):
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self._parts: list[str] = []
+        self._ignored_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        """style/script 안에서는 중첩 태그까지 본문 텍스트로 수집하지 않는다."""
+        del attrs
+        if tag.lower() in {"style", "script"}:
+            self._ignored_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        """style/script 범위를 벗어나면 뒤의 정상 본문 수집을 재개한다."""
+        if tag.lower() in {"style", "script"} and self._ignored_depth:
+            self._ignored_depth -= 1
 
     def handle_data(self, data: str) -> None:
+        if self._ignored_depth:
+            return
         stripped = data.strip()
         if stripped:
             self._parts.append(stripped)
@@ -95,6 +109,10 @@ def parse_mail_file(path: str) -> dict:
     source_type = "knox" if Path(path).suffix.lower() == ".mysingle" else "eml"
 
     with open(path, "rb") as f:
+        # Knox는 일부 .mysingle 파일 선두에 UTF-8 BOM을 붙인다. RFC822 헤더 앞의
+        # BOM은 email 모듈이 헤더 이름 일부로 취급하므로 스트림 위치만 3바이트 이동한다.
+        if f.read(3) != b"\xef\xbb\xbf":
+            f.seek(0)
         msg = email.message_from_binary_file(f, policy=email.policy.compat32)
 
     # --- 헤더 디코딩 ---
