@@ -10,6 +10,7 @@ import shutil
 import sys
 import types
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -142,21 +143,28 @@ class TestEmailIndexer:
             "source_meta": "{}",
         }
 
-    def test_index_and_is_indexed(self, tmp_path):
-        """index_mail 후 is_indexed가 True를 반환한다."""
-        from knowmate.rag.email_indexer import EmailIndexer
+    def test_email_indexer_syntax_is_python311_compatible(self):
+        """exact-ID SQL 문자열 생성이 Python 3.11 문법에서도 파싱된다."""
+        import ast
+
+        source = (Path(__file__).parents[1] / "rag" / "email_indexer.py").read_text(encoding="utf-8")
+        ast.parse(source, feature_version=(3, 11))
+
+    def test_index_and_get_index_state(self, tmp_path):
+        """index_mail 후 명시 상태가 CURRENT를 반환한다."""
+        from knowmate.rag.email_indexer import EmailIndexer, MailIndexState
         ei = EmailIndexer(db_path=tmp_path, embed_client=_fake_embed())
         chunk_ids = ei.index_mail(self._sample_parsed(), mtime=1000.0)
         assert len(chunk_ids) > 0
-        assert ei.is_indexed("knox:TEST001", 1000.0)
+        assert ei.get_index_state("knox:TEST001", 1000.0).state is MailIndexState.CURRENT
 
-    def test_is_indexed_false_for_unknown(self, tmp_path):
-        """인덱싱하지 않은 mail_uid는 is_indexed가 False를 반환한다."""
-        from knowmate.rag.email_indexer import EmailIndexer
+    def test_get_index_state_missing_for_unknown(self, tmp_path):
+        """인덱싱하지 않은 mail_uid는 MISSING 상태를 반환한다."""
+        from knowmate.rag.email_indexer import EmailIndexer, MailIndexState
         ei = EmailIndexer(db_path=tmp_path, embed_client=_fake_embed())
-        assert not ei.is_indexed("knox:UNKNOWN", 999.0)
+        assert ei.get_index_state("knox:UNKNOWN", 999.0).state is MailIndexState.MISSING
 
-    def test_is_indexed_projects_only_required_columns(self):
+    def test_get_index_state_projects_only_required_columns(self):
         """중복 확인은 벡터·암호문 없이 mtime과 버전 메타만 조회한다."""
         import pyarrow as pa
         from knowmate.rag.email_indexer import EMAIL_INDEX_VERSION, EmailIndexer
@@ -176,6 +184,7 @@ class TestEmailIndexer:
 
             def to_arrow(self):
                 return pa.table({
+                    "chunk_id": ["old-chunk"],
                     "mtime": [1000.0],
                     "source_meta": [json.dumps({"_index_version": EMAIL_INDEX_VERSION})],
                 })
@@ -184,8 +193,8 @@ class TestEmailIndexer:
         indexer = object.__new__(EmailIndexer)
         indexer.table = types.SimpleNamespace(search=lambda: query)
 
-        assert indexer.is_indexed("knox:TEST001", 1000.0)
-        assert query.selected == ["mtime", "source_meta"]
+        assert indexer.get_index_state("knox:TEST001", 1000.0).state.name == "CURRENT"
+        assert query.selected == ["chunk_id", "mtime", "source_meta"]
 
     def test_delete_mail_chunks(self, tmp_path):
         """delete_mail_chunks 후 is_indexed가 False가 된다."""
@@ -218,6 +227,75 @@ class TestEmailIndexer:
         assert len(chunk_ids) > 0
         assert ei.is_indexed("knox:MIG001", 1000.0)
 
+    def test_stale_state_captures_active_old_chunk_ids(self, tmp_path):
+        """변경 메일은 교체 전에 active 기존 청크 ID를 정확히 캡처한다."""
+        from knowmate.rag.email_indexer import EmailIndexer, MailIndexState
+
+        ei = EmailIndexer(db_path=tmp_path, embed_client=_fake_embed())
+        old_ids = ei.index_mail(self._sample_parsed(), mtime=1000.0)
+        check = ei.get_index_state("knox:TEST001", 2000.0)
+
+        assert check.state is MailIndexState.STALE
+        assert set(check.old_chunk_ids) == set(old_ids)
+
+    def test_missing_mail_never_deletes(self, tmp_path):
+        """신규 메일 저장은 기존 청크 삭제 API를 호출하지 않는다."""
+        from knowmate.rag.email_indexer import EmailIndexer
+
+        ei = EmailIndexer(db_path=tmp_path, embed_client=_fake_embed())
+        ei.delete_chunk_ids = MagicMock()
+        ei.index_mail(self._sample_parsed(), mtime=1000.0)
+
+        ei.delete_chunk_ids.assert_not_called()
+
+    def test_stale_embedding_failure_keeps_old_rows(self, tmp_path):
+        """변경 메일 임베딩 실패는 기존 검색 가능 행을 삭제하지 않는다."""
+        from knowmate.rag.email_indexer import EmailIndexer
+
+        ei = EmailIndexer(db_path=tmp_path, embed_client=_fake_embed())
+        old_ids = ei.index_mail(self._sample_parsed(), mtime=1000.0)
+
+        class FailingEmbed:
+            def embed(self, _texts):
+                raise RuntimeError("embedding failed")
+
+        ei._embed = FailingEmbed()
+        with pytest.raises(RuntimeError, match="embedding failed"):
+            ei.index_mail(self._sample_parsed(), mtime=2000.0)
+
+        rows = ei.table.search().select(["chunk_id"]).to_arrow().to_pylist()
+        assert {row["chunk_id"] for row in rows} == set(old_ids)
+
+    def test_stale_add_failure_keeps_old_rows(self, tmp_path):
+        """변경 메일 새 행 add 실패는 기존 검색 가능 행을 삭제하지 않는다."""
+        from knowmate.rag.email_indexer import EmailIndexer
+
+        ei = EmailIndexer(db_path=tmp_path, embed_client=_fake_embed())
+        old_ids = ei.index_mail(self._sample_parsed(), mtime=1000.0)
+        check = ei.get_index_state("knox:TEST001", 2000.0)
+        table = ei.table
+        ei.table = types.SimpleNamespace(add=MagicMock(side_effect=RuntimeError("add failed")))
+
+        with pytest.raises(RuntimeError, match="add failed"):
+            ei.index_mail(self._sample_parsed(), mtime=2000.0, index_check=check)
+
+        rows = table.search().select(["chunk_id"]).to_arrow().to_pylist()
+        assert {row["chunk_id"] for row in rows} == set(old_ids)
+
+    def test_direct_stale_delete_failure_is_not_silent(self, tmp_path):
+        """직접 index_mail 호출도 삭제 실패를 숨기지 않고 기존·새 행을 모두 보존한다."""
+        from knowmate.rag.email_indexer import EmailIndexer, PendingMailDeleteError
+
+        ei = EmailIndexer(db_path=tmp_path, embed_client=_fake_embed())
+        old_ids = ei.index_mail(self._sample_parsed(), mtime=1000.0)
+        ei.delete_chunk_ids = MagicMock(side_effect=RuntimeError("delete failed"))
+
+        with pytest.raises(PendingMailDeleteError) as exc_info:
+            ei.index_mail(self._sample_parsed(), mtime=2000.0)
+
+        assert set(exc_info.value.chunk_ids) == set(old_ids)
+        assert ei.table.count_rows() > len(old_ids)
+
 
 # ---------------------------------------------------------------------------
 # mail_scanner 테스트
@@ -236,18 +314,22 @@ class TestMailScanner:
             table_is_empty = empty
 
             def __init__(self):
-                self.is_indexed_calls = 0
+                self.state_check_calls = 0
                 self.indexed: set[tuple[str, float]] = set()
 
-            def is_indexed(self, mail_uid: str, mtime: float) -> bool:
-                self.is_indexed_calls += 1
-                return (mail_uid, mtime) in self.indexed
+            def get_index_state(self, mail_uid: str, mtime: float):
+                self.state_check_calls += 1
+                name = "CURRENT" if (mail_uid, mtime) in self.indexed else "MISSING"
+                return types.SimpleNamespace(state=types.SimpleNamespace(name=name), old_chunk_ids=())
 
-            def index_mail(self, parsed: dict, mtime: float) -> list[str]:
+            def index_mail(self, parsed: dict, mtime: float, **_kwargs) -> list[str]:
                 if fail_index:
                     raise KeyboardInterrupt("중단 재현")
                 self.indexed.add((parsed["mail_uid"], mtime))
                 return ["chunk"]
+
+            def delete_chunk_ids(self, _chunk_ids) -> None:
+                pass
 
         return FakeIndexer()
 
@@ -408,7 +490,7 @@ class TestMailScanner:
             [str(watch)], recovered, cfg, state_file=state_file,
             failure_file=tmp_path / "mail_index_failure.json",
         ) == (1, 0)
-        assert recovered.is_indexed_calls == 1
+        assert recovered.state_check_calls == 1
 
     def test_recreated_table_defers_scan_when_cache_clear_cannot_save(self, tmp_path, monkeypatch):
         """빈 캐시를 확정하지 못하면 재생성된 DB에 어떤 메일도 쓰지 않는다."""
@@ -425,8 +507,203 @@ class TestMailScanner:
             state_file=tmp_path / "mail_scan_state.json",
             failure_file=tmp_path / "mail_index_failure.json",
         ) == (0, 0)
-        assert indexer.is_indexed_calls == 0
+        assert indexer.state_check_calls == 0
         assert indexer.table_was_recreated
+
+    def test_db_state_error_records_failure_without_index_mutation(self, tmp_path, monkeypatch):
+        """DB 상태 조회 ERROR면 저장·삭제 없이 failure_state에만 실패를 기록한다."""
+        from knowmate.collector import failure_state
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        path = watch / "mail.mysingle"
+        _write_mail(path, uid="2026062600333333", msgid="db-error")
+
+        class ErrorIndexer:
+            table_was_recreated = False
+            table_is_empty = False
+
+            def __init__(self):
+                self.index_calls = 0
+                self.delete_calls = 0
+
+            def get_index_state(self, *_args):
+                return types.SimpleNamespace(state=types.SimpleNamespace(name="ERROR"), old_chunk_ids=())
+
+            def index_mail(self, *_args, **_kwargs):
+                self.index_calls += 1
+                raise AssertionError("ERROR 상태에서는 저장하면 안 됨")
+
+            def delete_chunk_ids(self, _chunk_ids):
+                self.delete_calls += 1
+                raise AssertionError("ERROR 상태에서는 삭제하면 안 됨")
+
+        indexer = ErrorIndexer()
+        failure_file = tmp_path / "mail_index_failure.json"
+        assert run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 1}},
+            state_file=tmp_path / "mail_scan_state.json", failure_file=failure_file,
+            get_now=lambda: 100.0,
+        ) == (0, 1)
+        assert indexer.index_calls == 0 and indexer.delete_calls == 0
+        assert str(path) in failure_state.load_failures(failure_file)
+
+    def test_delete_failure_is_persisted_and_retried_before_cache_skip(self, tmp_path, monkeypatch):
+        """기존 삭제 실패 ID는 성공 캐시 메일도 다음 사이클 시작 시 다시 삭제한다."""
+        from knowmate.collector.mail_scan_state import load_mail_scan_state
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        monkeypatch.setitem(
+            sys.modules, "knowmate.rag.email_indexer", types.SimpleNamespace(EMAIL_INDEX_VERSION="3"),
+        )
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        path = watch / "mail.mysingle"
+        _write_mail(path, uid="2026062600222222", msgid="pending-delete")
+
+        class StaleIndexer:
+            table_was_recreated = False
+            table_is_empty = False
+
+            def __init__(self):
+                self.delete_attempts = 0
+
+            def get_index_state(self, *_args):
+                return types.SimpleNamespace(
+                    state=types.SimpleNamespace(name="STALE"), old_chunk_ids=("old-1", "old-2"),
+                )
+
+            def index_mail(self, *_args, **_kwargs):
+                return ["new-1"]
+
+            def delete_chunk_ids(self, _chunk_ids):
+                self.delete_attempts += 1
+                if self.delete_attempts == 1:
+                    raise RuntimeError("delete failed")
+                return tuple(_chunk_ids)
+
+        state_file = tmp_path / "mail_scan_state.json"
+        failure_file = tmp_path / "mail_index_failure.json"
+        indexer = StaleIndexer()
+        cfg = {"mail": {"max_mails_per_scan": 1, "batch_commit_every": 1}}
+
+        assert run_mail_scan([str(watch)], indexer, cfg, state_file=state_file, failure_file=failure_file) == (1, 0)
+        pending = load_mail_scan_state(state_file)
+        assert pending["pending_deletes"] == ["old-1", "old-2"]
+
+        assert run_mail_scan([str(watch)], indexer, cfg, state_file=state_file, failure_file=failure_file) == (0, 1)
+        assert indexer.delete_attempts == 2
+        assert load_mail_scan_state(state_file)["pending_deletes"] == []
+
+    def test_pending_delete_survives_disk_reload_and_fresh_indexer(self, tmp_path, monkeypatch):
+        """저장된 대기열은 새 인덱서·새 스캔에서도 원본 파일과 무관하게 재시도된다."""
+        from knowmate.collector.mail_scan_state import load_mail_scan_state, save_mail_scan_state
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        monkeypatch.setitem(
+            sys.modules, "knowmate.rag.email_indexer", types.SimpleNamespace(EMAIL_INDEX_VERSION="3"),
+        )
+        state_file = tmp_path / "mail_scan_state.json"
+        save_mail_scan_state(state_file, {
+            "schema_version": 1,
+            "cursor": None,
+            "files": {},
+            "pending_deletes": ["old-a"],
+        })
+
+        class FreshIndexer:
+            table_was_recreated = False
+            table_is_empty = False
+
+            def __init__(self):
+                self.deleted = []
+
+            def delete_chunk_ids(self, chunk_ids):
+                self.deleted.append(tuple(chunk_ids))
+                return tuple(chunk_ids)
+
+        indexer = FreshIndexer()
+        assert run_mail_scan(
+            [], indexer, {"mail": {"max_mails_per_scan": 1}},
+            state_file=state_file, failure_file=tmp_path / "failures.json",
+        ) == (0, 0)
+        assert indexer.deleted == [("old-a",)]
+        assert load_mail_scan_state(state_file)["pending_deletes"] == []
+
+    def test_pending_delete_survives_index_cache_invalidation(self, tmp_path, monkeypatch):
+        """메일 인덱스 버전 변경으로 성공 캐시가 비워져도 대기 삭제 ID는 남는다."""
+        from knowmate.collector.mail_scan_state import load_mail_scan_state
+
+        monkeypatch.setitem(
+            sys.modules, "knowmate.rag.email_indexer", types.SimpleNamespace(EMAIL_INDEX_VERSION="4"),
+        )
+        state_file = tmp_path / "mail_scan_state.json"
+        state_file.write_text(json.dumps({
+            "schema_version": 1,
+            "cursor": None,
+            "files": {"old": {
+                "path": "C:/old.mysingle", "mtime": 1.0, "size": 1,
+                "mail_uid": "knox:old", "index_version": "3",
+            }},
+            "pending_deletes": ["old-a"],
+        }), encoding="utf-8")
+
+        state = load_mail_scan_state(state_file)
+        assert state["files"] == {}
+        assert state["pending_deletes"] == ["old-a"]
+
+    def test_new_replacement_keeps_older_pending_ids(self, tmp_path, monkeypatch):
+        """old-A 재시도 실패 뒤 old-B 삭제 성공은 old-A 대기열을 지우지 않는다."""
+        from knowmate.collector.mail_scan_state import load_mail_scan_state
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        monkeypatch.setitem(
+            sys.modules, "knowmate.rag.email_indexer", types.SimpleNamespace(EMAIL_INDEX_VERSION="3"),
+        )
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        path = watch / "mail.mysingle"
+        _write_mail(path, uid="2026062600111111", msgid="uid-a")
+
+        class ReplacingIndexer:
+            table_was_recreated = False
+            table_is_empty = False
+
+            def __init__(self):
+                self.round = 0
+                self.deleted = []
+
+            def get_index_state(self, *_args):
+                self.round += 1
+                old_id = "old-a" if self.round == 1 else "old-b"
+                return types.SimpleNamespace(
+                    state=types.SimpleNamespace(name="STALE"), old_chunk_ids=(old_id,),
+                )
+
+            def index_mail(self, *_args, **_kwargs):
+                return ["new"]
+
+            def delete_chunk_ids(self, chunk_ids):
+                ids = tuple(chunk_ids)
+                self.deleted.append(ids)
+                if "old-a" in ids:
+                    raise RuntimeError("old-a still locked")
+                return ids
+
+        indexer = ReplacingIndexer()
+        state_file = tmp_path / "mail_scan_state.json"
+        cfg = {"mail": {"max_mails_per_scan": 1, "batch_commit_every": 1}}
+        run_mail_scan([str(watch)], indexer, cfg, state_file=state_file, failure_file=tmp_path / "failures.json")
+        assert load_mail_scan_state(state_file)["pending_deletes"] == ["old-a"]
+
+        _write_mail(path, uid="2026062600111112", msgid="uid-b")
+        os.utime(path, (path.stat().st_mtime + 2, path.stat().st_mtime + 2))
+        run_mail_scan([str(watch)], indexer, cfg, state_file=state_file, failure_file=tmp_path / "failures.json")
+
+        assert load_mail_scan_state(state_file)["pending_deletes"] == ["old-a"]
+        assert ("old-b",) in indexer.deleted
 
     @pytest.mark.skipif(not _HAS_LANCEDB, reason="lancedb 미설치")
     def test_run_mail_scan_indexes_new(self, tmp_path):
@@ -500,7 +777,7 @@ class TestMailScanner:
 
     @pytest.mark.skipif(not _HAS_LANCEDB, reason="lancedb 미설치")
     def test_success_cache_avoids_db_check_on_later_cycle(self, tmp_path):
-        """성공 캐시 적중 메일은 이후 사이클에서 is_indexed를 호출하지 않는다."""
+        """성공 캐시 적중 메일은 이후 사이클에서 상태 조회를 호출하지 않는다."""
         from knowmate.collector.mail_scanner import run_mail_scan
         from knowmate.rag.email_indexer import EmailIndexer
 
@@ -516,7 +793,7 @@ class TestMailScanner:
         def fail_if_called(*_args):
             raise AssertionError("성공 캐시가 DB 확인을 막아야 함")
 
-        indexer.is_indexed = fail_if_called
+        indexer.get_index_state = fail_if_called
         indexed, skipped = run_mail_scan(
             [str(watch)], indexer, cfg, state_file=state_file, failure_file=failure_file,
         )

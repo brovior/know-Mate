@@ -12,9 +12,11 @@ from knowmate.collector import failure_state
 from knowmate.collector.mail_scan_state import (
     cache_matches,
     cache_success,
+    clear_pending_delete,
     load_mail_scan_state,
     normalize_path_key,
     prune_missing_files,
+    queue_pending_delete,
     save_mail_scan_state,
     set_cursor,
 )
@@ -132,6 +134,7 @@ def run_mail_scan(
     pruned = prune_missing_files(state, seen_keys) if roots_accessible else 0
     failure_pruned = failure_state.prune(failures) if roots_accessible else 0
     state_dirty = pruned > 0
+    state_dirty = _retry_pending_deletes(state, email_indexer) or state_dirty
     failures_dirty = failures_dirty or failure_pruned > 0
 
     indexed_count = 0
@@ -193,7 +196,16 @@ def run_mail_scan(
             skipped_count += 1
         else:
             try:
-                if email_indexer.is_indexed(parsed["mail_uid"], item["mtime"]):
+                check = email_indexer.get_index_state(parsed["mail_uid"], item["mtime"])
+                if check.state.name == "ERROR":
+                    logger.warning("[mail_scanner] DB 상태 조회 실패, 변경하지 않고 연기: %s", path)
+                    failure_state.note_failure(
+                        failures, path, failure_state.KIND_UNKNOWN_TRANSIENT, "index", None,
+                        item["mtime"], item["size"], now_fn(),
+                    )
+                    failures_dirty = True
+                    skipped_count += 1
+                elif check.state.name == "CURRENT":
                     cache_success(state, item, parsed["mail_uid"])
                     state_dirty = True
                     if path in failures:
@@ -202,7 +214,9 @@ def run_mail_scan(
                     email_indexer.table_is_empty = False
                     skipped_count += 1
                 else:
-                    chunk_ids = email_indexer.index_mail(parsed, item["mtime"])
+                    chunk_ids = email_indexer.index_mail(
+                        parsed, item["mtime"], index_check=check, delete_old=False,
+                    )
                     cache_success(state, item, parsed["mail_uid"])
                     state_dirty = True
                     if path in failures:
@@ -211,6 +225,26 @@ def run_mail_scan(
                     email_indexer.table_is_empty = False
                     indexed_count += 1
                     migrate_count += int(is_migration)
+                    if check.state.name == "STALE" and check.old_chunk_ids:
+                        # 새 행과 기존 삭제 대상을 먼저 원자적으로 기록한다. 이후 삭제가
+                        # 실패하거나 앱이 종료돼도 다음 사이클에서 정확히 그 ID만 재시도한다.
+                        queue_pending_delete(state, check.old_chunk_ids)
+                        if not save_mail_scan_state(state_file, state):
+                            logger.error(
+                                "[mail_scanner] 기존 메일 청크 삭제 대상을 저장하지 못해 삭제를 연기합니다: %s",
+                                path,
+                            )
+                        else:
+                            try:
+                                deleted_ids = email_indexer.delete_chunk_ids(check.old_chunk_ids)
+                            except Exception as exc:
+                                logger.warning(
+                                    "[mail_scanner] 기존 메일 청크 삭제 실패 — 다음 사이클 재시도: %s (%s)",
+                                    path, exc,
+                                )
+                            else:
+                                clear_pending_delete(state, deleted_ids)
+                                save_mail_scan_state(state_file, state)
                     logger.info(
                         "[mail_scanner] [%s] %s -> %d청크",
                         "MIGRATE" if is_migration else "NEW", Path(path).name, len(chunk_ids),
@@ -242,6 +276,22 @@ def run_mail_scan(
         f" 캐시정리={pruned}" if pruned else "",
     )
     return indexed_count, skipped_count
+
+
+def _retry_pending_deletes(state: dict, email_indexer: "EmailIndexer") -> bool:
+    """캐시 적중 여부와 무관하게 이전 교체의 기존 청크 삭제를 다시 시도한다."""
+    changed = False
+    chunk_ids = state.get("pending_deletes", [])
+    if not isinstance(chunk_ids, list) or not chunk_ids:
+        return False
+    try:
+        deleted_ids = email_indexer.delete_chunk_ids(chunk_ids)
+    except Exception as exc:
+        logger.warning("[mail_scanner] 보류된 기존 메일 청크 삭제 실패 — 다음 사이클 재시도: %s", exc)
+    else:
+        clear_pending_delete(state, deleted_ids)
+        changed = True
+    return changed
 
 
 def _candidates_from_cursor(candidates: list[dict], cursor: object) -> Iterator[dict]:

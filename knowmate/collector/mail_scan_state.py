@@ -20,7 +20,9 @@ def normalize_path_key(path: str) -> str:
 
 def load_mail_scan_state(path: Path, *, invalidate_cache: bool = False) -> dict[str, Any]:
     """유효한 메일 스캔 상태를 읽고, 손상·버전 불일치는 빈 상태로 복구한다."""
-    empty: dict[str, Any] = {"schema_version": SCHEMA_VERSION, "cursor": None, "files": {}}
+    empty: dict[str, Any] = {
+        "schema_version": SCHEMA_VERSION, "cursor": None, "files": {}, "pending_deletes": [],
+    }
     if not path.exists():
         return empty
     try:
@@ -36,7 +38,12 @@ def load_mail_scan_state(path: Path, *, invalidate_cache: bool = False) -> dict[
     if files and any(entry["index_version"] != _email_index_version() for entry in files.values()):
         logger.info("[mail_scanner] 메일 인덱스 버전 변경 감지 — 성공 캐시를 초기화합니다")
         files = {}
-    return {"schema_version": SCHEMA_VERSION, "cursor": cursor, "files": files}
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "cursor": cursor,
+        "files": files,
+        "pending_deletes": _valid_pending_deletes(raw.get("pending_deletes")),
+    }
 
 
 def save_mail_scan_state(path: Path, state: dict[str, Any]) -> bool:
@@ -74,6 +81,23 @@ def cache_success(state: dict[str, Any], item: dict[str, Any], mail_uid: str) ->
         "mail_uid": mail_uid,
         "index_version": _email_index_version(),
     }
+
+
+def queue_pending_delete(state: dict[str, Any], chunk_ids: tuple[str, ...] | list[str]) -> None:
+    """파일 캐시와 분리된 durable 삭제 대기열에 기존 청크 ID를 넣는다."""
+    existing = state.setdefault("pending_deletes", [])
+    ids = [*existing, *chunk_ids] if isinstance(existing, list) else list(chunk_ids)
+    state["pending_deletes"] = list(dict.fromkeys(
+        chunk_id for chunk_id in ids if isinstance(chunk_id, str)
+    ))
+
+
+def clear_pending_delete(state: dict[str, Any], chunk_ids: tuple[str, ...] | list[str]) -> None:
+    """확인된 삭제 성공 ID만 durable 대기열에서 제거한다."""
+    deleted = set(chunk_id for chunk_id in chunk_ids if isinstance(chunk_id, str))
+    pending = state.get("pending_deletes", [])
+    if isinstance(pending, list):
+        state["pending_deletes"] = [chunk_id for chunk_id in pending if chunk_id not in deleted]
 
 
 def set_cursor(state: dict[str, Any], item: dict[str, Any]) -> None:
@@ -121,6 +145,13 @@ def _valid_files(raw: object) -> dict[str, dict[str, Any]]:
         ):
             valid[key] = entry
     return valid
+
+
+def _valid_pending_deletes(raw: object) -> list[str]:
+    """삭제 대기열에서 유효한 chunk_id만 중복 없이 복구한다."""
+    if not isinstance(raw, list):
+        return []
+    return list(dict.fromkeys(chunk_id for chunk_id in raw if isinstance(chunk_id, str)))
 
 
 def _is_finite_number(value: object) -> bool:
