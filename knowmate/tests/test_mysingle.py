@@ -101,6 +101,40 @@ class TestParseMysingle:
         with pytest.raises(ValueError):
             parse_mysingle(str(p))
 
+    def test_utf8_bom_mysingle_keeps_rfc822_headers_and_html_body(self, tmp_path):
+        """Knox UTF-8 BOM이 있어도 헤더를 본문으로 오인하지 않는다."""
+        raw = (FIXTURES / "sample.mysingle").read_bytes().replace(
+            b"<html><body>", b"<html><body><script>bom_script_payload()</script>",
+        )
+        path = tmp_path / "bom.mysingle"
+        path.write_bytes(b"\xef\xbb\xbf" + raw)
+
+        from knowmate.secure.mysingle_reader import parse_mail_file
+        result = parse_mail_file(str(path))
+
+        assert result["subject"]
+        assert result["mail_uid"] == "knox:2026062600000001"
+        assert "A설비" in result["body_text"]
+        assert "MIME-Version:" not in result["body_text"]
+        assert "bom_script_payload" not in result["body_text"]
+
+    def test_bomless_eml_still_parses(self, tmp_path):
+        """BOM 없는 표준 .eml은 이전처럼 Message-ID와 본문을 유지한다."""
+        path = tmp_path / "plain.eml"
+        path.write_bytes(
+            b"From: sender@example.com\r\n"
+            b"Subject: plain\r\n"
+            b"Message-ID: <plain@example.com>\r\n"
+            b"Content-Type: text/html; charset=UTF-8\r\n\r\n"
+            b"<p>normal body</p>"
+        )
+
+        from knowmate.secure.mysingle_reader import parse_mail_file
+        result = parse_mail_file(str(path))
+
+        assert result["mail_uid"] == "eml:<plain@example.com>"
+        assert result["body_text"] == "normal body"
+
 
 # ---------------------------------------------------------------------------
 # html_to_text 테스트
@@ -117,6 +151,18 @@ class TestHtmlToText:
     def test_empty_string(self):
         from knowmate.secure.mysingle_reader import html_to_text
         assert html_to_text("") == ""
+
+    def test_excludes_style_and_script_but_preserves_nearby_body(self):
+        """대소문자 style/script 데이터는 버리고 앞뒤의 정상 본문은 보존한다."""
+        from knowmate.secure.mysingle_reader import html_to_text
+        result = html_to_text(
+            "before<STYLE>.huge { display: none; }</STYLE>"
+            "<p>normal body</p><ScRiPt>const fake = 'large payload';</ScRiPt>after"
+        )
+
+        assert result == "before normal body after"
+        assert "display" not in result
+        assert "large payload" not in result
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +209,55 @@ class TestEmailIndexer:
         from knowmate.rag.email_indexer import EmailIndexer, MailIndexState
         ei = EmailIndexer(db_path=tmp_path, embed_client=_fake_embed())
         assert ei.get_index_state("knox:UNKNOWN", 999.0).state is MailIndexState.MISSING
+
+    def test_has_current_mail_uid_ignores_copy_mtime(self, tmp_path):
+        """같은 UID 복사본의 mtime과 무관하게 저장된 v4 정상 행을 확인한다."""
+        from knowmate.rag.email_indexer import EmailIndexer
+
+        ei = EmailIndexer(db_path=tmp_path, embed_client=_fake_embed())
+        ei.index_mail(self._sample_parsed("knox:CURRENT-UID"), mtime=1000.0)
+        assert ei.has_current_mail_uid("knox:CURRENT-UID")
+        assert not ei.has_current_mail_uid("knox:UNKNOWN")
+
+    def test_v4_replaces_only_same_file_legacy_path_uid_after_new_save(self, tmp_path):
+        """BOM 오파싱 legacy UID는 정상 Knox UID 저장 뒤 같은 source에서만 삭제한다."""
+        from knowmate.rag.email_indexer import EmailIndexer
+
+        ei = EmailIndexer(db_path=tmp_path, embed_client=_fake_embed())
+        source = str(tmp_path / "mail.mysingle")
+        legacy = self._sample_parsed(f"knox:{source}", source)
+        other = self._sample_parsed(f"knox:{source}-other", f"{source}-other")
+        legacy["source_type"] = "knox"
+        other["source_type"] = "knox"
+        ei.index_mail(legacy, mtime=1000.0)
+        other_ids = ei.index_mail(other, mtime=1000.0)
+
+        normal = self._sample_parsed("knox:KNOWS-UID", source)
+        normal["source_type"] = "knox"
+        normal_ids = ei.index_mail(normal, mtime=1000.0)
+        rows = ei.table.search().select(["chunk_id", "mail_uid", "source_file"]).to_arrow().to_pylist()
+
+        assert normal_ids
+        assert {row["mail_uid"] for row in rows} == {"knox:KNOWS-UID", f"knox:{source}-other"}
+        assert {row["chunk_id"] for row in rows if row["mail_uid"] == f"knox:{source}-other"} == set(other_ids)
+
+    def test_legacy_path_uid_survives_new_save_failure(self, tmp_path, monkeypatch):
+        """새 데이터 저장 실패 시 legacy 청크는 삭제하지 않는다."""
+        from knowmate.rag.email_indexer import EmailIndexer
+
+        ei = EmailIndexer(db_path=tmp_path, embed_client=_fake_embed())
+        source = str(tmp_path / "mail.mysingle")
+        legacy = self._sample_parsed(f"knox:{source}", source)
+        legacy["source_type"] = "knox"
+        legacy_ids = ei.index_mail(legacy, mtime=1000.0)
+        monkeypatch.setattr(ei, "commit_mail_job", lambda *_args: (_ for _ in ()).throw(RuntimeError("write failed")))
+        normal = self._sample_parsed("knox:KNOWS-UID", source)
+        normal["source_type"] = "knox"
+
+        with pytest.raises(RuntimeError, match="write failed"):
+            ei.index_mail(normal, mtime=1000.0)
+        rows = ei.table.search().select(["chunk_id"]).to_arrow().to_pylist()
+        assert {row["chunk_id"] for row in rows} == set(legacy_ids)
 
     def test_get_index_state_projects_only_required_columns(self):
         """중복 확인은 벡터·암호문 없이 mtime과 버전 메타만 조회한다."""
@@ -906,6 +1001,322 @@ class TestMailScanner:
         assert run_mail_scan([str(watch)], indexer, cfg, state_file=state_file, failure_file=failure_file) == (0, 1)
         assert indexer.delete_attempts == 2
         assert load_mail_scan_state(state_file)["pending_deletes"] == []
+
+    def test_legacy_path_delete_is_queued_after_commit_and_retried(self, tmp_path):
+        """BOM legacy 삭제는 새 저장 뒤에만 대기열에 넣고 캐시 적중 전 재시도한다."""
+        from knowmate.collector.mail_scan_state import load_mail_scan_state
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        _write_mail(watch / "mail.mysingle", uid="2026062600222222", msgid="legacy-pending")
+
+        class LegacyIndexer:
+            table_was_recreated = False
+            table_is_empty = False
+
+            def __init__(self):
+                self.events = []
+                self.delete_attempts = 0
+
+            def get_index_state(self, *_args):
+                return types.SimpleNamespace(
+                    state=types.SimpleNamespace(name="MISSING"), old_chunk_ids=(),
+                )
+
+            def get_legacy_path_chunk_ids(self, _source_file):
+                self.events.append("lookup")
+                return ("legacy-1",)
+
+            def index_mail(self, *_args, **_kwargs):
+                self.events.append("commit")
+                return ["new-1"]
+
+            def delete_chunk_ids(self, chunk_ids):
+                self.events.append("delete")
+                self.delete_attempts += 1
+                if self.delete_attempts == 1:
+                    raise RuntimeError("delete failed")
+                return tuple(chunk_ids)
+
+        indexer = LegacyIndexer()
+        state_file = tmp_path / "mail_scan_state.json"
+        failure_file = tmp_path / "mail_index_failure.json"
+        cfg = {"mail": {"max_mails_per_scan": 1, "batch_commit_every": 1}}
+
+        assert run_mail_scan([str(watch)], indexer, cfg, state_file=state_file, failure_file=failure_file) == (1, 0)
+        assert indexer.events == ["lookup", "commit", "delete"]
+        assert load_mail_scan_state(state_file)["pending_deletes"] == ["legacy-1"]
+
+        assert run_mail_scan([str(watch)], indexer, cfg, state_file=state_file, failure_file=failure_file) == (0, 1)
+        assert indexer.events == ["lookup", "commit", "delete", "delete"]
+        assert load_mail_scan_state(state_file)["pending_deletes"] == []
+
+    def test_legacy_path_delete_is_not_queued_when_new_save_fails(self, tmp_path):
+        """임베딩·저장 실패 시 legacy 행은 대기 삭제 대상으로도 바꾸지 않는다."""
+        from knowmate.collector.mail_scan_state import load_mail_scan_state
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        _write_mail(watch / "mail.mysingle", uid="2026062600222223", msgid="legacy-save-failure")
+
+        class FailingIndexer:
+            table_was_recreated = False
+            table_is_empty = False
+
+            def get_index_state(self, *_args):
+                return types.SimpleNamespace(
+                    state=types.SimpleNamespace(name="MISSING"), old_chunk_ids=(),
+                )
+
+            def get_legacy_path_chunk_ids(self, _source_file):
+                return ("legacy-1",)
+
+            def index_mail(self, *_args, **_kwargs):
+                raise RuntimeError("write failed")
+
+            def delete_chunk_ids(self, _chunk_ids):
+                raise AssertionError("저장 실패 시 legacy 삭제 금지")
+
+        assert run_mail_scan(
+            [str(watch)], FailingIndexer(), {"mail": {"max_mails_per_scan": 1}},
+            state_file=tmp_path / "mail_scan_state.json", failure_file=tmp_path / "failures.json",
+        ) == (0, 1)
+        assert load_mail_scan_state(tmp_path / "mail_scan_state.json")["pending_deletes"] == []
+
+    def test_same_uid_aliases_each_clean_their_own_legacy_path_chunks(self, tmp_path, monkeypatch):
+        """동일 UID 복사본도 primary 저장 성공 뒤 source별 legacy 행을 함께 정리한다."""
+        from knowmate.collector.mail_scan_state import load_mail_scan_state
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        monkeypatch.setitem(
+            sys.modules, "knowmate.rag.email_indexer", types.SimpleNamespace(EMAIL_INDEX_VERSION="4"),
+        )
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        first = watch / "a.mysingle"
+        second = watch / "b.mysingle"
+        _write_mail(first, uid="2026062600222224", msgid="same-uid")
+        _write_mail(second, uid="2026062600222224", msgid="same-uid")
+        os.utime(first, (1_000, 1_000))
+        os.utime(second, (999, 999))
+
+        class BatchIndexer:
+            table_was_recreated = False
+            table_is_empty = False
+            _batch_size = 2
+
+            def __init__(self):
+                self.current_uids = set()
+                self.deleted = []
+
+            def get_index_state(self, uid, _mtime):
+                state = "CURRENT" if uid in self.current_uids else "MISSING"
+                return types.SimpleNamespace(state=types.SimpleNamespace(name=state), old_chunk_ids=())
+
+            def get_legacy_path_chunk_ids(self, source_file):
+                return (f"legacy:{Path(source_file).name}",)
+
+            def prepare_mail(self, parsed, _mtime, _check):
+                return types.SimpleNamespace(parsed=parsed, chunks=["chunk"], vectors=[[0.0]])
+
+            def embed_mail_jobs(self, _jobs):
+                return types.SimpleNamespace(
+                    input_chunks=1, batch_count=1, embed_calls=1, split_retries=0, blocking_error=None,
+                )
+
+            def commit_mail_job(self, job):
+                self.current_uids.add(job.parsed["mail_uid"])
+                return ["normal-chunk"]
+
+            def delete_chunk_ids(self, chunk_ids):
+                self.deleted.append(tuple(chunk_ids))
+                return tuple(chunk_ids)
+
+        indexer = BatchIndexer()
+        state_file = tmp_path / "mail_scan_state.json"
+        cfg = {"mail": {"max_mails_per_scan": 2, "batch_commit_every": 1}}
+        assert run_mail_scan(
+            [str(watch)], indexer, cfg, state_file=state_file, failure_file=tmp_path / "failures.json",
+        ) == (1, 1)
+        assert set(indexer.deleted) == {("legacy:a.mysingle", "legacy:b.mysingle")}
+        assert load_mail_scan_state(state_file)["pending_deletes"] == []
+
+        assert run_mail_scan(
+            [str(watch)], indexer, cfg, state_file=state_file, failure_file=tmp_path / "failures.json",
+        ) == (0, 2)
+        assert len(indexer.deleted) == 1
+
+    def test_current_normal_uid_cleans_remaining_same_source_legacy_chunk(self, tmp_path, monkeypatch):
+        """이전 중단 뒤 정상 v4 행이 있으면 CURRENT 경로에서 legacy만 재정리한다."""
+        from knowmate.collector.mail_scan_state import load_mail_scan_state
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        monkeypatch.setitem(
+            sys.modules, "knowmate.rag.email_indexer", types.SimpleNamespace(EMAIL_INDEX_VERSION="4"),
+        )
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        _write_mail(watch / "mail.mysingle", uid="2026062600222225", msgid="current-legacy")
+
+        class CurrentIndexer:
+            table_was_recreated = False
+            table_is_empty = False
+
+            def get_index_state(self, *_args):
+                return types.SimpleNamespace(state=types.SimpleNamespace(name="CURRENT"), old_chunk_ids=())
+
+            def get_legacy_path_chunk_ids(self, _source_file):
+                return ("legacy-1",)
+
+            def delete_chunk_ids(self, chunk_ids):
+                return tuple(chunk_ids)
+
+        state_file = tmp_path / "mail_scan_state.json"
+        assert run_mail_scan(
+            [str(watch)], CurrentIndexer(), {"mail": {"max_mails_per_scan": 1}},
+            state_file=state_file, failure_file=tmp_path / "failures.json",
+        ) == (0, 1)
+        assert load_mail_scan_state(state_file)["pending_deletes"] == []
+
+    def test_cached_copy_uses_mtime_independent_v4_uid_check_for_legacy_cleanup(self, tmp_path, monkeypatch):
+        """더 새 복사본 캐시가 있어도 다른 mtime의 legacy source를 정상 UID로 정리한다."""
+        from knowmate.collector.mail_scan_state import cache_success, load_mail_scan_state, save_mail_scan_state
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        monkeypatch.setitem(
+            sys.modules, "knowmate.rag.email_indexer", types.SimpleNamespace(EMAIL_INDEX_VERSION="4"),
+        )
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        cached_copy = watch / "cached.mysingle"
+        legacy_copy = watch / "legacy.mysingle"
+        _write_mail(cached_copy, uid="2026062600222228", msgid="cached-copy")
+        _write_mail(legacy_copy, uid="2026062600222228", msgid="cached-copy")
+        os.utime(cached_copy, (3_000, 3_000))
+        os.utime(legacy_copy, (2_000, 2_000))
+        state_file = tmp_path / "mail_scan_state.json"
+        state = {"schema_version": 2, "cursor": None, "files": {}, "pending_deletes": []}
+        cache_success(state, {
+            "path": str(cached_copy), "mtime": 3_000.0, "size": cached_copy.stat().st_size,
+        }, "knox:2026062600222228")
+        assert save_mail_scan_state(state_file, state)
+
+        class CachedUidIndexer:
+            table_was_recreated = False
+            table_is_empty = False
+
+            def __init__(self):
+                self.deleted = []
+
+            def get_legacy_path_chunk_ids(self, source_file):
+                return ("legacy-1",) if Path(source_file).name == "legacy.mysingle" else ()
+
+            def has_current_mail_uid(self, uid):
+                return uid == "knox:2026062600222228"
+
+            def get_index_state(self, *_args):
+                raise AssertionError("복사본 mtime으로 CURRENT 판정하면 안 됨")
+
+            def index_mail(self, *_args, **_kwargs):
+                raise AssertionError("정상 UID가 이미 있으면 재저장하지 않음")
+
+            def delete_chunk_ids(self, chunk_ids):
+                self.deleted.append(tuple(chunk_ids))
+                return tuple(chunk_ids)
+
+        indexer = CachedUidIndexer()
+        assert run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 1}},
+            state_file=state_file, failure_file=tmp_path / "failures.json",
+        ) == (0, 2)
+        assert indexer.deleted == [("legacy-1",)]
+        assert load_mail_scan_state(state_file)["pending_deletes"] == []
+
+    def test_empty_fallback_save_never_deletes_legacy_or_caches_success(self, tmp_path, monkeypatch):
+        """prepare 없는 fallback의 빈 저장 결과는 legacy 삭제·성공 캐시가 될 수 없다."""
+        from knowmate.collector.mail_scan_state import load_mail_scan_state
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        monkeypatch.setitem(
+            sys.modules, "knowmate.rag.email_indexer", types.SimpleNamespace(EMAIL_INDEX_VERSION="4"),
+        )
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        _write_mail(watch / "mail.mysingle", uid="2026062600222226", msgid="empty-save")
+
+        class EmptyFallbackIndexer:
+            table_was_recreated = False
+            table_is_empty = False
+
+            def get_index_state(self, *_args):
+                return types.SimpleNamespace(state=types.SimpleNamespace(name="MISSING"), old_chunk_ids=())
+
+            def get_legacy_path_chunk_ids(self, _source_file):
+                return ("legacy-1",)
+
+            def index_mail(self, *_args, **_kwargs):
+                return []
+
+            def delete_chunk_ids(self, _chunk_ids):
+                raise AssertionError("빈 저장 결과는 legacy 삭제 금지")
+
+        state_file = tmp_path / "mail_scan_state.json"
+        assert run_mail_scan(
+            [str(watch)], EmptyFallbackIndexer(), {"mail": {"max_mails_per_scan": 1}},
+            state_file=state_file, failure_file=tmp_path / "failures.json",
+        ) == (0, 1)
+        state = load_mail_scan_state(state_file)
+        assert state["files"] == {}
+        assert state["pending_deletes"] == []
+
+    def test_legacy_lookup_failure_does_not_leave_same_uid_alias_unresolved(self, tmp_path, monkeypatch):
+        """첫 복사본 lookup 실패 뒤 같은 UID의 다음 파일도 별도 결과로 확정한다."""
+        from knowmate.collector import failure_state
+        from knowmate.collector.mail_scan_state import load_mail_scan_state
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        monkeypatch.setitem(
+            sys.modules, "knowmate.rag.email_indexer", types.SimpleNamespace(EMAIL_INDEX_VERSION="4"),
+        )
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        failed = watch / "a.mysingle"
+        succeeds = watch / "b.mysingle"
+        _write_mail(failed, uid="2026062600222227", msgid="lookup-failure")
+        _write_mail(succeeds, uid="2026062600222227", msgid="lookup-failure")
+        os.utime(failed, (1_000, 1_000))
+        os.utime(succeeds, (999, 999))
+
+        class LookupFailureIndexer:
+            table_was_recreated = False
+            table_is_empty = False
+
+            def get_index_state(self, *_args):
+                return types.SimpleNamespace(state=types.SimpleNamespace(name="MISSING"), old_chunk_ids=())
+
+            def get_legacy_path_chunk_ids(self, source_file):
+                if Path(source_file).name == "a.mysingle":
+                    raise RuntimeError("lookup failed")
+                return ()
+
+            def index_mail(self, *_args, **_kwargs):
+                return ["normal-chunk"]
+
+            def delete_chunk_ids(self, _chunk_ids):
+                raise AssertionError("legacy ID가 없으면 삭제하지 않음")
+
+        state_file = tmp_path / "mail_scan_state.json"
+        failure_file = tmp_path / "failures.json"
+        assert run_mail_scan(
+            [str(watch)], LookupFailureIndexer(), {"mail": {"max_mails_per_scan": 2}},
+            state_file=state_file, failure_file=failure_file,
+        ) == (1, 1)
+        state = load_mail_scan_state(state_file)
+        assert len(state["files"]) == 1
+        assert next(iter(state["files"].values()))["mail_uid"] == "knox:2026062600222227"
+        assert str(failed) in failure_state.load_failures(failure_file)
 
     def test_pending_delete_survives_disk_reload_and_fresh_indexer(self, tmp_path, monkeypatch):
         """저장된 대기열은 새 인덱서·새 스캔에서도 원본 파일과 무관하게 재시도된다."""

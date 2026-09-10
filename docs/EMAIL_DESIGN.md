@@ -23,6 +23,8 @@ Outlook은 그 위에 얹는다. 스키마는 **Outlook까지 고려한 풀 스�
 - **source_type 판별**: 확장자로 결정 — `.mysingle` → `knox`, 그 외 → `eml`. `mail_uid` 접두도 동일(`knox:` / `eml:`).
 - **포맷**: 표준 RFC822 + MIME multipart. DRM 없음.
 - **파싱**: `email.message_from_binary_file(f, policy=email.policy.compat32)`
+  - Knox가 붙인 UTF-8 BOM은 파일 스트림에서 먼저 건너뛴다. 파일 전체를 복사하지 않아
+    RFC822 헤더를 평문 본문으로 오인하는 것을 막는다.
   - `policy.default`는 `=?UTF-8?B?...?=` 헤더 처리 이슈 → 헤더는 `email.header.decode_header()`로 별도 디코딩.
 - **실측 구조**:
   ```
@@ -41,7 +43,8 @@ Outlook은 그 위에 얹는다. 스키마는 **Outlook까지 고려한 풀 스�
 
 - `text/html`만 있는 경우가 일반적. `text/plain` fallback 지원.
 - **HTML→텍스트**: stdlib `html.parser` (외부 의존성 0, 사외 fake 테스트 즉시 통과).
-  - `_HTMLStripper(HTMLParser)`로 태그 제거 후 공백 정리.
+- `_HTMLStripper(HTMLParser)`로 태그 제거 후 공백 정리. `style`/`script` 내부 데이터는
+  대소문자·중첩과 무관하게 본문에서 제외한다.
 - 추출 텍스트는 기존 청킹 파이프라인(`chunk_size=400`, `overlap=80`)에 투입.
 
 ---
@@ -81,7 +84,7 @@ Outlook은 그 위에 얹는다. 스키마는 **Outlook까지 고려한 풀 스�
 파일은 정렬·보관할 처리 후보에서 즉시 제외한다. 캐시가 없는 기존 설치는 사이클당 처리 한도 안에서만
 `get_index_state`로 점진적으로 캐시를 만든다.
 
-`mail_uid` 정규화: Knox → `knox:{UniqueID}`, eml → `eml:{Message-ID}`, Outlook → `outlook:{EntryID}` (소스 접두사로 통일).
+`mail_uid` 정규화: Knox → `knox:{UniqueID}`, eml → `eml:{Message-ID}`, Outlook → `outlook:{EntryID}` (소스 접두사로 통일). v4 재인덱싱 때는 BOM 오파싱으로 과거에 생성된 같은 `source_file`의 `knox:{절대경로}` 활성 청크만, 새 정상 청크 저장 성공 뒤 `pending_deletes`를 거쳐 정리한다. 같은 UID 복사본은 source별 legacy ID를 함께 캡처하되 정상 UID 행과 다른 source는 건드리지 않으며, 저장 뒤 queue 기록 전 중단된 경우에는 정상 v4 행 확인 후 남은 같은 source의 legacy ID만 재시도한다.
 
 `mail_scan_state.json`은 **schema_version 2**다. `files`는 정규화한 source file 경로를
 키로 쓰므로 항목 안에 경로를 중복 저장하지 않으며, `mtime`·`size`·`mail_uid`·인덱스/UID
@@ -115,7 +118,7 @@ Outlook은 그 위에 얹는다. 스키마는 **Outlook까지 고려한 풀 스�
 
 ## 5. `emails` 테이블 스키마 (`rag/email_indexer.py`)
 
-> `EMAIL_INDEX_VERSION` 이력: v2(메타헤더 임베딩) → **v3**(`mail_date_ts` 추가, 날짜 범위 검색용).
+> `EMAIL_INDEX_VERSION` 이력: v2(메타헤더 임베딩) → v3(`mail_date_ts` 추가, 날짜 범위 검색용) → **v4**(HTML의 CSS/스크립트 제외, Knox UTF-8 BOM 파싱 수정).
 > 버전 범프 시 `_index_version`(source_meta) 불일치로 기존 메일이 자동 1회 재인덱싱된다.
 
 ```python
