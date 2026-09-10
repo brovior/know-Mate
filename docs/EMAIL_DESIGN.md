@@ -77,7 +77,9 @@ Outlook은 그 위에 얹는다. 스키마는 **Outlook까지 고려한 풀 스�
 `mail_scan_state.json`의 최상위 `pending_deletes` 대기열에 먼저 기록하고 다음 사이클에
 원본 파일·성공 캐시·인덱스 버전과 무관하게 재시도한다. 스캔 단계는
 `mail_scan_state.json`의 `source_file`+`mtime`+size+버전 성공 캐시를 먼저 확인해 정상 메일의 DB 조회와
-파싱을 피한다. 캐시가 없는 기존 설치는 사이클당 처리 한도 안에서만 `get_index_state`로 점진적으로 캐시를 만든다.
+파싱을 피한다. 스캔은 모든 파일을 확인해 캐시 정리·실패 이력을 유지하지만, 성공 캐시 적중과 활성 백오프
+파일은 정렬·보관할 처리 후보에서 즉시 제외한다. 캐시가 없는 기존 설치는 사이클당 처리 한도 안에서만
+`get_index_state`로 점진적으로 캐시를 만든다.
 
 `mail_uid` 정규화: Knox → `knox:{UniqueID}`, eml → `eml:{Message-ID}`, Outlook → `outlook:{EntryID}` (소스 접두사로 통일).
 

@@ -75,7 +75,9 @@ def cache_matches(entry: dict[str, Any] | None, item: dict[str, Any]) -> bool:
 
 def cache_success(state: dict[str, Any], item: dict[str, Any], mail_uid: str) -> None:
     """성공하거나 DB 중복으로 확인된 메일의 캐시 항목을 기록한다."""
-    key = normalize_path_key(item["path"])
+    key = item.get("path_key")
+    if not isinstance(key, str):
+        key = normalize_path_key(item["path"])
     state["files"][key] = {
         "path": item["path"],
         "mtime": item["mtime"],
@@ -107,7 +109,10 @@ def clear_pending_delete(state: dict[str, Any], chunk_ids: tuple[str, ...] | lis
 
 def set_cursor(state: dict[str, Any], item: dict[str, Any]) -> None:
     """현재 항목까지 순회했음을 다음 사이클용 커서에 기록한다."""
-    state["cursor"] = {"mtime": item["mtime"], "path": normalize_path_key(item["path"])}
+    key = item.get("path_key")
+    if not isinstance(key, str):
+        key = normalize_path_key(item["path"])
+    state["cursor"] = {"mtime": item["mtime"], "path": key}
 
 
 def prune_missing_files(state: dict[str, Any], seen_keys: set[str]) -> int:

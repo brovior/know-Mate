@@ -368,6 +368,87 @@ class TestMailScanner:
         assert [Path(item["path"]).stem for item in results] == ["a", "b", "c"]
         assert all(item["size"] == 4 for item in results)
 
+    def test_duplicate_identical_watch_roots_attempt_and_fail_once(self, tmp_path, monkeypatch):
+        """같은 root를 반복 등록해도 파일 하나는 한 번만 시도하고 실패를 한 번만 기록한다."""
+        from knowmate.collector import failure_state
+        from knowmate.collector.mail_scanner import run_mail_scan, scan_mail_folders
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        path = watch / "failed.mysingle"
+        _write_mail(path, uid="2026062600555555", msgid="duplicate-root")
+        parsed_paths = []
+        monkeypatch.setattr(
+            "knowmate.secure.mysingle_reader.parse_mail_file",
+            lambda source: parsed_paths.append(source) or (_ for _ in ()).throw(OSError("offline")),
+        )
+        failure_file = tmp_path / "failures.json"
+
+        assert len(scan_mail_folders([str(watch), str(watch), str(watch)], 3)) == 1
+        assert run_mail_scan(
+            [str(watch), str(watch), str(watch)], self._fake_mail_indexer(monkeypatch),
+            {"mail": {"max_mails_per_scan": 3}}, state_file=tmp_path / "state.json",
+            failure_file=failure_file, get_now=lambda: 1_000.0,
+        ) == (0, 1)
+        assert parsed_paths == [str(path)]
+        record = failure_state.load_failures(failure_file)[str(path)]
+        assert record.consecutive_failures == 1
+        assert failure_state.backoff_seconds(record, str(path), failure_state.BackoffPolicy()) == 1_800.0
+
+    def test_nested_watch_roots_attempt_and_fail_once(self, tmp_path, monkeypatch):
+        """상위·하위 root가 겹쳐도 하위 파일은 한 번만 예산을 쓰고 실패를 한 번만 기록한다."""
+        from knowmate.collector import failure_state
+        from knowmate.collector.mail_scanner import run_mail_scan, scan_mail_folders
+
+        watch = tmp_path / "watch"
+        nested = watch / "nested"
+        nested.mkdir(parents=True)
+        path = nested / "failed.mysingle"
+        _write_mail(path, uid="2026062600666666", msgid="nested-root")
+        parsed_paths = []
+        monkeypatch.setattr(
+            "knowmate.secure.mysingle_reader.parse_mail_file",
+            lambda source: parsed_paths.append(source) or (_ for _ in ()).throw(OSError("offline")),
+        )
+        failure_file = tmp_path / "failures.json"
+
+        assert len(scan_mail_folders([str(watch), str(nested)], 3)) == 1
+        assert run_mail_scan(
+            [str(watch), str(nested)], self._fake_mail_indexer(monkeypatch),
+            {"mail": {"max_mails_per_scan": 3}}, state_file=tmp_path / "state.json",
+            failure_file=failure_file, get_now=lambda: 1_000.0,
+        ) == (0, 1)
+        assert parsed_paths == [str(path)]
+        record = failure_state.load_failures(failure_file)[str(path)]
+        assert record.consecutive_failures == 1
+        assert failure_state.backoff_seconds(record, str(path), failure_state.BackoffPolicy()) == 1_800.0
+
+    @pytest.mark.parametrize("extensions", [None, []])
+    def test_empty_mail_extensions_use_defaults_without_pruning_success_cache(
+        self, tmp_path, monkeypatch, extensions,
+    ):
+        """None/[]도 .mysingle·.eml 기본값으로 스캔해 성공 캐시를 유지한다."""
+        from knowmate.collector.mail_scan_state import load_mail_scan_state
+        from knowmate.collector.mail_scanner import run_mail_scan, scan_mail_folders
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        path = watch / "mail.mysingle"
+        _write_mail(path, uid="2026062600777777", msgid="default-extensions")
+        state_file = tmp_path / "state.json"
+        cfg = {"mail": {"extensions": extensions, "max_mails_per_scan": 1}}
+
+        assert [item["path"] for item in scan_mail_folders([str(watch)], 1, extensions)] == [str(path)]
+        assert run_mail_scan(
+            [str(watch)], self._fake_mail_indexer(monkeypatch), cfg,
+            state_file=state_file, failure_file=tmp_path / "failures.json",
+        ) == (1, 0)
+        assert run_mail_scan(
+            [str(watch)], self._fake_mail_indexer(monkeypatch), cfg,
+            state_file=state_file, failure_file=tmp_path / "failures.json",
+        ) == (0, 1)
+        assert os.path.normcase(os.path.abspath(str(path))) in load_mail_scan_state(state_file)["files"]
+
     def test_changed_state_is_saved_once_and_steady_cache_is_not_rewritten(
         self, tmp_path, monkeypatch,
     ):
@@ -1431,6 +1512,250 @@ class TestMailScanner:
             state_file=state_file, failure_file=tmp_path / "failures.json",
         ) == (0, 1_000)
         assert progress == []
+
+    def test_early_filter_retains_only_actionable_candidates_and_normalizes_once(self, tmp_path, monkeypatch):
+        """대량 캐시·백오프는 전수 확인하되 후보 정렬·보관에는 넣지 않는다."""
+        from knowmate.collector import failure_state, mail_scanner
+
+        monkeypatch.setitem(
+            sys.modules, "knowmate.rag.email_indexer", types.SimpleNamespace(EMAIL_INDEX_VERSION="3"),
+        )
+        watch = tmp_path / "mail"
+        watch.mkdir()
+        paths = [str(watch / f"{index:04d}.mysingle") for index in range(1_000)]
+        state = {"files": {}, "pending_deletes": []}
+        for index, path in enumerate(paths[:980]):
+            state["files"][os.path.normcase(os.path.abspath(path))] = {
+                "path": path, "mtime": float(index), "size": 1,
+                "mail_uid": f"knox:cached-{index}", "index_version": "3",
+                "uid_resolution_version": 2,
+            }
+        failures = {}
+        for index, path in enumerate(paths[980:990], start=980):
+            failure_state.note_failure(
+                failures, path, failure_state.KIND_UNKNOWN_TRANSIENT, "parse", None,
+                float(index), 1, 1_000.0,
+            )
+
+        real_normalize = mail_scanner.normalize_path_key
+        normalized = []
+        monkeypatch.setattr(
+            mail_scanner, "normalize_path_key",
+            lambda path: normalized.append(path) or real_normalize(path),
+        )
+        monkeypatch.setattr(
+            mail_scanner, "_iter_mail_files",
+            lambda _root, _exts: ((path, float(index), 1) for index, path in enumerate(paths)),
+        )
+
+        candidates, seen_keys, cached_failures, cached_uids, skipped = mail_scanner._collect_actionable_candidates(
+            [str(watch)], [".mysingle"], state, failures, 1_001.0,
+            failure_state.BackoffPolicy(),
+        )
+
+        assert len(seen_keys) == len(paths)
+        assert len(normalized) == len(paths)
+        assert cached_failures == []
+        assert len(cached_uids) == 980
+        assert skipped == 990
+        assert [Path(item["path"]).stem for item in candidates] == [
+            f"{index:04d}" for index in range(999, 989, -1)
+        ]
+
+    def test_early_filter_excludes_cache_and_active_backoff_from_attempt_budget(
+        self, tmp_path, monkeypatch,
+    ):
+        """캐시·대기 파일은 파싱/DB 시도와 actionable 후보 모두에서 빠진다."""
+        from knowmate.collector import failure_state
+        from knowmate.collector.mail_scan_state import save_mail_scan_state
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        cached = watch / "cached.mysingle"
+        deferred = watch / "deferred.mysingle"
+        actionable = watch / "actionable.mysingle"
+        for index, path in enumerate((cached, deferred, actionable)):
+            _write_mail(path, uid=f"20260626007777{index}", msgid=path.stem)
+            os.utime(path, (3_000 - index, 3_000 - index))
+        indexer = self._fake_mail_indexer(monkeypatch)
+        state_file = tmp_path / "state.json"
+        cache_key = os.path.normcase(os.path.abspath(str(cached)))
+        save_mail_scan_state(state_file, {
+            "schema_version": 1,
+            "cursor": None,
+            "files": {cache_key: {
+                "path": str(cached), "mtime": cached.stat().st_mtime, "size": cached.stat().st_size,
+                "mail_uid": "knox:cached", "index_version": "3", "uid_resolution_version": 2,
+            }},
+            "pending_deletes": [],
+        })
+        failure_file = tmp_path / "failures.json"
+        failures = {}
+        failure_state.note_failure(
+            failures, str(deferred), failure_state.KIND_UNKNOWN_TRANSIENT, "parse", None,
+            deferred.stat().st_mtime, deferred.stat().st_size, 1_000.0,
+        )
+        failure_state.save_failures(failure_file, failures)
+        parsed_paths = []
+        monkeypatch.setattr(
+            "knowmate.secure.mysingle_reader.parse_mail_file",
+            lambda path: parsed_paths.append(path) or self._sample_parsed_for_scan(path, f"knox:{Path(path).stem}", "body"),
+        )
+
+        assert run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 1}},
+            state_file=state_file, failure_file=failure_file, get_now=lambda: 1_001.0,
+        ) == (1, 2)
+        assert parsed_paths == [str(actionable)]
+        assert indexer.state_check_calls == 1
+
+    def test_expired_mail_backoff_becomes_actionable_again(self, tmp_path, monkeypatch):
+        """백오프 만료 파일은 다음 전수 스캔에서 다시 시도 후보가 된다."""
+        from knowmate.collector import failure_state
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        path = watch / "retry.mysingle"
+        _write_mail(path, uid="2026062600777799", msgid="expired-backoff")
+        indexer = self._fake_mail_indexer(monkeypatch)
+        failure_file = tmp_path / "failures.json"
+        failures = {}
+        failure_state.note_failure(
+            failures, str(path), failure_state.KIND_UNKNOWN_TRANSIENT, "parse", None,
+            path.stat().st_mtime, path.stat().st_size, 1_000.0,
+        )
+        failure_state.save_failures(failure_file, failures)
+
+        assert run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 1}},
+            state_file=tmp_path / "state.json", failure_file=failure_file,
+            get_now=lambda: 2_801.0,
+        ) == (1, 0)
+        assert indexer.state_check_calls == 1
+        assert failure_state.load_failures(failure_file) == {}
+
+    def test_cached_newer_duplicate_uid_keeps_older_changed_alias_as_shadow(self, tmp_path, monkeypatch):
+        """후보에서 제외한 최신 alias가 오래된 변경 본문의 세대 되돌림을 막는다."""
+        from knowmate.collector.mail_scan_state import load_mail_scan_state, save_mail_scan_state
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        old_path = watch / "old.mysingle"
+        cached_new_path = watch / "new.mysingle"
+        old_path.write_bytes(b"old")
+        cached_new_path.write_bytes(b"new")
+        os.utime(old_path, (100, 100))
+        os.utime(cached_new_path, (200, 200))
+        indexer = self._fake_mail_indexer(monkeypatch)
+        state_file = tmp_path / "state.json"
+        cached_key = os.path.normcase(os.path.abspath(str(cached_new_path)))
+        save_mail_scan_state(state_file, {
+            "schema_version": 1,
+            "cursor": None,
+            "files": {cached_key: {
+                "path": str(cached_new_path),
+                "mtime": cached_new_path.stat().st_mtime, "size": cached_new_path.stat().st_size,
+                "mail_uid": "knox:duplicate", "index_version": "3", "uid_resolution_version": 2,
+            }},
+            "pending_deletes": [],
+        })
+        monkeypatch.setattr(
+            "knowmate.secure.mysingle_reader.parse_mail_file",
+            lambda path: self._sample_parsed_for_scan(path, "knox:duplicate", "old body"),
+        )
+
+        assert run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 1}},
+            state_file=state_file, failure_file=tmp_path / "failures.json",
+        ) == (0, 2)
+        assert indexer.state_check_calls == 0
+        state = load_mail_scan_state(state_file)
+        assert os.path.normcase(os.path.abspath(str(old_path))) in state["files"]
+
+    def test_actionable_cursor_reaches_more_than_limit_all_new_mail(self, tmp_path, monkeypatch):
+        """500건을 넘는 신규 backlog도 actionable 커서로 모두 한 번씩 처리한다."""
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        for index in range(501):
+            (watch / f"{index:04d}.mysingle").write_bytes(b"x")
+        indexer = self._fake_mail_indexer(monkeypatch)
+        monkeypatch.setattr(
+            "knowmate.secure.mysingle_reader.parse_mail_file",
+            lambda path: self._sample_parsed_for_scan(path, f"knox:{Path(path).stem}", "body"),
+        )
+        state_file = tmp_path / "state.json"
+        failure_file = tmp_path / "failures.json"
+        cfg = {"mail": {"max_mails_per_scan": 200}}
+
+        assert run_mail_scan([str(watch)], indexer, cfg, state_file=state_file, failure_file=failure_file) == (200, 0)
+        assert run_mail_scan([str(watch)], indexer, cfg, state_file=state_file, failure_file=failure_file) == (200, 200)
+        assert run_mail_scan([str(watch)], indexer, cfg, state_file=state_file, failure_file=failure_file) == (101, 400)
+        assert len(indexer.indexed) == 501
+
+    def test_actionable_cursor_wraps_when_newer_candidate_appears(self, tmp_path, monkeypatch):
+        """처리 중 후보 구성이 바뀌어도 새 최신 파일이 기존 backlog를 굶기지 않는다."""
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        for name, mtime in (("a", 300), ("b", 200), ("c", 100)):
+            path = watch / f"{name}.mysingle"
+            path.write_bytes(b"x")
+            os.utime(path, (mtime, mtime))
+        parsed_names = []
+        monkeypatch.setattr(
+            "knowmate.secure.mysingle_reader.parse_mail_file",
+            lambda path: parsed_names.append(Path(path).stem)
+            or self._sample_parsed_for_scan(path, f"knox:{Path(path).stem}", "body"),
+        )
+        indexer = self._fake_mail_indexer(monkeypatch)
+        state_file = tmp_path / "state.json"
+        failure_file = tmp_path / "failures.json"
+        cfg = {"mail": {"max_mails_per_scan": 1}}
+
+        assert run_mail_scan([str(watch)], indexer, cfg, state_file=state_file, failure_file=failure_file) == (1, 0)
+        newer = watch / "d.mysingle"
+        newer.write_bytes(b"x")
+        os.utime(newer, (400, 400))
+        for expected_skips in (1, 2, 3):
+            assert run_mail_scan(
+                [str(watch)], indexer, cfg, state_file=state_file, failure_file=failure_file,
+            ) == (1, expected_skips)
+        assert parsed_names == ["a", "b", "c", "d"]
+
+    def test_inaccessible_root_keeps_pending_deletes_and_failure_history(self, tmp_path, monkeypatch):
+        """일시 단절 root에서는 failure prune과 pending-delete 손실이 모두 없어야 한다."""
+        from knowmate.collector import failure_state
+        from knowmate.collector.mail_scan_state import load_mail_scan_state, save_mail_scan_state
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        missing_root = tmp_path / "disconnected"
+        failed_path = str(missing_root / "mail.mysingle")
+        failure_file = tmp_path / "failures.json"
+        failures = {}
+        failure_state.note_failure(
+            failures, failed_path, failure_state.KIND_UNKNOWN_TRANSIENT, "parse", None,
+            1_000.0, 1, 2_000.0,
+        )
+        failure_state.save_failures(failure_file, failures)
+        state_file = tmp_path / "state.json"
+        save_mail_scan_state(state_file, {
+            "schema_version": 1, "cursor": None, "files": {}, "pending_deletes": ["old-1"],
+        })
+        indexer = self._fake_mail_indexer(monkeypatch)
+        indexer.delete_chunk_ids = lambda _ids: (_ for _ in ()).throw(RuntimeError("offline"))
+
+        assert run_mail_scan(
+            [str(missing_root)], indexer, {"mail": {"max_mails_per_scan": 1}},
+            state_file=state_file, failure_file=failure_file,
+        ) == (0, 0)
+        assert failed_path in failure_state.load_failures(failure_file)
+        assert load_mail_scan_state(state_file)["pending_deletes"] == ["old-1"]
 
     def test_mail_disabled_check(self):
         """mail.enabled=false이면 스캔 분기에 진입하지 않는다."""

@@ -93,6 +93,31 @@ def _iter_mail_files(folder: str, exts: tuple[str, ...]) -> Iterator[tuple[str, 
             logger.error("[mail_scanner] 폴더 스캔 실패: %s (%s)", current_dir, exc)
 
 
+def _mail_extensions(extensions: list[str] | None) -> tuple[str, ...]:
+    """비어 있는 메일 확장자 설정은 배포 기본값으로 보완한다."""
+    return tuple(ext.lower() for ext in (extensions or _DEFAULT_MAIL_EXTS))
+
+
+def _iter_scanned_mail_items(watch_folders: list[str], exts: tuple[str, ...]) -> Iterator[dict]:
+    """파일마다 경로 키를 한 번 만들고, 중첩 root의 중복 파일은 한 번만 yield한다."""
+    seen_paths: set[str] = set()
+    for folder_str in watch_folders:
+        if not Path(folder_str).is_dir():
+            logger.warning("[mail_scanner] 폴더 접근 불가, 건너뜀: %s", folder_str)
+            continue
+        for path, mtime, size in _iter_mail_files(folder_str, exts):
+            path_key = normalize_path_key(path)
+            if path_key in seen_paths:
+                continue
+            seen_paths.add(path_key)
+            yield {
+                "path": path,
+                "path_key": path_key,
+                "mtime": mtime,
+                "size": size,
+            }
+
+
 def scan_mail_folders(
     watch_folders: list[str], max_per_scan: int, extensions: list[str] | None = None
 ) -> list[dict]:
@@ -102,16 +127,47 @@ def scan_mail_folders(
     ``run_mail_scan``이 파싱·DB 검증·인덱싱 시도에만 적용한다.
     """
     del max_per_scan
-    exts = tuple(e.lower() for e in (extensions or _DEFAULT_MAIL_EXTS))
-    found: list[dict] = []
-    for folder_str in watch_folders:
-        if not Path(folder_str).is_dir():
-            logger.warning("[mail_scanner] 폴더 접근 불가, 건너뜀: %s", folder_str)
-            continue
-        for path, mtime, size in _iter_mail_files(folder_str, exts):
-            found.append({"path": path, "mtime": mtime, "size": size})
-    found.sort(key=lambda item: (-item["mtime"], normalize_path_key(item["path"])))
+    exts = _mail_extensions(extensions)
+    found = list(_iter_scanned_mail_items(watch_folders, exts))
+    found.sort(key=lambda item: (-item["mtime"], item["path_key"]))
     return found
+
+
+def _collect_actionable_candidates(
+    watch_folders: list[str],
+    extensions: list[str] | None,
+    state: dict,
+    failures: dict,
+    now: float,
+    policy: failure_state.BackoffPolicy,
+) -> tuple[list[dict], set[str], list[str], dict[str, float], int]:
+    """한 번의 전체 순회에서 누락 정리용 경로와 실제 처리 후보만 분리한다."""
+    exts = _mail_extensions(extensions)
+    actionable: list[dict] = []
+    seen_keys: set[str] = set()
+    cached_failure_paths: list[str] = []
+    cached_uid_mtimes: dict[str, float] = {}
+    skipped_count = 0
+    for item in _iter_scanned_mail_items(watch_folders, exts):
+        seen_keys.add(item["path_key"])
+        cached = state["files"].get(item["path_key"])
+        if cache_matches(cached, item):
+            cached_uid_mtimes[cached["mail_uid"]] = max(
+                cached_uid_mtimes.get(cached["mail_uid"], float("-inf")), item["mtime"],
+            )
+            if item["path"] in failures:
+                cached_failure_paths.append(item["path"])
+            skipped_count += 1
+            continue
+        if failure_state.should_defer(
+            failures.get(item["path"]), item["path"], item["mtime"], item["size"], now, policy,
+        ):
+            skipped_count += 1
+            continue
+        item["cache_entry"] = cached
+        actionable.append(item)
+    actionable.sort(key=lambda item: (-item["mtime"], item["path_key"]))
+    return actionable, seen_keys, cached_failure_paths, cached_uid_mtimes, skipped_count
 
 
 def run_mail_scan(
@@ -135,7 +191,7 @@ def run_mail_scan(
     mail_cfg = cfg.get("mail", {})
     max_per_scan = max(int(mail_cfg.get("max_mails_per_scan", 500)), 0)
     progress_every = max(int(mail_cfg.get("batch_commit_every", 50)), 1)
-    extensions = mail_cfg.get("extensions", _DEFAULT_MAIL_EXTS)
+    extensions = mail_cfg.get("extensions") or _DEFAULT_MAIL_EXTS
     now_fn = get_now or time.time
 
     if state_file is None or failure_file is None:
@@ -162,20 +218,24 @@ def run_mail_scan(
     if retry_failures:
         failures_dirty = failure_state.request_retry_all(failures) > 0
     policy = failure_state.BackoffPolicy.from_config(cfg.get("collector", {}))
-    candidates = scan_mail_folders(watch_folders, max_per_scan, extensions)
+    candidates, seen_keys, cached_failure_paths, cached_uid_mtimes, early_skipped_count = _collect_actionable_candidates(
+        watch_folders, extensions, state, failures, now_fn(), policy,
+    )
 
     if table_was_recreated:
         logger.info("[mail_scanner] 메일 테이블 재생성 감지 — 성공 캐시를 다시 구축합니다")
     roots_accessible = bool(watch_folders) and all(Path(folder).is_dir() for folder in watch_folders)
-    seen_keys = {normalize_path_key(item["path"]) for item in candidates}
     pruned = prune_missing_files(state, seen_keys) if roots_accessible else 0
     failure_pruned = failure_state.prune(failures) if roots_accessible else 0
     state_dirty = pruned > 0
     state_dirty = _retry_pending_deletes(state, email_indexer) or state_dirty
     failures_dirty = failures_dirty or failure_pruned > 0
+    for path in cached_failure_paths:
+        failure_state.note_success(failures, path)
+        failures_dirty = True
 
     indexed_count = 0
-    skipped_count = 0
+    skipped_count = early_skipped_count
     attempted_count = 0
     migrate_count = 0
     migrate_logged = False
@@ -402,24 +462,10 @@ def run_mail_scan(
     stop_after_global_error = False
     for item in _candidates_from_cursor(candidates, state.get("cursor")):
         path = item["path"]
-        key = normalize_path_key(path)
-        cached = state["files"].get(key)
-        if cache_matches(cached, item):
-            if path in failures:
-                failure_state.note_success(failures, path)
-                failures_dirty = True
-            skipped_count += 1
-            continue
-
-        if failure_state.should_defer(
-            failures.get(path), path, item["mtime"], item["size"], now_fn(), policy,
-        ):
-            skipped_count += 1
-            continue
-
         if attempted_count >= max_per_scan:
             break
         attempted_count += 1
+        cached = item.get("cache_entry")
         is_migration = isinstance(cached, dict) and cached.get("index_version") != _email_index_version()
         if is_migration and not migrate_logged:
             logger.info("[mail_scanner] 인덱싱 포맷 변경 감지 — 메일을 재인덱싱합니다")
@@ -460,7 +506,14 @@ def run_mail_scan(
                 fingerprint = _content_fingerprint(parsed)
                 work = uid_work.get(mail_uid)
                 if work is None:
-                    if not begin_generation(item, parsed, fingerprint, is_migration):
+                    cached_uid_mtime = cached_uid_mtimes.get(mail_uid)
+                    if cached_uid_mtime is not None and item["mtime"] <= cached_uid_mtime:
+                        # 더 최신(또는 동시각) 복사본은 이번 스캔의 성공 캐시라 파싱 대상에서
+                        # 제외됐을 수 있다. 오래된 다른 본문이 그 세대를 되돌리지 않도록
+                        # shadow로만 캐시한다. 캐시 본문은 저장하지 않는다.
+                        mark_success(item, mail_uid)
+                        skipped_count += 1
+                    elif not begin_generation(item, parsed, fingerprint, is_migration):
                         stop_after_global_error = True
                 elif fingerprint == work.fingerprint or item["mtime"] <= work.mtime:
                     # 같은 내용은 복사본이고, 다른 내용이라도 더 오래된 source는 현재
@@ -504,8 +557,8 @@ def run_mail_scan(
     if migrate_count:
         logger.info("[mail_scanner] 포맷 마이그레이션 완료: 재인덱싱=%d건", migrate_count)
     logger.info(
-        "[mail_scanner] 스캔 완료: 전체=%d 시도=%d 인덱싱=%d (마이그레이션=%d) 스킵=%d%s",
-        len(candidates), attempted_count, indexed_count, migrate_count, skipped_count,
+        "[mail_scanner] 스캔 완료: 전체=%d 처리후보=%d 시도=%d 인덱싱=%d (마이그레이션=%d) 스킵=%d%s",
+        len(seen_keys), len(candidates), attempted_count, indexed_count, migrate_count, skipped_count,
         f" 캐시정리={pruned}" if pruned else "",
     )
     return indexed_count, skipped_count
@@ -531,7 +584,7 @@ def _candidates_from_cursor(candidates: list[dict], cursor: object) -> Iterator[
     """커서 다음부터 목록 끝·처음 순으로 후보를 정확히 한 바퀴 순회한다."""
     if not candidates:
         return
-    keys = [(-item["mtime"], normalize_path_key(item["path"])) for item in candidates]
+    keys = [(-item["mtime"], item["path_key"]) for item in candidates]
     start = 0
     if isinstance(cursor, dict) and isinstance(cursor.get("path"), str):
         try:
