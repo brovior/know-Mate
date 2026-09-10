@@ -1,4 +1,5 @@
 """Phase 2 RAG 파이프라인 pytest 테스트 — fake 모드 기준, 사외 환경에서 전부 통과."""
+import http.client
 import math
 from pathlib import Path
 
@@ -125,6 +126,263 @@ class TestEmbeddingFake:
         """빈 리스트 입력 시 빈 리스트를 반환함을 확인한다."""
         client = _fake_embed_client()
         assert client.embed([]) == []
+
+
+# ──────────────────────────────────────────────
+# TestEmbeddingApiResponse
+# ──────────────────────────────────────────────
+
+class TestEmbeddingApiResponse:
+    """OpenAI 호환 임베딩 응답의 순서·형식을 저장 전에 검증한다."""
+
+    @staticmethod
+    def _vector(value: float = 0.0) -> list[float]:
+        """차원이 맞는 간단한 테스트 벡터를 만든다."""
+        return [value] * VECTOR_DIM
+
+    def test_response_index_restores_request_order(self):
+        """서버 data 배열 순서가 섞여도 index 기준으로 요청 순서를 복원한다."""
+        from knowmate.rag.embedding import _vectors_in_request_order
+
+        result = _vectors_in_request_order(
+            {"data": [
+                {"index": 1, "embedding": self._vector(2.0)},
+                {"index": 0, "embedding": self._vector(1.0)},
+            ]},
+            expected_count=2,
+        )
+
+        assert result[0][0] == 1.0
+        assert result[1][0] == 2.0
+
+    def test_response_count_mismatch_is_protocol_error(self):
+        """요청보다 적은 벡터는 zip으로 조용히 저장하지 않고 실패한다."""
+        from knowmate.rag.embedding import EmbeddingProtocolError, _vectors_in_request_order
+
+        with pytest.raises(EmbeddingProtocolError, match="수 불일치"):
+            _vectors_in_request_order(
+                {"data": [{"index": 0, "embedding": self._vector()}]}, expected_count=2
+            )
+
+    @pytest.mark.parametrize(
+        "data, expected_message",
+        [
+            ([{"index": 0, "embedding": [0.0] * VECTOR_DIM},
+              {"index": 0, "embedding": [0.0] * VECTOR_DIM}], "중복"),
+            ([{"index": 2, "embedding": [0.0] * VECTOR_DIM}], "올바르지"),
+            ([{"embedding": [0.0] * VECTOR_DIM}], "올바르지"),
+        ],
+    )
+    def test_response_index_validation_rejects_duplicate_missing_and_out_of_range(
+        self, data, expected_message
+    ):
+        """중복·없는·범위 밖 index는 원래 청크에 잘못 붙지 않게 거부한다."""
+        from knowmate.rag.embedding import EmbeddingProtocolError, _vectors_in_request_order
+
+        with pytest.raises(EmbeddingProtocolError, match=expected_message):
+            _vectors_in_request_order({"data": data}, expected_count=len(data))
+
+    @pytest.mark.parametrize(
+        "vector",
+        [
+            [0.0] * (VECTOR_DIM - 1),
+            [float("nan")] * VECTOR_DIM,
+            [float("inf")] * VECTOR_DIM,
+        ],
+    )
+    def test_response_vector_dimension_and_finite_values_are_validated(self, vector):
+        """차원이 다르거나 NaN/Inf가 있는 벡터는 저장 전에 실패한다."""
+        from knowmate.rag.embedding import EmbeddingProtocolError, _vectors_in_request_order
+
+        with pytest.raises(EmbeddingProtocolError):
+            _vectors_in_request_order(
+                {"data": [{"index": 0, "embedding": vector}]}, expected_count=1
+            )
+
+    def test_response_rejects_finite_value_outside_float32_range(self):
+        """Python float로는 유한해도 float32 저장 범위를 넘으면 저장 전에 거부한다."""
+        from knowmate.rag.embedding import EmbeddingProtocolError, _vectors_in_request_order
+
+        vector = self._vector()
+        vector[0] = 1e100
+        with pytest.raises(EmbeddingProtocolError, match="범위"):
+            _vectors_in_request_order(
+                {"data": [{"index": 0, "embedding": vector}]}, expected_count=1
+            )
+
+    def test_response_accepts_float32_boundary_value(self):
+        """유한한 float32 최대값은 LanceDB 저장 전 검증을 통과한다."""
+        from knowmate.rag.embedding import _vectors_in_request_order
+
+        float32_max = float.fromhex("0x1.fffffep+127")
+        vector = self._vector()
+        vector[0] = float32_max
+        result = _vectors_in_request_order(
+            {"data": [{"index": 0, "embedding": vector}]}, expected_count=1
+        )
+        assert result[0][0] == float32_max
+
+    @pytest.mark.parametrize(
+        "status, body, expected",
+        [
+            (413, b"not json", "content"),
+            (400, b'{"error":{"param":"input"}}', "content"),
+            (422, b'{"error":{"param":"input[31]"}}', "content"),
+            (400, b'{"error":{"param":"model","code":"model_not_found"}}', "protocol"),
+            (422, b'{"error":{"param":"unknown"}}', "protocol"),
+            (400, b"not json", "protocol"),
+            (401, b"error", "protocol"), (403, b"error", "protocol"), (404, b"error", "protocol"),
+            (408, b"error", "transient"), (429, b"error", "transient"), (503, b"error", "transient"),
+        ],
+    )
+    def test_http_error_type_uses_only_explicit_input_signal_for_splitting(self, status, body, expected):
+        """400/422는 명시적 input 신호가 있을 때만 분할 대상으로 분류한다."""
+        from knowmate.rag.embedding import (
+            EmbeddingClient,
+            EmbeddingContentError,
+            EmbeddingProtocolError,
+            EmbeddingTransientError,
+        )
+
+        class Response:
+            def read(self) -> bytes:
+                return body
+
+        class Connection:
+            def request(self, *_args, **_kwargs) -> None:
+                pass
+
+            def getresponse(self):
+                response = Response()
+                response.status = status
+                return response
+
+        client = EmbeddingClient(base_url="http://intra", host_header="h")
+        client._get_connection = lambda: (Connection(), 0.0)
+
+        error_class = {
+            "content": EmbeddingContentError,
+            "protocol": EmbeddingProtocolError,
+            "transient": EmbeddingTransientError,
+        }[expected]
+        with pytest.raises(error_class):
+            client.embed(["one"])
+
+    @pytest.mark.parametrize(
+        "body",
+        [b"not json", b'{"data": {}}', b'{"data": [{"embedding": []}]}'],
+    )
+    def test_invalid_json_and_success_schema_are_non_splittable(self, body):
+        """성공 응답의 JSON·스키마 오류는 콘텐츠 분할 오류가 아니다."""
+        from knowmate.rag.embedding import EmbeddingClient, EmbeddingProtocolError
+
+        class Response:
+            status = 200
+
+            def read(self) -> bytes:
+                return body
+
+        class Connection:
+            def request(self, *_args, **_kwargs) -> None:
+                pass
+
+            def getresponse(self):
+                return Response()
+
+        client = EmbeddingClient(base_url="http://intra", host_header="h")
+        client._get_connection = lambda: (Connection(), 0.0)
+        with pytest.raises(EmbeddingProtocolError):
+            client.embed(["one"])
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param(True, id="bool"),
+            pytest.param("0.1", id="string"),
+            pytest.param(None, id="null"),
+            pytest.param(10 ** 1000, id="huge-integer"),
+        ],
+    )
+    def test_response_rejects_non_json_number_and_huge_integer(self, value):
+        """bool·문자열·null·float 범위를 넘는 정수는 벡터 원소로 허용하지 않는다."""
+        from knowmate.rag.embedding import EmbeddingProtocolError, _vectors_in_request_order
+
+        vector = self._vector()
+        vector[0] = value
+        with pytest.raises(EmbeddingProtocolError):
+            _vectors_in_request_order(
+                {"data": [{"index": 0, "embedding": vector}]}, expected_count=1
+            )
+
+    @pytest.mark.parametrize("index", [True, 0.0, "0", None])
+    def test_response_rejects_non_integer_index(self, index):
+        """JSON number라도 정수가 아닌 index는 청크 순서로 사용하지 않는다."""
+        from knowmate.rag.embedding import EmbeddingProtocolError, _vectors_in_request_order
+
+        with pytest.raises(EmbeddingProtocolError, match="index"):
+            _vectors_in_request_order(
+                {"data": [{"index": index, "embedding": self._vector()}]}, expected_count=1
+            )
+
+    def test_network_failure_is_transient_after_existing_retry(self, monkeypatch):
+        """연결 오류는 기존 1회 재연결 시도 뒤 transient로 노출된다."""
+        import http.client
+
+        from knowmate.rag.embedding import EmbeddingClient, EmbeddingTransientError
+
+        attempts = {"count": 0}
+
+        class Connection:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def connect(self) -> None:
+                attempts["count"] += 1
+                raise OSError("network down")
+
+        monkeypatch.setattr(http.client, "HTTPConnection", Connection)
+        client = EmbeddingClient(base_url="http://intra", host_header="h")
+
+        with pytest.raises(EmbeddingTransientError):
+            client.embed(["one"])
+        assert attempts["count"] == 2
+
+    @pytest.mark.parametrize("failure", [TimeoutError, http.client.HTTPException])
+    def test_read_transport_failure_retries_then_succeeds(self, monkeypatch, failure):
+        """read 단계의 timeout·HTTPException도 기존처럼 한 번 재연결 후 성공한다."""
+        import http.client
+        import json
+
+        from knowmate.rag.embedding import EmbeddingClient
+
+        attempts = {"count": 0}
+        vector = self._vector()
+
+        class Response:
+            status = 200
+
+            def read(self) -> bytes:
+                attempts["count"] += 1
+                if attempts["count"] == 1:
+                    raise failure("read failure")
+                return json.dumps({"data": [{"index": 0, "embedding": vector}]}).encode()
+
+        class Connection:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def connect(self) -> None:
+                pass
+
+            def request(self, *_args, **_kwargs) -> None:
+                pass
+
+            def getresponse(self):
+                return Response()
+
+        monkeypatch.setattr(http.client, "HTTPConnection", Connection)
+        assert len(EmbeddingClient(base_url="http://intra", host_header="h").embed(["one"])) == 1
+        assert attempts["count"] == 2
 
 
 # ──────────────────────────────────────────────
@@ -481,7 +739,7 @@ class TestProxyBypass:
         import http.client
         import json
 
-        response_body = {"data": [{"embedding": [0.0] * VECTOR_DIM}]}
+        response_body = {"data": [{"index": 0, "embedding": [0.0] * VECTOR_DIM}]}
         holder: dict = {}
 
         class FakeResp:
@@ -578,7 +836,7 @@ class TestSlowEmbedCallLogging:
 
         from knowmate.rag.embedding import EmbeddingClient, VECTOR_DIM
 
-        body = {"data": [{"embedding": [0.0] * VECTOR_DIM}]}
+        body = {"data": [{"index": 0, "embedding": [0.0] * VECTOR_DIM}]}
 
         class FakeResp:
             status = 200
@@ -668,7 +926,7 @@ class TestSlowEmbedCallLogging:
 
         from knowmate.rag.embedding import EmbeddingClient, VECTOR_DIM
 
-        body = {"data": [{"embedding": [0.0] * VECTOR_DIM}]}
+        body = {"data": [{"index": 0, "embedding": [0.0] * VECTOR_DIM}]}
         state = {"attempts": 0}
 
         class FakeResp:

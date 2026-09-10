@@ -1,5 +1,5 @@
 # EMAIL_DESIGN.md — Aegis Desk 메일 인덱싱 설계
-> 상태: **Phase 5a 구현 완료** (Knox `.mysingle` + 표준 `.eml`) | 2026-07-17
+> 상태: **Phase 5a 구현 완료** (Knox `.mysingle` + 표준 `.eml`) | 2026-09-10
 > Outlook PST/.msg 보류
 
 ---
@@ -70,14 +70,46 @@ Outlook은 그 위에 얹는다. 스키마는 **Outlook까지 고려한 풀 스�
 | 4 | `message_id` (RFC, 소스 간 공통) | (향후) 소스 간 dedup |
 | 5 | `attach_sha256` | (향후) 동일 첨부 중복 방지 |
 
-`is_indexed(mail_uid, mtime)`는 위 1·2·3을 모두 만족해야 "이미 인덱싱됨"으로 스킵한다. 스캔 단계는
+`get_index_state(mail_uid, mtime)`는 위 1·2·3을 모두 만족하면 `CURRENT`, DB에 행이 없으면
+`MISSING`, 기존 행의 mtime·포맷이 다르면 `STALE`, 조회 자체가 실패하면 `ERROR`를 반환한다.
+`ERROR`에서는 저장·삭제를 하지 않고 다음 수집 기회에 재시도한다. `STALE`은 기존 active `chunk_id`를
+캡처한 뒤 모든 새 청크 임베딩과 `add()`가 성공해야 그 ID만 삭제한다. 삭제 실패 ID는
+`mail_scan_state.json`의 최상위 `pending_deletes` 대기열에 먼저 기록하고 다음 사이클에
+원본 파일·성공 캐시·인덱스 버전과 무관하게 재시도한다. 스캔 단계는
 `mail_scan_state.json`의 `source_file`+`mtime`+size+버전 성공 캐시를 먼저 확인해 정상 메일의 DB 조회와
-파싱을 피한다. 캐시가 없는 기존 설치는 사이클당 처리 한도 안에서만 `is_indexed`로 점진적으로 캐시를 만든다.
+파싱을 피한다. 스캔은 모든 파일을 확인해 캐시 정리·실패 이력을 유지하지만, 성공 캐시 적중과 활성 백오프
+파일은 정렬·보관할 처리 후보에서 즉시 제외한다. 캐시가 없는 기존 설치는 사이클당 처리 한도 안에서만
+`get_index_state`로 점진적으로 캐시를 만든다.
 
 `mail_uid` 정규화: Knox → `knox:{UniqueID}`, eml → `eml:{Message-ID}`, Outlook → `outlook:{EntryID}` (소스 접두사로 통일).
 
+`mail_scan_state.json`은 **schema_version 2**다. `files`는 정규화한 source file 경로를
+키로 쓰므로 항목 안에 경로를 중복 저장하지 않으며, `mtime`·`size`·`mail_uid`·인덱스/UID
+해결 버전만 둔다. v1은 최초 읽기에서 성공 캐시·커서·`pending_deletes`를 보존해 v2로
+원자 저장한다. `mail_uid`는 동일 UID 복사본의 최신 세대를 판별하는 캐시 요약이므로 유지한다.
+
 **본문 임베딩 시 메타 헤더 삽입**: `index_mail`은 청킹 전 본문 앞에 `제목/발신/수신/날짜` 헤더를 붙여,
 "○○가 보낸 메일", "○월 메일" 같은 발신인·날짜 기반 질의도 벡터 검색에 매칭되게 한다.
+
+**교차메일 임베딩 배치**: 파싱·메타헤더·청킹은 메일별로 끝내고 각 청크에 소유 메일·청크 순번을 유지한다.
+그 뒤 여러 메일 청크만 평탄화해 최대 32개씩 임베딩하고, 벡터를 다시 메일별로 돌려놓는다. 한 메일은 모든
+청크 벡터가 준비될 때만 DB에 저장한다. `EmbeddingContentError`만 이분 분할해 불량 청크를 격리하며,
+`EmbeddingTransientError`·`EmbeddingProtocolError`는 분할하지 않고 해당·미처리 메일을 다음 스캔으로 넘긴다.
+응답 벡터는 유한한 float32 범위를 확인한 뒤에만 LanceDB에 저장한다.
+
+**같은 UID의 변경 복사본**: 스캔 안에서만 본문·인덱스 메타의 SHA-256 지문을 비교한다(본문·지문은 상태
+파일과 로그에 남기지 않음). 내용이 다르고 mtime이 더 새면 기존 세대가 최종 확정된 뒤 STALE 안전 교체를
+수행하며, 더 오래된 다른 내용은 새 세대를 되돌리지 않는 shadow로만 처리한다. `batch_commit_every`는
+실제 처리 시도의 **최종 결과** 진행률을 묶는 간격이며, 성공 캐시·백오프 skip은 진행률 callback을 만들지 않는다.
+
+**사이클 계측**: 종료 시 상태 읽기·후보 열거/선별/정렬·파싱·DB 상태 확인·임베딩·메일 저장·삭제 재시도·
+상태/실패 이력 저장의 시간과 건수를 한 줄로 기록한다. 파일 수, 캐시·백오프·DB 상태, 임베딩 청크/배치/
+`EmbeddingClient.embed()` 호출/분할 재시도, 저장 성공·실패만 남긴다. `embed_calls`는 내부 전송 재시도를
+제외한 애플리케이션 호출 수이며 HTTP POST 수가 아니다. 본문·복호화 평문·메일별 정상 처리 로그는 남기지 않는다.
+
+**현행 제한**: 내용이 다른 같은 UID 복사본이 `max_mails_per_scan` 때문에 서로 다른 사이클로 나뉘면,
+뒤 사이클의 더 오래된 복사본이 최신 세대를 교체할 수 있다. 한 사이클 안의 충돌만 방지하며, 이는 이번
+성능 후속에서 고치지 않은 기존 제한이다.
 
 ---
 
@@ -212,8 +244,8 @@ mail:
   extensions:              # 인덱싱할 메일 확장자
   - .mysingle
   - .eml
-  max_mails_per_scan: 500  # 스캔당 실제 처리 시도 상한 (파싱·DB 확인·인덱싱)
-  batch_commit_every: 50   # 진행률 알림 주기 (기존 설정 키명 유지)
+  max_mails_per_scan: 500  # 스캔당 실제 처리 시도 상한 (파싱·DB 확인·인덱싱, 다음 순환에서 계속)
+  batch_commit_every: 50   # 최종 결과 기반 진행률 알림 최소 간격(성공 캐시·백오프 skip 제외)
 ```
 
 `watch_folders`를 공유 — `extensions`에 지정된 확장자를 감지해 자동으로 메일 파이프라인으로 라우팅.

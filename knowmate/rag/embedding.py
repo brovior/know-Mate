@@ -19,6 +19,8 @@ _DUMMY_API_KEY = "dummy"
 # 진단 스크립트 실측(사내 PC)에서 정상 호출은 32청크도 0.15초였으므로, 3초는
 # "확실히 비정상"이면서 정상 호출을 걸러내기에 충분히 여유 있는 값이다.
 SLOW_EMBED_CALL_LOG_SEC = 3.0
+_FLOAT32_MAX = float.fromhex("0x1.fffffep+127")
+_MAX_ERROR_JSON_BYTES = 16 * 1024
 
 # 모델 → 벡터 차원 매핑 (단일 출처). 모델 추가 시 여기만 갱신한다.
 # 모델과 차원은 한 몸이라 따로 두면 desync 되므로 VECTOR_DIM은 여기서 파생한다.
@@ -30,6 +32,22 @@ EMBEDDING_MODEL = "bge-m3"
 VECTOR_DIM = MODEL_DIMS[EMBEDDING_MODEL]  # 모델에서 자동 파생. 변경 시 전체 재인덱싱 필수
 
 _local_model = None  # sentence-transformers 모델 싱글톤
+
+
+class EmbeddingError(RuntimeError):
+    """임베딩 요청이 실패했음을 나타내는 기본 예외다."""
+
+
+class EmbeddingContentError(EmbeddingError):
+    """입력 크기·내용과 직접 관련돼 분리 재시도가 가능한 실패다."""
+
+
+class EmbeddingTransientError(EmbeddingError):
+    """네트워크·과부하처럼 다음 수집 주기에 다시 시도할 전역 실패다."""
+
+
+class EmbeddingProtocolError(EmbeddingError):
+    """인증·설정·응답 형식 오류처럼 분리 재시도하면 안 되는 실패다."""
 
 
 def _get_local_model(model_name: str):
@@ -173,16 +191,19 @@ class EmbeddingClient:
                 read_sec = time.perf_counter() - t0
 
                 if resp.status >= 400:
-                    raise RuntimeError(
-                        f"임베딩 API 오류 {resp.status}: {body_bytes[:200]!r}"
-                    )
-                body = json.loads(body_bytes.decode("utf-8"))
-                result = [item["embedding"] for item in body["data"]]
+                    raise _classify_http_error(resp.status, body_bytes)
+                try:
+                    body = json.loads(body_bytes.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise EmbeddingProtocolError("임베딩 API 응답 JSON이 올바르지 않습니다") from exc
+                result = _vectors_in_request_order(body, len(texts))
                 self._log_if_slow(
                     len(texts), time.perf_counter() - call_t0,
                     connect_sec, ttfb_sec, read_sec, attempt,
                 )
                 return result
+            except (EmbeddingContentError, EmbeddingTransientError, EmbeddingProtocolError):
+                raise
             except (http.client.HTTPException, OSError) as exc:
                 # 연결이 끊겼을 가능성 — 폐기 후 재연결 시도.
                 # WARNING으로 올린다(이전엔 DEBUG): 재시도 자체가 느린 호출의
@@ -193,7 +214,7 @@ class EmbeddingClient:
                 )
                 self._conn = None
                 last_exc = exc
-        raise RuntimeError(f"임베딩 API 호출 실패: {last_exc}") from last_exc
+        raise EmbeddingTransientError(f"임베딩 API 호출 실패: {last_exc}") from last_exc
 
     def _log_if_slow(
         self, batch_size: int, total_sec: float,
@@ -214,6 +235,92 @@ class EmbeddingClient:
             connect_sec, ttfb_sec, read_sec,
             max(total_sec - connect_sec - ttfb_sec - read_sec, 0.0),
         )
+
+
+def _vectors_in_request_order(body: object, expected_count: int) -> list[list[float]]:
+    """OpenAI 호환 응답의 index를 검증하고 요청 순서로 벡터를 복원한다."""
+    if not isinstance(body, dict) or not isinstance(body.get("data"), list):
+        raise EmbeddingProtocolError("임베딩 API 응답에 data 배열이 없습니다")
+    data = body["data"]
+    if len(data) != expected_count:
+        raise EmbeddingProtocolError(
+            f"임베딩 API 응답 수 불일치: 요청={expected_count}, 응답={len(data)}"
+        )
+
+    ordered: list[list[float] | None] = [None] * expected_count
+    for item in data:
+        if not isinstance(item, dict):
+            raise EmbeddingProtocolError("임베딩 API 응답 항목 형식이 올바르지 않습니다")
+        index = item.get("index")
+        if not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < expected_count:
+            raise EmbeddingProtocolError("임베딩 API 응답 index가 올바르지 않습니다")
+        if ordered[index] is not None:
+            raise EmbeddingProtocolError("임베딩 API 응답 index가 중복되었습니다")
+        vector = item.get("embedding")
+        if not isinstance(vector, list):
+            raise EmbeddingProtocolError("임베딩 API 응답에 embedding 배열이 없습니다")
+        ordered[index] = vector
+
+    if any(vector is None for vector in ordered):
+        raise EmbeddingProtocolError("임베딩 API 응답 index가 누락되었습니다")
+    return _validate_vectors(ordered, expected_count)
+
+
+def _classify_http_error(status: int, body_bytes: bytes) -> EmbeddingError:
+    """분할 가능 여부가 확인된 HTTP 오류만 ContentError로 분류한다."""
+    message = f"임베딩 API 오류 status={status}"
+    if status in {408, 429} or status >= 500:
+        return EmbeddingTransientError(message)
+    if status == 413:
+        return EmbeddingContentError(message)
+    if status not in {400, 422}:
+        return EmbeddingProtocolError(message)
+    if len(body_bytes) > _MAX_ERROR_JSON_BYTES:
+        return EmbeddingProtocolError(message)
+    try:
+        body = json.loads(body_bytes.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return EmbeddingProtocolError(message)
+    error = body.get("error") if isinstance(body, dict) else None
+    param = error.get("param") if isinstance(error, dict) else None
+    if _is_input_parameter(param):
+        return EmbeddingContentError(message)
+    return EmbeddingProtocolError(message)
+
+
+def _is_input_parameter(param: object) -> bool:
+    """명시적인 input 또는 input[n] 경로만 입력 오류로 인정한다."""
+    if param == "input":
+        return True
+    if not isinstance(param, str) or not param.startswith("input[") or not param.endswith("]"):
+        return False
+    index = param[6:-1]
+    return index.isdecimal()
+
+
+def _validate_vectors(vectors: list[list[float] | None], expected_count: int) -> list[list[float]]:
+    """응답 벡터의 개수·차원·수치를 검증해 부분 저장을 막는다."""
+    if len(vectors) != expected_count:
+        raise EmbeddingProtocolError(
+            f"임베딩 벡터 수 불일치: 요청={expected_count}, 응답={len(vectors)}"
+        )
+    checked: list[list[float]] = []
+    for index, vector in enumerate(vectors):
+        if not isinstance(vector, list) or len(vector) != VECTOR_DIM:
+            size = len(vector) if isinstance(vector, list) else "invalid"
+            raise EmbeddingProtocolError(
+                f"임베딩 벡터 차원 불일치(index={index}): 기대={VECTOR_DIM}, 실제={size}"
+            )
+        if any(not isinstance(value, (int, float)) or isinstance(value, bool) for value in vector):
+            raise EmbeddingProtocolError(f"임베딩 벡터 값 형식이 올바르지 않습니다(index={index})")
+        try:
+            converted = [float(value) for value in vector]
+        except (OverflowError, TypeError, ValueError) as exc:
+            raise EmbeddingProtocolError(f"임베딩 벡터 값을 변환할 수 없습니다(index={index})") from exc
+        if not all(math.isfinite(value) and abs(value) <= _FLOAT32_MAX for value in converted):
+            raise EmbeddingProtocolError(f"임베딩 벡터 값 범위가 올바르지 않습니다(index={index})")
+        checked.append(converted)
+    return checked
 
 
 def get_embedding_client(cfg: dict[str, Any]) -> EmbeddingClient:
