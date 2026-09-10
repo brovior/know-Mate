@@ -22,6 +22,7 @@ from knowmate.collector.mail_scan_state import (
     queue_pending_delete,
     save_mail_scan_state,
     set_cursor,
+    state_needs_save,
 )
 
 if TYPE_CHECKING:
@@ -202,6 +203,7 @@ def run_mail_scan(
     table_was_recreated = bool(getattr(email_indexer, "table_was_recreated", False))
     invalidate_cache = table_was_recreated or bool(getattr(email_indexer, "table_is_empty", False))
     state = load_mail_scan_state(state_file, invalidate_cache=invalidate_cache)
+    state_dirty = state_needs_save(state)
     if invalidate_cache:
         # DB가 비어 있거나 재생성됐다는 사실을 메모리 플래그만으로 소비하면 안 된다.
         # 첫 DB 저장 뒤 상태 저장 전에 프로세스가 종료되면, 다음 시작에서 이전 성공
@@ -227,7 +229,7 @@ def run_mail_scan(
     roots_accessible = bool(watch_folders) and all(Path(folder).is_dir() for folder in watch_folders)
     pruned = prune_missing_files(state, seen_keys) if roots_accessible else 0
     failure_pruned = failure_state.prune(failures) if roots_accessible else 0
-    state_dirty = pruned > 0
+    state_dirty = state_dirty or pruned > 0
     state_dirty = _retry_pending_deletes(state, email_indexer) or state_dirty
     failures_dirty = failures_dirty or failure_pruned > 0
     for path in cached_failure_paths:

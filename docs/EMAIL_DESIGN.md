@@ -83,6 +83,11 @@ Outlook은 그 위에 얹는다. 스키마는 **Outlook까지 고려한 풀 스�
 
 `mail_uid` 정규화: Knox → `knox:{UniqueID}`, eml → `eml:{Message-ID}`, Outlook → `outlook:{EntryID}` (소스 접두사로 통일).
 
+`mail_scan_state.json`은 **schema_version 2**다. `files`는 정규화한 source file 경로를
+키로 쓰므로 항목 안에 경로를 중복 저장하지 않으며, `mtime`·`size`·`mail_uid`·인덱스/UID
+해결 버전만 둔다. v1은 최초 읽기에서 성공 캐시·커서·`pending_deletes`를 보존해 v2로
+원자 저장한다. `mail_uid`는 동일 UID 복사본의 최신 세대를 판별하는 캐시 요약이므로 유지한다.
+
 **본문 임베딩 시 메타 헤더 삽입**: `index_mail`은 청킹 전 본문 앞에 `제목/발신/수신/날짜` 헤더를 붙여,
 "○○가 보낸 메일", "○월 메일" 같은 발신인·날짜 기반 질의도 벡터 검색에 매칭되게 한다.
 

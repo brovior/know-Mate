@@ -298,6 +298,200 @@ class TestEmailIndexer:
 
 
 # ---------------------------------------------------------------------------
+# mail_scan_state v2 테스트
+# ---------------------------------------------------------------------------
+
+class TestMailScanStateV2:
+    def test_v1_migration_keeps_cache_cursor_and_pending_deletes(self, tmp_path, monkeypatch):
+        """v1은 path만 제거해 필요한 성공 캐시와 top-level 대기열을 보존한다."""
+        from knowmate.collector.mail_scan_state import (
+            load_mail_scan_state, save_mail_scan_state, state_needs_save,
+        )
+
+        monkeypatch.setitem(
+            sys.modules, "knowmate.rag.email_indexer", types.SimpleNamespace(EMAIL_INDEX_VERSION="3"),
+        )
+
+        source = str(tmp_path / "한글 메일.mysingle")
+        path = tmp_path / "state.json"
+        path.write_text(json.dumps({
+            "schema_version": 1,
+            "cursor": {"mtime": 44.5, "path": "C:\\메일\\다음.mysingle"},
+            "files": {"legacy-key": {
+                "path": source, "mtime": 12.5, "size": 99, "mail_uid": "knox:uid",
+                "index_version": "3", "uid_resolution_version": 2,
+            }},
+            "pending_deletes": ["old-a", "old-a", "old-b"],
+        }, ensure_ascii=False), encoding="utf-8")
+
+        state = load_mail_scan_state(path)
+        key = os.path.normcase(os.path.abspath(source))
+        assert state_needs_save(state)
+        assert state["cursor"] == {"mtime": 44.5, "path": "C:\\메일\\다음.mysingle"}
+        assert state["pending_deletes"] == ["old-a", "old-b"]
+        assert state["files"] == {key: {
+            "mtime": 12.5, "size": 99, "mail_uid": "knox:uid", "index_version": "3",
+            "uid_resolution_version": 2,
+        }}
+
+        assert save_mail_scan_state(path, state)
+        stored = json.loads(path.read_text(encoding="utf-8"))
+        assert stored["schema_version"] == 2
+        assert "path" not in stored["files"][key]
+
+    def test_idle_scan_persists_v1_migration_once(self, tmp_path):
+        """처리할 파일이 없어도 v1→v2 변환은 다음 재시작 전에 저장된다."""
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({
+            "schema_version": 1, "cursor": None, "files": {}, "pending_deletes": ["old-a"],
+        }), encoding="utf-8")
+        indexer = types.SimpleNamespace(
+            table_was_recreated=False, table_is_empty=False,
+            delete_chunk_ids=lambda _ids: (_ for _ in ()).throw(RuntimeError("offline")),
+        )
+
+        assert run_mail_scan(
+            [], indexer, {"mail": {"max_mails_per_scan": 1}},
+            state_file=state_file, failure_file=tmp_path / "failures.json",
+        ) == (0, 0)
+        assert json.loads(state_file.read_text(encoding="utf-8"))["schema_version"] == 2
+
+    def test_compact_output_unicode_roundtrip_and_v2_reload_does_not_rewrite(self, tmp_path, monkeypatch):
+        """저장은 한 줄 compact JSON이며 정상 v2는 유휴 사이클에 다시 쓰지 않는다."""
+        from knowmate.collector import mail_scanner
+        from knowmate.collector.mail_scan_state import cache_success, save_mail_scan_state
+
+        path = tmp_path / "상태.json"
+        source = str(tmp_path / "메일함" / "한글😀.mysingle")
+        state = {"schema_version": 2, "cursor": None, "files": {}, "pending_deletes": []}
+        cache_success(state, {"path": source, "mtime": 1.0, "size": 2}, "knox:한글😀")
+        assert save_mail_scan_state(path, state)
+        content = path.read_text(encoding="utf-8")
+        assert "\n" not in content and "한글😀" in content
+
+        saves = []
+        real_save = mail_scanner.save_mail_scan_state
+        monkeypatch.setattr(mail_scanner, "save_mail_scan_state", lambda *args: saves.append(args) or real_save(*args))
+        assert mail_scanner.run_mail_scan(
+            [], types.SimpleNamespace(table_was_recreated=False, table_is_empty=False),
+            {"mail": {"max_mails_per_scan": 1}},
+            state_file=path, failure_file=tmp_path / "failures.json",
+        ) == (0, 0)
+        assert saves == []
+        assert json.loads(content) == json.loads(path.read_text(encoding="utf-8"))
+
+    def test_pending_deletes_survive_migration_and_invalidation(self, tmp_path, monkeypatch):
+        """v1 변환이나 빈 테이블 재생성도 삭제 대기열을 지우지 않는다."""
+        from knowmate.collector.mail_scan_state import load_mail_scan_state, save_mail_scan_state
+
+        monkeypatch.setitem(
+            sys.modules, "knowmate.rag.email_indexer", types.SimpleNamespace(EMAIL_INDEX_VERSION="3"),
+        )
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({
+            "schema_version": 1, "cursor": None,
+            "files": {"old": {"path": str(tmp_path / "old.mysingle"), "mtime": 1, "size": 1,
+                                "mail_uid": "knox:old", "index_version": "3", "uid_resolution_version": 2}},
+            "pending_deletes": ["old-a"],
+        }), encoding="utf-8")
+
+        state = load_mail_scan_state(state_file, invalidate_cache=True)
+        assert state["files"] == {}
+        assert state["pending_deletes"] == ["old-a"]
+        assert save_mail_scan_state(state_file, state)
+        assert load_mail_scan_state(state_file)["pending_deletes"] == ["old-a"]
+
+    def test_v1_path_key_collision_keeps_newest_entry_deterministically(self, tmp_path, monkeypatch):
+        """대소문자만 다른 legacy 키가 충돌하면 최신 항목 하나를 일관되게 고른다."""
+        from knowmate.collector.mail_scan_state import load_mail_scan_state
+
+        monkeypatch.setitem(
+            sys.modules, "knowmate.rag.email_indexer", types.SimpleNamespace(EMAIL_INDEX_VERSION="3"),
+        )
+        source = str(tmp_path / "same.mysingle")
+        path = tmp_path / "state.json"
+        path.write_text(json.dumps({
+            "schema_version": 1, "cursor": None,
+            "files": {
+                "A": {"path": source, "mtime": 1, "size": 1, "mail_uid": "knox:old", "index_version": "3", "uid_resolution_version": 2},
+                "a": {"path": source, "mtime": 2, "size": 1, "mail_uid": "knox:new", "index_version": "3", "uid_resolution_version": 2},
+            }, "pending_deletes": [],
+        }), encoding="utf-8")
+
+        entry = next(iter(load_mail_scan_state(path)["files"].values()))
+        assert entry["mail_uid"] == "knox:new"
+
+    def test_atomic_save_failure_keeps_previous_state(self, tmp_path, monkeypatch):
+        """replace 실패는 기존 정상 상태 파일을 덮어쓰지 않는다."""
+        from knowmate.collector.mail_scan_state import save_mail_scan_state
+
+        path = tmp_path / "state.json"
+        original = '{"schema_version":2,"cursor":null,"files":{},"pending_deletes":["old"]}'
+        path.write_text(original, encoding="utf-8")
+        monkeypatch.setattr(Path, "replace", lambda *_args: (_ for _ in ()).throw(OSError("disk full")))
+        assert not save_mail_scan_state(path, {"schema_version": 2, "cursor": None, "files": {}, "pending_deletes": []})
+        assert path.read_text(encoding="utf-8") == original
+
+    def test_corrupt_json_falls_back_to_empty_state(self, tmp_path):
+        """부분 기록된 JSON은 다음 스캔을 안전한 빈 상태로 시작한다."""
+        from knowmate.collector.mail_scan_state import load_mail_scan_state
+
+        path = tmp_path / "state.json"
+        path.write_text('{"schema_version":2,"files":', encoding="utf-8")
+        assert load_mail_scan_state(path) == {
+            "schema_version": 2, "cursor": None, "files": {}, "pending_deletes": [],
+        }
+
+    def test_migrated_uid_summary_remains_available_for_duplicate_resolution(self, tmp_path, monkeypatch):
+        """v2에도 UID/max-mtime 요약에 필요한 mail_uid가 남는다."""
+        from knowmate.collector import failure_state, mail_scanner
+        from knowmate.collector.mail_scan_state import load_mail_scan_state
+
+        monkeypatch.setitem(
+            sys.modules, "knowmate.rag.email_indexer", types.SimpleNamespace(EMAIL_INDEX_VERSION="3"),
+        )
+        source = str(tmp_path / "copy.mysingle")
+        state_file = tmp_path / "state.json"
+        state_file.write_text(json.dumps({
+            "schema_version": 1, "cursor": None,
+            "files": {"old": {"path": source, "mtime": 77, "size": 4,
+                                "mail_uid": "knox:duplicate", "index_version": "3", "uid_resolution_version": 2}},
+            "pending_deletes": [],
+        }), encoding="utf-8")
+        state = load_mail_scan_state(state_file)
+        monkeypatch.setattr(mail_scanner, "_iter_mail_files", lambda *_args: iter([(source, 77.0, 4)]))
+
+        _items, _seen, _failures, cached_uids, _skipped = mail_scanner._collect_actionable_candidates(
+            [str(tmp_path)], [".mysingle"], state, {}, 0.0, failure_state.BackoffPolicy(),
+        )
+        assert cached_uids == {"knox:duplicate": 77.0}
+
+    def test_large_v2_state_is_meaningfully_smaller_than_v1(self, tmp_path, monkeypatch):
+        """경로 중복 제거는 2만 건 상태에서도 크기 절감으로 확인된다."""
+        from knowmate.collector.mail_scan_state import load_mail_scan_state, save_mail_scan_state
+
+        monkeypatch.setitem(
+            sys.modules, "knowmate.rag.email_indexer", types.SimpleNamespace(EMAIL_INDEX_VERSION="3"),
+        )
+
+        files = {}
+        for index in range(20_000):
+            source = f"C:/very/long/mail/archive/2026/09/folder-{index:05d}/message-{index:05d}.mysingle"
+            files[os.path.normcase(os.path.abspath(source))] = {
+                "path": source, "mtime": float(index), "size": index + 1,
+                "mail_uid": f"knox:{index}", "index_version": "3", "uid_resolution_version": 2,
+            }
+        path = tmp_path / "state.json"
+        v1 = {"schema_version": 1, "cursor": None, "files": files, "pending_deletes": []}
+        path.write_text(json.dumps(v1, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        v1_size = path.stat().st_size
+        assert save_mail_scan_state(path, load_mail_scan_state(path))
+        assert path.stat().st_size < v1_size * 0.8
+
+
+# ---------------------------------------------------------------------------
 # mail_scanner 테스트
 # ---------------------------------------------------------------------------
 
