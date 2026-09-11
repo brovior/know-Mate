@@ -1,5 +1,6 @@
 """Phase 2 RAG 파이프라인 pytest 테스트 — fake 모드 기준, 사외 환경에서 전부 통과."""
 import http.client
+import logging
 import math
 from pathlib import Path
 
@@ -87,6 +88,62 @@ class TestChunker:
         result = chunk_text(text, "txt")
         for chunk in result:
             assert isinstance(chunk, str)
+
+    def test_chunk_limit_stops_long_segment_immediately(self, monkeypatch, caplog):
+        """긴 단일 본문은 상한 확인용 1개까지만 생성하고 즉시 중단한다."""
+        from knowmate.rag import chunker
+
+        yielded = 0
+        original = chunker._iter_split_by_size
+
+        def counting_split(text, chunk_size, overlap):
+            nonlocal yielded
+            for chunk in original(text, chunk_size, overlap):
+                yielded += 1
+                yield chunk
+
+        monkeypatch.setattr(chunker, "_iter_split_by_size", counting_split)
+        with caplog.at_level(logging.WARNING):
+            result = chunker.chunk_text(
+                "가" * 10_000,
+                "txt",
+                chunk_size=10,
+                overlap=0,
+                max_chunks_per_file=5,
+            )
+
+        assert len(result) == 5
+        assert yielded == 6
+        assert "5개에서 분할 중단" in caplog.text
+
+    def test_exact_chunk_limit_does_not_warn(self, caplog):
+        """청크 수가 상한과 정확히 같으면 초과 경고를 남기지 않는다."""
+        with caplog.at_level(logging.WARNING):
+            result = chunk_text(
+                "가" * 50,
+                "txt",
+                chunk_size=10,
+                overlap=0,
+                max_chunks_per_file=5,
+            )
+
+        assert len(result) == 5
+        assert "청크 수 상한 초과" not in caplog.text
+
+    def test_chunk_limit_warning_includes_source_filename(self, caplog):
+        """메일 호출자가 넘긴 파일명은 상한 초과 경고에 포함한다."""
+        with caplog.at_level(logging.WARNING):
+            result = chunk_text(
+                "가" * 60,
+                "txt",
+                chunk_size=10,
+                overlap=0,
+                max_chunks_per_file=5,
+                log_source_name="large-mail.mysingle",
+            )
+
+        assert len(result) == 5
+        assert "파일명='large-mail.mysingle'" in caplog.text
 
 
 # ──────────────────────────────────────────────

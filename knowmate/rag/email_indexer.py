@@ -372,7 +372,15 @@ class EmailIndexer:
             f"수신: {parsed.get('recipients', '')}\n"
             f"날짜: {parsed.get('mail_date', '')}\n\n"
         )
-        chunks = chunk_text(meta_header + parsed["body_text"], "txt", self._chunk_size, self._overlap)
+        source_file = str(parsed.get("source_file", ""))
+        source_name = source_file.replace("\\", "/").rsplit("/", 1)[-1]
+        chunks = chunk_text(
+            meta_header + parsed["body_text"],
+            "txt",
+            self._chunk_size,
+            self._overlap,
+            log_source_name=source_name or None,
+        )
         return MailIndexJob(
             parsed=parsed,
             mtime=mtime,
