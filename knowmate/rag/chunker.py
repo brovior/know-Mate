@@ -1,8 +1,8 @@
 """파일 타입별 청크 분할 전략 (CLAUDE.md 6-4, 6-5)."""
-from collections.abc import Iterable, Iterator
-from itertools import islice
 import logging
 import re
+from collections.abc import Iterable, Iterator
+from itertools import islice
 
 logger = logging.getLogger(__name__)
 
@@ -18,11 +18,13 @@ def chunk_text(
     overlap: int = 80,
     max_chunks_per_file: int = _DEFAULT_MAX_CHUNKS,
     xlsx_max_rows_per_sheet: int = _DEFAULT_XLSX_MAX_ROWS,
+    log_source_name: str | None = None,
 ) -> list[str]:
     """텍스트를 파일 타입에 맞는 전략으로 분할해 청크 리스트를 반환한다.
 
     max_chunks_per_file: 파일당 최대 청크 수. 상한 초과가 확인되면 분할을 즉시 중단한다.
     xlsx_max_rows_per_sheet: xlsx 시트당 최대 행 수. 초과 시트는 메타 청크 1개로 대체.
+    log_source_name: 상한 초과 경고에 선택적으로 표시할 원본 파일명.
     """
     if not text or text.isspace():
         return []
@@ -56,11 +58,20 @@ def chunk_text(
     probe_count = max(0, max_chunks_per_file) + 1
     chunks = list(islice(chunk_iter, probe_count))
     if len(chunks) > max_chunks_per_file:
-        logger.warning(
-            "청크 수 상한 초과 — %d개에서 분할 중단: max_chunks_per_file=%d",
-            max_chunks_per_file,
-            max_chunks_per_file,
-        )
+        if log_source_name:
+            logger.warning(
+                "청크 수 상한 초과 — %d개에서 분할 중단: "
+                "max_chunks_per_file=%d 파일명=%r",
+                max_chunks_per_file,
+                max_chunks_per_file,
+                log_source_name,
+            )
+        else:
+            logger.warning(
+                "청크 수 상한 초과 — %d개에서 분할 중단: max_chunks_per_file=%d",
+                max_chunks_per_file,
+                max_chunks_per_file,
+            )
         chunks = chunks[:max_chunks_per_file]
 
     return chunks

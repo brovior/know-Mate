@@ -130,6 +130,21 @@ class TestChunker:
         assert len(result) == 5
         assert "청크 수 상한 초과" not in caplog.text
 
+    def test_chunk_limit_warning_includes_source_filename(self, caplog):
+        """메일 호출자가 넘긴 파일명은 상한 초과 경고에 포함한다."""
+        with caplog.at_level(logging.WARNING):
+            result = chunk_text(
+                "가" * 60,
+                "txt",
+                chunk_size=10,
+                overlap=0,
+                max_chunks_per_file=5,
+                log_source_name="large-mail.mysingle",
+            )
+
+        assert len(result) == 5
+        assert "파일명='large-mail.mysingle'" in caplog.text
+
 
 # ──────────────────────────────────────────────
 # TestEmbeddingFake

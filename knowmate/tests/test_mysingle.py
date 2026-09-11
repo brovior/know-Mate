@@ -233,6 +233,32 @@ class TestEmailIndexer:
         source = (Path(__file__).parents[1] / "rag" / "email_indexer.py").read_text(encoding="utf-8")
         ast.parse(source, feature_version=(3, 11))
 
+    def test_prepare_mail_passes_only_source_filename_to_chunker(self, monkeypatch):
+        """청크 상한 로그에는 전체 경로나 제목 대신 원본 파일명만 전달한다."""
+        from knowmate.rag import email_indexer
+        from knowmate.rag.email_indexer import EmailIndexer, MailIndexCheck, MailIndexState
+
+        captured = {}
+
+        def fake_chunk_text(_text, _file_type, _chunk_size, _overlap, **kwargs):
+            captured.update(kwargs)
+            return ["chunk"]
+
+        monkeypatch.setattr(email_indexer, "chunk_text", fake_chunk_text)
+        indexer = object.__new__(EmailIndexer)
+        indexer._chunk_size = 400
+        indexer._overlap = 80
+        parsed = self._sample_parsed(source=r"C:\mail-export\large-mail.mysingle")
+
+        indexer.prepare_mail(
+            parsed,
+            1000.0,
+            MailIndexCheck(MailIndexState.MISSING),
+        )
+
+        assert captured["log_source_name"] == "large-mail.mysingle"
+        assert parsed["subject"] not in captured.values()
+
     def test_index_and_get_index_state(self, tmp_path):
         """index_mail 후 명시 상태가 CURRENT를 반환한다."""
         from knowmate.rag.email_indexer import EmailIndexer, MailIndexState
