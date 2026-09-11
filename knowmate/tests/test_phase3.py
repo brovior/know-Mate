@@ -2822,3 +2822,33 @@ class TestComWatchdog:
         wd.arm("EXCEL.EXE", 300.0)
         timers[0].fire()
         assert wd.timeout_stages == []
+
+
+@pytest.mark.skipif(not _HAS_PYQT6, reason="PyQt6 미설치 — scheduler import 불가")
+class TestMailFailureMigration:
+    def test_legacy_mail_failures_merge_without_losing_document_records(self, tmp_path: Path):
+        """기존 mail 전용 실패 파일은 공용 UI 파일로 병합하고 원본을 보관한다."""
+        from knowmate.collector import failure_state
+        from knowmate.collector.scheduler import _migrate_legacy_mail_failures
+
+        failure_file = tmp_path / "index_failure.json"
+        legacy_file = tmp_path / "mail_index_failure.json"
+        document = str(tmp_path / "document.xlsx")
+        mail = str(tmp_path / "mail.mysingle")
+        current = {}
+        failure_state.note_failure(
+            current, document, failure_state.KIND_OPEN_ERROR, "open", None,
+            mtime=1.0, size=1, now=100.0,
+        )
+        failure_state.save_failures(failure_file, current)
+        legacy = {}
+        failure_state.note_failure(
+            legacy, mail, failure_state.KIND_NEEDS_USER_ACTION, "parse", None,
+            mtime=2.0, size=2, now=200.0,
+        )
+        failure_state.save_failures(legacy_file, legacy)
+
+        assert _migrate_legacy_mail_failures(legacy_file, failure_file)
+        assert set(failure_state.load_failures(failure_file)) == {document, mail}
+        assert not legacy_file.exists()
+        assert legacy_file.with_name("mail_index_failure.migrated.json").exists()

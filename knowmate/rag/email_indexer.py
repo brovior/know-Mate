@@ -22,7 +22,7 @@ from knowmate.rag.embedding import (
 logger = logging.getLogger(__name__)
 
 # 인덱싱 포맷 버전 — 변경 시 기존 메일 자동 재인덱싱
-EMAIL_INDEX_VERSION = "4"  # v4: HTML 정제·Knox BOM 파싱 수정 — 기존 메일 재인덱싱
+EMAIL_INDEX_VERSION = "5"  # v5: 제어문자뿐인 손상 본문 차단 — 기존 메일 재검증
 
 EMAIL_SCHEMA = pa.schema([
     # ── 청크 공통 ──
@@ -303,7 +303,7 @@ class EmailIndexer:
         )
 
     def has_current_mail_uid(self, mail_uid: str) -> bool:
-        """mtime와 무관하게 정상 UID의 v4 활성 청크가 하나라도 있는지 확인한다."""
+        """mtime와 무관하게 정상 UID의 현재 버전 활성 청크가 있는지 확인한다."""
         import json
         safe_uid = mail_uid.replace("'", "''")
         rows = (

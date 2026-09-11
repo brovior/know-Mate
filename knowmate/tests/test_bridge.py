@@ -290,6 +290,32 @@ class TestFailureManagementSlots:
         assert cards[0]["excluded"] is False
         assert cards[0]["next_retry_ts"] is not None  # 7일 안전밸브 — 영구 무시 아님
 
+    def test_get_failures_shows_mail_parse_and_keeps_document_record(self, tmp_path, monkeypatch):
+        """공용 실패 파일에서는 손상 메일과 기존 문서를 함께 확인할 수 있다."""
+        from knowmate.collector import failure_state
+
+        failure_file = tmp_path / "index_failure.json"
+        document = str(tmp_path / "broken.xlsx")
+        mail = str(tmp_path / "broken.mysingle")
+        records = {}
+        failure_state.note_failure(
+            records, document, failure_state.KIND_OPEN_ERROR, "open", None,
+            mtime=100.0, size=10, now=1_699_999_000.0,
+        )
+        failure_state.note_failure(
+            records, mail, failure_state.KIND_NEEDS_USER_ACTION, "parse", None,
+            mtime=200.0, size=20, now=1_699_999_001.0,
+        )
+        failure_state.save_failures(failure_file, records)
+        self._patch_collector_config(monkeypatch)
+
+        cards = __import__("json").loads(
+            _make_bridge(_FakeWorkerForFailures(failure_file, tmp_path / "state.json")).getFailures()
+        )
+
+        assert {card["path"] for card in cards} == {document, mail}
+        assert next(card for card in cards if card["path"] == mail)["stage_label"] == "메일 파싱"
+
     def test_get_failures_escalation_matches_backoff_computation(self, tmp_path, monkeypatch):
         """6a AC-4: bridge.getFailures()의 escalation 필드가 backoff_seconds()가
         실제로 쓰는 것과 같은 escalation_state() 호출 결과여야 한다 — 판정 로직이

@@ -12,6 +12,10 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 
+class CorruptMailBodyError(ValueError):
+    """본문이 공백·제어문자뿐인 손상 메일임을 알린다."""
+
+
 # ---------------------------------------------------------------------------
 # 내부 유틸
 # ---------------------------------------------------------------------------
@@ -73,6 +77,11 @@ def html_to_text(html_str: str) -> str:
     except Exception as exc:
         logger.warning("HTML 파싱 실패, 원본 반환: %s", exc)
         return html_str
+
+
+def _has_printable_body_text(body_text: str) -> bool:
+    """본문에 공백이 아닌 출력 가능한 문자가 하나라도 있는지 확인한다."""
+    return any(char.isprintable() and not char.isspace() for char in body_text)
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +167,8 @@ def parse_mail_file(path: str) -> dict:
 
     if not body_text:
         raise ValueError(f"본문이 없는 메일 파일: {path_str}")
+    if not _has_printable_body_text(body_text):
+        raise CorruptMailBodyError(f"본문이 제어문자뿐인 손상 메일 파일: {path_str}")
 
     logger.debug(
         "[mail] 파싱 완료 type=%s uid=%s subject=%s body_len=%d",

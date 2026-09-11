@@ -84,7 +84,7 @@ Outlook은 그 위에 얹는다. 스키마는 **Outlook까지 고려한 풀 스�
 파일은 정렬·보관할 처리 후보에서 즉시 제외한다. 캐시가 없는 기존 설치는 사이클당 처리 한도 안에서만
 `get_index_state`로 점진적으로 캐시를 만든다.
 
-`mail_uid` 정규화: Knox → `knox:{UniqueID}`, eml → `eml:{Message-ID}`, Outlook → `outlook:{EntryID}` (소스 접두사로 통일). v4 재인덱싱 때는 BOM 오파싱으로 과거에 생성된 같은 `source_file`의 `knox:{절대경로}` 활성 청크만, 새 정상 청크 저장 성공 뒤 `pending_deletes`를 거쳐 정리한다. 같은 UID 복사본은 source별 legacy ID를 함께 캡처하되 정상 UID 행과 다른 source는 건드리지 않으며, 저장 뒤 queue 기록 전 중단된 경우에는 정상 v4 행 확인 후 남은 같은 source의 legacy ID만 재시도한다.
+`mail_uid` 정규화: Knox → `knox:{UniqueID}`, eml → `eml:{Message-ID}`, Outlook → `outlook:{EntryID}` (소스 접두사로 통일). v4 재인덱싱 때는 BOM 오파싱으로 과거에 생성된 같은 `source_file`의 `knox:{절대경로}` 활성 청크만, 새 정상 청크 저장 성공 뒤 `pending_deletes`를 거쳐 정리한다. 같은 UID 복사본은 source별 legacy ID를 함께 캡처하되 정상 UID 행과 다른 source는 건드리지 않으며, 저장 뒤 queue 기록 전 중단된 경우에는 정상 현재 버전 행 확인 후 남은 같은 source의 legacy ID만 재시도한다. v5에서는 공백·유니코드 제어문자만 있는 본문을 손상으로 거부한다. 이 전용 오류가 `.mysingle`에서 발생하면 새 본문을 저장하지 않고도 같은 `source_file`과 `knox:{절대경로}`가 모두 일치하는 활성 legacy 청크만 `pending_deletes`에 먼저 저장한 뒤 정리한다. 조회 또는 상태 저장에 실패하면 삭제하지 않으며, 정상 Knox UID와 다른 source는 건드리지 않는다.
 
 `mail_scan_state.json`은 **schema_version 2**다. `files`는 정규화한 source file 경로를
 키로 쓰므로 항목 안에 경로를 중복 저장하지 않으며, `mtime`·`size`·`mail_uid`·인덱스/UID
@@ -110,6 +110,8 @@ Outlook은 그 위에 얹는다. 스키마는 **Outlook까지 고려한 풀 스�
 `EmbeddingClient.embed()` 호출/분할 재시도, 저장 성공·실패만 남긴다. `embed_calls`는 내부 전송 재시도를
 제외한 애플리케이션 호출 수이며 HTTP POST 수가 아니다. 본문·복호화 평문·메일별 정상 처리 로그는 남기지 않는다.
 
+**실패 이력**: 메일도 문서와 동일한 `index_failure.json`을 사용하므로 [확인 필요한 문서] 화면에서 `parse` 단계의 손상 메일을 확인하고 재시도할 수 있다. 기존 `mail_index_failure.json`이 있으면 공용 파일에 최신 기록을 병합해 원자 저장한 뒤 `mail_index_failure.migrated.json`으로 이름만 바꿔 보관한다. 병합 저장·보관 이동 중 하나라도 실패하면 원본은 그대로 유지한다.
+
 **현행 제한**: 내용이 다른 같은 UID 복사본이 `max_mails_per_scan` 때문에 서로 다른 사이클로 나뉘면,
 뒤 사이클의 더 오래된 복사본이 최신 세대를 교체할 수 있다. 한 사이클 안의 충돌만 방지하며, 이는 이번
 성능 후속에서 고치지 않은 기존 제한이다.
@@ -118,7 +120,7 @@ Outlook은 그 위에 얹는다. 스키마는 **Outlook까지 고려한 풀 스�
 
 ## 5. `emails` 테이블 스키마 (`rag/email_indexer.py`)
 
-> `EMAIL_INDEX_VERSION` 이력: v2(메타헤더 임베딩) → v3(`mail_date_ts` 추가, 날짜 범위 검색용) → **v4**(HTML의 CSS/스크립트 제외, Knox UTF-8 BOM 파싱 수정).
+> `EMAIL_INDEX_VERSION` 이력: v2(메타헤더 임베딩) → v3(`mail_date_ts` 추가, 날짜 범위 검색용) → v4(HTML의 CSS/스크립트 제외, Knox UTF-8 BOM 파싱 수정) → **v5**(공백·제어문자뿐인 손상 본문 차단).
 > 버전 범프 시 `_index_version`(source_meta) 불일치로 기존 메일이 자동 1회 재인덱싱된다.
 
 ```python
