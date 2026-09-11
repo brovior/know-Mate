@@ -24,6 +24,42 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _migrate_legacy_mail_failures(legacy_file: Path, failure_file: Path) -> bool:
+    """기존 mail 전용 실패 이력을 공용 파일로 보존 병합하고 원본을 보관한다."""
+    from knowmate.collector import failure_state
+
+    if legacy_file == failure_file or not legacy_file.exists():
+        return False
+    legacy_records = failure_state.load_failures(legacy_file)
+    if not legacy_records:
+        return False
+    records = failure_state.load_failures(failure_file)
+    changed = False
+    for path, legacy_record in legacy_records.items():
+        current = records.get(path)
+        if current is None or legacy_record.last_failed_ts > current.last_failed_ts:
+            records[path] = legacy_record
+            changed = True
+    if changed and not failure_state.save_failures(failure_file, records):
+        logger.error("[mail_scanner] 기존 메일 실패 이력 병합 저장 실패 — 원본을 유지합니다")
+        return False
+
+    archive_file = legacy_file.with_name(f"{legacy_file.stem}.migrated{legacy_file.suffix}")
+    archive_number = 2
+    while archive_file.exists():
+        archive_file = legacy_file.with_name(
+            f"{legacy_file.stem}.migrated-{archive_number}{legacy_file.suffix}"
+        )
+        archive_number += 1
+    try:
+        legacy_file.replace(archive_file)
+    except OSError as exc:
+        logger.warning("[mail_scanner] 기존 메일 실패 이력 보관 이동 실패 — 원본을 유지합니다: %s", exc)
+        return False
+    logger.info("[mail_scanner] 기존 메일 실패 이력 %d건을 확인 필요 목록으로 병합했습니다", len(legacy_records))
+    return True
+
 PRIORITY_NEW = 1
 PRIORITY_MODIFIED = 2
 PRIORITY_ORPHAN = 3
@@ -882,9 +918,12 @@ class CollectorWorker(QThread):
         if self._email_indexer and self._config.get("mail", {}).get("enabled", False):
             from knowmate.collector.mail_scanner import run_mail_scan
             try:
+                legacy_mail_failure_file = self._failure_file.with_name("mail_index_failure.json")
+                _migrate_legacy_mail_failures(legacy_mail_failure_file, self._failure_file)
                 mail_indexed, _ = run_mail_scan(
                     watch_folders, self._email_indexer, self._config,
                     on_progress=lambda cur, tot, fn: self.progress.emit(cur, tot, fn),
+                    failure_file=self._failure_file,
                     retry_failures=retry_requested,
                 )
             except Exception as exc:

@@ -369,6 +369,7 @@ class Bridge(QObject):
         "UNKNOWN_TRANSIENT":    ("원인 미확인", "b-gray"),
     }
     _FAIL_STAGE_LABEL = {
+        "parse": "메일 파싱",
         "dispatch": "오피스 실행",
         "open": "파일 열기",
         "sheets": "데이터 읽기",

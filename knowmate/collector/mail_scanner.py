@@ -239,7 +239,7 @@ def run_mail_scan(
     성공 캐시 적중과 백오프 대기는 예산을 쓰지 않는다. 상태가 없는 기존 설치는
     매 사이클 최대 N건만 ``is_indexed``로 확인해 캐시를 점진적으로 구축한다.
     """
-    from knowmate.secure.mysingle_reader import parse_mail_file
+    from knowmate.secure.mysingle_reader import CorruptMailBodyError, parse_mail_file
 
     mail_cfg = cfg.get("mail", {})
     max_per_scan = max(int(mail_cfg.get("max_mails_per_scan", 500)), 0)
@@ -410,8 +410,14 @@ def run_mail_scan(
             return ()
         return email_indexer.get_legacy_path_chunk_ids(parsed["source_file"])
 
+    def corrupt_knox_legacy_chunk_ids(path: str) -> tuple[str, ...]:
+        """손상 Knox 본문의 같은 source 경로 기반 legacy 청크만 캡처한다."""
+        if Path(path).suffix.lower() != ".mysingle" or not hasattr(email_indexer, "get_legacy_path_chunk_ids"):
+            return ()
+        return email_indexer.get_legacy_path_chunk_ids(str(Path(path).resolve()))
+
     def normal_uid_is_current(mail_uid: str, mtime: float) -> bool:
-        """복사본 mtime과 무관하게 정상 UID v4 행이 저장됐는지 확인한다."""
+        """복사본 mtime과 무관하게 정상 UID의 현재 버전 행이 저장됐는지 확인한다."""
         if hasattr(email_indexer, "has_current_mail_uid"):
             return bool(email_indexer.has_current_mail_uid(mail_uid))
         return email_indexer.get_index_state(mail_uid, mtime).state.name == "CURRENT"
@@ -538,7 +544,7 @@ def run_mail_scan(
             uid_work.pop(mail_uid, None)
             raise
         if check.state.name == "CURRENT":
-            # DB가 현재 v4 정상 UID 행을 확인했으므로, 이전 실행이 queue 기록 전에
+            # DB가 현재 버전 정상 UID 행을 확인했으므로, 이전 실행이 queue 기록 전에
             # 중단된 경우에도 같은 source의 legacy 행만 안전하게 정리할 수 있다.
             delete_captured_ids(item, legacy_chunk_ids)
             work.outcome = "success"
@@ -595,6 +601,27 @@ def run_mail_scan(
             parsed = parse_mail_file(path)
             metrics.parse_s += time.perf_counter() - parse_started
             metrics.parsed += 1
+        except CorruptMailBodyError as exc:
+            metrics.parse_s += time.perf_counter() - parse_started
+            metrics.failures += 1
+            logger.warning("[mail_scanner] 파싱 실패, 다음 기회에 재시도: %s (%s)", path, exc)
+            try:
+                # 파싱에는 실패했지만 이 전용 오류는 NUL 등으로 생성된 과거 경로 UID
+                # 청크만 안전하게 식별할 수 있다. 조회·queue 저장 어느 하나라도 실패하면
+                # 삭제하지 않고 다음 사이클에 다시 시도한다.
+                delete_captured_ids(item, corrupt_knox_legacy_chunk_ids(path))
+            except Exception as cleanup_exc:
+                logger.warning(
+                    "[mail_scanner] 손상 메일의 기존 청크 조회 실패 — 삭제하지 않고 연기: %s (%s)",
+                    path, cleanup_exc,
+                )
+            failure_state.note_failure(
+                failures, path, failure_state.KIND_NEEDS_USER_ACTION, "parse", None,
+                item["mtime"], item["size"], now_fn(),
+            )
+            failures_dirty = True
+            skipped_count += 1
+            report_resolved(item)
         except ValueError as exc:
             metrics.parse_s += time.perf_counter() - parse_started
             metrics.failures += 1

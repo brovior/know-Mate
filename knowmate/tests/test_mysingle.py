@@ -101,6 +101,43 @@ class TestParseMysingle:
         with pytest.raises(ValueError):
             parse_mysingle(str(p))
 
+    @pytest.mark.parametrize("body", [b"\x00" * 300_000, b" \t\r\n\x00\x1f\x7f"])
+    def test_control_only_body_raises_corrupt_body_error(self, tmp_path, body):
+        """NUL·제어문자뿐인 본문은 청킹 전에 전용 ValueError로 거부한다."""
+        from knowmate.secure.mysingle_reader import CorruptMailBodyError, parse_mail_file
+
+        path = tmp_path / "control-only.mysingle"
+        path.write_bytes(
+            b"MIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n" + body
+        )
+
+        with pytest.raises(CorruptMailBodyError):
+            parse_mail_file(str(path))
+
+    def test_all_zero_file_raises_corrupt_body_error(self, tmp_path):
+        """RFC822 헤더도 없이 파일 전체가 NUL인 실제 손상 형태도 거부한다."""
+        from knowmate.secure.mysingle_reader import CorruptMailBodyError, parse_mail_file
+
+        path = tmp_path / "all-zero.mysingle"
+        path.write_bytes(b"\x00" * 300_000)
+
+        with pytest.raises(CorruptMailBodyError):
+            parse_mail_file(str(path))
+
+    @pytest.mark.parametrize("body", ["한글", "ASCII", "\n\t 짧음 \r\n"])
+    def test_printable_short_body_is_preserved(self, tmp_path, body):
+        """정상 한글·ASCII·공백 혼합의 짧은 본문은 손상으로 오인하지 않는다."""
+        from knowmate.secure.mysingle_reader import parse_mail_file
+
+        path = tmp_path / "printable.mysingle"
+        path.write_bytes(
+            (
+                "MIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n" + body
+            ).encode("utf-8")
+        )
+
+        assert parse_mail_file(str(path))["body_text"].strip()
+
     def test_utf8_bom_mysingle_keeps_rfc822_headers_and_html_body(self, tmp_path):
         """Knox UTF-8 BOM이 있어도 헤더를 본문으로 오인하지 않는다."""
         raw = (FIXTURES / "sample.mysingle").read_bytes().replace(
@@ -416,6 +453,28 @@ class TestEmailIndexer:
 # ---------------------------------------------------------------------------
 
 class TestMailScanStateV2:
+    def test_v5_invalidates_v4_success_cache(self, tmp_path, monkeypatch):
+        """v5는 v4 성공 캐시를 비워 손상 본문 검사를 다시 거치게 한다."""
+        from knowmate.collector.mail_scan_state import load_mail_scan_state
+
+        monkeypatch.setitem(
+            sys.modules, "knowmate.rag.email_indexer", types.SimpleNamespace(EMAIL_INDEX_VERSION="5"),
+        )
+        path = tmp_path / "state.json"
+        path.write_text(json.dumps({
+            "schema_version": 2, "cursor": None,
+            "files": {"old": {
+                "mtime": 1.0, "size": 1, "mail_uid": "knox:old", "index_version": "4",
+                "uid_resolution_version": 2,
+            }},
+            "pending_deletes": ["old-chunk"],
+        }), encoding="utf-8")
+
+        state = load_mail_scan_state(path)
+        assert state["files"] == {}
+        assert state["pending_deletes"] == ["old-chunk"]
+        assert state.needs_save
+
     def test_v1_migration_keeps_cache_cursor_and_pending_deletes(self, tmp_path, monkeypatch):
         """v1은 path만 제거해 필요한 성공 캐시와 top-level 대기열을 보존한다."""
         from knowmate.collector.mail_scan_state import (
@@ -656,6 +715,134 @@ class TestMailScanner:
                 pass
 
         return FakeIndexer()
+
+    def test_corrupt_body_is_user_action_and_cleans_only_exact_legacy_ids(self, tmp_path):
+        """손상 Knox는 임베딩 없이 실패 기록하고 같은 source legacy 청크만 정리한다."""
+        from knowmate.collector import failure_state
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        broken = watch / "broken.mysingle"
+        broken.write_bytes(
+            b"MIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n" + b"\x00" * 300_000
+        )
+        valid = watch / "valid.mysingle"
+        _write_mail(valid, uid="2026091000000001", msgid="after-corrupt")
+
+        class CorruptCleanupIndexer:
+            table_was_recreated = False
+            table_is_empty = False
+
+            def __init__(self):
+                self.index_calls = 0
+                self.lookups = []
+                self.deleted = []
+
+            def get_index_state(self, *_args):
+                return types.SimpleNamespace(state=types.SimpleNamespace(name="MISSING"), old_chunk_ids=())
+
+            def get_legacy_path_chunk_ids(self, source_file):
+                self.lookups.append(source_file)
+                return ("corrupt-legacy",) if source_file == str(broken.resolve()) else ()
+
+            def index_mail(self, *_args, **_kwargs):
+                self.index_calls += 1
+                return ["normal-new"]
+
+            def delete_chunk_ids(self, chunk_ids):
+                self.deleted.append(tuple(chunk_ids))
+                return tuple(chunk_ids)
+
+        indexer = CorruptCleanupIndexer()
+        state_file = tmp_path / "mail_scan_state.json"
+        failure_file = tmp_path / "index_failure.json"
+        assert run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 2}},
+            state_file=state_file, failure_file=failure_file, get_now=lambda: 1_000.0,
+        ) == (1, 1)
+        record = failure_state.load_failures(failure_file)[str(broken)]
+        assert (record.kind, record.stage) == (failure_state.KIND_NEEDS_USER_ACTION, "parse")
+        assert indexer.index_calls == 1
+        assert indexer.deleted == [("corrupt-legacy",)]
+
+    def test_corrupt_body_does_not_delete_when_pending_queue_cannot_persist(self, tmp_path, monkeypatch):
+        """손상 메일의 queue 저장 실패 시 기존 legacy 청크를 삭제하지 않는다."""
+        from knowmate.collector import mail_scanner
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        broken = watch / "broken.mysingle"
+        broken.write_bytes(
+            b"MIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n\x00"
+        )
+
+        class NoPersistIndexer:
+            table_was_recreated = False
+            table_is_empty = False
+
+            def get_legacy_path_chunk_ids(self, _source_file):
+                return ("corrupt-legacy",)
+
+            def delete_chunk_ids(self, _chunk_ids):
+                raise AssertionError("queue 저장 실패 시 삭제하면 안 됩니다")
+
+        monkeypatch.setattr(mail_scanner, "save_mail_scan_state", lambda *_args: False)
+        assert mail_scanner.run_mail_scan(
+            [str(watch)], NoPersistIndexer(), {"mail": {"max_mails_per_scan": 1}},
+            state_file=tmp_path / "mail_scan_state.json", failure_file=tmp_path / "index_failure.json",
+        ) == (0, 1)
+
+    def test_corrupt_body_legacy_delete_is_persisted_and_retried(self, tmp_path, monkeypatch):
+        """손상 본문의 exact legacy ID는 삭제 실패 뒤에도 pending queue로 재시도한다."""
+        from knowmate.collector.mail_scan_state import load_mail_scan_state
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        monkeypatch.setitem(
+            sys.modules, "knowmate.rag.email_indexer", types.SimpleNamespace(EMAIL_INDEX_VERSION="5"),
+        )
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        broken = watch / "broken.mysingle"
+        broken.write_bytes(
+            b"MIME-Version: 1.0\r\nContent-Type: text/plain; charset=UTF-8\r\n\r\n\x00"
+        )
+
+        class RetryingIndexer:
+            table_was_recreated = False
+            table_is_empty = False
+
+            def __init__(self):
+                self.legacy_active = True
+                self.delete_attempts = 0
+
+            def get_legacy_path_chunk_ids(self, source_file):
+                assert source_file == str(broken.resolve())
+                return ("corrupt-legacy",) if self.legacy_active else ()
+
+            def delete_chunk_ids(self, chunk_ids):
+                assert tuple(chunk_ids) == ("corrupt-legacy",)
+                self.delete_attempts += 1
+                if self.delete_attempts == 1:
+                    raise RuntimeError("delete failed")
+                self.legacy_active = False
+                return tuple(chunk_ids)
+
+        indexer = RetryingIndexer()
+        state_file = tmp_path / "mail_scan_state.json"
+        failure_file = tmp_path / "index_failure.json"
+        assert run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 1}},
+            state_file=state_file, failure_file=failure_file,
+        ) == (0, 1)
+        assert load_mail_scan_state(state_file)["pending_deletes"] == ["corrupt-legacy"]
+
+        assert run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 1}},
+            state_file=state_file, failure_file=failure_file, get_now=lambda: 9_999_999_999.0,
+        ) == (0, 1)
+        assert indexer.delete_attempts == 2
+        assert load_mail_scan_state(state_file)["pending_deletes"] == []
 
     def test_scan_finds_mysingle(self, tmp_path):
         """scan_mail_folders가 .mysingle 파일을 탐지한다."""
