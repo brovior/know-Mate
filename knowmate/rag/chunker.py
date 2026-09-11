@@ -1,4 +1,6 @@
 """파일 타입별 청크 분할 전략 (CLAUDE.md 6-4, 6-5)."""
+from collections.abc import Iterable, Iterator
+from itertools import islice
 import logging
 import re
 
@@ -19,60 +21,45 @@ def chunk_text(
 ) -> list[str]:
     """텍스트를 파일 타입에 맞는 전략으로 분할해 청크 리스트를 반환한다.
 
-    max_chunks_per_file: 파일당 최대 청크 수. 초과분은 잘라낸다 (최후 안전망).
+    max_chunks_per_file: 파일당 최대 청크 수. 상한 초과가 확인되면 분할을 즉시 중단한다.
     xlsx_max_rows_per_sheet: xlsx 시트당 최대 행 수. 초과 시트는 메타 청크 1개로 대체.
     """
-    if not text or not text.strip():
+    if not text or text.isspace():
         return []
 
     ft = file_type.lower().lstrip(".")
 
     if ft in {"txt", "md", "log"}:
-        segments = re.split(r"\n{2,}", text)
-        chunks = _merge_and_split(segments, chunk_size, overlap)
+        chunk_iter = _iter_merge_and_split(
+            _iter_blankline_segments(text), chunk_size, overlap
+        )
 
     elif ft == "docx":
-        segments = [line for line in text.splitlines() if line.strip()]
-        chunks = _merge_and_split(segments, chunk_size, overlap)
+        chunk_iter = _iter_merge_and_split(text.splitlines(), chunk_size, overlap)
 
     elif ft == "pdf":
         # 페이지 단위 독립 처리 → 초과 시 재분할
-        pages = re.split(r"\n{2,}", text)
-        chunks = []
-        for page in pages:
-            page = page.strip()
-            if not page:
-                continue
-            if len(page) <= chunk_size:
-                chunks.append(page)
-            else:
-                chunks.extend(_split_by_size(page, chunk_size, overlap))
+        chunk_iter = _iter_independent_sections(text, chunk_size, overlap)
 
     elif ft == "pptx":
         # 슬라이드 단위 독립 처리 → 초과 시 재분할
-        slides = re.split(r"\n{2,}", text)
-        chunks = []
-        for slide in slides:
-            slide = slide.strip()
-            if not slide:
-                continue
-            if len(slide) <= chunk_size:
-                chunks.append(slide)
-            else:
-                chunks.extend(_split_by_size(slide, chunk_size, overlap))
+        chunk_iter = _iter_independent_sections(text, chunk_size, overlap)
 
     elif ft in {"xlsx", "xls"}:
-        chunks = _chunk_xlsx(text, xlsx_max_rows_per_sheet)
+        chunk_iter = iter(_chunk_xlsx(text, xlsx_max_rows_per_sheet))
 
     else:
         # 그 외 파일 타입 — 기본 크기 분할
-        chunks = _split_by_size(text, chunk_size, overlap)
+        chunk_iter = _iter_split_by_size(text, chunk_size, overlap)
 
-    # 파일당 최대 청크 수 상한 (최후 안전망)
+    # 상한 초과 판별을 위해 1개만 더 생성하고, 나머지 분할은 즉시 중단한다.
+    probe_count = max(0, max_chunks_per_file) + 1
+    chunks = list(islice(chunk_iter, probe_count))
     if len(chunks) > max_chunks_per_file:
         logger.warning(
-            "청크 수 상한 초과 (%d → %d): max_chunks_per_file=%d",
-            len(chunks), max_chunks_per_file, max_chunks_per_file,
+            "청크 수 상한 초과 — %d개에서 분할 중단: max_chunks_per_file=%d",
+            max_chunks_per_file,
+            max_chunks_per_file,
         )
         chunks = chunks[:max_chunks_per_file]
 
@@ -142,24 +129,33 @@ def _chunk_single_sheet(text: str, sheet_name: str, max_rows_per_sheet: int) -> 
 
 def _split_by_size(text: str, chunk_size: int, overlap: int) -> list[str]:
     """텍스트를 chunk_size씩, step=chunk_size-overlap 으로 슬라이싱한다."""
-    if not text.strip():
-        return []
+    return list(_iter_split_by_size(text, chunk_size, overlap))
+
+
+def _iter_split_by_size(text: str, chunk_size: int, overlap: int) -> Iterator[str]:
+    """텍스트를 크기 단위로 하나씩 분할한다."""
+    if not text or text.isspace():
+        return
     step = max(1, chunk_size - overlap)
-    chunks: list[str] = []
     start = 0
     while start < len(text):
         chunk = text[start : start + chunk_size].strip()
         if chunk:
-            chunks.append(chunk)
+            yield chunk
         start += step
-    return chunks
 
 
 def _merge_and_split(
     segments: list[str], chunk_size: int, overlap: int
 ) -> list[str]:
     """세그먼트를 합치다 chunk_size 초과 시 새 청크 시작. 초과 세그먼트는 재분할."""
-    chunks: list[str] = []
+    return list(_iter_merge_and_split(segments, chunk_size, overlap))
+
+
+def _iter_merge_and_split(
+    segments: Iterable[str], chunk_size: int, overlap: int
+) -> Iterator[str]:
+    """세그먼트를 합치면서 완성된 청크를 하나씩 반환한다."""
     buffer = ""
 
     for seg in segments:
@@ -170,20 +166,41 @@ def _merge_and_split(
         if len(seg) > chunk_size:
             # 버퍼 먼저 flush
             if buffer.strip():
-                chunks.append(buffer.strip())
+                yield buffer.strip()
                 buffer = ""
-            chunks.extend(_split_by_size(seg, chunk_size, overlap))
+            yield from _iter_split_by_size(seg, chunk_size, overlap)
             continue
 
         candidate = (buffer + "\n" + seg).strip() if buffer else seg
         if len(candidate) > chunk_size:
             if buffer.strip():
-                chunks.append(buffer.strip())
+                yield buffer.strip()
             buffer = seg
         else:
             buffer = candidate
 
     if buffer.strip():
-        chunks.append(buffer.strip())
+        yield buffer.strip()
 
-    return chunks
+
+def _iter_blankline_segments(text: str) -> Iterator[str]:
+    """전체 분할 목록을 만들지 않고 빈 줄 경계의 세그먼트를 반환한다."""
+    start = 0
+    for match in re.finditer(r"\n{2,}", text):
+        yield text[start : match.start()]
+        start = match.end()
+    yield text[start:]
+
+
+def _iter_independent_sections(
+    text: str, chunk_size: int, overlap: int
+) -> Iterator[str]:
+    """PDF 페이지나 PPT 슬라이드를 독립적으로 하나씩 분할한다."""
+    for section in _iter_blankline_segments(text):
+        section = section.strip()
+        if not section:
+            continue
+        if len(section) <= chunk_size:
+            yield section
+        else:
+            yield from _iter_split_by_size(section, chunk_size, overlap)
