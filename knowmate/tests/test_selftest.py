@@ -18,10 +18,21 @@
 에서는 저장소 루트의 ./AegisDesk/)에 파일을 만든다.
 """
 import sys
+from pathlib import Path
 
 import pytest
 
 from knowmate.app import selftest
+
+
+def test_webengine_share_context_is_set_before_qapplication_creation():
+    """WebEngine 지연 import에 필요한 Qt 속성은 QApplication보다 먼저 설정한다."""
+    source = (Path(__file__).parents[1] / "app" / "main.py").read_text(encoding="utf-8")
+    attribute_call = (
+        "QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)"
+    )
+
+    assert source.index(attribute_call) < source.index("app = QApplication(sys.argv)")
 
 
 class TestRunSelftestAggregation:
