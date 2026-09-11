@@ -11,11 +11,8 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
-from PyQt6.QtCore import QFile, QIODevice, QUrl, Qt
+from PyQt6.QtCore import QFile, QIODevice, QTimer, QUrl, Qt
 from PyQt6.QtGui import QIcon, QAction
-from PyQt6.QtWebEngineCore import QWebEngineScript
-from PyQt6.QtWebEngineWidgets import QWebEngineView
-from PyQt6.QtWebChannel import QWebChannel
 from PyQt6.QtWidgets import QApplication, QMainWindow, QSizeGrip, QSystemTrayIcon, QMenu
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -33,11 +30,9 @@ def resource_path(rel: str) -> Path:
     return base / rel
 
 
-from knowmate.app.bridge import Bridge
-from knowmate.agents.registry import AgentRegistry
-
 UI_DIR = resource_path("knowmate/app/ui")
 APP_ICON = UI_DIR / "assets" / "aegisdesk.ico"
+STARTUP_LOGO = UI_DIR / "assets" / "logo.png"
 logger = logging.getLogger(__name__)
 
 
@@ -67,6 +62,12 @@ class MainWindow(QMainWindow):
         self._tray: QSystemTrayIcon | None = None
         self._really_quit = False
         self._shutdown_done = False
+
+        # WebEngine과 검색 구성요소는 시작 화면이 먼저 표시된 뒤 로드한다.
+        from PyQt6.QtWebChannel import QWebChannel
+        from PyQt6.QtWebEngineWidgets import QWebEngineView
+        from knowmate.agents.registry import AgentRegistry
+        from knowmate.app.bridge import Bridge
 
         self._view = QWebEngineView(self)
         self.setCentralWidget(self._view)
@@ -328,8 +329,10 @@ class MainWindow(QMainWindow):
         )
 
 
-def _inject_qwebchannel_js(view: QWebEngineView) -> None:
+def _inject_qwebchannel_js(view: object) -> None:
     """Qt 내부 리소스에서 qwebchannel.js를 읽어 페이지 스크립트로 주입한다."""
+    from PyQt6.QtWebEngineCore import QWebEngineScript
+
     f = QFile(":/qtwebchannel/qwebchannel.js")
     if not f.open(QIODevice.OpenModeFlag.ReadOnly):
         raise RuntimeError("qwebchannel.js 리소스를 열 수 없습니다.")
@@ -415,16 +418,6 @@ def main() -> None:
 
     logger.info("Aegis Desk %s 시작 (platform=%s)", __version__, sys.platform)
 
-    # 배포 빌드에 번들된 lancedb가 실측 검증 범위(requirements.txt) 안인지 확인한다
-    # (설계 리뷰 19차 M-2) — 포터블 빌드라 사용자가 버전을 바꿀 수 없으므로, 이 검사는
-    # 런타임 방어가 아니라 빌드 실수를 조기에 드러내는 진단 신호다. 범위 밖이어도
-    # 앱은 계속 실행한다(강제 종료할 만큼 확실한 장애가 아님 — 실제 비호환은 purge의
-    # "unsupported" 판정이 별도로 처리).
-    from knowmate.lancedb_compat import check_lancedb_version
-    lancedb_version_warning = check_lancedb_version()
-    if lancedb_version_warning:
-        logger.error(lancedb_version_warning)
-
     os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
     _set_windows_app_id("AegisDesk.App")
     app = QApplication(sys.argv)
@@ -445,6 +438,23 @@ def main() -> None:
     )
     if not try_acquire_or_notify_existing():
         return
+
+    # 단일 인스턴스 확인 뒤 즉시 시작 화면을 보여준다. WebEngine·LanceDB·수집기 같은
+    # 무거운 구성요소는 이 다음에 로드해 exe 시작 후 무반응으로 보이는 시간을 줄인다.
+    from knowmate.app.startup_splash import StartupSplash
+    splash = StartupSplash(STARTUP_LOGO)
+    splash.show()
+    app.processEvents()
+
+    # 배포 빌드에 번들된 lancedb가 실측 검증 범위(requirements.txt) 안인지 확인한다
+    # (설계 리뷰 19차 M-2) — 포터블 빌드라 사용자가 버전을 바꿀 수 없으므로, 이 검사는
+    # 런타임 방어가 아니라 빌드 실수를 조기에 드러내는 진단 신호다. 범위 밖이어도
+    # 앱은 계속 실행한다(강제 종료할 만큼 확실한 장애가 아님 — 실제 비호환은 purge의
+    # "unsupported" 판정이 별도로 처리).
+    from knowmate.lancedb_compat import check_lancedb_version
+    lancedb_version_warning = check_lancedb_version()
+    if lancedb_version_warning:
+        logger.error(lancedb_version_warning)
 
     # 단일 인스턴스로 확정된 뒤에만 강제 종료 표식을 다룬다(설계 리뷰 12차 M-1) —
     # 그렇지 않으면 곧 조용히 종료할 보조 인스턴스가 주 인스턴스의 표식을 건드려
@@ -468,6 +478,22 @@ def main() -> None:
     single_instance_server = SingleInstanceServer(parent=win)
     single_instance_server.show_requested.connect(win._show_from_tray)
 
+    startup_finished = False
+
+    def finish_startup(*_args) -> None:
+        """웹 UI 준비 시 시작 화면을 한 번만 닫고 메인 창을 앞으로 가져온다."""
+        nonlocal startup_finished
+        if startup_finished:
+            return
+        startup_finished = True
+        splash.close()
+        splash.deleteLater()
+        win.raise_()
+        win.activateWindow()
+
+    win._view.loadFinished.connect(finish_startup)
+    # 로컬 HTML 로드 신호가 오지 않는 예외 상황에서도 시작 화면이 고착되지 않는다.
+    QTimer.singleShot(15_000, finish_startup)
     win.show()
     exit_code = app.exec()
     # app.exec()가 반환됐다 = 정상 quit이 확정됐다(하드 종료 경로는 os._exit()로

@@ -912,7 +912,7 @@ function _renderFailCard(card, index) {
           <span><span class="k">단계</span> ${escHtml(card.stage_label)}</span>
           <span><span class="k">실패</span> ${card.consecutive_failures}회</span>
           <span><span class="k">마지막</span> ${_formatFailTimestamp(card.last_failed_ts)}</span>
-          <span class="k">다음 재시도</span><span class="next none">사용자가 제외함</span>
+          <span class="k">다음 자동 재시도</span><span class="next none">사용자가 제외함</span>
         </div>
         <div class="f-actions">
           ${act("unexclude", "제외 해제", "f-btn primary")}
@@ -935,7 +935,7 @@ function _renderFailCard(card, index) {
         <span><span class="k">단계</span> ${escHtml(card.stage_label)}</span>
         <span><span class="k">실패</span> ${card.consecutive_failures}회</span>
         <span><span class="k">마지막</span> ${_formatFailTimestamp(card.last_failed_ts)}</span>
-        <span class="k">다음 재시도</span><span class="next">${waitLabel}</span>
+        <span class="k">다음 자동 재시도</span><span class="next">${waitLabel}</span>
       </div>
       <div class="f-actions">
         ${act("retry", "⟳ 지금 다시 시도", "f-btn primary")}

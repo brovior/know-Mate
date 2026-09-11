@@ -44,7 +44,7 @@ _COMMON_IMPORTS = ("lancedb", "pyarrow", "pandas", "yaml", "cryptography",
 
 def _check_bundled_resources(failures: list[str]) -> None:
     """UI 리소스·아이콘·config 템플릿이 번들에 실재하는지 확인한다."""
-    from knowmate.app.main import UI_DIR, APP_ICON
+    from knowmate.app.main import UI_DIR, APP_ICON, STARTUP_LOGO
 
     for label, path in (
         ("UI 폴더", UI_DIR),
@@ -52,6 +52,7 @@ def _check_bundled_resources(failures: list[str]) -> None:
         ("app.js", UI_DIR / "app.js"),
         ("styles.css", UI_DIR / "styles.css"),
         ("앱 아이콘", APP_ICON),
+        ("시작 화면 로고", STARTUP_LOGO),
     ):
         if not Path(path).exists():
             failures.append(f"번들 리소스 누락: {label} ({path})")
