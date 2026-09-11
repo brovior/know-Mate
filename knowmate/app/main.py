@@ -420,6 +420,9 @@ def main() -> None:
 
     os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
     _set_windows_app_id("AegisDesk.App")
+    # QtWebEngineWidgets를 QApplication 생성 뒤에 지연 import하려면 이 속성을 먼저
+    # 설정해야 한다. 그렇지 않으면 Qt가 WebEngine 초기화 순서 오류로 앱을 중단한다.
+    QApplication.setAttribute(Qt.ApplicationAttribute.AA_ShareOpenGLContexts)
     app = QApplication(sys.argv)
     app.setApplicationName("Aegis Desk")
     # 트레이 상주 앱 표준 관용구: 창이 트레이로 숨겨진 상태(hide())에서는 "보이는 창이
