@@ -1,12 +1,42 @@
 """배포 빌드 환경 검증 스크립트 테스트."""
 from __future__ import annotations
 
+from pathlib import Path
 import runpy
 import subprocess
 
 import pytest
 
 from scripts import build_guard
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_build_launcher_is_ascii_and_switches_codepage_before_impl():
+    """CMD가 읽는 도중 코드페이지를 바꾸지 않도록 런처는 ASCII만 사용한다."""
+    launcher_bytes = (REPO_ROOT / "build.bat").read_bytes()
+    assert all(byte < 128 for byte in launcher_bytes)
+
+    launcher = launcher_bytes.decode("ascii").lower()
+    switch_position = launcher.index("chcp 65001")
+    call_position = launcher.index(r'call "%~dp0scripts\build_impl.bat"')
+    capture_position = launcher.index('set "_build_exit=%errorlevel%"')
+    restore_position = launcher.rindex("chcp %_orig_cp%")
+    exit_position = launcher.index("endlocal & exit /b %_build_exit%")
+    assert switch_position < call_position < capture_position < restore_position < exit_position
+
+
+def test_build_impl_requires_wrapper_and_does_not_change_codepage():
+    """UTF-8 빌드 본체는 런처를 통해서만 실행하고 코드페이지는 건드리지 않는다."""
+    implementation = (REPO_ROOT / "scripts" / "build_impl.bat").read_text(
+        encoding="utf-8",
+    ).lower()
+
+    assert 'if not "%aegis_build_wrapper%"=="1"' in implementation
+    assert 'cd /d "%~dp0.."' in implementation
+    assert "chcp 65001" not in implementation
+    assert ":restore_cp" not in implementation
 
 
 def test_reads_exact_pyinstaller_pin(tmp_path):
