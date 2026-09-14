@@ -82,6 +82,14 @@ def get_config() -> dict[str, Any]:
     if _cache is None:
         with _get_config_path().open(encoding="utf-8") as f:
             _cache = yaml.safe_load(f) or {}
+        mail_cfg = _cache.get("mail")
+        if isinstance(mail_cfg, dict) and "batch_commit_every" in mail_cfg:
+            legacy_value = mail_cfg.pop("batch_commit_every")
+            mail_cfg.setdefault("progress_report_every", legacy_value)
+            try:
+                _save_config(_cache)
+            except OSError as exc:
+                logger.warning("구형 메일 진행률 설정 이름 변경 저장 실패: %s", exc)
     return _cache
 
 

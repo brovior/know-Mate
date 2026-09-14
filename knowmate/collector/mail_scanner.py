@@ -243,7 +243,11 @@ def run_mail_scan(
 
     mail_cfg = cfg.get("mail", {})
     max_per_scan = max(int(mail_cfg.get("max_mails_per_scan", 500)), 0)
-    progress_every = max(int(mail_cfg.get("batch_commit_every", 50)), 1)
+    # get_config()가 구형 키를 변환하지만, cfg를 직접 넘기는 호출도 호환한다.
+    progress_every = max(
+        int(mail_cfg.get("progress_report_every", mail_cfg.get("batch_commit_every", 50))),
+        1,
+    )
     extensions = mail_cfg.get("extensions") or _DEFAULT_MAIL_EXTS
     now_fn = get_now or time.time
     cycle_started = time.perf_counter()

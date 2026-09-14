@@ -127,6 +127,7 @@ zip에 섞인다.
 | `mail.enabled` | `true` | 메일 파일 자동 인덱싱 on/off | ✅ |
 | `mail.extensions` | `[.mysingle, .eml]` | 인덱싱할 메일 확장자 | |
 | `mail.max_mails_per_scan` | `500` | 스캔당 실제 처리 시도 상한 | |
+| `mail.progress_report_every` | `50` | 처리 결과 진행률 알림 간격 | |
 | `llm.mode` | `api` | fake / claude / openrouter / **api** | |
 | `llm.base_url` | - | 사내 LLM 서버 IP | ✅ |
 | `llm.model` | `qwen3-27b` | 사용할 모델명 | ✅ |

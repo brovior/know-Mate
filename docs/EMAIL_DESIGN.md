@@ -102,7 +102,7 @@ Outlook은 그 위에 얹는다. 스키마는 **Outlook까지 고려한 풀 스�
 
 **같은 UID의 변경 복사본**: 스캔 안에서만 본문·인덱스 메타의 SHA-256 지문을 비교한다(본문·지문은 상태
 파일과 로그에 남기지 않음). 내용이 다르고 mtime이 더 새면 기존 세대가 최종 확정된 뒤 STALE 안전 교체를
-수행하며, 더 오래된 다른 내용은 새 세대를 되돌리지 않는 shadow로만 처리한다. `batch_commit_every`는
+수행하며, 더 오래된 다른 내용은 새 세대를 되돌리지 않는 shadow로만 처리한다. `progress_report_every`는
 실제 처리 시도의 **최종 결과** 진행률을 묶는 간격이며, 성공 캐시·백오프 skip은 진행률 callback을 만들지 않는다.
 
 **사이클 계측**: 종료 시 상태 읽기·후보 열거/선별/정렬·파싱·DB 상태 확인·임베딩·메일 저장·삭제 재시도·
@@ -250,8 +250,9 @@ mail:
   - .mysingle
   - .eml
   max_mails_per_scan: 500  # 스캔당 실제 처리 시도 상한 (파싱·DB 확인·인덱싱, 다음 순환에서 계속)
-  batch_commit_every: 50   # 최종 결과 기반 진행률 알림 최소 간격(성공 캐시·백오프 skip 제외)
+  progress_report_every: 50  # 최종 결과 기반 진행률 알림 최소 간격(성공 캐시·백오프 skip 제외)
 ```
 
 `watch_folders`를 공유 — `extensions`에 지정된 확장자를 감지해 자동으로 메일 파이프라인으로 라우팅.
 스캔은 `mail_scanner._iter_mail_files`가 `os.scandir` 단일 순회로 처리(확장자별 rglob 아님, `DirEntry.stat` 캐시 재사용).
+구형 사용자 설정의 `batch_commit_every`는 시작 시 같은 값을 유지한 채 `progress_report_every`로 자동 변경한다.
