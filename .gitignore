@@ -41,6 +41,7 @@ km.key
 test_docs/
 write_test4.py
 debug.log
+.aegisdesk_build/
 
 # IDE
 .idea/

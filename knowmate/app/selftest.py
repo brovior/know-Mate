@@ -14,7 +14,8 @@ pytest가 담당하므로 여기서 중복하지 않는다:
   3. QtWebEngineProcess 실행 파일 — 없으면 화면이 흰색으로 뜬다
   4. 지연 import 모듈(win32timezone 등) — 정적 분석으로 안 잡히는 것들
   5. lancedb 번들 버전 — 검증 범위 밖 버전이 섞였는지
-  6. 로그 폴더 쓰기 가능 여부 — 실패 시 진단 수단 자체를 잃는다
+  6. 빌드 출처 정보 — 어떤 Git 커밋으로 만든 exe인지 확인
+  7. 로그 폴더 쓰기 가능 여부 — 실패 시 진단 수단 자체를 잃는다
 
 **결과 전달**: ① 종료 코드(0=통과, 1=실패) ② 보고서 파일
 (`%APPDATA%/AegisDesk/logs/selftest.log`) ③ stderr(있을 때만).
@@ -32,7 +33,9 @@ WebEngine이 실제로 페이지를 렌더링하는지는 창을 띄워야만 �
 """
 from __future__ import annotations
 
+import re
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # 지연 import(정적 분석으로 안 잡혀 hiddenimports에 명시한 것들)를 실제로 import해본다.
@@ -109,6 +112,46 @@ def _check_lancedb_version(failures: list[str]) -> None:
         failures.append(f"lancedb 버전: {warning}")
 
 
+def _check_build_info(failures: list[str]) -> None:
+    """frozen 빌드에 Git 커밋 출처 정보가 내장됐는지 확인한다."""
+    if not bool(getattr(sys, "frozen", False)):
+        return
+    from knowmate.build_info import get_build_info
+
+    info = get_build_info()
+    commit = info.get("commit")
+    short_commit = info.get("short_commit")
+    valid_commit = bool(
+        isinstance(commit, str) and re.fullmatch(r"[0-9a-fA-F]{40}", commit)
+    )
+    if not valid_commit:
+        failures.append("빌드 출처 정보 오류: 40자리 16진수 Git commit")
+    valid_short = bool(
+        isinstance(short_commit, str)
+        and re.fullmatch(r"[0-9a-fA-F]{7,40}", short_commit)
+        and valid_commit
+        and commit.startswith(short_commit)
+    )
+    if not valid_short:
+        failures.append("빌드 출처 정보 오류: short_commit 불일치")
+    dirty = info.get("dirty")
+    if not isinstance(dirty, bool):
+        failures.append("빌드 출처 정보 오류: dirty 값")
+    if dirty is True:
+        fingerprint = info.get("source_fingerprint")
+        if not isinstance(fingerprint, str) or not re.fullmatch(
+            r"[0-9a-fA-F]{8}", fingerprint
+        ):
+            failures.append("빌드 출처 정보 오류: dirty 작업 트리 지문")
+    built_at = info.get("built_at_utc")
+    try:
+        built_at_value = datetime.fromisoformat(built_at) if isinstance(built_at, str) else None
+    except ValueError:
+        built_at_value = None
+    if built_at_value is None or built_at_value.tzinfo is None:
+        failures.append("빌드 출처 정보 오류: built_at_utc")
+
+
 def _check_log_dir_writable(failures: list[str]) -> None:
     """로그 폴더가 생성·기록 가능한지 확인한다 — 실패하면 진단 수단 자체를 잃는다."""
     from knowmate.config import get_data_dir
@@ -177,6 +220,7 @@ def run_selftest(report_path=None) -> int:
         ("WebEngine 프로세스", _check_webengine_process),
         ("지연 import 모듈", _check_lazy_imports),
         ("lancedb 버전", _check_lancedb_version),
+        ("빌드 출처", _check_build_info),
         ("로그 폴더", _check_log_dir_writable),
     )
     for label, check in checks:
@@ -186,7 +230,13 @@ def run_selftest(report_path=None) -> int:
             failures.append(f"[{label}] 점검 중 예외: {type(exc).__name__}: {exc}")
 
     frozen = bool(getattr(sys, "frozen", False))
-    lines = [f"[selftest] frozen={frozen} platform={sys.platform}"]
+    from knowmate.build_info import get_build_info
+    build_info = get_build_info()
+    build_label = str(build_info.get("short_commit", "unknown"))
+    if build_info.get("dirty") is True:
+        fingerprint = str(build_info.get("source_fingerprint", "unknown"))
+        build_label += f"-dirty.{fingerprint}"
+    lines = [f"[selftest] frozen={frozen} platform={sys.platform} build={build_label}"]
     if failures:
         lines.append(f"[selftest] 실패 {len(failures)}건:")
         lines.extend(f"  - {item}" for item in failures)

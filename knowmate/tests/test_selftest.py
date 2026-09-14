@@ -42,6 +42,7 @@ class TestRunSelftestAggregation:
         monkeypatch.setattr(selftest, "_check_webengine_process", checks[1])
         monkeypatch.setattr(selftest, "_check_lazy_imports", checks[2])
         monkeypatch.setattr(selftest, "_check_lancedb_version", checks[3])
+        monkeypatch.setattr(selftest, "_check_build_info", lambda failures: None)
         monkeypatch.setattr(selftest, "_check_log_dir_writable", checks[4])
 
     def test_all_pass_returns_zero(self, monkeypatch, tmp_path):
@@ -119,6 +120,63 @@ class TestRunSelftestAggregation:
 
 
 class TestIndividualChecks:
+    def test_frozen_build_without_provenance_is_reported(self, monkeypatch):
+        """배포 exe에서 Git 출처 정보가 빠지면 selftest가 실패한다."""
+        import knowmate.build_info as build_info
+
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        monkeypatch.setattr(build_info, "get_build_info", lambda: {})
+        failures = []
+        selftest._check_build_info(failures)
+
+        assert len(failures) == 4
+        assert all("빌드 출처 정보 오류" in failure for failure in failures)
+
+    def test_frozen_build_with_commit_provenance_passes(self, monkeypatch):
+        """커밋 출처가 내장된 배포 exe는 빌드 정보 점검을 통과한다."""
+        import knowmate.build_info as build_info
+
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        monkeypatch.setattr(build_info, "get_build_info", lambda: {
+            "commit": "a" * 40, "short_commit": "a" * 7, "dirty": False,
+            "built_at_utc": "2026-09-14T00:00:00+00:00",
+        })
+        failures = []
+        selftest._check_build_info(failures)
+
+        assert failures == []
+
+    def test_frozen_build_with_mismatched_short_commit_fails(self, monkeypatch):
+        """다른 커밋의 짧은 값이 섞인 오래된 출처 모듈은 통과시키지 않는다."""
+        import knowmate.build_info as build_info
+
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        monkeypatch.setattr(build_info, "get_build_info", lambda: {
+            "commit": "a" * 40, "short_commit": "b" * 7, "dirty": False,
+            "built_at_utc": "2026-09-14T00:00:00+00:00",
+        })
+        failures = []
+        selftest._check_build_info(failures)
+
+        assert failures == ["빌드 출처 정보 오류: short_commit 불일치"]
+
+    def test_dirty_build_with_malformed_fingerprint_fails(self, monkeypatch):
+        """dirty 빌드의 변경 지문이 빠지거나 변조되면 selftest가 실패한다."""
+        import knowmate.build_info as build_info
+
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        monkeypatch.setattr(build_info, "get_build_info", lambda: {
+            "commit": "a" * 40,
+            "short_commit": "a" * 7,
+            "dirty": True,
+            "source_fingerprint": "bad",
+            "built_at_utc": "2026-09-14T00:00:00+00:00",
+        })
+        failures = []
+        selftest._check_build_info(failures)
+
+        assert failures == ["빌드 출처 정보 오류: dirty 작업 트리 지문"]
+
     def test_log_dir_writable_passes_in_normal_env(self, monkeypatch, tmp_path):
         """데이터 폴더를 임시 경로로 바꿔 검증한다 — 기본 경로를 그대로 쓰면
         테스트가 실제 앱 데이터 폴더(사외에서는 저장소 루트의 ./AegisDesk/)를
@@ -184,7 +242,7 @@ class TestReportOutputRobustness:
         noop = lambda failures: None
         for name in ("_check_bundled_resources", "_check_webengine_process",
                      "_check_lazy_imports", "_check_lancedb_version",
-                     "_check_log_dir_writable"):
+                     "_check_build_info", "_check_log_dir_writable"):
             monkeypatch.setattr(selftest, name, noop)
 
     def test_passes_even_when_stderr_is_none(self, monkeypatch, tmp_path):

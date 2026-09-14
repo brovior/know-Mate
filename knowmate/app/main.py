@@ -401,7 +401,7 @@ def _install_exception_hook() -> None:
 
 
 def main() -> None:
-    from knowmate.version import __version__
+    from knowmate.version import get_version_label
     from knowmate.config import get_config
 
     # 빌드 자체 점검 모드 — 창을 띄우지 않고 번들 구성만 확인하고 종료 코드로 알린다.
@@ -410,13 +410,19 @@ def main() -> None:
     # QApplication 생성 전에 처리해야 한다 — 점검 목적상 GUI를 띄우면 안 된다.
     if "--selftest" in sys.argv:
         from knowmate.app.selftest import run_selftest
-        sys.exit(run_selftest())
+        report_path = None
+        if "--selftest-report" in sys.argv:
+            index = sys.argv.index("--selftest-report")
+            if index + 1 >= len(sys.argv):
+                sys.exit(2)
+            report_path = sys.argv[index + 1]
+        sys.exit(run_selftest(report_path=report_path))
 
     cfg = get_config()
     _init_logging(cfg.get("log_level", "INFO"))
     _install_exception_hook()
 
-    logger.info("Aegis Desk %s 시작 (platform=%s)", __version__, sys.platform)
+    logger.info("Aegis Desk %s 시작 (platform=%s)", get_version_label(), sys.platform)
 
     os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
     _set_windows_app_id("AegisDesk.App")
