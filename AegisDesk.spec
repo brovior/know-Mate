@@ -5,11 +5,17 @@
 onedir 채택 이유: QWebEngineView 리소스(수백MB)를 매 실행 압축해제하는
 onefile은 시동이 느리고 폐쇄망 백신 오탐이 잦다.
 """
+import os
+
 from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
 hiddenimports = []
+
+build_info_dir = os.environ.get("AEGIS_BUILD_INFO_DIR")
+if not build_info_dir or not os.path.isfile(os.path.join(build_info_dir, "aegisdesk_build_info.py")):
+    raise SystemExit("빌드 출처 정보가 없습니다. AegisDesk.spec 대신 build.bat을 실행하세요.")
 
 # PyQt6 전체(WebEngine 프로세스·리소스·번역 파일 포함) 수집
 for pkg in ("PyQt6",):
@@ -20,6 +26,7 @@ for pkg in ("PyQt6",):
 
 # LanceDB/PyArrow/Pandas 등은 동적 import가 많아 hiddenimports로 명시
 hiddenimports += [
+    "aegisdesk_build_info",
     "lancedb",
     "pyarrow",
     "pandas",
@@ -49,7 +56,7 @@ datas += [
 
 a = Analysis(
     ["knowmate/app/main.py"],
-    pathex=["."],
+    pathex=[build_info_dir, "."],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,

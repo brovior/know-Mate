@@ -103,9 +103,9 @@ class Bridge(QObject):
 
     @pyqtSlot(result=str)
     def getVersion(self) -> str:
-        """앱 버전 문자열을 반환한다."""
-        from knowmate.version import __version__
-        return __version__
+        """앱 버전과 빌드 커밋 식별자를 반환한다."""
+        from knowmate.version import get_version_label
+        return get_version_label()
 
     # ------------------------------------------------------------------
     # 설정 패널

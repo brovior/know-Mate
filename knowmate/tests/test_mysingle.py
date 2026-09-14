@@ -982,7 +982,7 @@ class TestMailScanner:
         indexer = self._fake_mail_indexer(monkeypatch)
         state_file = tmp_path / "mail_scan_state.json"
         failure_file = tmp_path / "mail_index_failure.json"
-        cfg = {"mail": {"max_mails_per_scan": 1, "batch_commit_every": 1}}
+        cfg = {"mail": {"max_mails_per_scan": 1, "progress_report_every": 1}}
         real_save = mail_scanner.save_mail_scan_state
         save_calls = []
         failure_save_calls = []
@@ -1061,7 +1061,7 @@ class TestMailScanner:
         indexer = self._fake_mail_indexer(monkeypatch)
         state_file = tmp_path / "mail_scan_state.json"
         failure_file = tmp_path / "mail_index_failure.json"
-        cfg = {"mail": {"max_mails_per_scan": 1, "batch_commit_every": 1}}
+        cfg = {"mail": {"max_mails_per_scan": 1, "progress_report_every": 1}}
 
         assert run_mail_scan(
             [str(watch)], indexer, cfg, state_file=state_file, failure_file=failure_file,
@@ -1093,7 +1093,7 @@ class TestMailScanner:
             },
         }), encoding="utf-8")
         indexer = self._fake_mail_indexer(monkeypatch, recreated=True, empty=True, fail_index=True)
-        cfg = {"mail": {"max_mails_per_scan": 1, "batch_commit_every": 1}}
+        cfg = {"mail": {"max_mails_per_scan": 1, "progress_report_every": 1}}
 
         with pytest.raises(KeyboardInterrupt):
             run_mail_scan(
@@ -1205,7 +1205,7 @@ class TestMailScanner:
         state_file = tmp_path / "mail_scan_state.json"
         failure_file = tmp_path / "mail_index_failure.json"
         indexer = StaleIndexer()
-        cfg = {"mail": {"max_mails_per_scan": 1, "batch_commit_every": 1}}
+        cfg = {"mail": {"max_mails_per_scan": 1, "progress_report_every": 1}}
 
         assert run_mail_scan([str(watch)], indexer, cfg, state_file=state_file, failure_file=failure_file) == (1, 0)
         pending = load_mail_scan_state(state_file)
@@ -1255,7 +1255,7 @@ class TestMailScanner:
         indexer = LegacyIndexer()
         state_file = tmp_path / "mail_scan_state.json"
         failure_file = tmp_path / "mail_index_failure.json"
-        cfg = {"mail": {"max_mails_per_scan": 1, "batch_commit_every": 1}}
+        cfg = {"mail": {"max_mails_per_scan": 1, "progress_report_every": 1}}
 
         assert run_mail_scan([str(watch)], indexer, cfg, state_file=state_file, failure_file=failure_file) == (1, 0)
         assert indexer.events == ["lookup", "commit", "delete"]
@@ -1349,7 +1349,7 @@ class TestMailScanner:
 
         indexer = BatchIndexer()
         state_file = tmp_path / "mail_scan_state.json"
-        cfg = {"mail": {"max_mails_per_scan": 2, "batch_commit_every": 1}}
+        cfg = {"mail": {"max_mails_per_scan": 2, "progress_report_every": 1}}
         assert run_mail_scan(
             [str(watch)], indexer, cfg, state_file=state_file, failure_file=tmp_path / "failures.json",
         ) == (1, 1)
@@ -1628,7 +1628,7 @@ class TestMailScanner:
 
         indexer = ReplacingIndexer()
         state_file = tmp_path / "mail_scan_state.json"
-        cfg = {"mail": {"max_mails_per_scan": 1, "batch_commit_every": 1}}
+        cfg = {"mail": {"max_mails_per_scan": 1, "progress_report_every": 1}}
         run_mail_scan([str(watch)], indexer, cfg, state_file=state_file, failure_file=tmp_path / "failures.json")
         assert load_mail_scan_state(state_file)["pending_deletes"] == ["old-a"]
 
@@ -1650,7 +1650,7 @@ class TestMailScanner:
         shutil.copy(FIXTURES / "sample.mysingle", dest)
 
         ei = EmailIndexer(db_path=tmp_path / "db", embed_client=_fake_embed())
-        cfg = {"mail": {"max_mails_per_scan": 100, "batch_commit_every": 10}}
+        cfg = {"mail": {"max_mails_per_scan": 100, "progress_report_every": 10}}
         cnt, _ = run_mail_scan(
             [str(dest.parent)], ei, cfg,
             state_file=tmp_path / "mail_scan_state.json",
@@ -1669,7 +1669,7 @@ class TestMailScanner:
         shutil.copy(FIXTURES / "sample.mysingle", dest)
 
         ei = EmailIndexer(db_path=tmp_path / "db", embed_client=_fake_embed())
-        cfg = {"mail": {"max_mails_per_scan": 100, "batch_commit_every": 10}}
+        cfg = {"mail": {"max_mails_per_scan": 100, "progress_report_every": 10}}
 
         state_file = tmp_path / "mail_scan_state.json"
         failure_file = tmp_path / "mail_index_failure.json"
@@ -1694,7 +1694,7 @@ class TestMailScanner:
             os.utime(path, (ts, ts))
 
         indexer = EmailIndexer(db_path=tmp_path / "db", embed_client=_fake_embed())
-        cfg = {"mail": {"max_mails_per_scan": 2, "batch_commit_every": 1}}
+        cfg = {"mail": {"max_mails_per_scan": 2, "progress_report_every": 1}}
         state_file = tmp_path / "mail_scan_state.json"
         failure_file = tmp_path / "mail_index_failure.json"
 
@@ -1719,7 +1719,7 @@ class TestMailScanner:
         watch.mkdir()
         _write_mail(watch / "mail.mysingle", uid="2026062600999999", msgid="cached")
         indexer = EmailIndexer(db_path=tmp_path / "db", embed_client=_fake_embed())
-        cfg = {"mail": {"max_mails_per_scan": 1, "batch_commit_every": 1}}
+        cfg = {"mail": {"max_mails_per_scan": 1, "progress_report_every": 1}}
         state_file = tmp_path / "mail_scan_state.json"
         failure_file = tmp_path / "mail_index_failure.json"
         run_mail_scan([str(watch)], indexer, cfg, state_file=state_file, failure_file=failure_file)
@@ -1749,7 +1749,7 @@ class TestMailScanner:
         os.utime(valid, (1_000, 1_000))
 
         indexer = EmailIndexer(db_path=tmp_path / "db", embed_client=_fake_embed())
-        cfg = {"mail": {"max_mails_per_scan": 2, "batch_commit_every": 1}}
+        cfg = {"mail": {"max_mails_per_scan": 2, "progress_report_every": 1}}
         indexed, _ = run_mail_scan(
             [str(watch)], indexer, cfg,
             state_file=tmp_path / "mail_scan_state.json",
@@ -2319,7 +2319,7 @@ class TestMailScanner:
             progress.append((current, total, filename, indexer.table.count_rows()))
 
         assert run_mail_scan(
-            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 2, "batch_commit_every": 1}}, on_progress,
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 2, "progress_report_every": 1}}, on_progress,
             state_file=tmp_path / "state.json", failure_file=tmp_path / "failures.json",
         ) == (2, 0)
         assert [(current, total, rows) for current, total, _name, rows in progress] == [(1, 2, 1), (2, 2, 2)]
@@ -2352,7 +2352,7 @@ class TestMailScanner:
         caplog.set_level("INFO", logger="knowmate.collector.mail_scanner")
         assert run_mail_scan(
             [str(watch)], indexer,
-            {"mail": {"max_mails_per_scan": 500, "batch_commit_every": 1}},
+            {"mail": {"max_mails_per_scan": 500, "progress_report_every": 1}},
             on_progress=lambda *event: progress.append(event),
             state_file=state_file, failure_file=tmp_path / "failures.json",
         ) == (0, 1_000)
