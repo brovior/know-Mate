@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 # PyTorch/sentence-transformers가 import되기 전에 설정해야 효과 있음
@@ -11,7 +12,7 @@ os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
 
-from PyQt6.QtCore import QFile, QIODevice, QTimer, QUrl, Qt
+from PyQt6.QtCore import QEventLoop, QFile, QIODevice, QTimer, QUrl, Qt
 from PyQt6.QtGui import QIcon, QAction
 from PyQt6.QtWidgets import QApplication, QMainWindow, QSizeGrip, QSystemTrayIcon, QMenu
 
@@ -41,6 +42,7 @@ class MainWindow(QMainWindow):
         self,
         dirty_shutdown_detected: bool = False,
         lancedb_version_warning: str | None = None,
+        startup_pump: Callable[[], None] | None = None,
     ) -> None:
         """메인 윈도우를 초기화한다.
 
@@ -51,8 +53,11 @@ class MainWindow(QMainWindow):
         lancedb_version_warning: main()이 check_lancedb_version()으로 확인한 경고
             문구(범위 안이면 None) — 있으면 트레이 초기화 후 풍선 알림으로 표시한다
             (설계 리뷰 19차 M-2, 로그만으로는 놓치기 쉬움).
+        startup_pump: 시작 화면의 애니메이션·그리기를 처리하는 콜백. 무거운 초기화
+            단계 사이에서 호출하며 일반 실행 외에는 생략할 수 있다.
         """
         super().__init__()
+        self._startup_pump = startup_pump or (lambda: None)
         self.setWindowTitle("Aegis Desk")
         if APP_ICON.exists():
             self.setWindowIcon(QIcon(str(APP_ICON)))
@@ -62,15 +67,21 @@ class MainWindow(QMainWindow):
         self._tray: QSystemTrayIcon | None = None
         self._really_quit = False
         self._shutdown_done = False
+        self._pump_startup()
 
         # WebEngine과 검색 구성요소는 시작 화면이 먼저 표시된 뒤 로드한다.
         from PyQt6.QtWebChannel import QWebChannel
+        self._pump_startup()
         from PyQt6.QtWebEngineWidgets import QWebEngineView
+        self._pump_startup()
         from knowmate.agents.registry import AgentRegistry
+        self._pump_startup()
         from knowmate.app.bridge import Bridge
+        self._pump_startup()
 
         self._view = QWebEngineView(self)
         self.setCentralWidget(self._view)
+        self._pump_startup()
 
         self._grip = QSizeGrip(self)
         self._grip.setFixedSize(16, 16)
@@ -81,8 +92,10 @@ class MainWindow(QMainWindow):
         self._bridge   = Bridge(agent_registry=self._registry, main_window=self, parent=self)
         self._channel.registerObject("bridge", self._bridge)
         self._view.page().setWebChannel(self._channel)
+        self._pump_startup()
 
         self._init_collector()
+        self._pump_startup()
         self._init_tray()
         if dirty_shutdown_detected and self._tray is not None:
             self._tray.showMessage(
@@ -97,9 +110,15 @@ class MainWindow(QMainWindow):
                 "Aegis Desk", lancedb_version_warning,
                 QSystemTrayIcon.MessageIcon.Warning, 8000,
             )
+        self._pump_startup()
 
         _inject_qwebchannel_js(self._view)
+        self._pump_startup()
         self._view.load(QUrl.fromLocalFile(str(UI_DIR / "index.html")))
+
+    def _pump_startup(self) -> None:
+        """무거운 초기화 단계 사이에서 시작 화면의 그리기·애니메이션을 처리한다."""
+        self._startup_pump()
 
     def _init_tray(self) -> None:
         """시스템 트레이 아이콘과 메뉴를 초기화한다. 창을 닫아도 백그라운드 상주한다."""
@@ -158,20 +177,28 @@ class MainWindow(QMainWindow):
         """수집기 파이프라인을 초기화하고 IdleScheduler를 시작한다."""
         try:
             from knowmate.config import get_config, get_data_dir
+            self._pump_startup()
             from knowmate.rag.embedding import get_embedding_client
+            self._pump_startup()
             from knowmate.rag.indexer import Indexer
+            self._pump_startup()
             from knowmate.secure import get_extractor
+            self._pump_startup()
             from knowmate.secure.crypto import get_crypto_manager
+            self._pump_startup()
             from knowmate.collector.scheduler import CollectorWorker, IdleScheduler
+            self._pump_startup()
 
             cfg = get_config()
             db_path = get_data_dir() / "index"
             db_path.mkdir(parents=True, exist_ok=True)
+            self._pump_startup()
 
             chunking = cfg.get("chunking", {})
             batch_size = cfg.get("embedding", {}).get("batch_size", 32)
             embed_client = get_embedding_client(cfg)
             crypto = get_crypto_manager(cfg)
+            self._pump_startup()
             self._cfg      = cfg
             self._indexer  = Indexer(
                 db_path=db_path,
@@ -181,8 +208,10 @@ class MainWindow(QMainWindow):
                 batch_size=batch_size,
                 crypto=crypto,
             )
+            self._pump_startup()
             # 메일(.mysingle) 인덱서 — mail.enabled: true 일 때 워커가 사용
             from knowmate.rag.email_indexer import EmailIndexer
+            self._pump_startup()
             self._email_indexer = EmailIndexer(
                 db_path=db_path,
                 embed_client=embed_client,
@@ -191,13 +220,16 @@ class MainWindow(QMainWindow):
                 batch_size=batch_size,
                 crypto=crypto,
             )
+            self._pump_startup()
             self._extractor = get_extractor(
                 cfg.get("extractor", "fake"),
                 xlsx_block_rows=chunking.get("xlsx_block_rows"),
             )
+            self._pump_startup()
 
             # 단일 워커를 생성해 bridge에 연결한다 (수동·유휴 인덱싱 공유)
             self._make_worker()
+            self._pump_startup()
 
             # 유휴시간 자동 인덱싱 스케줄러 (6-7). 설정에서 끌 수 있다(collector.idle_enabled).
             # 동일한 단일 워커를 재사용해 동시 실행을 방지한다.
@@ -213,6 +245,7 @@ class MainWindow(QMainWindow):
                     parent=self,
                 )
                 self._idle_scheduler.start()
+                self._pump_startup()
             else:
                 logger.info("유휴 자동 인덱싱 비활성화됨 (collector.idle_enabled=false)")
 
@@ -452,63 +485,80 @@ def main() -> None:
     # 무거운 구성요소는 이 다음에 로드해 exe 시작 후 무반응으로 보이는 시간을 줄인다.
     from knowmate.app.startup_splash import StartupSplash
     splash = StartupSplash(STARTUP_LOGO)
+
+    def pump_startup_events() -> None:
+        """부분 초기화 중 사용자 입력은 막고 애니메이션·그리기 이벤트만 처리한다."""
+        app.processEvents(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+
     splash.show()
-    app.processEvents()
+    pump_startup_events()
+    runtime: dict[str, object] = {}
 
-    # 배포 빌드에 번들된 lancedb가 실측 검증 범위(requirements.txt) 안인지 확인한다
-    # (설계 리뷰 19차 M-2) — 포터블 빌드라 사용자가 버전을 바꿀 수 없으므로, 이 검사는
-    # 런타임 방어가 아니라 빌드 실수를 조기에 드러내는 진단 신호다. 범위 밖이어도
-    # 앱은 계속 실행한다(강제 종료할 만큼 확실한 장애가 아님 — 실제 비호환은 purge의
-    # "unsupported" 판정이 별도로 처리).
-    from knowmate.lancedb_compat import check_lancedb_version
-    lancedb_version_warning = check_lancedb_version()
-    if lancedb_version_warning:
-        logger.error(lancedb_version_warning)
+    def initialize_app() -> None:
+        """이벤트 루프 안에서 초기화해 시작 화면의 무한 로딩바를 계속 그린다."""
+        try:
+            # 배포 빌드에 번들된 lancedb가 실측 검증 범위(requirements.txt) 안인지
+            # 확인한다. 포터블 빌드라 사용자가 버전을 바꿀 수 없으므로 강제 종료 대신
+            # 진단 신호를 남긴다(실제 비호환은 purge의 "unsupported" 판정이 처리).
+            from knowmate.lancedb_compat import check_lancedb_version
+            lancedb_version_warning = check_lancedb_version()
+            if lancedb_version_warning:
+                logger.error(lancedb_version_warning)
+            pump_startup_events()
 
-    # 단일 인스턴스로 확정된 뒤에만 강제 종료 표식을 다룬다(설계 리뷰 12차 M-1) —
-    # 그렇지 않으면 곧 조용히 종료할 보조 인스턴스가 주 인스턴스의 표식을 건드려
-    # false-positive(또는 놓친) 감지를 유발할 수 있다. 이번 실행을 위한 표식은
-    # 지금 남기고 정상 quit에서만 지워진다(11차 B-1). 반환값은 "직전 실행이
-    # 표식을 못 지우고 끝났는가" = 강제 종료 여부. LanceDB 쓰기 도중이었을 가능성을
-    # 배제할 수 없으므로(커밋 원자성 미검증, 10차 M-1) 자동 복구는 하지 않되, 로그 +
-    # 트레이 알림(MainWindow 생성 후)으로 재인덱싱을 권장한다.
-    from knowmate.app.lifecycle import check_and_remark_dirty_shutdown
-    dirty_shutdown_detected = check_and_remark_dirty_shutdown()
-    if dirty_shutdown_detected:
-        logger.warning(
-            "이전 실행이 강제 종료됐습니다 — 검색 결과가 이상하면 설정 패널에서 해당 "
-            "폴더를 제거 후 재추가해 재인덱싱하는 것을 권장합니다."
-        )
+            # 단일 인스턴스로 확정된 뒤에만 강제 종료 표식을 기록한다. 그렇지 않으면
+            # 곧 종료할 보조 인스턴스가 주 인스턴스의 표식을 건드릴 수 있다. 표식은
+            # app.exec()가 정상 반환한 뒤에만 지운다.
+            from knowmate.app.lifecycle import check_and_remark_dirty_shutdown
+            dirty_shutdown_detected = check_and_remark_dirty_shutdown()
+            if dirty_shutdown_detected:
+                logger.warning(
+                    "이전 실행이 강제 종료됐습니다 — 검색 결과가 이상하면 설정 패널에서 "
+                    "해당 폴더를 제거 후 재추가해 재인덱싱하는 것을 권장합니다."
+                )
+            pump_startup_events()
 
-    win = MainWindow(
-        dirty_shutdown_detected=dirty_shutdown_detected,
-        lancedb_version_warning=lancedb_version_warning,
-    )
-    single_instance_server = SingleInstanceServer(parent=win)
-    single_instance_server.show_requested.connect(win._show_from_tray)
+            win = MainWindow(
+                dirty_shutdown_detected=dirty_shutdown_detected,
+                lancedb_version_warning=lancedb_version_warning,
+                startup_pump=pump_startup_events,
+            )
+            single_instance_server = SingleInstanceServer(parent=win)
+            single_instance_server.show_requested.connect(win._show_from_tray)
+            runtime["window"] = win
+            runtime["single_instance_server"] = single_instance_server
 
-    startup_finished = False
+            startup_finished = False
 
-    def finish_startup(*_args) -> None:
-        """웹 UI 준비 시 시작 화면을 한 번만 닫고 메인 창을 앞으로 가져온다."""
-        nonlocal startup_finished
-        if startup_finished:
-            return
-        startup_finished = True
-        splash.close()
-        splash.deleteLater()
-        win.raise_()
-        win.activateWindow()
+            def finish_startup(*_args) -> None:
+                """웹 UI 준비 시 시작 화면을 한 번만 닫고 메인 창을 표시한다."""
+                nonlocal startup_finished
+                if startup_finished:
+                    return
+                startup_finished = True
+                splash.close()
+                splash.deleteLater()
+                win.show()
+                win.raise_()
+                win.activateWindow()
 
-    win._view.loadFinished.connect(finish_startup)
-    # 로컬 HTML 로드 신호가 오지 않는 예외 상황에서도 시작 화면이 고착되지 않는다.
-    QTimer.singleShot(15_000, finish_startup)
-    win.show()
+            win._view.loadFinished.connect(finish_startup)
+            # 로컬 HTML 로드 신호가 오지 않아도 15초 뒤에는 메인 화면을 표시한다.
+            QTimer.singleShot(15_000, finish_startup)
+            runtime["startup_completed"] = True
+        except Exception:
+            logger.exception("앱 초기화 실패")
+            splash.close()
+            app.exit(1)
+
+    # app.exec()가 먼저 시작돼야 QProgressBar의 무한 애니메이션 타이머가 동작한다.
+    QTimer.singleShot(0, initialize_app)
     exit_code = app.exec()
     # app.exec()가 반환됐다 = 정상 quit이 확정됐다(하드 종료 경로는 os._exit()로
     # 여기 절대 돌아오지 않는다) — 이 시점에만 강제 종료 표식을 지운다(설계 리뷰 13차 M-1).
-    from knowmate.app.lifecycle import clear_dirty_shutdown
-    clear_dirty_shutdown()
+    if runtime.get("startup_completed"):
+        from knowmate.app.lifecycle import clear_dirty_shutdown
+        clear_dirty_shutdown()
     sys.exit(exit_code)
 
 

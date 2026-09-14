@@ -35,6 +35,20 @@ def test_webengine_share_context_is_set_before_qapplication_creation():
     assert source.index(attribute_call) < source.index("app = QApplication(sys.argv)")
 
 
+def test_startup_event_loop_begins_before_main_window_initialization():
+    """시작 화면 로딩바가 움직이도록 무거운 초기화를 이벤트 루프 안에서 시작한다."""
+    source = (Path(__file__).parents[1] / "app" / "main.py").read_text(encoding="utf-8")
+
+    schedule = source.index("QTimer.singleShot(0, initialize_app)")
+    event_loop = source.index("exit_code = app.exec()")
+    initializer = source.index("def initialize_app()")
+    main_window = source.index("win = MainWindow(", initializer)
+
+    assert initializer < schedule < event_loop
+    assert initializer < main_window < schedule
+    assert "startup_pump=pump_startup_events" in source[main_window:schedule]
+
+
 class TestRunSelftestAggregation:
     def _patch_checks(self, monkeypatch, checks):
         """run_selftest가 도는 점검 목록을 통째로 교체한다."""
