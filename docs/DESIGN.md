@@ -268,6 +268,15 @@ chunks·emails 테이블 **전체**를 `to_arrow().to_pandas()`로 로드했고,
 있었는지)가 False면 `_on_worker_finished`가 DB를 아예 열지 않고 직전 캐시값을 재사용. 조회
 실패 시에도 0으로 튀지 않고 직전 값으로 폴백(부수 개선).
 
+**수집 사이클 메모리 진단** (`collector.memory_diagnostics_enabled`, 기본 `false`): 메모리 증가의
+소유 영역을 나누기 위해 `cycle_start` → `after_document_indexing` → `after_documents`(orphan·purge
+정리와 상태 저장 뒤) → `after_mail` → `after_gc_collect` 시점마다 한 줄 INFO 로그를 남긴다.
+로그에는 Windows Process Private Bytes, `tracemalloc` current/peak, PyArrow 기본 메모리 풀의
+current/peak/backend만 포함하며 문서·메일 내용은 포함하지 않는다. Windows Private Bytes는 번들에
+새 의존성을 추가하지 않고 `GetProcessMemoryInfo`로 조회한다. 진단을 켠 사이클에서만
+`tracemalloc`과 마지막 `gc.collect()`를 실행하며, 운영 메모리 동작을 바꾸는 Arrow
+`release_unused()`는 호출하지 않는다. Arrow peak는 기본 메모리 풀 생성 이후의 누적 고수위다.
+
 ---
 
 ## 스캔 트리거 / 태스크 우선순위

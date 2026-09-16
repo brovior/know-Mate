@@ -11,6 +11,7 @@ from typing import Callable, TYPE_CHECKING
 from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal
 
 from knowmate.collector.cleanup import CleanupManager
+from knowmate.collector.memory_diagnostics import MemoryDiagnostics
 from knowmate.collector.scanner import get_scope, iter_scan_folder, normalize_path_key
 from knowmate.collector.state import load_state, save_state
 from knowmate.secure import com_stage
@@ -204,6 +205,7 @@ class CollectorWorker(QThread):
         # False면 건수 재계산(DB projection 조회)을 건너뛴다. 기본값 True(안전한 방향 —
         # 아직 사이클을 한 번도 안 돈 상태에서 조회되면 재계산하도록).
         self.last_cycle_changed: bool = True
+        self._memory_diagnostics: MemoryDiagnostics | None = None
         # 수동 재인덱싱(사용자의 [인덱싱 시작]/트레이 [재인덱싱])이 다음 사이클
         # 시작 시 모든 실패 기록에 force_retry를 세워달라고 요청했는지(초기화
         # 조건 4 수정판 — failure_state.request_retry_all 참고: 기록 전체를
@@ -222,6 +224,13 @@ class CollectorWorker(QThread):
         """증분 스캔 사이클 1회를 실행한다."""
         self._cancelled = False
         start = time.time()
+        memory_diagnostics = MemoryDiagnostics(
+            enabled=self._config.get("collector", {}).get("memory_diagnostics_enabled", False)
+            is True
+        )
+        self._memory_diagnostics = memory_diagnostics
+        memory_diagnostics.start()
+        memory_diagnostics.log("cycle_start")
 
         # QThread에서 COM 사용 시 초기화 필수.
         # MTA로 초기화해야 메시지 펌프 없이 Office STA 서버를 호출할 수 있다.
@@ -242,17 +251,24 @@ class CollectorWorker(QThread):
             logger.exception("수집기 예외 발생: %s", exc)
             self.error.emit(str(exc))
         finally:
+            try:
+                if _com_initialized:
+                    # COM 앱 Quit은 반드시 생성 스레드(여기)에서 수행해야 한다(STA)
+                    try:
+                        from knowmate.secure.com_reader import quit_com_apps
+                        quit_com_apps(grace_sec=getattr(self, "_com_quit_grace_sec", 5.0))
+                    except Exception:
+                        pass
+                    import pythoncom  # type: ignore
+                    pythoncom.CoUninitialize()
+            finally:
+                # COM 정리까지 끝난 뒤 GC 후 최종 표본을 남겨,
+                # 사이클 작업과 COM 자원 해제를 모두 반영한다.
+                memory_diagnostics.collect_and_log()
+                memory_diagnostics.stop()
+                self._memory_diagnostics = None
             elapsed = time.time() - start
             logger.info("수집기 사이클 완료: %.1f초", elapsed)
-            if _com_initialized:
-                # COM 앱 Quit은 반드시 생성 스레드(여기)에서 수행해야 한다(STA)
-                try:
-                    from knowmate.secure.com_reader import quit_com_apps
-                    quit_com_apps(grace_sec=getattr(self, "_com_quit_grace_sec", 5.0))
-                except Exception:
-                    pass
-                import pythoncom  # type: ignore
-                pythoncom.CoUninitialize()
 
     def cancel(self):
         """취소 플래그를 설정한다. 현재 처리 중인 파일 완료 후 중단된다."""
@@ -840,6 +856,10 @@ class CollectorWorker(QThread):
         # 생산자 스레드 정리 (정상 종료 시 이미 끝나 있음)
         producer.join(timeout=5)
 
+        memory_diagnostics = self._memory_diagnostics
+        if memory_diagnostics is not None:
+            memory_diagnostics.log("after_document_indexing")
+
         # watch_folders에서 제거된 폴더의 청크를 정리한다 (dry_run·대량삭제차단 준수).
         # 판정 순서는 차단 → 백오프 → 성공 스킵 → 실행 순으로 고정(purge_meta.decide) —
         # 실패 직후 성공 서명을 해제하지 않으면 백오프가 성공 스킵에 가려 무력화된다.
@@ -913,6 +933,9 @@ class CollectorWorker(QThread):
                 f" (정리된 기록 {pruned_count}건)" if pruned_count else "",
             )
 
+        if memory_diagnostics is not None:
+            memory_diagnostics.log("after_documents")
+
         # 메일 스캔 (.mysingle) — mail.enabled: true 일 때만
         mail_indexed = 0
         if self._email_indexer and self._config.get("mail", {}).get("enabled", False):
@@ -928,6 +951,9 @@ class CollectorWorker(QThread):
                 )
             except Exception as exc:
                 logger.error("[mail_scanner] 메일 스캔 실패: %s", exc)
+
+        if memory_diagnostics is not None:
+            memory_diagnostics.log("after_mail")
 
         summary = (
             f"인덱싱 완료 - 처리 {done}건 / 실패 {len(failed)}건 / "

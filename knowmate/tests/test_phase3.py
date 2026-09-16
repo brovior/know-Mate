@@ -343,6 +343,47 @@ def _make_worker_for_indexer(tmp_path: Path, watch_folder: str, indexer):
     )
 
 
+def test_memory_diagnostics_cover_collector_cycle_phases(tmp_path: Path, monkeypatch):
+    """활성화 시 문서·정리·메일·GC 경계의 표본 순서를 보장한다."""
+    from knowmate.collector import scheduler
+
+    events: list[str] = []
+
+    class _FakeMemoryDiagnostics:
+        def __init__(self, enabled: bool) -> None:
+            assert enabled is True
+
+        def start(self) -> None:
+            events.append("start")
+
+        def log(self, phase: str) -> None:
+            events.append(phase)
+
+        def collect_and_log(self) -> None:
+            events.append("after_gc_collect")
+
+        def stop(self) -> None:
+            events.append("stop")
+
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    worker, _, _ = _make_worker(tmp_path, str(folder))
+    worker._config["collector"]["memory_diagnostics_enabled"] = True
+    monkeypatch.setattr(scheduler, "MemoryDiagnostics", _FakeMemoryDiagnostics)
+
+    worker.run()
+
+    assert events == [
+        "start",
+        "cycle_start",
+        "after_document_indexing",
+        "after_documents",
+        "after_mail",
+        "after_gc_collect",
+        "stop",
+    ]
+
+
 class TestCollectorWorker:
     def test_new_file_indexed(self, tmp_path: Path):
         """파일 생성 후 run() -> state에 chunk_ids 존재."""
