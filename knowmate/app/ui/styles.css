@@ -362,6 +362,12 @@ html, body { height: 100%; font-family: 'Malgun Gothic', sans-serif; font-size: 
   padding: 8px 14px; background: none; border: 1px solid var(--border-dark);
   border-radius: 8px; font-size: 13px; color: var(--text-sub); font-family: inherit; cursor: pointer;
 }
+.btn-bulk-fail {
+  padding: 8px 14px; background: none; border: 1px solid #E8C4C0;
+  border-radius: 8px; font-size: 13px; color: #C42B1C; font-family: inherit; cursor: pointer;
+}
+.btn-bulk-fail.unexclude { border-color: var(--primary); color: var(--primary); }
+.btn-bulk-fail:disabled, .btn-retry-all:disabled { opacity: .5; cursor: default; }
 .btn-close {
   padding: 8px 18px; background: var(--primary); color: #fff;
   border: none; border-radius: 8px; font-size: 13px; font-family: inherit; cursor: pointer;

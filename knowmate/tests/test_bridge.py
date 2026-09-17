@@ -260,11 +260,12 @@ class TestFailureManagementSlots:
         """config.get_config/update_exclude_files를 인메모리 dict로 대체한다
         (%APPDATA% 실제 파일을 건드리지 않기 위해)."""
         import knowmate.config as config_module
-        state = {"collector": {"exclude_files": list(exclude_files or [])}}
+        state = {"collector": {"exclude_files": list(exclude_files or [])}, "_updates": 0}
         monkeypatch.setattr(config_module, "get_config", lambda: state)
 
         def _update(paths):
             state["collector"]["exclude_files"] = paths
+            state["_updates"] += 1
         monkeypatch.setattr(config_module, "update_exclude_files", _update)
         return state
 
@@ -425,3 +426,156 @@ class TestFailureManagementSlots:
 
         assert result == "ok"
         assert target not in state["collector"]["exclude_files"]
+
+    def test_exclude_files_deduplicates_and_updates_config_once(self, tmp_path, monkeypatch):
+        from knowmate.collector.state import load_state, save_state
+
+        existing = str(tmp_path / "already.xlsx")
+        target = str(tmp_path / "new.xlsx")
+        state = self._patch_collector_config(monkeypatch, exclude_files=[existing])
+        state_file = tmp_path / "state.json"
+        save_state(state_file, {target.upper(): {"mtime": 1}, existing: {"mtime": 2}})
+        worker = _FakeWorkerForFailures(tmp_path / "f.json", state_file)
+
+        result = __import__("json").loads(
+            _make_bridge(worker).excludeFiles(__import__("json").dumps([target, target.upper(), existing]))
+        )
+
+        assert result == {
+            "ok": True, "requested": 2, "changed": 1, "already_target": 1,
+            "delete_failed": 0, "state_cleanup_failed": False,
+            "mail_cleanup_failed": False, "mail_pending_chunks": 0,
+        }
+        assert state["_updates"] == 1
+        assert state["collector"]["exclude_files"] == [existing, target]
+        assert len(worker._indexer.table.deleted_where) == 1
+        assert load_state(state_file) == {existing: {"mtime": 2}}
+
+    def test_exclude_files_reports_partial_delete_failure_and_keeps_other_deletes(self, tmp_path, monkeypatch):
+        from knowmate.collector.state import load_state, save_state
+
+        first = str(tmp_path / "first.xlsx")
+        failing = str(tmp_path / "failing.xlsx")
+        self._patch_collector_config(monkeypatch)
+        state_file = tmp_path / "state.json"
+        save_state(state_file, {first: {"mtime": 1}, failing: {"mtime": 2}})
+        worker = _FakeWorkerForFailures(tmp_path / "f.json", state_file)
+        original_delete = worker._indexer.table.delete
+
+        def _delete(where):
+            if "failing.xlsx" in where:
+                raise RuntimeError("delete failed")
+            original_delete(where)
+
+        worker._indexer.table.delete = _delete
+        result = __import__("json").loads(
+            _make_bridge(worker).excludeFiles(__import__("json").dumps([first, failing]))
+        )
+
+        assert result["ok"] is True
+        assert result["changed"] == 2
+        assert result["delete_failed"] == 1
+        assert len(worker._indexer.table.deleted_where) == 1
+        assert load_state(state_file) == {}
+
+    def test_exclude_files_reports_state_cleanup_failure_without_undoing_exclusion(self, tmp_path, monkeypatch):
+        from knowmate.collector import state as state_module
+        from knowmate.collector.state import load_state, save_state
+
+        target = str(tmp_path / "state-failure.xlsx")
+        config = self._patch_collector_config(monkeypatch)
+        state_file = tmp_path / "state.json"
+        save_state(state_file, {target: {"mtime": 1}})
+
+        def _save_failure(*_args):
+            raise OSError("disk full")
+
+        monkeypatch.setattr(state_module, "save_state", _save_failure)
+        worker = _FakeWorkerForFailures(tmp_path / "f.json", state_file)
+
+        result = __import__("json").loads(_make_bridge(worker).excludeFiles(__import__("json").dumps([target])))
+
+        assert result["ok"] is True
+        assert result["state_cleanup_failed"] is True
+        assert config["collector"]["exclude_files"] == [target]
+        assert len(worker._indexer.table.deleted_where) == 1
+        assert load_state(state_file) == {target: {"mtime": 1}}
+
+    @pytest.mark.parametrize("payload", ["{", "{}", '["ok.xlsx", 1]', '[""]'])
+    def test_exclude_files_rejects_invalid_json_array(self, tmp_path, payload):
+        worker = _FakeWorkerForFailures(tmp_path / "f.json", tmp_path / "s.json")
+
+        result = __import__("json").loads(_make_bridge(worker).excludeFiles(payload))
+
+        assert result["ok"] is False
+        assert "error" in result
+
+    def test_unexclude_files_removes_targets_once_and_is_idempotent(self, tmp_path, monkeypatch):
+        first = str(tmp_path / "first.xlsx")
+        second = str(tmp_path / "second.xlsx")
+        state = self._patch_collector_config(monkeypatch, exclude_files=[first, second])
+        worker = _FakeWorkerForFailures(tmp_path / "f.json", tmp_path / "s.json")
+        bridge = _make_bridge(worker)
+
+        result = __import__("json").loads(
+            bridge.unexcludeFiles(__import__("json").dumps([first.upper(), first, str(tmp_path / "missing.xlsx")]))
+        )
+        repeat = __import__("json").loads(bridge.unexcludeFiles(__import__("json").dumps([first])))
+
+        assert result == {"ok": True, "requested": 2, "changed": 1, "already_target": 1}
+        assert state["collector"]["exclude_files"] == [second]
+        assert state["_updates"] == 1
+        assert repeat == {"ok": True, "requested": 1, "changed": 0, "already_target": 1}
+        assert state["_updates"] == 1
+
+    def test_bulk_exclusion_refuses_while_worker_is_running(self, tmp_path, monkeypatch):
+        config = self._patch_collector_config(monkeypatch)
+        worker = _FakeWorkerForFailures(
+            tmp_path / "f.json", tmp_path / "s.json", running=True,
+        )
+        bridge = _make_bridge(worker)
+
+        excluded = __import__("json").loads(bridge.excludeFiles('["busy.xlsx"]'))
+        unexcluded = __import__("json").loads(bridge.unexcludeFiles('["busy.xlsx"]'))
+
+        assert excluded == {"ok": False, "error": "busy"}
+        assert unexcluded == {"ok": False, "error": "busy"}
+        assert config["collector"]["exclude_files"] == []
+        assert config["_updates"] == 0
+
+    def test_exclude_files_routes_mail_to_durable_mail_cleanup(self, tmp_path, monkeypatch):
+        from knowmate.collector.mail_scan_state import save_mail_scan_state
+
+        target = str(tmp_path / "broken.mysingle")
+        config = self._patch_collector_config(monkeypatch)
+        worker = _FakeWorkerForFailures(tmp_path / "f.json", tmp_path / "doc-state.json")
+        worker._mail_state_file = tmp_path / "mail-state.json"
+        worker._mail_exclusions_reconciled = set()
+        save_mail_scan_state(worker._mail_state_file, {
+            "schema_version": 2, "cursor": None, "files": {}, "pending_deletes": [],
+        })
+
+        class MailIndexer:
+            def __init__(self):
+                self.deleted = []
+
+            def get_source_chunk_refs(self, paths):
+                assert paths == [target]
+                return [{"chunk_id": "mail-1", "mail_uid": "knox:one", "source_file": target}]
+
+            def delete_chunk_ids(self, chunk_ids):
+                self.deleted.append(tuple(chunk_ids))
+                return tuple(chunk_ids)
+
+        worker._email_indexer = MailIndexer()
+
+        result = __import__("json").loads(
+            _make_bridge(worker).excludeFiles(__import__("json").dumps([target]))
+        )
+
+        assert result["ok"] is True
+        assert result["mail_cleanup_failed"] is False
+        assert result["mail_pending_chunks"] == 0
+        assert config["collector"]["exclude_files"] == [target]
+        assert worker._indexer.table.deleted_where == []
+        assert worker._email_indexer.deleted == [("mail-1",)]

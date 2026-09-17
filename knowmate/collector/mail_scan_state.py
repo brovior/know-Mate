@@ -14,6 +14,10 @@ SCHEMA_VERSION = 2
 _UID_RESOLUTION_CACHE_VERSION = 2
 
 
+class MailScanStateLoadError(RuntimeError):
+    """파괴적 정리 전에 메일 상태를 안전하게 읽지 못했음을 나타낸다."""
+
+
 class _MailScanState(dict[str, Any]):
     """저장 필요 여부를 메모리에만 보관하는 메일 스캔 상태다."""
 
@@ -23,11 +27,14 @@ class _MailScanState(dict[str, Any]):
 
 
 def normalize_path_key(path: str) -> str:
-    """운영체제별 대소문자 규칙을 반영한 안정적인 경로 키를 반환한다."""
-    return os.path.normcase(os.path.abspath(path))
+    """메일 출처 비교용 절대·실경로·슬래시·대소문자 통합 키를 반환한다."""
+    absolute = os.path.realpath(os.path.abspath(path))
+    return os.path.normcase(absolute).replace("\\", "/").casefold()
 
 
-def load_mail_scan_state(path: Path, *, invalidate_cache: bool = False) -> dict[str, Any]:
+def load_mail_scan_state(
+    path: Path, *, invalidate_cache: bool = False, strict: bool = False,
+) -> dict[str, Any]:
     """유효한 상태를 읽고 v1은 성공 캐시를 보존한 v2로 올린다."""
     empty = _empty_state()
     if not path.exists():
@@ -36,9 +43,13 @@ def load_mail_scan_state(path: Path, *, invalidate_cache: bool = False) -> dict[
         with path.open("r", encoding="utf-8") as handle:
             raw = json.load(handle)
     except (json.JSONDecodeError, OSError) as exc:
+        if strict:
+            raise MailScanStateLoadError(str(path)) from exc
         logger.warning("[mail_scanner] 메일 상태 파일 읽기 실패, 초기화: %s (%s)", path, exc)
         return empty
     if not isinstance(raw, dict):
+        if strict:
+            raise MailScanStateLoadError(str(path))
         return empty
 
     version = raw.get("schema_version")
@@ -66,6 +77,8 @@ def load_mail_scan_state(path: Path, *, invalidate_cache: bool = False) -> dict[
         if raw != state:
             state.needs_save = True
     else:
+        if strict:
+            raise MailScanStateLoadError(str(path))
         return empty
 
     files = state["files"]

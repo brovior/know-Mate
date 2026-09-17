@@ -154,7 +154,7 @@ class CollectorWorker(QThread):
 
     def __init__(self, config, indexer, extractor, state_file=None, email_indexer=None,
                  parent=None, get_idle_seconds=None, com_restart_fn=None,
-                 purge_meta_file=None, failure_file=None, get_now=None):
+                 purge_meta_file=None, failure_file=None, get_now=None, mail_state_file=None):
         """수집기 워커를 초기화한다.
 
         get_idle_seconds: () -> float, 현재 OS 유휴 경과초 조회(테스트 주입용,
@@ -196,6 +196,12 @@ class CollectorWorker(QThread):
         self._purge_meta_file = purge_meta_file or default_purge_meta_file
         default_failure_file = get_data_dir() / "index_failure.json"
         self._failure_file = failure_file or default_failure_file
+        default_mail_state_file = (
+            Path(state_file).with_name("mail_scan_state.json")
+            if state_file is not None else get_data_dir() / "mail_scan_state.json"
+        )
+        self._mail_state_file = mail_state_file or default_mail_state_file
+        self._mail_exclusions_reconciled: set[str] = set()
         # 사이클 안에서 억제·성공 상태를 sidecar 저장과 무관하게 즉시 반영하기 위한
         # 인메모리 캐시(설계 리뷰6 m-2) — 프로세스 재시작 전까지 sidecar 저장 실패가
         # 매 사이클 재조회를 유발하지 않도록 한다.
@@ -936,9 +942,35 @@ class CollectorWorker(QThread):
         if memory_diagnostics is not None:
             memory_diagnostics.log("after_documents")
 
-        # 메일 스캔 (.mysingle) — mail.enabled: true 일 때만
+        # 메일 제외 정리는 신규 메일 인덱싱 설정과 무관하게 수행한다. mail.enabled가
+        # 꺼져 있어도 기존 메일은 검색되므로 제외·보류 삭제 복구가 멈추면 안 된다.
         mail_indexed = 0
-        if self._email_indexer and self._config.get("mail", {}).get("enabled", False):
+        mail_exclusion_changed = False
+        mail_maintenance_ok = True
+        if self._email_indexer:
+            from knowmate.collector.mail_exclusion import (
+                mail_exclusion_paths, reconcile_mail_exclusions,
+            )
+            try:
+                mail_paths = mail_exclusion_paths(
+                    [p for p in raw_exclude_files if isinstance(p, str)], self._config,
+                )
+                exclusion_report = reconcile_mail_exclusions(
+                    self._email_indexer, self._mail_state_file, mail_paths,
+                    self._mail_exclusions_reconciled,
+                )
+                mail_maintenance_ok = exclusion_report.ok
+                mail_exclusion_changed = exclusion_report.deleted_chunks > 0
+            except Exception as exc:
+                mail_maintenance_ok = False
+                logger.error("[mail_exclude] 제외 정리 실패: %s", exc)
+
+        # 메일 스캔 (.mysingle) — 제외 정리가 안전하게 끝났고 mail.enabled일 때만
+        if (
+            self._email_indexer
+            and mail_maintenance_ok
+            and self._config.get("mail", {}).get("enabled", False)
+        ):
             from knowmate.collector.mail_scanner import run_mail_scan
             try:
                 legacy_mail_failure_file = self._failure_file.with_name("mail_index_failure.json")
@@ -946,6 +978,7 @@ class CollectorWorker(QThread):
                 mail_indexed, _ = run_mail_scan(
                     watch_folders, self._email_indexer, self._config,
                     on_progress=lambda cur, tot, fn: self.progress.emit(cur, tot, fn),
+                    state_file=self._mail_state_file,
                     failure_file=self._failure_file,
                     retry_failures=retry_requested,
                 )
@@ -1013,7 +1046,8 @@ class CollectorWorker(QThread):
         # 사이클) bridge가 건수 재계산(DB projection 조회)을 건너뛸 수 있게 표시한다
         # (설계: bridge._on_worker_finished, 유휴 60초마다 DB를 여는 것 자체를 없앤다).
         self.last_cycle_changed = (
-            done > 0 or report.newly_marked > 0 or report.physically_deleted > 0 or mail_indexed > 0
+            done > 0 or report.newly_marked > 0 or report.physically_deleted > 0
+            or mail_indexed > 0 or mail_exclusion_changed
         )
         self.finished.emit(summary)
 

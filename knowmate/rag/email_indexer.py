@@ -247,7 +247,9 @@ class EmailIndexer:
         except Exception:
             self.table_is_empty = False
 
-    def get_index_state(self, mail_uid: str, mtime: float) -> MailIndexCheck:
+    def get_index_state(
+        self, mail_uid: str, mtime: float, ignored_chunk_ids: set[str] | None = None,
+    ) -> MailIndexCheck:
         """현재 파일과 DB 행의 관계 및 안전한 교체 대상 ID를 조회한다."""
         import json
         safe_uid = mail_uid.replace("'", "''")
@@ -262,6 +264,8 @@ class EmailIndexer:
         except Exception as exc:
             logger.warning("[email_indexer] 상태 조회 실패 (uid=%s): %s", mail_uid[:20], exc)
             return MailIndexCheck(MailIndexState.ERROR)
+        if ignored_chunk_ids:
+            rows = [row for row in rows if row.get("chunk_id") not in ignored_chunk_ids]
         if not rows:
             return MailIndexCheck(MailIndexState.MISSING)
 
@@ -302,24 +306,75 @@ class EmailIndexer:
             row["chunk_id"] for row in rows if isinstance(row.get("chunk_id"), str)
         )
 
-    def has_current_mail_uid(self, mail_uid: str) -> bool:
+    def has_current_mail_uid(
+        self, mail_uid: str, ignored_chunk_ids: set[str] | None = None,
+    ) -> bool:
         """mtime와 무관하게 정상 UID의 현재 버전 활성 청크가 있는지 확인한다."""
         import json
         safe_uid = mail_uid.replace("'", "''")
         rows = (
             self.table.search()
             .where(f"mail_uid = '{safe_uid}' AND is_deleted = false")
-            .select(["source_meta"])
+            .select(["chunk_id", "source_meta"])
             .to_arrow()
             .to_pylist()
         )
         for row in rows:
+            if ignored_chunk_ids and row.get("chunk_id") in ignored_chunk_ids:
+                continue
             try:
                 if json.loads(row.get("source_meta", "{}") or "{}").get("_index_version") == EMAIL_INDEX_VERSION:
                     return True
             except (TypeError, json.JSONDecodeError):
                 continue
         return False
+
+    def get_source_chunk_refs(self, source_files: list[str]) -> list[dict[str, str]]:
+        """출처 경로와 일치하는 활성 청크 ID·UID만 projection 조회한다."""
+        from knowmate.collector.mail_scan_state import normalize_path_key
+
+        paths = list(dict.fromkeys(path for path in source_files if isinstance(path, str) and path))
+        if not paths:
+            return []
+        target_keys = {normalize_path_key(path) for path in paths}
+        # 실패 목록 전체를 한 IN 절에 넣으면 수천 경로에서 SQL 파서 한계를 넘을
+        # 수 있다. 작은 projection 쿼리만 배치하고 상태 저장·삭제는 호출자가 한
+        # 번에 수행한다.
+        exact_rows: list[dict[str, str]] = []
+        query_batch_size = 200
+        for offset in range(0, len(paths), query_batch_size):
+            batch = paths[offset:offset + query_batch_size]
+            quoted = ", ".join(
+                f"'{path.replace(chr(39), chr(39) * 2)}'" for path in batch
+            )
+            exact_rows.extend(
+                self.table.search()
+                .where(f"source_file IN ({quoted}) AND is_deleted = false")
+                .select(["chunk_id", "mail_uid", "source_file"])
+                .to_arrow()
+                .to_pylist()
+            )
+        matched_keys = {
+            normalize_path_key(row["source_file"])
+            for row in exact_rows if isinstance(row.get("source_file"), str)
+        }
+        if target_keys <= matched_keys:
+            return exact_rows
+
+        # 구버전 행은 대소문자·슬래시·resolve 표기가 다를 수 있다. exact 조회가
+        # 못 찾은 경우에만 메타데이터 세 열을 projection해 공통 키로 보완한다.
+        rows = (
+            self.table.search()
+            .where("is_deleted = false")
+            .select(["chunk_id", "mail_uid", "source_file"])
+            .to_arrow()
+            .to_pylist()
+        )
+        return [
+            row for row in rows
+            if isinstance(row.get("source_file"), str)
+            and normalize_path_key(row["source_file"]) in target_keys
+        ]
 
     def is_indexed(self, mail_uid: str, mtime: float) -> bool:
         """하위호환용 bool 조회; 새 수집 경로는 ``get_index_state``를 사용한다."""

@@ -774,23 +774,28 @@ function openConfigFile() {
 /* ===== 확인 필요한 문서 (5차) ===== */
 let _failCards = [];
 let _failFilter = "all";
+let _failBulkRunning = false;
 
 function refreshFailAttention() {
   if (!bridge) return;
   bridge.getFailures().then(json => {
     let cards;
     try { cards = JSON.parse(json); } catch { return; }
-    const btn = document.getElementById("btnFailAttention");
-    const text = document.getElementById("failAttentionText");
-    const count = cards.filter(c => !c.excluded).length;
-    if (!btn || !text) return;
-    if (count > 0) {
-      text.textContent = `확인 필요한 문서 ${count}건`;
-      btn.style.display = "flex";
-    } else {
-      btn.style.display = "none";
-    }
+    _renderFailAttention(cards);
   }).catch(() => {});
+}
+
+function _renderFailAttention(cards) {
+  const btn = document.getElementById("btnFailAttention");
+  const text = document.getElementById("failAttentionText");
+  const count = cards.filter(c => !c.excluded).length;
+  if (!btn || !text) return;
+  if (count > 0) {
+    text.textContent = `확인 필요한 문서 ${count}건`;
+    btn.style.display = "flex";
+  } else {
+    btn.style.display = "none";
+  }
 }
 
 function openFailuresPanel() {
@@ -833,15 +838,97 @@ function renderFailuresPanel() {
     });
   }
 
+  const visible = _failCards.filter(c => _failFilter === "all" || _failCategory(c) === _failFilter);
+  _renderBulkFailureAction(visible);
+
   const body = document.getElementById("failBody");
   if (!body) return;
-  const visible = _failCards.filter(c => _failFilter === "all" || _failCategory(c) === _failFilter);
   if (visible.length === 0) {
     body.innerHTML = '<div class="fail-empty">해당하는 문서가 없습니다.</div>';
     return;
   }
   body.innerHTML = visible.map(_renderFailCard).join("");
   _bindFailCardActions(body, visible);
+}
+
+function _bulkFailureTargets(visible) {
+  return _failFilter === "excluded" ? visible : visible.filter(card => !card.excluded);
+}
+
+function _renderBulkFailureAction(visible) {
+  const button = document.getElementById("btnBulkFailAction");
+  const retryAll = document.getElementById("btnRetryAll");
+  if (!button || !retryAll) return;
+  const isUnexclude = _failFilter === "excluded";
+  const targets = _bulkFailureTargets(visible);
+  button.textContent = isUnexclude ? `${targets.length}건 제외 해제` : `${targets.length}건 제외`;
+  button.classList.toggle("unexclude", isUnexclude);
+  button.disabled = _failBulkRunning || targets.length === 0;
+  retryAll.style.display = isUnexclude ? "none" : "";
+}
+
+function runBulkFailureAction() {
+  if (!bridge || _failBulkRunning) return;
+  const visible = _failCards.filter(c => _failFilter === "all" || _failCategory(c) === _failFilter);
+  const targets = _bulkFailureTargets(visible);
+  if (targets.length === 0) return;
+
+  const isUnexclude = _failFilter === "excluded";
+  const message = isUnexclude
+    ? `${targets.length}개 문서를 인덱싱 제외에서 해제합니다.\n다음 인덱싱부터 다시 대상이 됩니다. 기존 실패 이력과 재시도 대기는 유지됩니다.\n계속하시겠습니까?`
+    : `${targets.length}개 문서를 인덱싱에서 제외합니다.\n기존 검색 데이터는 삭제되지만 원본 파일은 삭제되지 않습니다.\n계속하시겠습니까?`;
+  if (!window.confirm(message)) return;
+
+  _failBulkRunning = true;
+  renderFailuresPanel();
+  const payload = JSON.stringify(targets.map(card => card.path));
+  const request = isUnexclude ? bridge.unexcludeFiles(payload) : bridge.excludeFiles(payload);
+  request.then(json => {
+    let result;
+    try { result = JSON.parse(json); } catch { throw new Error("invalid response"); }
+    if (!result.ok) throw new Error(result.error || "request failed");
+    return _refreshFailuresAfterBulk().then(
+      () => ({ result, refreshFailed: false }),
+      () => ({ result, refreshFailed: true }),
+    );
+  }).then(({ result, refreshFailed }) => {
+    const message = _bulkFailureSuccessMessage(isUnexclude, result);
+    showToast(refreshFailed ? `${message} 목록을 새로고침하지 못했습니다.` : message);
+  }).catch(error => {
+    if (error && error.message === "busy") {
+      showToast("인덱싱이 끝난 후 다시 시도해 주세요.");
+    } else {
+      showToast(isUnexclude ? "일괄 제외 해제에 실패했습니다." : "일괄 인덱싱 제외에 실패했습니다.");
+    }
+  }).finally(() => {
+    _failBulkRunning = false;
+    renderFailuresPanel();
+  });
+}
+
+function _bulkFailureSuccessMessage(isUnexclude, result) {
+  if (isUnexclude) {
+    return result.changed ? `${result.changed}건을 인덱싱 제외에서 해제했습니다.` : "이미 제외 해제된 문서입니다.";
+  }
+  let message;
+  if (result.delete_failed) {
+    message = `${result.changed}건 제외, ${result.delete_failed}개 문서의 검색 데이터 정리 실패`;
+  } else {
+    message = result.changed ? `${result.changed}건을 인덱싱에서 제외했습니다.` : "이미 제외된 문서입니다.";
+  }
+  if (result.mail_cleanup_failed) return `${message} 메일 검색 데이터 정리는 다음 사이클에 재시도합니다.`;
+  if (result.mail_pending_chunks) return `${message} 메일 검색 데이터 ${result.mail_pending_chunks}개 정리 대기 중.`;
+  return result.state_cleanup_failed ? `${message} 인덱싱 상태 정리 실패.` : message;
+}
+
+function _refreshFailuresAfterBulk() {
+  return bridge.getFailures().then(json => {
+    let cards;
+    try { cards = JSON.parse(json); } catch { throw new Error("invalid failures"); }
+    _failCards = cards;
+    renderFailuresPanel();
+    _renderFailAttention(cards);
+  });
 }
 
 // data-act → 실행할 함수. 경로는 HTML을 거치지 않고 카드 객체에서 직접 꺼내
@@ -956,7 +1043,9 @@ function retryFailureFile(path) {
 
 function excludeFailureFile(path) {
   if (!bridge) return;
-  bridge.excludeFile(path).then(() => {
+  bridge.excludeFile(path).then(result => {
+    if (result === "busy") { showToast("인덱싱이 끝난 후 다시 시도해 주세요."); return; }
+    if (result !== "ok") { showToast("인덱싱 제외에 실패했습니다."); return; }
     bridge.getFailures().then(json => {
       try { _failCards = JSON.parse(json); } catch { _failCards = []; }
       renderFailuresPanel();
@@ -967,7 +1056,9 @@ function excludeFailureFile(path) {
 
 function unexcludeFailureFile(path) {
   if (!bridge) return;
-  bridge.unexcludeFile(path).then(() => {
+  bridge.unexcludeFile(path).then(result => {
+    if (result === "busy") { showToast("인덱싱이 끝난 후 다시 시도해 주세요."); return; }
+    if (result !== "ok") { showToast("제외 해제에 실패했습니다."); return; }
     bridge.getFailures().then(json => {
       try { _failCards = JSON.parse(json); } catch { _failCards = []; }
       renderFailuresPanel();
