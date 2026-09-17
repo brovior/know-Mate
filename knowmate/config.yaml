@@ -20,6 +20,13 @@ chunking:
                               # 매우 느리다 — 범위 단위로 묶어 왕복을 블록당 1회로 줄인다.
                               # 크게 잡을수록 왕복이 줄지만 순간 메모리가 늘어난다.
                               # 비우거나 잘못된 값이면 1000으로 폴백.
+lancedb_maintenance:
+  enabled: true
+  # 문서 chunks와 메일 emails 테이블에 각각 독립 적용된다.
+  startup_optimize_when_small_fragments_reach: 100  # 프로세스 최초 수집 사이클에서 1회 확인
+  optimize_every_mutations: 100                     # 성공한 add/delete/update 호출 누적 기준
+  cycle_end_min_mutations: 20                       # 사이클 끝 잔여 변경 기준. 0이면 비활성
+  failure_cooldown_sec: 300                         # 실패 뒤 재시도 대기(초)
 search:
   top_k_max: 10
   score_threshold: 0.3

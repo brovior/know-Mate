@@ -840,10 +840,13 @@ class TestMailScanner:
                 raise AssertionError("queue 저장 실패 시 삭제하면 안 됩니다")
 
         monkeypatch.setattr(mail_scanner, "save_mail_scan_state", lambda *_args: False)
+        persisted = []
         assert mail_scanner.run_mail_scan(
             [str(watch)], NoPersistIndexer(), {"mail": {"max_mails_per_scan": 1}},
             state_file=tmp_path / "mail_scan_state.json", failure_file=tmp_path / "index_failure.json",
+            on_state_persisted=lambda ok: persisted.append(ok),
         ) == (0, 1)
+        assert persisted == [False]
 
     def test_corrupt_body_legacy_delete_is_persisted_and_retried(self, tmp_path, monkeypatch):
         """손상 본문의 exact legacy ID는 삭제 실패 뒤에도 pending queue로 재시도한다."""

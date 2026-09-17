@@ -195,6 +195,7 @@ class MainWindow(QMainWindow):
             self._pump_startup()
 
             chunking = cfg.get("chunking", {})
+            maintenance = cfg.get("lancedb_maintenance", {})
             batch_size = cfg.get("embedding", {}).get("batch_size", 32)
             embed_client = get_embedding_client(cfg)
             crypto = get_crypto_manager(cfg)
@@ -207,6 +208,7 @@ class MainWindow(QMainWindow):
                 overlap=chunking.get("overlap", 80),
                 batch_size=batch_size,
                 crypto=crypto,
+                maintenance_config=maintenance,
             )
             self._pump_startup()
             # 메일(.mysingle) 인덱서 — mail.enabled: true 일 때 워커가 사용
@@ -219,6 +221,7 @@ class MainWindow(QMainWindow):
                 overlap=chunking.get("overlap", 80),
                 batch_size=batch_size,
                 crypto=crypto,
+                maintenance_config=maintenance,
             )
             self._pump_startup()
             self._extractor = get_extractor(

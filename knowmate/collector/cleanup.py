@@ -41,7 +41,6 @@ class CleanupManager:
     def run(self, watch_folders: list[str], state: dict) -> CleanupReport:
         """전체 watch_folders 에 대해 orphan 정리를 수행하고 CleanupReport 를 반환한다."""
         report = CleanupReport()
-        any_physical = False
 
         for folder_str in watch_folders:
             folder = Path(folder_str)
@@ -83,12 +82,6 @@ class CleanupManager:
             marked, deleted = self._process_orphans(folder_orphans, state)
             report.newly_marked += marked
             report.physically_deleted += deleted
-            if deleted > 0:
-                any_physical = True
-
-        # 안전장치 4: 물리 삭제가 있으면 optimize()
-        if any_physical and not self._dry_run:
-            self._indexer.optimize()
 
         # 안전장치 6: 사이클 리포트
         logger.info(

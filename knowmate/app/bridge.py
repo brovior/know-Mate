@@ -527,14 +527,19 @@ class Bridge(QObject):
         ]
 
         delete_failed = 0
-        table = getattr(getattr(self._worker, "_indexer", None), "table", None)
+        document_indexer = getattr(self._worker, "_indexer", None)
+        table = getattr(document_indexer, "table", None)
         if table is not None:
             import logging
             logger = logging.getLogger(__name__)
             for path in changed_documents:
                 try:
-                    safe = path.replace("'", "''")
-                    table.delete(f"file_path = '{safe}'")
+                    delete_file = getattr(document_indexer, "delete_file_chunks", None)
+                    if callable(delete_file):
+                        delete_file(path)
+                    else:
+                        safe = path.replace("'", "''")
+                        table.delete(f"file_path = '{safe}'")
                 except Exception as exc:
                     delete_failed += 1
                     logger.warning("[exclude] 청크 삭제 실패: %s (%s)", path, exc)

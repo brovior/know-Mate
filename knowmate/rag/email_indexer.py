@@ -18,6 +18,7 @@ from knowmate.rag.embedding import (
     VECTOR_DIM,
     _validate_vectors,
 )
+from knowmate.rag.lance_maintenance import LanceTableMaintenance
 
 logger = logging.getLogger(__name__)
 
@@ -225,6 +226,7 @@ class EmailIndexer:
         overlap: int = 80,
         batch_size: int = 32,
         crypto=None,
+        maintenance_config=None,
     ) -> None:
         """emails 테이블에 연결하고 EmailIndexer를 초기화한다."""
         import lancedb
@@ -242,6 +244,9 @@ class EmailIndexer:
 
         db = lancedb.connect(str(db_path))
         self.table, self.table_was_recreated = get_or_create_emails_table(db, with_status=True)
+        self._maintenance = LanceTableMaintenance(
+            self.table, EMAIL_TABLE_NAME, maintenance_config,
+        )
         try:
             self.table_is_empty = self.table.count_rows() == 0
         except Exception:
@@ -529,6 +534,7 @@ class EmailIndexer:
                 "source_meta": _inject_version(parsed["source_meta"]),
             })
         self.table.add(rows)
+        self._maintenance.record_mutation()
         if on_progress:
             on_progress(len(rows), len(rows))
         return chunk_ids
@@ -559,9 +565,27 @@ class EmailIndexer:
             quoted_ids.append(f"'{safe_chunk_id}'")
         quoted = ", ".join(quoted_ids)
         self.table.delete(f"chunk_id IN ({quoted})")
+        self._maintenance.record_mutation()
         return tuple(ids)
+
+    @property
+    def maintenance_in_progress(self) -> bool:
+        return self._maintenance.in_progress
+
+    def maintenance_periodic_due(self) -> bool:
+        return self._maintenance.periodic_due()
+
+    def run_startup_maintenance(self, **kwargs) -> bool:
+        return self._maintenance.run_startup_check(**kwargs)
+
+    def run_periodic_maintenance(self, **kwargs) -> bool:
+        return self._maintenance.run_periodic(**kwargs)
+
+    def run_cycle_end_maintenance(self, **kwargs) -> bool:
+        return self._maintenance.run_cycle_end(**kwargs)
 
     def optimize(self) -> None:
 
         """emails 테이블을 최적화한다."""
         self.table.optimize()
+        self._maintenance.note_external_optimize_success()

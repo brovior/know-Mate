@@ -238,6 +238,9 @@ def run_mail_scan(
     failure_file: Path | None = None,
     get_now=None,
     retry_failures: bool = False,
+    cancel_check=None,
+    maintenance_memory_log=None,
+    on_state_persisted=None,
 ) -> tuple[int, int]:
     """메일을 순환 처리하되 한 수집 사이클의 실제 시도 수를 제한한다.
 
@@ -292,6 +295,8 @@ def run_mail_scan(
         # DB를 건드리기 전에 빈 상태를 먼저 디스크에 확정한다.
         if not save_state():
             logger.error("[mail_scanner] 캐시 무효화 상태를 저장하지 못해 이번 메일 스캔을 연기합니다")
+            if on_state_persisted:
+                on_state_persisted(False)
             return 0, 0
         if table_was_recreated:
             # 같은 EmailIndexer 인스턴스의 다음 유휴 사이클은 새 캐시를 사용할 수 있다.
@@ -746,6 +751,23 @@ def run_mail_scan(
 
         set_cursor(state, item)
         state_dirty = True
+        maintenance_due = getattr(email_indexer, "maintenance_periodic_due", None)
+        run_maintenance = getattr(email_indexer, "run_periodic_maintenance", None)
+        if (
+            callable(maintenance_due)
+            and callable(run_maintenance)
+            and maintenance_due()
+            and not (cancel_check and cancel_check())
+        ):
+            # DB 결과를 가리키는 성공 캐시·커서를 먼저 내구성 있게 저장한 뒤에만
+            # native optimize를 시작한다. 저장 실패 시 인덱싱은 유지하고 다음
+            # 체크포인트로 최적화를 미룬다.
+            if save_state():
+                state_dirty = False
+                run_maintenance(
+                    cancelled=cancel_check,
+                    memory_log=maintenance_memory_log,
+                )
         if stop_after_global_error:
             break
 
@@ -754,8 +776,9 @@ def run_mail_scan(
 
     report_final_progress()
 
-    if state_dirty:
-        save_state()
+    state_persisted = not state_dirty or save_state()
+    if on_state_persisted:
+        on_state_persisted(state_persisted)
     if failures_dirty:
         save_failures()
     if migrate_count:
