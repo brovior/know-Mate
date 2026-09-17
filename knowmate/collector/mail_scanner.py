@@ -185,6 +185,7 @@ def _collect_actionable_candidates(
     now: float,
     policy: failure_state.BackoffPolicy,
     metrics: _MailScanMetrics | None = None,
+    excluded_keys: frozenset[str] | None = None,
 ) -> tuple[list[dict], set[str], list[str], dict[str, float], int]:
     """한 번의 전체 순회에서 누락 정리용 경로와 실제 처리 후보만 분리한다."""
     exts = _mail_extensions(extensions)
@@ -193,10 +194,14 @@ def _collect_actionable_candidates(
     cached_failure_paths: list[str] = []
     cached_uid_mtimes: dict[str, float] = {}
     skipped_count = 0
+    excluded_keys = excluded_keys or frozenset()
     for item in _iter_scanned_mail_items(watch_folders, exts):
         if metrics is not None:
             metrics.enumerated += 1
         seen_keys.add(item["path_key"])
+        if item["path_key"] in excluded_keys:
+            skipped_count += 1
+            continue
         cached = state["files"].get(item["path_key"])
         if cache_matches(cached, item):
             cached_uid_mtimes[cached["mail_uid"]] = max(
@@ -233,6 +238,9 @@ def run_mail_scan(
     failure_file: Path | None = None,
     get_now=None,
     retry_failures: bool = False,
+    cancel_check=None,
+    maintenance_memory_log=None,
+    on_state_persisted=None,
 ) -> tuple[int, int]:
     """메일을 순환 처리하되 한 수집 사이클의 실제 시도 수를 제한한다.
 
@@ -287,6 +295,8 @@ def run_mail_scan(
         # DB를 건드리기 전에 빈 상태를 먼저 디스크에 확정한다.
         if not save_state():
             logger.error("[mail_scanner] 캐시 무효화 상태를 저장하지 못해 이번 메일 스캔을 연기합니다")
+            if on_state_persisted:
+                on_state_persisted(False)
             return 0, 0
         if table_was_recreated:
             # 같은 EmailIndexer 인스턴스의 다음 유휴 사이클은 새 캐시를 사용할 수 있다.
@@ -298,9 +308,21 @@ def run_mail_scan(
     if retry_failures:
         failures_dirty = failure_state.request_retry_all(failures) > 0
     policy = failure_state.BackoffPolicy.from_config(cfg.get("collector", {}))
+    # 과거 삭제 예약을 후보·성공 캐시 판정보다 먼저 소비한다. 실패해 남은 ID는
+    # 아래 현재성 조회에서 무시해 같은 UID 복사본이 빈 성공 캐시를 만들지 않게 한다.
+    pending_delete_started = time.perf_counter()
+    pending_changed = _retry_pending_deletes(state, email_indexer, metrics)
+    metrics.pending_delete_retry_s = time.perf_counter() - pending_delete_started
+    if pending_changed:
+        save_state()
+    excluded_keys = frozenset(
+        normalize_path_key(path)
+        for path in cfg.get("collector", {}).get("exclude_files", [])
+        if isinstance(path, str)
+    )
     enumerate_started = time.perf_counter()
     candidates, seen_keys, cached_failure_paths, cached_uid_mtimes, early_skipped_count = _collect_actionable_candidates(
-        watch_folders, extensions, state, failures, now_fn(), policy, metrics,
+        watch_folders, extensions, state, failures, now_fn(), policy, metrics, excluded_keys,
     )
     metrics.enumerate_filter_sort_s = time.perf_counter() - enumerate_started
 
@@ -310,9 +332,7 @@ def run_mail_scan(
     pruned = prune_missing_files(state, seen_keys) if roots_accessible else 0
     failure_pruned = failure_state.prune(failures) if roots_accessible else 0
     state_dirty = state_dirty or pruned > 0
-    pending_delete_started = time.perf_counter()
-    state_dirty = _retry_pending_deletes(state, email_indexer, metrics) or state_dirty
-    metrics.pending_delete_retry_s = time.perf_counter() - pending_delete_started
+    state_dirty = pending_changed or state_dirty
     failures_dirty = failures_dirty or failure_pruned > 0
     for path in cached_failure_paths:
         failure_state.note_success(failures, path)
@@ -422,8 +442,16 @@ def run_mail_scan(
 
     def normal_uid_is_current(mail_uid: str, mtime: float) -> bool:
         """복사본 mtime과 무관하게 정상 UID의 현재 버전 행이 저장됐는지 확인한다."""
+        ignored = {
+            chunk_id for chunk_id in state.get("pending_deletes", [])
+            if isinstance(chunk_id, str)
+        }
         if hasattr(email_indexer, "has_current_mail_uid"):
+            if ignored:
+                return bool(email_indexer.has_current_mail_uid(mail_uid, ignored))
             return bool(email_indexer.has_current_mail_uid(mail_uid))
+        if ignored:
+            return email_indexer.get_index_state(mail_uid, mtime, ignored).state.name == "CURRENT"
         return email_indexer.get_index_state(mail_uid, mtime).state.name == "CURRENT"
 
     def release_job(pending: _PreparedMail) -> None:
@@ -525,7 +553,14 @@ def run_mail_scan(
             work.outcome = None
 
         db_check_started = time.perf_counter()
-        check = email_indexer.get_index_state(mail_uid, item["mtime"])
+        ignored = {
+            chunk_id for chunk_id in state.get("pending_deletes", [])
+            if isinstance(chunk_id, str)
+        }
+        if ignored:
+            check = email_indexer.get_index_state(mail_uid, item["mtime"], ignored)
+        else:
+            check = email_indexer.get_index_state(mail_uid, item["mtime"])
         metrics.db_check_s += time.perf_counter() - db_check_started
         if check.state.name == "CURRENT":
             metrics.db_current += 1
@@ -716,6 +751,23 @@ def run_mail_scan(
 
         set_cursor(state, item)
         state_dirty = True
+        maintenance_due = getattr(email_indexer, "maintenance_periodic_due", None)
+        run_maintenance = getattr(email_indexer, "run_periodic_maintenance", None)
+        if (
+            callable(maintenance_due)
+            and callable(run_maintenance)
+            and maintenance_due()
+            and not (cancel_check and cancel_check())
+        ):
+            # DB 결과를 가리키는 성공 캐시·커서를 먼저 내구성 있게 저장한 뒤에만
+            # native optimize를 시작한다. 저장 실패 시 인덱싱은 유지하고 다음
+            # 체크포인트로 최적화를 미룬다.
+            if save_state():
+                state_dirty = False
+                run_maintenance(
+                    cancelled=cancel_check,
+                    memory_log=maintenance_memory_log,
+                )
         if stop_after_global_error:
             break
 
@@ -724,8 +776,9 @@ def run_mail_scan(
 
     report_final_progress()
 
-    if state_dirty:
-        save_state()
+    state_persisted = not state_dirty or save_state()
+    if on_state_persisted:
+        on_state_persisted(state_persisted)
     if failures_dirty:
         save_failures()
     if migrate_count:

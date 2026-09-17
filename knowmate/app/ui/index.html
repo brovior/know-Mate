@@ -294,7 +294,8 @@
 
     <div class="fail-footer">
       <span class="fail-foot-note">파일을 수정하면 대기 시간과 관계없이 즉시 다시 시도합니다.</span>
-      <button class="btn-retry-all" onclick="startReindex()">전체 다시 시도</button>
+      <button class="btn-retry-all" id="btnRetryAll" onclick="startReindex()">전체 다시 시도</button>
+      <button class="btn-bulk-fail" id="btnBulkFailAction" onclick="runBulkFailureAction()" disabled>0건 제외</button>
       <button class="btn-close" onclick="closeFailuresPanel()">닫기</button>
     </div>
   </div>

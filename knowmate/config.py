@@ -2,6 +2,7 @@
 import logging
 import os
 import sys
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -101,10 +102,15 @@ def update_watch_folders(folders: list[str]) -> None:
 
 
 def update_exclude_files(paths: list[str]) -> None:
-    """collector.exclude_files를 갱신하고 config.yaml에 저장한다."""
+    """exclude_files를 원자 저장한 뒤 공유 설정 객체에 반영한다."""
     cfg = get_config()
-    cfg.setdefault("collector", {})["exclude_files"] = paths
-    _save_config(cfg)
+    updated = deepcopy(cfg)
+    updated.setdefault("collector", {})["exclude_files"] = list(paths)
+    _save_config(updated)
+    # CollectorWorker 등은 get_config()가 반환한 객체를 계속 참조한다. 저장 성공
+    # 뒤 기존 객체를 제자리 갱신해야 실행 중 구성도 디스크와 같은 값을 본다.
+    cfg.clear()
+    cfg.update(updated)
 
 
 def update_settings(patch: dict[str, Any]) -> None:
@@ -124,6 +130,9 @@ def update_settings(patch: dict[str, Any]) -> None:
 
 
 def _save_config(cfg: dict[str, Any]) -> None:
-    """현재 config dict를 %APPDATA%의 config.yaml에 저장한다."""
-    with _get_config_path().open("w", encoding="utf-8") as f:
+    """현재 config dict를 임시 파일 작성 후 원자 교체한다."""
+    target = _get_config_path()
+    tmp = target.with_suffix(".yaml.tmp")
+    with tmp.open("w", encoding="utf-8") as f:
         yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    tmp.replace(target)

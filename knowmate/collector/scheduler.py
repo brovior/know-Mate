@@ -154,7 +154,7 @@ class CollectorWorker(QThread):
 
     def __init__(self, config, indexer, extractor, state_file=None, email_indexer=None,
                  parent=None, get_idle_seconds=None, com_restart_fn=None,
-                 purge_meta_file=None, failure_file=None, get_now=None):
+                 purge_meta_file=None, failure_file=None, get_now=None, mail_state_file=None):
         """수집기 워커를 초기화한다.
 
         get_idle_seconds: () -> float, 현재 OS 유휴 경과초 조회(테스트 주입용,
@@ -196,6 +196,12 @@ class CollectorWorker(QThread):
         self._purge_meta_file = purge_meta_file or default_purge_meta_file
         default_failure_file = get_data_dir() / "index_failure.json"
         self._failure_file = failure_file or default_failure_file
+        default_mail_state_file = (
+            Path(state_file).with_name("mail_scan_state.json")
+            if state_file is not None else get_data_dir() / "mail_scan_state.json"
+        )
+        self._mail_state_file = mail_state_file or default_mail_state_file
+        self._mail_exclusions_reconciled: set[str] = set()
         # 사이클 안에서 억제·성공 상태를 sidecar 저장과 무관하게 즉시 반영하기 위한
         # 인메모리 캐시(설계 리뷰6 m-2) — 프로세스 재시작 전까지 sidecar 저장 실패가
         # 매 사이클 재조회를 유발하지 않도록 한다.
@@ -274,6 +280,49 @@ class CollectorWorker(QThread):
         """취소 플래그를 설정한다. 현재 처리 중인 파일 완료 후 중단된다."""
         self._cancelled = True
         logger.info("수집기 취소 요청됨")
+
+    @property
+    def maintenance_in_progress(self) -> bool:
+        """종료 유예 판단용: 어느 테이블이든 native optimize 실행 중인지 반환한다."""
+        return any(
+            bool(getattr(indexer, "maintenance_in_progress", False))
+            for indexer in (self._indexer, self._email_indexer)
+            if indexer is not None
+        )
+
+    def _maintenance_kwargs(self) -> dict:
+        diagnostics = self._memory_diagnostics
+        return {
+            "cancelled": lambda: self._cancelled,
+            "memory_log": diagnostics.log if diagnostics is not None else None,
+        }
+
+    def _run_startup_maintenance(self) -> None:
+        """테이블별 프로세스 최초 fragment 검사를 순차 실행한다."""
+        for indexer in (self._indexer, self._email_indexer):
+            run = getattr(indexer, "run_startup_maintenance", None)
+            if callable(run) and not self._cancelled:
+                run(**self._maintenance_kwargs())
+
+    def _run_periodic_maintenance(self, indexer) -> bool:
+        """mutation 임계값에 도달한 테이블을 안전 체크포인트에서 최적화한다."""
+        due = getattr(indexer, "maintenance_periodic_due", None)
+        run = getattr(indexer, "run_periodic_maintenance", None)
+        if not callable(due) or not callable(run) or not due() or self._cancelled:
+            return False
+        return bool(run(**self._maintenance_kwargs()))
+
+    def _run_cycle_end_maintenance(self, indexers=None) -> None:
+        """취소되지 않은 사이클 끝에 잔여 mutation을 테이블별로 정리한다."""
+        if self._cancelled:
+            return
+        targets = indexers if indexers is not None else (self._indexer, self._email_indexer)
+        for indexer in targets:
+            if indexer is None:
+                continue
+            run = getattr(indexer, "run_cycle_end_maintenance", None)
+            if callable(run):
+                run(**self._maintenance_kwargs())
 
     def _purge_removed_folders(
         self, normalized_folders: list[str], state: dict, dry_run: bool = True,
@@ -371,23 +420,19 @@ class CollectorWorker(QThread):
         logger.info("[purge] 제거된 폴더 DB 청크 정리: %d개 경로", len(stale_paths_db))
 
         # 경로별로 삭제 (SQL 길이 제한 방지)
-        any_deleted = False
         delete_failed = False
         for path_str in stale_paths_db:
             try:
                 safe = path_str.replace("'", "''")
-                self._indexer.table.delete(f"file_path = '{safe}'")
-                any_deleted = True
+                delete_file = getattr(self._indexer, "delete_file_chunks", None)
+                if callable(delete_file):
+                    delete_file(path_str)
+                else:
+                    self._indexer.table.delete(f"file_path = '{safe}'")
                 logger.info("[purge] 삭제 완료: %s", path_str)
             except Exception as exc:
                 logger.error("[purge] 삭제 실패: %s - %s", path_str, exc)
                 delete_failed = True
-
-        if any_deleted:
-            try:
-                self._indexer.optimize()
-            except Exception as exc:
-                logger.warning("[purge] optimize 실패: %s", exc)
 
         return "failed" if delete_failed else "success"
 
@@ -507,6 +552,10 @@ class CollectorWorker(QThread):
                 pending_changed = True
         if pending_changed:
             save_state(self._state_file, state)
+
+        # 과거 실행에서 이미 쌓인 작은 fragment는 프로세스 최초 수집 사이클에만
+        # 테이블별 한 번 확인한다. 이 지점의 state는 이전/보류 삭제까지 저장된 상태다.
+        self._run_startup_maintenance()
 
         from knowmate.collector import failure_state
         failures = failure_state.load_failures(self._failure_file)
@@ -839,6 +888,17 @@ class CollectorWorker(QThread):
                     task.mtime, task.size, self._get_now(),
                 )
 
+            maintenance_due = getattr(self._indexer, "maintenance_periodic_due", None)
+            if callable(maintenance_due) and maintenance_due() and not self._cancelled:
+                try:
+                    save_state(self._state_file, state)
+                except OSError as exc:
+                    logger.warning(
+                        "[lance_maintenance] 문서 상태 저장 실패로 주기 optimize 연기: %s", exc,
+                    )
+                else:
+                    self._run_periodic_maintenance(self._indexer)
+
             if com_used:
                 com_since_restart += 1
                 if com_restart_every > 0 and com_since_restart >= com_restart_every:
@@ -936,21 +996,68 @@ class CollectorWorker(QThread):
         if memory_diagnostics is not None:
             memory_diagnostics.log("after_documents")
 
-        # 메일 스캔 (.mysingle) — mail.enabled: true 일 때만
+        # 메일 제외 정리는 신규 메일 인덱싱 설정과 무관하게 수행한다. mail.enabled가
+        # 꺼져 있어도 기존 메일은 검색되므로 제외·보류 삭제 복구가 멈추면 안 된다.
         mail_indexed = 0
-        if self._email_indexer and self._config.get("mail", {}).get("enabled", False):
+        mail_exclusion_changed = False
+        mail_maintenance_ok = True
+        mail_state_persisted = False
+        if self._email_indexer:
+            from knowmate.collector.mail_exclusion import (
+                mail_exclusion_paths, reconcile_mail_exclusions,
+            )
+            try:
+                mail_paths = mail_exclusion_paths(
+                    [p for p in raw_exclude_files if isinstance(p, str)], self._config,
+                )
+                exclusion_report = reconcile_mail_exclusions(
+                    self._email_indexer, self._mail_state_file, mail_paths,
+                    self._mail_exclusions_reconciled,
+                )
+                mail_maintenance_ok = exclusion_report.ok
+                mail_state_persisted = exclusion_report.ok
+                mail_exclusion_changed = exclusion_report.deleted_chunks > 0
+            except Exception as exc:
+                mail_maintenance_ok = False
+                logger.error("[mail_exclude] 제외 정리 실패: %s", exc)
+
+        # 메일 스캔 (.mysingle) — 제외 정리가 안전하게 끝났고 mail.enabled일 때만
+        if (
+            self._email_indexer
+            and mail_maintenance_ok
+            and self._config.get("mail", {}).get("enabled", False)
+        ):
             from knowmate.collector.mail_scanner import run_mail_scan
+            mail_state_status = {"persisted": False}
             try:
                 legacy_mail_failure_file = self._failure_file.with_name("mail_index_failure.json")
                 _migrate_legacy_mail_failures(legacy_mail_failure_file, self._failure_file)
                 mail_indexed, _ = run_mail_scan(
                     watch_folders, self._email_indexer, self._config,
                     on_progress=lambda cur, tot, fn: self.progress.emit(cur, tot, fn),
+                    state_file=self._mail_state_file,
                     failure_file=self._failure_file,
                     retry_failures=retry_requested,
+                    cancel_check=lambda: self._cancelled,
+                    maintenance_memory_log=(
+                        memory_diagnostics.log if memory_diagnostics is not None else None
+                    ),
+                    on_state_persisted=lambda persisted: mail_state_status.update(
+                        persisted=bool(persisted)
+                    ),
                 )
+                mail_state_persisted = mail_state_status["persisted"]
             except Exception as exc:
+                mail_state_persisted = False
                 logger.error("[mail_scanner] 메일 스캔 실패: %s", exc)
+
+        # run_mail_scan은 종료 전에 메일 상태를, 위 문서 경로는 cleanup 뒤 문서 상태를
+        # 저장했다. 취소가 없을 때만 잔여 mutation의 사이클 종료 최적화를 순차 실행한다.
+        self._run_cycle_end_maintenance((self._indexer,))
+        if mail_state_persisted:
+            self._run_cycle_end_maintenance((self._email_indexer,))
+        elif self._email_indexer is not None:
+            logger.warning("[lance_maintenance] 메일 상태 미저장으로 cycle-end optimize 연기")
 
         if memory_diagnostics is not None:
             memory_diagnostics.log("after_mail")
@@ -1013,7 +1120,8 @@ class CollectorWorker(QThread):
         # 사이클) bridge가 건수 재계산(DB projection 조회)을 건너뛸 수 있게 표시한다
         # (설계: bridge._on_worker_finished, 유휴 60초마다 DB를 여는 것 자체를 없앤다).
         self.last_cycle_changed = (
-            done > 0 or report.newly_marked > 0 or report.physically_deleted > 0 or mail_indexed > 0
+            done > 0 or report.newly_marked > 0 or report.physically_deleted > 0
+            or mail_indexed > 0 or mail_exclusion_changed
         )
         self.finished.emit(summary)
 

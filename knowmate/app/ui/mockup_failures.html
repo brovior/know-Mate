@@ -263,7 +263,8 @@ body {
   <code>app.js</code> · <code>styles.css</code>에 구현돼 있으며, 동작·문구가
   다를 경우 <b>구현 쪽이 정본</b>입니다. 시안 이후 바뀐 점:
   ① 「기록 초기화」 버튼 삭제(「지금 다시 시도」와 결과가 같고 실패 이력만 잃어서),
-  ② 사이드바 진입점 건수에서 제외된 파일은 제외(이미 조치가 끝난 항목이라).
+  ② 사이드바 진입점 건수에서 제외된 파일은 제외(이미 조치가 끝난 항목이라),
+  ③ 하단 일괄 처리 버튼은 현재 필터의 대상 건수에 맞춰 바뀜.
 </p>
 
 <div class="mock-label">1. 메인 화면 — 「확인 필요한 문서」 오버레이</div>
@@ -479,6 +480,7 @@ body {
       <div class="fail-footer">
         <span class="fail-foot-note">파일을 수정하면 대기 시간과 관계없이 즉시 다시 시도합니다.</span>
         <button class="btn-retry-all">전체 다시 시도</button>
+        <button class="btn-retry-all" style="color:#C42B1C;border-color:#E8C4C0;">8건 제외</button>
         <button class="btn-close">닫기</button>
       </div>
     </div>

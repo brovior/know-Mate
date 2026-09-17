@@ -11,6 +11,7 @@ import pyarrow as pa
 
 from knowmate.rag.chunker import chunk_text
 from knowmate.rag.embedding import EmbeddingClient, VECTOR_DIM
+from knowmate.rag.lance_maintenance import LanceTableMaintenance
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,7 @@ class Indexer:
         overlap: int = 80,
         batch_size: int = 32,
         crypto=None,
+        maintenance_config=None,
     ) -> None:
         """LanceDB에 연결하고 chunks 테이블을 준비한다.
 
@@ -75,6 +77,9 @@ class Indexer:
             self._table = self._db.open_table(TABLE_NAME)
         except Exception:
             self._table = self._db.create_table(TABLE_NAME, schema=SCHEMA)
+        self._maintenance = LanceTableMaintenance(
+            self._table, TABLE_NAME, maintenance_config,
+        )
 
     @property
     def table(self) -> Any:
@@ -149,6 +154,7 @@ class Indexer:
         # 검색·후속 쓰기 성능이 저하된다.
         t0 = time.perf_counter()
         self._table.add(all_rows)
+        self._maintenance.record_mutation()
         save_sec = time.perf_counter() - t0
 
         logger.info(
@@ -189,6 +195,7 @@ class Indexer:
                 where=f"chunk_id IN ({fm_list})",
                 values={"is_deleted": True, "deleted_at": now, "miss_count": 1},
             )
+            self._maintenance.record_mutation()
             logger.info("soft delete 마킹(1차): %d건", len(first_miss_ids))
 
         # miss_count >= 1 → 2차 miss: 물리 삭제
@@ -196,6 +203,7 @@ class Indexer:
         if hard_delete_ids:
             hd_list = ", ".join(f"'{cid}'" for cid in hard_delete_ids)
             self._table.delete(f"chunk_id IN ({hd_list})")
+            self._maintenance.record_mutation()
             logger.info("물리 삭제(2차): %d건", len(hard_delete_ids))
 
     def delete_chunks_permanently(self, chunk_ids: list[str]) -> None:
@@ -205,9 +213,33 @@ class Indexer:
 
         id_list = ", ".join(f"'{cid}'" for cid in chunk_ids)
         self._table.delete(f"chunk_id IN ({id_list})")
+        self._maintenance.record_mutation()
         logger.info("교체된 기존 청크 물리 삭제: %d건", len(chunk_ids))
+
+    def delete_file_chunks(self, path: str) -> None:
+        """경로의 문서 청크를 삭제하고 유지보수 mutation으로 기록한다."""
+        safe = path.replace("'", "''")
+        self._table.delete(f"file_path = '{safe}'")
+        self._maintenance.record_mutation()
+
+    @property
+    def maintenance_in_progress(self) -> bool:
+        return self._maintenance.in_progress
+
+    def maintenance_periodic_due(self) -> bool:
+        return self._maintenance.periodic_due()
+
+    def run_startup_maintenance(self, **kwargs) -> bool:
+        return self._maintenance.run_startup_check(**kwargs)
+
+    def run_periodic_maintenance(self, **kwargs) -> bool:
+        return self._maintenance.run_periodic(**kwargs)
+
+    def run_cycle_end_maintenance(self, **kwargs) -> bool:
+        return self._maintenance.run_cycle_end(**kwargs)
 
     def optimize(self) -> None:
         """LanceDB optimize()로 삭제 데이터를 정리한다 (compact_files() 사용 금지)."""
         self._table.optimize()
+        self._maintenance.note_external_optimize_success()
         logger.info("LanceDB optimize 완료")

@@ -219,7 +219,9 @@ openpyxl이 `docProps/custom.xml` 타입 오류로 실패하면, custom.xml 파�
 1. **폴더 루트 가드**: 감시 폴더 접근 불가 시 해당 폴더 항목 전부 제외 + WARNING
 2. **대량 삭제 차단기**: orphan 비율 30% 초과 시 해당 폴더 정리 중단 + ERROR + UI 알림 (`cleanup.max_delete_ratio`)
 3. **Soft delete**: orphan 즉시 삭제 않고 `miss_count` 증가 + `is_deleted=true` 마킹, 다음 스캔에서도 없으면 물리 삭제
-4. **물리 삭제 후 `optimize()` 호출**
+4. **주기적 `optimize()`**: 문서·메일 테이블별 성공 write 100회, 최초 작은 fragment
+   100개, 또는 사이클 종료 잔여 write 20회를 안전 체크포인트에서 처리. 물리 삭제
+   직후마다 실행하지 않아 중복 compaction을 피하고 상태 파일 저장 뒤에만 시작.
 5. **dry-run 모드**: `cleanup.dry_run: true`이면 대상 목록 로그만 출력 (기본값 true). 설정 패널에선 "제거된 폴더 데이터 자동 삭제" 토글(긍정형)로 노출.
 6. **사이클 리포트**: 스캔N / 신규a / 변경b / 마킹c / 물리삭제d / 스킵 폴더 목록 매 사이클 로그
 

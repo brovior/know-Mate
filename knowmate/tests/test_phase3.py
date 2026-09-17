@@ -2529,6 +2529,7 @@ class TestStopWorker:
             self._wait_results = list(wait_results or [])
             self.cancelled = False
             self.terminated = False
+            self.wait_calls = []
 
         def isRunning(self):
             return self._running
@@ -2537,6 +2538,7 @@ class TestStopWorker:
             self.cancelled = True
 
         def wait(self, ms):
+            self.wait_calls.append(ms)
             return self._wait_results.pop(0) if self._wait_results else True
 
         def terminate(self):
@@ -2550,6 +2552,33 @@ class TestStopWorker:
         result = stop_worker(w, hard_exit=lambda c: hard.append(c))
         assert w.cancelled and not w.terminated and hard == []
         assert result is False
+
+    def test_optimize_in_progress_gets_bounded_extended_grace(self):
+        """취소 불가능한 native optimize 중에는 terminate 전 유예를 60초로 늘린다."""
+        from knowmate.app.lifecycle import stop_worker
+        w = self._FakeWorker(running=True, wait_results=[True])
+        w.maintenance_in_progress = True
+
+        assert stop_worker(w, hard_exit=lambda _code: None) is False
+        assert w.wait_calls == [60000]
+
+    def test_optimize_starting_during_initial_wait_gets_remaining_grace(self):
+        """취소 직후 시작된 optimize도 8초 뒤 재확인해 남은 52초를 보장한다."""
+        from knowmate.app.lifecycle import stop_worker
+
+        class RaceWorker(self._FakeWorker):
+            maintenance_reads = 0
+
+            @property
+            def maintenance_in_progress(self):
+                self.maintenance_reads += 1
+                return self.maintenance_reads >= 2
+
+        w = RaceWorker(running=True, wait_results=[False, True])
+
+        assert stop_worker(w, hard_exit=lambda _code: None) is False
+        assert w.wait_calls == [8000, 52000]
+        assert not w.terminated
 
     def test_terminate_when_graceful_times_out(self):
         """정상 종료 실패 → terminate 후 성공하면 하드 종료는 안 하지만, terminate()가

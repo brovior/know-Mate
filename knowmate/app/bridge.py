@@ -472,30 +472,10 @@ class Bridge(QObject):
     def excludeFile(self, path: str) -> str:
         """파일을 collector.exclude_files에 추가하고, 이미 인덱싱된 청크가
         있으면 즉시 삭제한다(사용자 확정 요청 — 다음 사이클을 기다리지 않는다)."""
-        from knowmate.config import get_config, update_exclude_files
-        from knowmate.collector.scanner import normalize_path_key
-        from knowmate.collector.state import load_state, save_state
-
-        folders: list[str] = get_config().get("collector", {}).get("exclude_files", [])
-        key = normalize_path_key(path)
-        if not any(normalize_path_key(f) == key for f in folders):
-            folders.append(path)
-            update_exclude_files(folders)
-
-        if self._worker is not None:
-            try:
-                if getattr(self._worker, "_indexer", None) is not None:
-                    safe = path.replace("'", "''")
-                    self._worker._indexer.table.delete(f"file_path = '{safe}'")
-            except Exception as exc:
-                import logging
-                logging.getLogger(__name__).warning("[exclude] 청크 삭제 실패: %s (%s)", path, exc)
-            state_file = getattr(self._worker, "_state_file", None)
-            if state_file is not None:
-                state = load_state(state_file)
-                if state.pop(path, None) is not None:
-                    save_state(state_file, state)
-        return "ok"
+        result = json.loads(self.excludeFiles(json.dumps([path], ensure_ascii=False)))
+        if result.get("ok"):
+            return "ok"
+        return "busy" if result.get("error") == "busy" else "error"
 
     @pyqtSlot(str, result=str)
     def unexcludeFile(self, path: str) -> str:
@@ -503,14 +483,168 @@ class Bridge(QObject):
 
         다음 스캔 사이클부터 다시 대상이 된다 — 백오프는 별도 판정(실패 이력이
         남아 있으면 그 정책을 그대로 따른다. 즉시 재시도가 필요하면 retryFile 사용)."""
+        result = json.loads(self.unexcludeFiles(json.dumps([path], ensure_ascii=False)))
+        if result.get("ok"):
+            return "ok"
+        return "busy" if result.get("error") == "busy" else "error"
+
+    @pyqtSlot(str, result=str)
+    def excludeFiles(self, payload: str) -> str:
+        """여러 파일을 한 번에 인덱싱에서 제외하고 결과 요약 JSON을 반환한다."""
+        paths, error = self._parse_failure_paths(payload)
+        if error:
+            return json.dumps({"ok": False, "error": error})
+        if self._worker is not None and self._worker.isRunning():
+            return json.dumps({"ok": False, "error": "busy"})
+
+        from knowmate.config import get_config, update_exclude_files
+        from knowmate.collector.scanner import normalize_path_key
+        from knowmate.collector.state import load_state, save_state
+
+        folders: list[str] = get_config().get("collector", {}).get("exclude_files", [])
+        existing_keys = {normalize_path_key(path) for path in folders if isinstance(path, str)}
+        changed = [path for path in paths if normalize_path_key(path) not in existing_keys]
+        if changed:
+            try:
+                update_exclude_files(folders + changed)
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning("[exclude] 일괄 제외 설정 저장 실패: %s", exc)
+                return json.dumps({"ok": False, "error": "config update failed"})
+
+        from knowmate.collector.mail_exclusion import (
+            mail_exclusion_paths, reconcile_mail_exclusions,
+        )
+
+        cfg = get_config()
+        all_excluded = cfg.get("collector", {}).get("exclude_files", [])
+        mail_paths = mail_exclusion_paths(
+            [path for path in all_excluded if isinstance(path, str)], cfg,
+        )
+        mail_keys = {normalize_path_key(path) for path in mail_paths}
+        changed_documents = [
+            path for path in changed if normalize_path_key(path) not in mail_keys
+        ]
+
+        delete_failed = 0
+        document_indexer = getattr(self._worker, "_indexer", None)
+        table = getattr(document_indexer, "table", None)
+        if table is not None:
+            import logging
+            logger = logging.getLogger(__name__)
+            for path in changed_documents:
+                try:
+                    delete_file = getattr(document_indexer, "delete_file_chunks", None)
+                    if callable(delete_file):
+                        delete_file(path)
+                    else:
+                        safe = path.replace("'", "''")
+                        table.delete(f"file_path = '{safe}'")
+                except Exception as exc:
+                    delete_failed += 1
+                    logger.warning("[exclude] 청크 삭제 실패: %s (%s)", path, exc)
+
+        state_cleanup_failed = False
+        state_file = getattr(self._worker, "_state_file", None)
+        if state_file is not None and changed_documents:
+            state = load_state(state_file)
+            changed_keys = {normalize_path_key(path) for path in changed_documents}
+            retained = {
+                path: value for path, value in state.items()
+                if normalize_path_key(path) not in changed_keys
+            }
+            if len(retained) != len(state):
+                try:
+                    save_state(state_file, retained)
+                except Exception as exc:
+                    import logging
+                    logging.getLogger(__name__).warning("[exclude] state 정리 실패: %s (%s)", state_file, exc)
+                    state_cleanup_failed = True
+
+        mail_cleanup_failed = False
+        mail_pending_chunks = 0
+        email_indexer = getattr(self._worker, "_email_indexer", None)
+        mail_state_file = getattr(self._worker, "_mail_state_file", None)
+        reconciled = getattr(self._worker, "_mail_exclusions_reconciled", None)
+        if email_indexer is not None and mail_state_file is not None and isinstance(reconciled, set):
+            report = reconcile_mail_exclusions(
+                email_indexer, mail_state_file, mail_paths, reconciled,
+            )
+            mail_cleanup_failed = not report.ok
+            mail_pending_chunks = report.pending_chunks
+
+        return json.dumps({
+            "ok": True,
+            "requested": len(paths),
+            "changed": len(changed),
+            "already_target": len(paths) - len(changed),
+            "delete_failed": delete_failed,
+            "state_cleanup_failed": state_cleanup_failed,
+            "mail_cleanup_failed": mail_cleanup_failed,
+            "mail_pending_chunks": mail_pending_chunks,
+        })
+
+    @pyqtSlot(str, result=str)
+    def unexcludeFiles(self, payload: str) -> str:
+        """여러 파일을 한 번에 인덱싱 제외에서 해제하고 결과 요약 JSON을 반환한다."""
+        paths, error = self._parse_failure_paths(payload)
+        if error:
+            return json.dumps({"ok": False, "error": error})
+        if self._worker is not None and self._worker.isRunning():
+            return json.dumps({"ok": False, "error": "busy"})
+
         from knowmate.config import get_config, update_exclude_files
         from knowmate.collector.scanner import normalize_path_key
 
         folders: list[str] = get_config().get("collector", {}).get("exclude_files", [])
-        key = normalize_path_key(path)
-        folders = [f for f in folders if normalize_path_key(f) != key]
-        update_exclude_files(folders)
-        return "ok"
+        target_keys = {normalize_path_key(path) for path in paths}
+        changed_keys = {
+            normalize_path_key(path) for path in folders
+            if isinstance(path, str) and normalize_path_key(path) in target_keys
+        }
+        if changed_keys:
+            remaining = [
+                path for path in folders
+                if not isinstance(path, str) or normalize_path_key(path) not in changed_keys
+            ]
+            try:
+                update_exclude_files(remaining)
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).warning("[exclude] 일괄 제외 해제 설정 저장 실패: %s", exc)
+                return json.dumps({"ok": False, "error": "config update failed"})
+
+        reconciled = getattr(self._worker, "_mail_exclusions_reconciled", None)
+        if isinstance(reconciled, set):
+            from knowmate.collector.mail_scan_state import normalize_path_key as normalize_mail_key
+            reconciled.difference_update(normalize_mail_key(path) for path in paths)
+
+        return json.dumps({
+            "ok": True,
+            "requested": len(paths),
+            "changed": len(changed_keys),
+            "already_target": len(paths) - len(changed_keys),
+        })
+
+    @staticmethod
+    def _parse_failure_paths(payload: str) -> tuple[list[str], str | None]:
+        """배치 실패 문서 경로 JSON을 검증·정규화·중복 제거한다."""
+        try:
+            raw_paths = json.loads(payload)
+        except json.JSONDecodeError:
+            return [], "invalid JSON"
+        if not isinstance(raw_paths, list) or any(not isinstance(path, str) or not path for path in raw_paths):
+            return [], "paths must be a JSON array of non-empty strings"
+
+        from knowmate.collector.scanner import normalize_path_key
+        paths: list[str] = []
+        seen_keys: set[str] = set()
+        for path in raw_paths:
+            key = normalize_path_key(path)
+            if key not in seen_keys:
+                paths.append(path)
+                seen_keys.add(key)
+        return paths, None
 
     def _get_now(self) -> float:
         """failure_state 계산용 현재 시각(초). 워커가 있으면 그 시계를 따른다

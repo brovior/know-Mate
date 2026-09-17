@@ -110,11 +110,41 @@ class Retriever:
         # emails 테이블 병합 (local scope 포함 시 또는 scopes=None)
         if self._email_indexer and (scopes is None or "local" in scopes):
             try:
+                from knowmate.collector.mail_exclusion import mail_exclusion_paths
+                from knowmate.collector.mail_scan_state import normalize_path_key
+                from knowmate.config import get_config
+
+                cfg = get_config()
+                raw_excluded = cfg.get("collector", {}).get("exclude_files", [])
+                excluded_mail_paths = mail_exclusion_paths(
+                    [path for path in raw_excluded if isinstance(path, str)], cfg,
+                )
+                excluded_mail_keys = {
+                    normalize_path_key(path) for path in excluded_mail_paths
+                }
+                email_where = email_date_where
+                if excluded_mail_paths:
+                    sql_paths = set()
+                    for path in excluded_mail_paths:
+                        sql_paths.add(path.replace("\\", "/").casefold())
+                        sql_paths.add(path.replace("/", "\\").casefold())
+                    quoted = ", ".join(
+                        f"'{path.replace(chr(39), chr(39) * 2)}'"
+                        for path in sorted(sql_paths)
+                    )
+                    exclusion_where = f"lower(source_file) NOT IN ({quoted})"
+                    email_where = (
+                        f"({email_where}) AND ({exclusion_where})"
+                        if email_where else exclusion_where
+                    )
                 email_rows = self._search_table(
                     self._email_indexer.table, vec, scopes=None, use_owner_filter=False,
-                    extra_where=email_date_where,
+                    extra_where=email_where,
                     apply_threshold=(date_range is None),
-                    limit_override=date_limit_override,
+                    limit_override=max(date_limit_override or 0, self._top_k * 5)
+                    if excluded_mail_keys else date_limit_override,
+                    excluded_path_keys=excluded_mail_keys,
+                    path_column="source_file",
                 )
                 for row in email_rows:
                     # emails 테이블에는 file_path가 없으므로 source_file로 채움
@@ -148,6 +178,8 @@ class Retriever:
         extra_where: str | None = None,
         apply_threshold: bool = True,
         limit_override: int | None = None,
+        excluded_path_keys: set[str] | None = None,
+        path_column: str | None = None,
     ) -> list[dict[str, Any]]:
         """단일 테이블에서 벡터 검색 후 점수 필터·권한 필터·복호화를 수행한다.
 
@@ -169,6 +201,17 @@ class Retriever:
 
         if raw.empty:
             return []
+
+        if excluded_path_keys and path_column and path_column in raw.columns:
+            from knowmate.collector.mail_scan_state import normalize_path_key
+            raw = raw[
+                ~raw[path_column].map(
+                    lambda path: isinstance(path, str)
+                    and normalize_path_key(path) in excluded_path_keys
+                )
+            ]
+            if raw.empty:
+                return []
 
         # 유사도 점수 계산
         if "_distance" in raw.columns:

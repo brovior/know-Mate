@@ -87,6 +87,7 @@ def _build_pipeline() -> dict[str, Any]:
 
     cfg = get_config()
     chunking = cfg.get("chunking", {})
+    maintenance = cfg.get("lancedb_maintenance", {})
     search = cfg.get("search", {})
 
     db_path = str(get_data_dir() / "index")
@@ -103,6 +104,7 @@ def _build_pipeline() -> dict[str, Any]:
         overlap=chunking.get("overlap", 80),
         batch_size=cfg.get("embedding", {}).get("batch_size", 32),
         crypto=crypto,
+        maintenance_config=maintenance,
     )
 
     # 메일 인덱서 (mail.enabled 무관하게 항상 초기화 — 기존 emails 테이블 검색 지원)
@@ -114,6 +116,7 @@ def _build_pipeline() -> dict[str, Any]:
         overlap=chunking.get("overlap", 80),
         batch_size=cfg.get("embedding", {}).get("batch_size", 32),
         crypto=crypto,
+        maintenance_config=maintenance,
     )
 
     retriever = Retriever(

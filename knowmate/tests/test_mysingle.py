@@ -282,6 +282,32 @@ class TestEmailIndexer:
         assert ei.has_current_mail_uid("knox:CURRENT-UID")
         assert not ei.has_current_mail_uid("knox:UNKNOWN")
 
+    def test_pending_chunk_ids_are_not_treated_as_current(self, tmp_path):
+        """삭제 대기 ID만 남은 UID는 CURRENT나 현재 UID로 판정하지 않는다."""
+        from knowmate.rag.email_indexer import EmailIndexer, MailIndexState
+
+        ei = EmailIndexer(db_path=tmp_path, embed_client=_fake_embed())
+        ids = ei.index_mail(self._sample_parsed("knox:PENDING"), mtime=1000.0)
+
+        check = ei.get_index_state("knox:PENDING", 1000.0, set(ids))
+
+        assert check.state is MailIndexState.MISSING
+        assert not ei.has_current_mail_uid("knox:PENDING", set(ids))
+
+    def test_source_chunk_refs_match_case_variant_without_loading_content(self, tmp_path):
+        """기존 source 표기가 달라도 공통 경로 키로 정확한 ID·UID를 찾는다."""
+        from knowmate.rag.email_indexer import EmailIndexer
+
+        source = str(tmp_path / "CaseMail.mysingle")
+        ei = EmailIndexer(db_path=tmp_path, embed_client=_fake_embed())
+        ids = ei.index_mail(self._sample_parsed("knox:CASE", source), mtime=1000.0)
+
+        refs = ei.get_source_chunk_refs([source.upper()])
+
+        assert {row["chunk_id"] for row in refs} == set(ids)
+        assert {row["mail_uid"] for row in refs} == {"knox:CASE"}
+        assert all(set(row) == {"chunk_id", "mail_uid", "source_file"} for row in refs)
+
     def test_v4_replaces_only_same_file_legacy_path_uid_after_new_save(self, tmp_path):
         """BOM 오파싱 legacy UID는 정상 Knox UID 저장 뒤 같은 source에서만 삭제한다."""
         from knowmate.rag.email_indexer import EmailIndexer
@@ -814,10 +840,13 @@ class TestMailScanner:
                 raise AssertionError("queue 저장 실패 시 삭제하면 안 됩니다")
 
         monkeypatch.setattr(mail_scanner, "save_mail_scan_state", lambda *_args: False)
+        persisted = []
         assert mail_scanner.run_mail_scan(
             [str(watch)], NoPersistIndexer(), {"mail": {"max_mails_per_scan": 1}},
             state_file=tmp_path / "mail_scan_state.json", failure_file=tmp_path / "index_failure.json",
+            on_state_persisted=lambda ok: persisted.append(ok),
         ) == (0, 1)
+        assert persisted == [False]
 
     def test_corrupt_body_legacy_delete_is_persisted_and_retried(self, tmp_path, monkeypatch):
         """손상 본문의 exact legacy ID는 삭제 실패 뒤에도 pending queue로 재시도한다."""
@@ -868,6 +897,66 @@ class TestMailScanner:
             state_file=state_file, failure_file=failure_file, get_now=lambda: 9_999_999_999.0,
         ) == (0, 1)
         assert indexer.delete_attempts == 2
+        assert load_mail_scan_state(state_file)["pending_deletes"] == []
+
+    def test_pending_exclusion_ids_are_ignored_before_alias_success_cache(self, tmp_path):
+        """삭제 대기 행을 CURRENT로 오인해 복사본 캐시만 남기는 회귀를 막는다."""
+        from knowmate.collector.mail_scan_state import load_mail_scan_state, save_mail_scan_state
+        from knowmate.collector.mail_scanner import run_mail_scan
+
+        watch = tmp_path / "watch"
+        watch.mkdir()
+        alias = watch / "alias.mysingle"
+        _write_mail(alias, uid="2026062600333333", msgid="pending-alias")
+        state_file = tmp_path / "mail_scan_state.json"
+        assert save_mail_scan_state(state_file, {
+            "schema_version": 2, "cursor": None, "files": {},
+            "pending_deletes": ["excluded-old"],
+        })
+
+        class Indexer:
+            table_was_recreated = False
+            table_is_empty = False
+
+            def __init__(self):
+                self.delete_attempts = 0
+                self.indexed = 0
+
+            def delete_chunk_ids(self, chunk_ids):
+                assert tuple(chunk_ids) == ("excluded-old",)
+                self.delete_attempts += 1
+                if self.delete_attempts == 1:
+                    raise RuntimeError("still locked")
+                return tuple(chunk_ids)
+
+            def get_index_state(self, _uid, _mtime, ignored_chunk_ids=None):
+                assert ignored_chunk_ids == {"excluded-old"}
+                return types.SimpleNamespace(
+                    state=types.SimpleNamespace(name="MISSING"), old_chunk_ids=(),
+                )
+
+            def get_legacy_path_chunk_ids(self, _source_file):
+                return ()
+
+            def index_mail(self, *_args, **_kwargs):
+                self.indexed += 1
+                return ["alias-new"]
+
+        indexer = Indexer()
+        cfg = {"mail": {"max_mails_per_scan": 1}}
+
+        assert run_mail_scan(
+            [str(watch)], indexer, cfg,
+            state_file=state_file, failure_file=tmp_path / "failures.json",
+        ) == (1, 0)
+        assert indexer.indexed == 1
+        assert load_mail_scan_state(state_file)["pending_deletes"] == ["excluded-old"]
+
+        assert run_mail_scan(
+            [str(watch)], indexer, cfg,
+            state_file=state_file, failure_file=tmp_path / "failures.json",
+        ) == (0, 1)
+        assert indexer.indexed == 1
         assert load_mail_scan_state(state_file)["pending_deletes"] == []
 
     def test_scan_finds_mysingle(self, tmp_path):
