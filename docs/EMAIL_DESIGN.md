@@ -86,10 +86,21 @@ Outlook은 그 위에 얹는다. 스키마는 **Outlook까지 고려한 풀 스�
 
 `mail_uid` 정규화: Knox → `knox:{UniqueID}`, eml → `eml:{Message-ID}`, Outlook → `outlook:{EntryID}` (소스 접두사로 통일). v4 재인덱싱 때는 BOM 오파싱으로 과거에 생성된 같은 `source_file`의 `knox:{절대경로}` 활성 청크만, 새 정상 청크 저장 성공 뒤 `pending_deletes`를 거쳐 정리한다. 같은 UID 복사본은 source별 legacy ID를 함께 캡처하되 정상 UID 행과 다른 source는 건드리지 않으며, 저장 뒤 queue 기록 전 중단된 경우에는 정상 현재 버전 행 확인 후 남은 같은 source의 legacy ID만 재시도한다. v5에서는 공백·유니코드 제어문자만 있는 본문을 손상으로 거부한다. 이 전용 오류가 `.mysingle`에서 발생하면 새 본문을 저장하지 않고도 같은 `source_file`과 `knox:{절대경로}`가 모두 일치하는 활성 legacy 청크만 `pending_deletes`에 먼저 저장한 뒤 정리한다. 조회 또는 상태 저장에 실패하면 삭제하지 않으며, 정상 Knox UID와 다른 source는 건드리지 않는다.
 
-`mail_scan_state.json`은 **schema_version 2**다. `files`는 정규화한 source file 경로를
+`mail_scan_state.json`은 **schema_version 3**이다. `files`는 정규화한 source file 경로를
 키로 쓰므로 항목 안에 경로를 중복 저장하지 않으며, `mtime`·`size`·`mail_uid`·인덱스/UID
-해결 버전만 둔다. v1은 최초 읽기에서 성공 캐시·커서·`pending_deletes`를 보존해 v2로
-원자 저장한다. `mail_uid`는 동일 UID 복사본의 최신 세대를 판별하는 캐시 요약이므로 유지한다.
+해결 버전만 둔다. v1·v2는 최초 읽기에서 성공 캐시·커서·`pending_deletes`를 보존해 v3로
+원자 저장한다. v3의 저장 키 검증은 문자열 연산만 사용해 상태 항목마다 파일시스템을 조회하지
+않는다. `mail_uid`는 동일 UID 복사본의 최신 세대를 판별하는 캐시 요약이므로 유지한다.
+
+**경로 키 성능 계약**: 설정·제외 요청처럼 외부에서 들어온 경로만 `realpath`로 한 번
+canonicalize한다. 메일 열거는 감시 root를 한 번 canonicalize한 뒤 하위 파일 키를 상대경로
+문자열로 조합한다. 일반 파일별 `realpath`는 호출하지 않고 file symlink/reparse 항목만 예외로
+실경로를 확인한다. 디렉터리 symlink/junction은 기존처럼 따라가지 않는다. mapped drive와 UNC는
+동일성을 보장하지 않으며 서로 다른 감시 경로로 취급한다.
+
+메일 제외 정리와 실제 스캔은 한 사이클에서 같은 상태 객체를 사용한다. 테이블 재생성·빈 테이블
+또는 상태 마이그레이션은 제외 청크 조회·삭제 전에 원자 저장하며, 이 체크포인트가 실패하면 해당
+사이클의 메일 DB 변경을 시작하지 않는다. 변경 없는 정상 유휴 사이클은 상태 파일을 다시 쓰지 않는다.
 
 **본문 임베딩 시 메타 헤더 삽입**: `index_mail`은 청킹 전 본문 앞에 `제목/발신/수신/날짜` 헤더를 붙여,
 "○○가 보낸 메일", "○월 메일" 같은 발신인·날짜 기반 질의도 벡터 검색에 매칭되게 한다.

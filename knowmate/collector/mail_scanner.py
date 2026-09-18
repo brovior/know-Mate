@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -15,7 +16,9 @@ from knowmate.collector import failure_state
 from knowmate.collector.mail_scan_state import (
     cache_matches,
     cache_success,
+    canonicalize_external_path_key,
     clear_pending_delete,
+    join_root_path_key,
     load_mail_scan_state,
     normalize_path_key,
     prune_missing_files,
@@ -99,6 +102,14 @@ class _MailScanMetrics:
     failure_persists: int = 0
 
 
+@dataclass(frozen=True)
+class _MailTraversalError:
+    """한 감시 root의 열거가 불완전했음을 상위 스캔에 전달한다."""
+
+    root: str
+    directory: str
+
+
 def _content_fingerprint(parsed: dict) -> str:
     """인덱스 결과를 바꾸는 메일 내용을 메모리 안에서만 SHA-256으로 식별한다."""
     fields = (
@@ -110,8 +121,10 @@ def _content_fingerprint(parsed: dict) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def _iter_mail_files(folder: str, exts: tuple[str, ...]) -> Iterator[tuple[str, float, int]]:
-    """os.scandir 스택 순회로 메일 파일을 (경로, mtime, size)로 yield 한다."""
+def _iter_mail_files(
+    folder: str, exts: tuple[str, ...],
+) -> Iterator[tuple[str, float, int, bool] | _MailTraversalError]:
+    """메일 파일의 경로·mtime·size와 reparse 여부를 스트리밍한다."""
     stack: list[str] = [folder]
     while stack:
         current_dir = stack.pop()
@@ -119,22 +132,36 @@ def _iter_mail_files(folder: str, exts: tuple[str, ...]) -> Iterator[tuple[str, 
             with os.scandir(current_dir) as it:
                 for entry in it:
                     try:
+                        is_symlink = entry.is_symlink()
+                        is_junction_fn = getattr(entry, "is_junction", None)
+                        is_junction = bool(is_junction_fn()) if callable(is_junction_fn) else False
                         is_dir = entry.is_dir(follow_symlinks=False)
                     except OSError as exc:
                         logger.warning("[mail_scanner] 항목 접근 실패: %s (%s)", entry.path, exc)
+                        yield _MailTraversalError(folder, current_dir)
                         continue
                     if is_dir:
+                        # 내부 symlink/junction은 순환·root 밖 진입을 막기 위해 따라가지 않는다.
+                        if is_symlink or is_junction:
+                            continue
                         stack.append(entry.path)
                         continue
                     if entry.name.startswith("~$") or not entry.name.lower().endswith(exts):
                         continue
                     try:
-                        st = entry.stat()  # Windows: scandir 캐시 재사용(무 syscall)
-                        yield entry.path, st.st_mtime, st.st_size
+                        raw_st = entry.stat(follow_symlinks=False)
+                        reparse_flag = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+                        is_reparse = is_symlink or bool(
+                            getattr(raw_st, "st_file_attributes", 0) & reparse_flag
+                        )
+                        st = entry.stat() if is_reparse else raw_st
+                        yield entry.path, st.st_mtime, st.st_size, is_reparse
                     except OSError as exc:
                         logger.warning("[mail_scanner] stat 실패: %s (%s)", entry.path, exc)
+                        yield _MailTraversalError(folder, current_dir)
         except OSError as exc:
             logger.error("[mail_scanner] 폴더 스캔 실패: %s (%s)", current_dir, exc)
+            yield _MailTraversalError(folder, current_dir)
 
 
 def _mail_extensions(extensions: list[str] | None) -> tuple[str, ...]:
@@ -142,15 +169,37 @@ def _mail_extensions(extensions: list[str] | None) -> tuple[str, ...]:
     return tuple(ext.lower() for ext in (extensions or _DEFAULT_MAIL_EXTS))
 
 
-def _iter_scanned_mail_items(watch_folders: list[str], exts: tuple[str, ...]) -> Iterator[dict]:
-    """파일마다 경로 키를 한 번 만들고, 중첩 root의 중복 파일은 한 번만 yield한다."""
+def _iter_scanned_mail_items(
+    watch_folders: list[str],
+    exts: tuple[str, ...],
+    scan_status: dict[str, bool] | None = None,
+) -> Iterator[dict]:
+    """root만 실경로화하고 하위 파일 키는 문자열로 만들어 중복을 제거한다."""
     seen_paths: set[str] = set()
+    root_keys: dict[str, str] = {}
     for folder_str in watch_folders:
         if not Path(folder_str).is_dir():
             logger.warning("[mail_scanner] 폴더 접근 불가, 건너뜀: %s", folder_str)
+            if scan_status is not None:
+                scan_status["complete"] = False
             continue
-        for path, mtime, size in _iter_mail_files(folder_str, exts):
-            path_key = normalize_path_key(path)
+        root_key = root_keys.get(folder_str)
+        if root_key is None:
+            root_key = canonicalize_external_path_key(folder_str)
+            root_keys[folder_str] = root_key
+        for raw_item in _iter_mail_files(folder_str, exts):
+            if isinstance(raw_item, _MailTraversalError):
+                if scan_status is not None:
+                    scan_status["complete"] = False
+                continue
+            # 기존 테스트·외부 진단 코드가 3-tuple을 주입하는 경우도 호환한다.
+            path, mtime, size = raw_item[:3]
+            is_reparse = bool(raw_item[3]) if len(raw_item) > 3 else False
+            if is_reparse:
+                path_key = canonicalize_external_path_key(path)
+            else:
+                relative = os.path.relpath(path, folder_str)
+                path_key = join_root_path_key(root_key, relative)
             if path_key in seen_paths:
                 continue
             seen_paths.add(path_key)
@@ -186,6 +235,7 @@ def _collect_actionable_candidates(
     policy: failure_state.BackoffPolicy,
     metrics: _MailScanMetrics | None = None,
     excluded_keys: frozenset[str] | None = None,
+    scan_status: dict[str, bool] | None = None,
 ) -> tuple[list[dict], set[str], list[str], dict[str, float], int]:
     """한 번의 전체 순회에서 누락 정리용 경로와 실제 처리 후보만 분리한다."""
     exts = _mail_extensions(extensions)
@@ -195,7 +245,7 @@ def _collect_actionable_candidates(
     cached_uid_mtimes: dict[str, float] = {}
     skipped_count = 0
     excluded_keys = excluded_keys or frozenset()
-    for item in _iter_scanned_mail_items(watch_folders, exts):
+    for item in _iter_scanned_mail_items(watch_folders, exts, scan_status):
         if metrics is not None:
             metrics.enumerated += 1
         seen_keys.add(item["path_key"])
@@ -241,6 +291,8 @@ def run_mail_scan(
     cancel_check=None,
     maintenance_memory_log=None,
     on_state_persisted=None,
+    preloaded_state: dict | None = None,
+    preloaded_state_load_s: float = 0.0,
 ) -> tuple[int, int]:
     """메일을 순환 처리하되 한 수집 사이클의 실제 시도 수를 제한한다.
 
@@ -268,9 +320,15 @@ def run_mail_scan(
         failure_file = failure_file or data_dir / "mail_index_failure.json"
     table_was_recreated = bool(getattr(email_indexer, "table_was_recreated", False))
     invalidate_cache = table_was_recreated or bool(getattr(email_indexer, "table_is_empty", False))
-    state_load_started = time.perf_counter()
-    state = load_mail_scan_state(state_file, invalidate_cache=invalidate_cache)
-    metrics.state_load_s = time.perf_counter() - state_load_started
+    if preloaded_state is None:
+        state_load_started = time.perf_counter()
+        state = load_mail_scan_state(state_file, invalidate_cache=invalidate_cache)
+        metrics.state_load_s = time.perf_counter() - state_load_started
+    else:
+        state = preloaded_state
+        metrics.state_load_s = max(float(preloaded_state_load_s), 0.0)
+        # 선로드 호출자는 캐시 무효화를 DB 작업 전에 이미 저장해야 한다.
+        invalidate_cache = False
 
     def save_state() -> bool:
         """메일 상태 저장 시간을 사이클 집계에 더한다."""
@@ -298,9 +356,12 @@ def run_mail_scan(
             if on_state_persisted:
                 on_state_persisted(False)
             return 0, 0
+        # 같은 EmailIndexer 인스턴스의 다음 유휴 사이클은 확정된 빈 캐시를
+        # 그대로 사용할 수 있다. 실제 첫 저장 성공 시 table_is_empty는 다시 False가 된다.
         if table_was_recreated:
-            # 같은 EmailIndexer 인스턴스의 다음 유휴 사이클은 새 캐시를 사용할 수 있다.
             email_indexer.table_was_recreated = False
+        if hasattr(email_indexer, "table_is_empty"):
+            email_indexer.table_is_empty = False
     failure_load_started = time.perf_counter()
     failures = failure_state.load_failures(failure_file)
     metrics.state_load_s += time.perf_counter() - failure_load_started
@@ -321,14 +382,16 @@ def run_mail_scan(
         if isinstance(path, str)
     )
     enumerate_started = time.perf_counter()
+    scan_status = {"complete": True}
     candidates, seen_keys, cached_failure_paths, cached_uid_mtimes, early_skipped_count = _collect_actionable_candidates(
         watch_folders, extensions, state, failures, now_fn(), policy, metrics, excluded_keys,
+        scan_status,
     )
     metrics.enumerate_filter_sort_s = time.perf_counter() - enumerate_started
 
     if table_was_recreated:
         logger.info("[mail_scanner] 메일 테이블 재생성 감지 — 성공 캐시를 다시 구축합니다")
-    roots_accessible = bool(watch_folders) and all(Path(folder).is_dir() for folder in watch_folders)
+    roots_accessible = bool(watch_folders) and scan_status["complete"]
     pruned = prune_missing_files(state, seen_keys) if roots_accessible else 0
     failure_pruned = failure_state.prune(failures) if roots_accessible else 0
     state_dirty = state_dirty or pruned > 0

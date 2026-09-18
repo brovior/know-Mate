@@ -501,10 +501,10 @@ class TestEmailIndexer:
 
 
 # ---------------------------------------------------------------------------
-# mail_scan_state v2 테스트
+# mail_scan_state v3 테스트
 # ---------------------------------------------------------------------------
 
-class TestMailScanStateV2:
+class TestMailScanStateV3:
     def test_v5_invalidates_v4_success_cache(self, tmp_path, monkeypatch):
         """v5는 v4 성공 캐시를 비워 손상 본문 검사를 다시 거치게 한다."""
         from knowmate.collector.mail_scan_state import load_mail_scan_state
@@ -530,7 +530,8 @@ class TestMailScanStateV2:
     def test_v1_migration_keeps_cache_cursor_and_pending_deletes(self, tmp_path, monkeypatch):
         """v1은 path만 제거해 필요한 성공 캐시와 top-level 대기열을 보존한다."""
         from knowmate.collector.mail_scan_state import (
-            load_mail_scan_state, save_mail_scan_state, state_needs_save,
+            load_mail_scan_state, normalize_stored_path_key, save_mail_scan_state,
+            state_needs_save,
         )
 
         monkeypatch.setitem(
@@ -552,7 +553,10 @@ class TestMailScanStateV2:
         state = load_mail_scan_state(path)
         key = os.path.normcase(os.path.abspath(source))
         assert state_needs_save(state)
-        assert state["cursor"] == {"mtime": 44.5, "path": "C:\\메일\\다음.mysingle"}
+        assert state["cursor"] == {
+            "mtime": 44.5,
+            "path": normalize_stored_path_key("C:\\메일\\다음.mysingle"),
+        }
         assert state["pending_deletes"] == ["old-a", "old-b"]
         assert state["files"] == {key: {
             "mtime": 12.5, "size": 99, "mail_uid": "knox:uid", "index_version": "3",
@@ -561,11 +565,11 @@ class TestMailScanStateV2:
 
         assert save_mail_scan_state(path, state)
         stored = json.loads(path.read_text(encoding="utf-8"))
-        assert stored["schema_version"] == 2
+        assert stored["schema_version"] == 3
         assert "path" not in stored["files"][key]
 
     def test_idle_scan_persists_v1_migration_once(self, tmp_path):
-        """처리할 파일이 없어도 v1→v2 변환은 다음 재시작 전에 저장된다."""
+        """처리할 파일이 없어도 v1→v3 변환은 다음 재시작 전에 저장된다."""
         from knowmate.collector.mail_scanner import run_mail_scan
 
         state_file = tmp_path / "state.json"
@@ -581,16 +585,16 @@ class TestMailScanStateV2:
             [], indexer, {"mail": {"max_mails_per_scan": 1}},
             state_file=state_file, failure_file=tmp_path / "failures.json",
         ) == (0, 0)
-        assert json.loads(state_file.read_text(encoding="utf-8"))["schema_version"] == 2
+        assert json.loads(state_file.read_text(encoding="utf-8"))["schema_version"] == 3
 
-    def test_compact_output_unicode_roundtrip_and_v2_reload_does_not_rewrite(self, tmp_path, monkeypatch):
-        """저장은 한 줄 compact JSON이며 정상 v2는 유휴 사이클에 다시 쓰지 않는다."""
+    def test_compact_output_unicode_roundtrip_and_v3_reload_does_not_rewrite(self, tmp_path, monkeypatch):
+        """저장은 한 줄 compact JSON이며 정상 v3는 유휴 사이클에 다시 쓰지 않는다."""
         from knowmate.collector import mail_scanner
         from knowmate.collector.mail_scan_state import cache_success, save_mail_scan_state
 
         path = tmp_path / "상태.json"
         source = str(tmp_path / "메일함" / "한글😀.mysingle")
-        state = {"schema_version": 2, "cursor": None, "files": {}, "pending_deletes": []}
+        state = {"schema_version": 3, "cursor": None, "files": {}, "pending_deletes": []}
         cache_success(state, {"path": source, "mtime": 1.0, "size": 2}, "knox:한글😀")
         assert save_mail_scan_state(path, state)
         content = path.read_text(encoding="utf-8")
@@ -653,10 +657,10 @@ class TestMailScanStateV2:
         from knowmate.collector.mail_scan_state import save_mail_scan_state
 
         path = tmp_path / "state.json"
-        original = '{"schema_version":2,"cursor":null,"files":{},"pending_deletes":["old"]}'
+        original = '{"schema_version":3,"cursor":null,"files":{},"pending_deletes":["old"]}'
         path.write_text(original, encoding="utf-8")
         monkeypatch.setattr(Path, "replace", lambda *_args: (_ for _ in ()).throw(OSError("disk full")))
-        assert not save_mail_scan_state(path, {"schema_version": 2, "cursor": None, "files": {}, "pending_deletes": []})
+        assert not save_mail_scan_state(path, {"schema_version": 3, "cursor": None, "files": {}, "pending_deletes": []})
         assert path.read_text(encoding="utf-8") == original
 
     def test_corrupt_json_falls_back_to_empty_state(self, tmp_path):
@@ -666,7 +670,7 @@ class TestMailScanStateV2:
         path = tmp_path / "state.json"
         path.write_text('{"schema_version":2,"files":', encoding="utf-8")
         assert load_mail_scan_state(path) == {
-            "schema_version": 2, "cursor": None, "files": {}, "pending_deletes": [],
+            "schema_version": 3, "cursor": None, "files": {}, "pending_deletes": [],
         }
 
     def test_migrated_uid_summary_remains_available_for_duplicate_resolution(self, tmp_path, monkeypatch):
@@ -714,6 +718,119 @@ class TestMailScanStateV2:
         v1_size = path.stat().st_size
         assert save_mail_scan_state(path, load_mail_scan_state(path))
         assert path.stat().st_size < v1_size * 0.8
+
+    def test_large_v3_state_load_and_save_never_resolve_each_path(self, tmp_path, monkeypatch):
+        """정상 v3 상태 1만 건의 load/save는 realpath 파일시스템 호출을 하지 않는다."""
+        from knowmate.collector import mail_scan_state
+
+        monkeypatch.setitem(
+            sys.modules, "knowmate.rag.email_indexer", types.SimpleNamespace(EMAIL_INDEX_VERSION="5"),
+        )
+        files = {
+            f"c:/mail/archive/message-{index:05d}.mysingle": {
+                "mtime": float(index), "size": index + 1, "mail_uid": f"knox:{index}",
+                "index_version": "5", "uid_resolution_version": 2,
+            }
+            for index in range(10_000)
+        }
+        state = {
+            "schema_version": 3, "cursor": None, "files": files, "pending_deletes": [],
+        }
+        state_file = tmp_path / "mail_scan_state.json"
+        monkeypatch.setattr(
+            mail_scan_state.os.path, "realpath",
+            lambda _path: (_ for _ in ()).throw(AssertionError("realpath must not be called")),
+        )
+
+        assert mail_scan_state.save_mail_scan_state(state_file, state)
+        loaded = mail_scan_state.load_mail_scan_state(state_file)
+
+        assert len(loaded["files"]) == 10_000
+        assert not mail_scan_state.state_needs_save(loaded)
+
+    def test_v2_to_v3_preserves_files_cursor_and_pending_deletes(self, tmp_path, monkeypatch):
+        """v2 업그레이드는 성공 캐시·순환 커서·삭제 대기열을 모두 보존한다."""
+        from knowmate.collector import mail_scan_state
+
+        monkeypatch.setitem(
+            sys.modules, "knowmate.rag.email_indexer", types.SimpleNamespace(EMAIL_INDEX_VERSION="5"),
+        )
+        source = mail_scan_state.normalize_stored_path_key(str(tmp_path / "mail.mysingle"))
+        state_file = tmp_path / "mail_scan_state.json"
+        state_file.write_text(json.dumps({
+            "schema_version": 2,
+            "cursor": {"mtime": 9.0, "path": source},
+            "files": {source: {
+                "mtime": 9.0, "size": 3, "mail_uid": "knox:kept",
+                "index_version": "5", "uid_resolution_version": 2,
+            }},
+            "pending_deletes": ["old-1"],
+        }), encoding="utf-8")
+        monkeypatch.setattr(
+            mail_scan_state.os.path, "realpath",
+            lambda _path: (_ for _ in ()).throw(AssertionError("v2 migration must be no-I/O")),
+        )
+
+        state = mail_scan_state.load_mail_scan_state(state_file)
+
+        assert state["files"][source]["mail_uid"] == "knox:kept"
+        assert state["cursor"] == {"mtime": 9.0, "path": source}
+        assert state["pending_deletes"] == ["old-1"]
+        assert mail_scan_state.state_needs_save(state)
+
+    def test_windows_extended_prefixes_share_the_same_stored_key(self):
+        r"""일반 Windows 경로와 \\?\ 장경로 표기는 같은 저장 키가 된다."""
+        from knowmate.collector.mail_scan_state import normalize_stored_path_key
+
+        assert normalize_stored_path_key(r"C:\Mail\A.mysingle") == normalize_stored_path_key(
+            r"\\?\C:\Mail\A.mysingle"
+        )
+        assert normalize_stored_path_key(r"\\server\share\A.mysingle") == normalize_stored_path_key(
+            r"\\?\UNC\server\share\A.mysingle"
+        )
+
+    def test_windows_extended_prefix_is_preserved_for_external_os_lookup(self, monkeypatch):
+        r"""Windows 장경로 접두사는 실제 경로 조회가 끝날 때까지 보존한다."""
+        from knowmate.collector import mail_scan_state
+
+        source = r"\\?\C:\Mail\A.mysingle"
+        calls = []
+        monkeypatch.setattr(mail_scan_state.os, "name", "nt")
+        monkeypatch.setattr(
+            mail_scan_state.os.path, "abspath",
+            lambda path: calls.append(("abspath", path)) or path,
+        )
+        monkeypatch.setattr(
+            mail_scan_state.os.path, "realpath",
+            lambda path: calls.append(("realpath", path)) or path,
+        )
+
+        assert mail_scan_state.canonicalize_external_path_key(source) == (
+            mail_scan_state.normalize_stored_path_key(r"C:\Mail\A.mysingle")
+        )
+        assert calls == [("abspath", source), ("realpath", source)]
+
+    def test_preloaded_state_skips_second_state_file_load(self, tmp_path, monkeypatch):
+        """스케줄러가 연 상태를 넘기면 run_mail_scan은 같은 파일을 다시 읽지 않는다."""
+        from knowmate.collector import mail_scanner
+
+        monkeypatch.setattr(
+            mail_scanner, "load_mail_scan_state",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("duplicate load")),
+        )
+        state = {
+            "schema_version": 3, "cursor": None, "files": {}, "pending_deletes": [],
+        }
+        persisted = []
+
+        assert mail_scanner.run_mail_scan(
+            [], types.SimpleNamespace(table_was_recreated=False, table_is_empty=False),
+            {"mail": {"max_mails_per_scan": 1}},
+            state_file=tmp_path / "state.json", failure_file=tmp_path / "failures.json",
+            preloaded_state=state,
+            on_state_persisted=lambda ok: persisted.append(ok),
+        ) == (0, 0)
+        assert persisted == [True]
 
 
 # ---------------------------------------------------------------------------
@@ -2504,8 +2621,8 @@ class TestMailScanner:
         assert "mail(commits=2 failures=0" in cycle_logs[0]
         assert secret_body not in caplog.text
 
-    def test_early_filter_retains_only_actionable_candidates_and_normalizes_once(self, tmp_path, monkeypatch):
-        """대량 캐시·백오프는 전수 확인하되 후보 정렬·보관에는 넣지 않는다."""
+    def test_early_filter_retains_only_actionable_candidates_and_resolves_root_once(self, tmp_path, monkeypatch):
+        """대량 캐시를 훑어도 실경로 조회는 파일별이 아니라 root 한 번만 수행한다."""
         from knowmate.collector import failure_state, mail_scanner
 
         monkeypatch.setitem(
@@ -2528,11 +2645,11 @@ class TestMailScanner:
                 float(index), 1, 1_000.0,
             )
 
-        real_normalize = mail_scanner.normalize_path_key
-        normalized = []
+        real_canonicalize = mail_scanner.canonicalize_external_path_key
+        canonicalized = []
         monkeypatch.setattr(
-            mail_scanner, "normalize_path_key",
-            lambda path: normalized.append(path) or real_normalize(path),
+            mail_scanner, "canonicalize_external_path_key",
+            lambda path: canonicalized.append(path) or real_canonicalize(path),
         )
         monkeypatch.setattr(
             mail_scanner, "_iter_mail_files",
@@ -2545,12 +2662,177 @@ class TestMailScanner:
         )
 
         assert len(seen_keys) == len(paths)
-        assert len(normalized) == len(paths)
+        assert canonicalized == [str(watch)]
         assert cached_failures == []
         assert len(cached_uids) == 980
         assert skipped == 990
         assert [Path(item["path"]).stem for item in candidates] == [
             f"{index:04d}" for index in range(999, 989, -1)
+        ]
+
+    def test_3504_cached_idle_cycle_loads_no_state_and_saves_nothing(self, tmp_path, monkeypatch):
+        """선로드된 3,504건 유휴 사이클은 root만 해석하고 파싱·DB·저장을 하지 않는다."""
+        from knowmate.collector import mail_scanner
+        from knowmate.collector.mail_scan_state import normalize_stored_path_key
+        from knowmate.rag.email_indexer import EMAIL_INDEX_VERSION
+
+        watch = tmp_path / "mail"
+        watch.mkdir()
+        paths = [str(watch / f"{index:04d}.mysingle") for index in range(3_504)]
+        state = {
+            "schema_version": 3,
+            "cursor": None,
+            "files": {
+                normalize_stored_path_key(path): {
+                    "mtime": float(index), "size": 1, "mail_uid": f"knox:{index}",
+                    "index_version": EMAIL_INDEX_VERSION, "uid_resolution_version": 2,
+                }
+                for index, path in enumerate(paths)
+            },
+            "pending_deletes": [],
+        }
+        monkeypatch.setattr(
+            mail_scanner, "_iter_mail_files",
+            lambda _root, _exts: (
+                (path, float(index), 1) for index, path in enumerate(paths)
+            ),
+        )
+        monkeypatch.setattr(
+            mail_scanner, "load_mail_scan_state",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("duplicate load")),
+        )
+        saves = []
+        monkeypatch.setattr(
+            mail_scanner, "save_mail_scan_state",
+            lambda *_args: saves.append(True) or True,
+        )
+        real_canonicalize = mail_scanner.canonicalize_external_path_key
+        canonicalized = []
+        monkeypatch.setattr(
+            mail_scanner, "canonicalize_external_path_key",
+            lambda path: canonicalized.append(path) or real_canonicalize(path),
+        )
+        indexer = types.SimpleNamespace(
+            table_was_recreated=False,
+            table_is_empty=False,
+            get_index_state=lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("cached idle cycle must not query DB")
+            ),
+        )
+
+        assert mail_scanner.run_mail_scan(
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 500}},
+            state_file=tmp_path / "state.json", failure_file=tmp_path / "failures.json",
+            preloaded_state=state,
+        ) == (0, 3_504)
+        assert canonicalized == [str(watch)]
+        assert saves == []
+
+    def test_scandir_failure_does_not_prune_success_cache(self, tmp_path, monkeypatch):
+        """접근 가능한 root의 일시적 scandir 실패도 정상 성공 캐시를 보존한다."""
+        from knowmate.collector import mail_scanner
+        from knowmate.collector.mail_scan_state import (
+            load_mail_scan_state, normalize_stored_path_key, save_mail_scan_state,
+        )
+        from knowmate.rag.email_indexer import EMAIL_INDEX_VERSION
+
+        watch = tmp_path / "mail"
+        watch.mkdir()
+        source = str(watch / "kept.mysingle")
+        key = normalize_stored_path_key(source)
+        state_file = tmp_path / "state.json"
+        assert save_mail_scan_state(state_file, {
+            "schema_version": 3,
+            "cursor": None,
+            "files": {key: {
+                "mtime": 1.0, "size": 1, "mail_uid": "knox:kept",
+                "index_version": EMAIL_INDEX_VERSION, "uid_resolution_version": 2,
+            }},
+            "pending_deletes": [],
+        })
+        monkeypatch.setattr(
+            mail_scanner.os, "scandir", lambda _path: (_ for _ in ()).throw(PermissionError("busy")),
+        )
+
+        assert mail_scanner.run_mail_scan(
+            [str(watch)], types.SimpleNamespace(table_was_recreated=False, table_is_empty=False),
+            {"mail": {"max_mails_per_scan": 1}},
+            state_file=state_file, failure_file=tmp_path / "failures.json",
+        ) == (0, 0)
+        assert key in load_mail_scan_state(state_file)["files"]
+
+    def test_internal_junction_is_not_traversed(self, tmp_path, monkeypatch):
+        """Windows 내부 junction은 스캔 stack에 넣지 않아 root 밖 진입·순환을 막는다."""
+        from knowmate.collector import mail_scanner
+
+        class JunctionEntry:
+            name = "junction"
+            path = str(tmp_path / name)
+
+            @staticmethod
+            def is_symlink():
+                return False
+
+            @staticmethod
+            def is_junction():
+                return True
+
+            @staticmethod
+            def is_dir(*, follow_symlinks):
+                assert follow_symlinks is False
+                return True
+
+        class ScandirResult:
+            def __enter__(self):
+                return iter([JunctionEntry()])
+
+            def __exit__(self, *_args):
+                return False
+
+        monkeypatch.setattr(mail_scanner.os, "scandir", lambda _path: ScandirResult())
+
+        assert list(mail_scanner._iter_mail_files(str(tmp_path), (".mysingle",))) == []
+
+    def test_file_reparse_point_is_marked_for_exceptional_canonicalize(self, tmp_path, monkeypatch):
+        """symlink가 아닌 Windows file reparse도 파일별 canonicalize 대상으로 표시한다."""
+        from knowmate.collector import mail_scanner
+
+        class ReparseEntry:
+            name = "cloud.mysingle"
+            path = str(tmp_path / name)
+
+            @staticmethod
+            def is_symlink():
+                return False
+
+            @staticmethod
+            def is_junction():
+                return False
+
+            @staticmethod
+            def is_dir(*, follow_symlinks):
+                assert follow_symlinks is False
+                return False
+
+            @staticmethod
+            def stat(*, follow_symlinks=True):
+                if follow_symlinks is False:
+                    return types.SimpleNamespace(
+                        st_mtime=1.0, st_size=2, st_file_attributes=0x400,
+                    )
+                return types.SimpleNamespace(st_mtime=3.0, st_size=4)
+
+        class ScandirResult:
+            def __enter__(self):
+                return iter([ReparseEntry()])
+
+            def __exit__(self, *_args):
+                return False
+
+        monkeypatch.setattr(mail_scanner.os, "scandir", lambda _path: ScandirResult())
+
+        assert list(mail_scanner._iter_mail_files(str(tmp_path), (".mysingle",))) == [
+            (str(tmp_path / "cloud.mysingle"), 3.0, 4, True),
         ]
 
     def test_early_filter_excludes_cache_and_active_backoff_from_attempt_budget(

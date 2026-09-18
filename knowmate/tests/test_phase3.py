@@ -385,6 +385,84 @@ def test_memory_diagnostics_cover_collector_cycle_phases(tmp_path: Path, monkeyp
 
 
 class TestCollectorWorker:
+    class _IdleEmailIndexer:
+        table_was_recreated = False
+        table_is_empty = False
+
+        def __init__(self):
+            self.get_source_chunk_refs = MagicMock(return_value=[])
+            self.delete_chunk_ids = MagicMock(side_effect=lambda ids: tuple(ids))
+
+    def test_mail_state_is_loaded_once_for_exclusion_and_idle_scan(self, tmp_path, monkeypatch):
+        """메일 제외 정리와 실제 유휴 스캔은 같은 상태 객체를 공유한다."""
+        from knowmate.collector import mail_scan_state
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        worker, _, _ = _make_worker(tmp_path, str(folder))
+        worker._email_indexer = self._IdleEmailIndexer()
+        worker._config["mail"] = {"enabled": True, "max_mails_per_scan": 1}
+        real_load = mail_scan_state.load_mail_scan_state
+        loads = []
+
+        def recording_load(*args, **kwargs):
+            loads.append(args[0])
+            return real_load(*args, **kwargs)
+
+        monkeypatch.setattr(mail_scan_state, "load_mail_scan_state", recording_load)
+
+        worker.run()
+
+        assert loads == [worker._mail_state_file]
+
+    def test_corrupt_mail_state_blocks_exclusion_db_work(self, tmp_path):
+        """strict 상태 로드 실패 시 제외 청크 조회·삭제를 시작하지 않는다."""
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        worker, _, _ = _make_worker(tmp_path, str(folder))
+        email_indexer = self._IdleEmailIndexer()
+        worker._email_indexer = email_indexer
+        worker._config["collector"]["exclude_files"] = [str(folder / "blocked.mysingle")]
+        worker._config["mail"] = {"enabled": False}
+        worker._mail_state_file.write_text("{broken", encoding="utf-8")
+
+        worker.run()
+
+        email_indexer.get_source_chunk_refs.assert_not_called()
+        email_indexer.delete_chunk_ids.assert_not_called()
+        assert worker._mail_state_file.read_text(encoding="utf-8") == "{broken"
+
+    def test_empty_mail_table_checkpoint_failure_blocks_db_work(self, tmp_path, monkeypatch):
+        """빈 테이블 캐시 무효화 저장 실패 시 제외·스캔을 모두 중단한다."""
+        from knowmate.collector import mail_scan_state
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        worker, _, _ = _make_worker(tmp_path, str(folder))
+        email_indexer = self._IdleEmailIndexer()
+        email_indexer.table_is_empty = True
+        worker._email_indexer = email_indexer
+        worker._config["collector"]["exclude_files"] = [str(folder / "blocked.mysingle")]
+        worker._config["mail"] = {"enabled": True, "max_mails_per_scan": 1}
+        worker._mail_state_file.write_text(json.dumps({
+            "schema_version": 3,
+            "cursor": None,
+            "files": {
+                str(folder / "old.mysingle"): {
+                    "mtime": 1.0, "size": 1, "mail_uid": "knox:old",
+                    "index_version": "5", "uid_resolution_version": 2,
+                },
+            },
+            "pending_deletes": [],
+        }), encoding="utf-8")
+        monkeypatch.setattr(mail_scan_state, "save_mail_scan_state", lambda *_args: False)
+
+        worker.run()
+
+        email_indexer.get_source_chunk_refs.assert_not_called()
+        email_indexer.delete_chunk_ids.assert_not_called()
+        assert email_indexer.table_is_empty
+
     def test_new_file_indexed(self, tmp_path: Path):
         """파일 생성 후 run() -> state에 chunk_ids 존재."""
         folder = tmp_path / "docs"

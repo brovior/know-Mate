@@ -4,13 +4,14 @@ from __future__ import annotations
 import json
 import logging
 import math
+import ntpath
 import os
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 _UID_RESOLUTION_CACHE_VERSION = 2
 
 
@@ -26,16 +27,58 @@ class _MailScanState(dict[str, Any]):
         self.needs_save = needs_save
 
 
+def _strip_extended_windows_prefix(path: str) -> str:
+    """동일 파일의 Windows 장경로 접두사를 일반 drive/UNC 표기로 줄인다."""
+    folded = path.casefold()
+    if folded.startswith("\\\\?\\unc\\"):
+        return "\\\\" + path[8:]
+    if folded.startswith("//?/unc/"):
+        return "//" + path[8:]
+    if folded.startswith(("\\\\?\\", "//?/")):
+        return path[4:]
+    return path
+
+
+def normalize_stored_path_key(path: str) -> str:
+    """파일시스템 조회 없이 저장 경로 키의 표기만 통일한다."""
+    path = _strip_extended_windows_prefix(path)
+    is_windows_path = (
+        (len(path) >= 2 and path[1] == ":")
+        or path.startswith(("\\\\", "//"))
+    )
+    path_module = ntpath if is_windows_path else os.path
+    absolute = path_module.abspath(path)
+    return path_module.normcase(path_module.normpath(absolute)).replace("\\", "/").casefold()
+
+
+def canonicalize_external_path_key(path: str) -> str:
+    """외부 입력 경로를 한 번 실경로로 확인해 비교 키로 만든다."""
+    if os.name != "nt" and (
+        (len(path) >= 2 and path[1] == ":")
+        or path.startswith(("\\\\", "//"))
+    ):
+        # 사외 Linux 테스트에서는 Windows 경로를 실제 파일시스템에 조회하지 않는다.
+        return normalize_stored_path_key(path)
+    # Windows 장경로 접두사는 긴 경로에 실제로 접근하기 위해 OS 호출까지 보존하고,
+    # 조회 결과를 저장 키로 바꾸는 마지막 단계에서만 제거한다.
+    return normalize_stored_path_key(os.path.realpath(os.path.abspath(path)))
+
+
+def join_root_path_key(root_key: str, relative_path: str) -> str:
+    """정규화된 root와 하위 상대경로를 파일시스템 조회 없이 결합한다."""
+    relative = relative_path.replace("\\", "/").strip("/")
+    return f"{root_key.rstrip('/')}/{relative}".casefold() if relative else root_key
+
+
 def normalize_path_key(path: str) -> str:
-    """메일 출처 비교용 절대·실경로·슬래시·대소문자 통합 키를 반환한다."""
-    absolute = os.path.realpath(os.path.abspath(path))
-    return os.path.normcase(absolute).replace("\\", "/").casefold()
+    """하위호환용 외부 경로 canonicalize 별칭을 반환한다."""
+    return canonicalize_external_path_key(path)
 
 
 def load_mail_scan_state(
     path: Path, *, invalidate_cache: bool = False, strict: bool = False,
 ) -> dict[str, Any]:
-    """유효한 상태를 읽고 v1은 성공 캐시를 보존한 v2로 올린다."""
+    """유효한 상태를 읽고 구버전 성공 캐시를 보존한 v3로 올린다."""
     empty = _empty_state()
     if not path.exists():
         return empty
@@ -57,22 +100,22 @@ def load_mail_scan_state(
         state = _MailScanState(
             {
                 "schema_version": SCHEMA_VERSION,
-                "cursor": _valid_cursor(raw.get("cursor")),
+                "cursor": _valid_cursor(raw.get("cursor"), normalize_key=True),
                 "files": {} if invalidate_cache else _valid_v1_files(raw.get("files")),
                 "pending_deletes": _valid_pending_deletes(raw.get("pending_deletes")),
             },
             needs_save=True,
         )
-    elif version == SCHEMA_VERSION:
+    elif version in (2, SCHEMA_VERSION):
         files, files_changed = _valid_v2_files(raw.get("files"))
         state = _MailScanState(
             {
                 "schema_version": SCHEMA_VERSION,
-                "cursor": _valid_cursor(raw.get("cursor")),
+                "cursor": _valid_cursor(raw.get("cursor"), normalize_key=version != SCHEMA_VERSION),
                 "files": {} if invalidate_cache else files,
                 "pending_deletes": _valid_pending_deletes(raw.get("pending_deletes")),
             },
-            needs_save=files_changed or invalidate_cache,
+            needs_save=files_changed or invalidate_cache or version != SCHEMA_VERSION,
         )
         if raw != state:
             state.needs_save = True
@@ -179,25 +222,28 @@ def prune_missing_files(state: dict[str, Any], seen_keys: set[str]) -> int:
     return len(stale)
 
 
-def _valid_cursor(raw: object) -> dict[str, Any] | None:
+def _valid_cursor(raw: object, *, normalize_key: bool = False) -> dict[str, Any] | None:
     """저장된 커서의 최소 스키마를 검증한다."""
     if not isinstance(raw, dict):
         return None
     mtime, path = raw.get("mtime"), raw.get("path")
     if not _is_finite_number(mtime) or not isinstance(path, str):
         return None
-    return {"mtime": float(mtime), "path": path}
+    return {
+        "mtime": float(mtime),
+        "path": normalize_stored_path_key(path) if normalize_key else path,
+    }
 
 
 def _empty_state() -> _MailScanState:
-    """새 상태 파일의 v2 기본 구조를 만든다."""
+    """새 상태 파일의 v3 기본 구조를 만든다."""
     return _MailScanState({
         "schema_version": SCHEMA_VERSION, "cursor": None, "files": {}, "pending_deletes": [],
     })
 
 
 def _valid_v1_files(raw: object) -> dict[str, dict[str, Any]]:
-    """v1의 중복 path를 키로 승격해 v2 성공 캐시를 복구한다."""
+    """v1의 중복 path를 키로 승격해 v3 성공 캐시를 복구한다."""
     if not isinstance(raw, dict):
         return {}
     valid: dict[str, dict[str, Any]] = {}
@@ -218,7 +264,7 @@ def _valid_v1_files(raw: object) -> dict[str, dict[str, Any]]:
 
 
 def _valid_v2_files(raw: object) -> tuple[dict[str, dict[str, Any]], bool]:
-    """v2 파일 캐시를 검증하고 저장형과 다른 항목만 다시 쓰게 표시한다."""
+    """v2/v3 파일 캐시를 무-I/O로 검증하고 표기만 정규화한다."""
     if not isinstance(raw, dict):
         return {}, raw is not None
     valid: dict[str, dict[str, Any]] = {}
@@ -229,7 +275,7 @@ def _valid_v2_files(raw: object) -> tuple[dict[str, dict[str, Any]], bool]:
         if normalized is None:
             changed = True
             continue
-        canonical_key = normalize_path_key(key)
+        canonical_key = normalize_stored_path_key(key)
         priority = (normalized["mtime"], normalized["size"], key)
         if priority < priorities.get(canonical_key, (float("-inf"), -1, "")):
             changed = True
@@ -242,7 +288,7 @@ def _valid_v2_files(raw: object) -> tuple[dict[str, dict[str, Any]], bool]:
 
 
 def _valid_entry(entry: object) -> dict[str, Any] | None:
-    """본문 없이 v2 성공 캐시에 필요한 메타데이터만 보존한다."""
+    """본문 없이 성공 캐시에 필요한 메타데이터만 보존한다."""
     if not isinstance(entry, dict):
         return None
     mtime, size = entry.get("mtime"), entry.get("size")
@@ -265,7 +311,7 @@ def _valid_entry(entry: object) -> dict[str, Any] | None:
 
 
 def _canonical_state(state: dict[str, Any]) -> dict[str, Any]:
-    """호출자가 준 구버전 상태도 안전한 v2 저장 형태로 축소한다."""
+    """호출자가 준 구버전 상태도 안전한 v3 저장 형태로 축소한다."""
     legacy = state.get("schema_version") == 1
     files = _valid_v1_files(state.get("files")) if legacy else _valid_v2_files(state.get("files"))[0]
     return {

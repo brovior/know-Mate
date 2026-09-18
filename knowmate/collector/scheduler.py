@@ -1002,17 +1002,43 @@ class CollectorWorker(QThread):
         mail_exclusion_changed = False
         mail_maintenance_ok = True
         mail_state_persisted = False
+        mail_state = None
+        mail_state_load_s = 0.0
         if self._email_indexer:
             from knowmate.collector.mail_exclusion import (
                 mail_exclusion_paths, reconcile_mail_exclusions,
             )
+            from knowmate.collector.mail_scan_state import (
+                load_mail_scan_state, save_mail_scan_state, state_needs_save,
+            )
             try:
+                state_load_started = time.perf_counter()
+                invalidate_mail_cache = bool(
+                    getattr(self._email_indexer, "table_was_recreated", False)
+                    or getattr(self._email_indexer, "table_is_empty", False)
+                )
+                mail_state = load_mail_scan_state(
+                    self._mail_state_file,
+                    invalidate_cache=invalidate_mail_cache,
+                    strict=True,
+                )
+                mail_state_load_s = time.perf_counter() - state_load_started
+                # 마이그레이션·빈 테이블 캐시 무효화는 DB 조회/삭제보다 먼저
+                # 디스크에 확정한다. 실패하면 이번 메일 유지보수 전체를 중단한다.
+                if state_needs_save(mail_state):
+                    if not save_mail_scan_state(self._mail_state_file, mail_state):
+                        raise OSError("mail state checkpoint failed")
+                if invalidate_mail_cache:
+                    self._email_indexer.table_was_recreated = False
+                    self._email_indexer.table_is_empty = False
+
                 mail_paths = mail_exclusion_paths(
                     [p for p in raw_exclude_files if isinstance(p, str)], self._config,
                 )
                 exclusion_report = reconcile_mail_exclusions(
                     self._email_indexer, self._mail_state_file, mail_paths,
                     self._mail_exclusions_reconciled,
+                    preloaded_state=mail_state,
                 )
                 mail_maintenance_ok = exclusion_report.ok
                 mail_state_persisted = exclusion_report.ok
@@ -1045,6 +1071,8 @@ class CollectorWorker(QThread):
                     on_state_persisted=lambda persisted: mail_state_status.update(
                         persisted=bool(persisted)
                     ),
+                    preloaded_state=mail_state,
+                    preloaded_state_load_s=mail_state_load_s,
                 )
                 mail_state_persisted = mail_state_status["persisted"]
             except Exception as exc:
