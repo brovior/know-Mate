@@ -45,6 +45,8 @@ def reconcile_mail_exclusions(
     state_file: Path,
     excluded_paths: list[str],
     reconciled_keys: set[str],
+    *,
+    preloaded_state: dict | None = None,
 ) -> MailExclusionReport:
     """메일 제외 경로를 캐시·삭제 대기열·DB에 순서대로 반영한다."""
     current_by_key = {
@@ -57,11 +59,14 @@ def reconcile_mail_exclusions(
         if key not in reconciled_keys
     ]
 
-    try:
-        state = load_mail_scan_state(state_file, strict=True)
-    except Exception as exc:
-        logger.warning("[mail_exclude] 상태 읽기 실패 — 제외 정리 연기: %s", exc)
-        return MailExclusionReport(False, paths=len(targets), error="state load failed")
+    if preloaded_state is None:
+        try:
+            state = load_mail_scan_state(state_file, strict=True)
+        except Exception as exc:
+            logger.warning("[mail_exclude] 상태 읽기 실패 — 제외 정리 연기: %s", exc)
+            return MailExclusionReport(False, paths=len(targets), error="state load failed")
+    else:
+        state = preloaded_state
 
     # 이전 사이클에서 내구성 있게 예약된 삭제를 후보 판정보다 먼저 끝낸다.
     pending_before = tuple(

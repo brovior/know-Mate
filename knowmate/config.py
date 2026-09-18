@@ -91,6 +91,39 @@ def get_config() -> dict[str, Any]:
                 _save_config(_cache)
             except OSError as exc:
                 logger.warning("구형 메일 진행률 설정 이름 변경 저장 실패: %s", exc)
+        maintenance = _cache.get("lancedb_maintenance")
+        if isinstance(maintenance, dict):
+            changed = False
+            had_legacy_startup = "startup_optimize_when_small_fragments_reach" in maintenance
+            legacy_startup = maintenance.pop("startup_optimize_when_small_fragments_reach", None)
+            if "optimize_when_small_fragments_reach" not in maintenance and legacy_startup is not None:
+                maintenance["optimize_when_small_fragments_reach"] = legacy_startup
+                changed = True
+                logger.info("lancedb_maintenance 구형 startup 임계값을 새 steady 임계값으로 이전했습니다")
+            for key in ("optimize_every_mutations", "cycle_end_min_mutations"):
+                if key in maintenance:
+                    maintenance.pop(key)
+                    changed = True
+                    logger.warning("lancedb_maintenance 구형 %s 설정을 제거했습니다", key)
+            if had_legacy_startup:
+                changed = True
+            # 기존 AppData config는 번들 기본 파일을 다시 시드하지 않는다. 새 정책의
+            # 조절값도 실제 사용자 파일에 한 번 채워 넣어 이후 직접 확인·조정할 수 있게 한다.
+            for key, default in (
+                ("optimize_when_small_fragments_reach", 100),
+                ("backlog_hard_limit_small_fragments", 1000),
+                ("backlog_finalize_small_fragments_reach", 300),
+                ("min_optimize_interval_sec", 86400),
+                ("failure_cooldown_sec", 300),
+            ):
+                if key not in maintenance:
+                    maintenance[key] = default
+                    changed = True
+            if changed:
+                try:
+                    _save_config(_cache)
+                except OSError as exc:
+                    logger.warning("lancedb_maintenance 설정 이전 저장 실패: %s", exc)
     return _cache
 
 

@@ -219,9 +219,13 @@ openpyxl이 `docProps/custom.xml` 타입 오류로 실패하면, custom.xml 파�
 1. **폴더 루트 가드**: 감시 폴더 접근 불가 시 해당 폴더 항목 전부 제외 + WARNING
 2. **대량 삭제 차단기**: orphan 비율 30% 초과 시 해당 폴더 정리 중단 + ERROR + UI 알림 (`cleanup.max_delete_ratio`)
 3. **Soft delete**: orphan 즉시 삭제 않고 `miss_count` 증가 + `is_deleted=true` 마킹, 다음 스캔에서도 없으면 물리 삭제
-4. **주기적 `optimize()`**: 문서·메일 테이블별 성공 write 100회, 최초 작은 fragment
-   100개, 또는 사이클 종료 잔여 write 20회를 안전 체크포인트에서 처리. 물리 삭제
-   직후마다 실행하지 않아 중복 compaction을 피하고 상태 파일 저장 뒤에만 시작.
+4. **적응형 `optimize()`**: mutation 수가 아니라 실제 작은 fragment 수로만 판단한다.
+   `%APPDATA%/AegisDesk/lancedb_maintenance/{chunks,emails}.json` sidecar는 테이블
+   identity·generation·마지막 결과·backlog marker·steady gate를 tmp→replace로 보관한다.
+   활성 backlog는 1000개에서 hard-limit optimize, 실제 완료 때 300개에서 final optimize를
+   한 번만 시도한다. 그 외에는 100개와 24시간 steady gate가 모두 충족될 때만 실행한다.
+   실패 cooldown과 no-effect 뒤 +300 growth 억제는 모든 트리거에 적용한다. optimize는
+   문서/mail state가 먼저 저장된 checkpoint에서만 시작하며 sidecar 오류는 indexing을 막지 않는다.
 5. **dry-run 모드**: `cleanup.dry_run: true`이면 대상 목록 로그만 출력 (기본값 true). 설정 패널에선 "제거된 폴더 데이터 자동 삭제" 토글(긍정형)로 노출.
 6. **사이클 리포트**: 스캔N / 신규a / 변경b / 마킹c / 물리삭제d / 스킵 폴더 목록 매 사이클 로그
 
@@ -278,6 +282,9 @@ current/peak/backend만 포함하며 문서·메일 내용은 포함하지 않�
 새 의존성을 추가하지 않고 `GetProcessMemoryInfo`로 조회한다. 진단을 켠 사이클에서만
 `tracemalloc`과 마지막 `gc.collect()`를 실행하며, 운영 메모리 동작을 바꾸는 Arrow
 `release_unused()`는 호출하지 않는다. Arrow peak는 기본 메모리 풀 생성 이후의 누적 고수위다.
+진단이 tracing을 시작할 때만 depth 10을 사용하고, 외부 tracing 중이면 depth/lifetime을 보존한다.
+cycle baseline과 optimize 전후, after_mail/after_gc_collect snapshot diff는 상위 코드 위치의
+size/count delta만 로그에 남기며 snapshot·원문·AppData/사용자 절대경로는 저장하지 않는다.
 
 ---
 

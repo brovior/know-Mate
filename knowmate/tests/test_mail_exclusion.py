@@ -20,7 +20,7 @@ class _FakeEmailIndexer:
 
 
 def _state(files):
-    return {"schema_version": 2, "cursor": None, "files": files, "pending_deletes": []}
+    return {"schema_version": 3, "cursor": None, "files": files, "pending_deletes": []}
 
 
 def _entry(uid):

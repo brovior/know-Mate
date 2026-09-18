@@ -5,6 +5,7 @@ import ctypes
 import gc
 import logging
 import os
+from pathlib import Path
 import tracemalloc
 from collections.abc import Callable
 from ctypes import wintypes
@@ -84,6 +85,8 @@ class MemoryDiagnostics:
         self._arrow_pool_getter = arrow_pool_getter
         self._owns_tracing = False
         self._started = False
+        self._cycle_snapshot = None
+        self._before_optimize_snapshot = None
 
     def start(self) -> None:
         """필요할 때만 tracemalloc 추적을 시작하고 사이클 peak를 초기화한다."""
@@ -91,9 +94,15 @@ class MemoryDiagnostics:
             return
         try:
             if not tracemalloc.is_tracing():
-                tracemalloc.start(1)
+                tracemalloc.start(10)
                 self._owns_tracing = True
-            tracemalloc.reset_peak()
+            else:
+                logger.info(
+                    "[memory] external tracemalloc tracing detected; preserving its depth and lifetime"
+                )
+            if self._owns_tracing:
+                tracemalloc.reset_peak()
+            self._cycle_snapshot = tracemalloc.take_snapshot() if tracemalloc.is_tracing() else None
         except Exception:
             logger.debug("[memory] tracemalloc 시작 실패", exc_info=True)
         self._started = True
@@ -139,6 +148,45 @@ class MemoryDiagnostics:
             _format_mib(arrow_peak),
             arrow_backend,
         )
+        self._log_snapshot_diff(phase)
+
+    @staticmethod
+    def _display_trace_filename(filename: str) -> str:
+        """Keep diagnostic locations useful without exposing user/AppData paths."""
+        normalized = filename.replace("\\", "/")
+        marker = "/knowmate/"
+        if marker in normalized:
+            return "knowmate/" + normalized.split(marker, 1)[1]
+        for package in ("/site-packages/", "/lib/python"):
+            if package in normalized:
+                return normalized.split(package, 1)[1]
+        return Path(normalized).name
+
+    def _log_snapshot_diff(self, phase: str) -> None:
+        """Log top code-location deltas only; snapshots never leave process memory."""
+        if not self.enabled or not tracemalloc.is_tracing():
+            return
+        try:
+            snapshot = tracemalloc.take_snapshot()
+            if phase.startswith("before_optimize_"):
+                self._before_optimize_snapshot = snapshot
+                return
+            baseline = self._before_optimize_snapshot if phase.startswith("after_optimize_") else self._cycle_snapshot
+            if baseline is None or not (phase.startswith("after_optimize_") or phase in {"after_mail", "after_gc_collect"}):
+                return
+            stats = [
+                stat for stat in snapshot.compare_to(baseline, "lineno")
+                if stat.size_diff > 0
+            ][:5]
+            items = [
+                f"{self._display_trace_filename(stat.traceback[0].filename)}:{stat.traceback[0].lineno} "
+                f"size_diff={stat.size_diff} count_diff={stat.count_diff}"
+                for stat in stats if stat.traceback
+            ]
+            if items:
+                logger.info("[memory] snapshot_diff phase=%s top=%s", phase, " | ".join(items))
+        except Exception:
+            logger.debug("[memory] tracemalloc snapshot diff failed", exc_info=True)
 
     def collect_and_log(self) -> None:
         """진단 모드에서만 Python GC를 실행한 뒤 마지막 메모리를 기록한다."""
@@ -159,3 +207,5 @@ class MemoryDiagnostics:
             logger.debug("[memory] tracemalloc 종료 실패", exc_info=True)
         self._owns_tracing = False
         self._started = False
+        self._cycle_snapshot = None
+        self._before_optimize_snapshot = None

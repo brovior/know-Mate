@@ -244,13 +244,14 @@ class EmailIndexer:
 
         db = lancedb.connect(str(db_path))
         self.table, self.table_was_recreated = get_or_create_emails_table(db, with_status=True)
-        self._maintenance = LanceTableMaintenance(
-            self.table, EMAIL_TABLE_NAME, maintenance_config,
-        )
         try:
             self.table_is_empty = self.table.count_rows() == 0
         except Exception:
             self.table_is_empty = False
+        self._maintenance = LanceTableMaintenance(
+            self.table, EMAIL_TABLE_NAME, maintenance_config, db_path=db_path,
+            recreated=self.table_was_recreated, confirmed_empty=self.table_is_empty,
+        )
 
     def get_index_state(
         self, mail_uid: str, mtime: float, ignored_chunk_ids: set[str] | None = None,
@@ -574,6 +575,19 @@ class EmailIndexer:
 
     def maintenance_periodic_due(self) -> bool:
         return self._maintenance.periodic_due()
+
+    def mark_maintenance_backlog(self) -> bool:
+        """Persist an actionable-mail backlog before processing it."""
+        return self._maintenance.mark_backlog_active()
+
+    def run_hard_limit_maintenance(self, **kwargs) -> bool:
+        return self._maintenance.checkpoint_hard_limit(**kwargs)
+
+    def finish_maintenance_backlog(self, **kwargs) -> bool:
+        return self._maintenance.finish_backlog(**kwargs)
+
+    def run_steady_maintenance(self, **kwargs) -> bool:
+        return self._maintenance.checkpoint_steady(**kwargs)
 
     def run_startup_maintenance(self, **kwargs) -> bool:
         return self._maintenance.run_startup_check(**kwargs)

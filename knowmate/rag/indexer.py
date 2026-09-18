@@ -73,12 +73,19 @@ class Indexer:
             self._crypto = crypto
 
         self._db = lancedb.connect(str(db_path))
+        self.table_was_recreated = False
         try:
             self._table = self._db.open_table(TABLE_NAME)
         except Exception:
             self._table = self._db.create_table(TABLE_NAME, schema=SCHEMA)
+            self.table_was_recreated = True
+        try:
+            self.table_is_empty = self._table.count_rows() == 0
+        except Exception:
+            self.table_is_empty = False
         self._maintenance = LanceTableMaintenance(
-            self._table, TABLE_NAME, maintenance_config,
+            self._table, TABLE_NAME, maintenance_config, db_path=db_path,
+            recreated=self.table_was_recreated, confirmed_empty=self.table_is_empty,
         )
 
     @property
@@ -155,6 +162,7 @@ class Indexer:
         t0 = time.perf_counter()
         self._table.add(all_rows)
         self._maintenance.record_mutation()
+        self.table_is_empty = False
         save_sec = time.perf_counter() - t0
 
         logger.info(
@@ -228,6 +236,20 @@ class Indexer:
 
     def maintenance_periodic_due(self) -> bool:
         return self._maintenance.periodic_due()
+
+    def mark_maintenance_backlog(self) -> bool:
+        """Mark a streaming document backlog before writes begin."""
+        return self._maintenance.mark_backlog_active()
+
+    def run_hard_limit_maintenance(self, **kwargs) -> bool:
+        return self._maintenance.checkpoint_hard_limit(**kwargs)
+
+    def finish_maintenance_backlog(self, **kwargs) -> bool:
+        """Close a completed document stream after its state checkpoint."""
+        return self._maintenance.finish_backlog(**kwargs)
+
+    def run_steady_maintenance(self, **kwargs) -> bool:
+        return self._maintenance.checkpoint_steady(**kwargs)
 
     def run_startup_maintenance(self, **kwargs) -> bool:
         return self._maintenance.run_startup_check(**kwargs)
