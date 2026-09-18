@@ -35,7 +35,7 @@ def test_logs_private_python_and_arrow_in_one_info_line(monkeypatch, caplog):
         diagnostics.start()
         diagnostics.log("after_mail")
 
-    memory_lines = [record.message for record in caplog.records if "[memory]" in record.message]
+    memory_lines = [record.message for record in caplog.records if "[memory] phase=" in record.message]
     assert memory_lines == [
         "[memory] phase=after_mail private_mib=50.0 python_current_mib=10.0 "
         "python_peak_mib=20.0 arrow_current_mib=30.0 arrow_peak_mib=40.0 "

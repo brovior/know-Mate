@@ -198,6 +198,15 @@ EMAIL_SCHEMA = pa.schema([
 
 ## 6. get-or-create + 스키마 마이그레이션 패턴
 
+### 메일 스캔 완료와 LanceDB 유지보수
+
+메일 스캔 결과는 `REMAINING` / `EXHAUSTED` / `UNKNOWN` 세 상태다. `EXHAUSTED`는 root 열거가
+완료되고 현재 actionable 후보를 모두 시도했으며, 마지막 embedding flush와 mail state checkpoint가
+성공하고 취소·전역 오류가 없을 때만 쓴다. Backoff 대상은 현재 actionable backlog가 아니다.
+후보가 하나라도 있으면 처리 전에 emails sidecar의 backlog marker를 연다. `REMAINING`/`UNKNOWN`은
+marker를 유지하고 final optimize를 하지 않는다. EXHAUSTED에서는 state checkpoint 뒤 marker close를
+원자 저장하고, close 저장 실패 시 in-memory marker만 닫고 optimize를 건너뛴다.
+
 ```python
 def get_or_create_emails_table(db):
     if "emails" in db.table_names():

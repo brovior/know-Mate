@@ -22,11 +22,12 @@ chunking:
                               # 비우거나 잘못된 값이면 1000으로 폴백.
 lancedb_maintenance:
   enabled: true
-  # 문서 chunks와 메일 emails 테이블에 각각 독립 적용된다.
-  startup_optimize_when_small_fragments_reach: 100  # 프로세스 최초 수집 사이클에서 1회 확인
-  optimize_every_mutations: 100                     # 성공한 add/delete/update 호출 누적 기준
-  cycle_end_min_mutations: 20                       # 사이클 끝 잔여 변경 기준. 0이면 비활성
-  failure_cooldown_sec: 300                         # 실패 뒤 재시도 대기(초)
+  # chunks/emails 별 sidecar가 backlog와 마지막 결과를 독립적으로 기억한다.
+  optimize_when_small_fragments_reach: 100       # 평상시 증분 수집에서 정리를 검토할 조각 수
+  backlog_hard_limit_small_fragments: 1000       # 대량 수집 중 메모리 보호를 위한 강제 상한
+  backlog_finalize_small_fragments_reach: 300    # backlog 소진 직후 즉시 정리할 최소 조각 수
+  min_optimize_interval_sec: 86400               # 평상시 반복 정리 방지 간격(24시간)
+  failure_cooldown_sec: 300                       # 실패 뒤 모든 trigger의 재시도 대기
 search:
   top_k_max: 10
   score_threshold: 0.3

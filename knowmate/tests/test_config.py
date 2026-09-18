@@ -47,6 +47,35 @@ def test_new_mail_progress_key_wins_during_legacy_migration(tmp_path, monkeypatc
     assert "batch_commit_every" not in persisted["mail"]
 
 
+def test_legacy_lance_maintenance_config_is_migrated_and_completed(tmp_path, monkeypatch):
+    """구형 mutation 정책을 제거하고 새 fragment 정책 기본값을 AppData config에 저장한다."""
+    import knowmate.config as config_module
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        "lancedb_maintenance:\n"
+        "  enabled: true\n"
+        "  startup_optimize_when_small_fragments_reach: 77\n"
+        "  optimize_every_mutations: 100\n"
+        "  cycle_end_min_mutations: 20\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(config_module, "_cache", None)
+    monkeypatch.setattr(config_module, "_get_config_path", lambda: config_path)
+
+    cfg = config_module.get_config()["lancedb_maintenance"]
+
+    assert cfg == {
+        "enabled": True,
+        "optimize_when_small_fragments_reach": 77,
+        "backlog_hard_limit_small_fragments": 1000,
+        "backlog_finalize_small_fragments_reach": 300,
+        "min_optimize_interval_sec": 86400,
+        "failure_cooldown_sec": 300,
+    }
+    assert yaml.safe_load(config_path.read_text(encoding="utf-8"))["lancedb_maintenance"] == cfg
+
+
 def test_exclude_update_failure_keeps_shared_config_unchanged(monkeypatch):
     """제외 설정 저장 실패는 워커가 참조하는 공유 설정도 바꾸지 않는다."""
     import knowmate.config as config_module

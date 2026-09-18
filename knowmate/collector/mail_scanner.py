@@ -9,6 +9,7 @@ import os
 import stat
 import time
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Iterator, TYPE_CHECKING
 
@@ -34,6 +35,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MAIL_EXTS = [".mysingle", ".eml"]
+
+
+class MailScanCompletion(str, Enum):
+    """Whether this invocation proved the currently actionable backlog ended."""
+
+    REMAINING = "REMAINING"
+    EXHAUSTED = "EXHAUSTED"
+    UNKNOWN = "UNKNOWN"
 
 
 @dataclass
@@ -388,6 +397,12 @@ def run_mail_scan(
         scan_status,
     )
     metrics.enumerate_filter_sort_s = time.perf_counter() - enumerate_started
+    # A one-cycle import must survive a crash/restart even when it never reaches
+    # the per-scan attempt limit.  Sidecar failure is warning-only for indexing.
+    if candidates:
+        marker = getattr(email_indexer, "mark_maintenance_backlog", None)
+        if callable(marker) and not marker():
+            logger.warning("[lance_maintenance] mail backlog marker save failed; continuing indexing")
 
     if table_was_recreated:
         logger.info("[mail_scanner] 메일 테이블 재생성 감지 — 성공 캐시를 다시 구축합니다")
@@ -686,7 +701,11 @@ def run_mail_scan(
         return True
 
     stop_after_global_error = False
+    cancelled = bool(cancel_check and cancel_check())
     for item in _candidates_from_cursor(candidates, state.get("cursor")):
+        if cancel_check and cancel_check():
+            cancelled = True
+            break
         path = item["path"]
         if attempted_count >= max_per_scan:
             break
@@ -814,14 +833,8 @@ def run_mail_scan(
 
         set_cursor(state, item)
         state_dirty = True
-        maintenance_due = getattr(email_indexer, "maintenance_periodic_due", None)
-        run_maintenance = getattr(email_indexer, "run_periodic_maintenance", None)
-        if (
-            callable(maintenance_due)
-            and callable(run_maintenance)
-            and maintenance_due()
-            and not (cancel_check and cancel_check())
-        ):
+        run_maintenance = getattr(email_indexer, "run_hard_limit_maintenance", None)
+        if callable(run_maintenance) and not (cancel_check and cancel_check()):
             # DB 결과를 가리키는 성공 캐시·커서를 먼저 내구성 있게 저장한 뒤에만
             # native optimize를 시작한다. 저장 실패 시 인덱싱은 유지하고 다음
             # 체크포인트로 최적화를 미룬다.
@@ -834,8 +847,11 @@ def run_mail_scan(
         if stop_after_global_error:
             break
 
-    if not stop_after_global_error:
-        flush_window()
+    final_flush_ok = False
+    if not stop_after_global_error and not cancelled and not (cancel_check and cancel_check()):
+        final_flush_ok = flush_window()
+    elif not prepared_window:
+        final_flush_ok = not stop_after_global_error and not cancelled
 
     report_final_progress()
 
@@ -844,6 +860,32 @@ def run_mail_scan(
         on_state_persisted(state_persisted)
     if failures_dirty:
         save_failures()
+    # EXHAUSTED is deliberately strict: enumeration must be complete, every
+    # actionable candidate must have been attempted, the final embedding flush
+    # must finish, state must be durable, and neither cancellation nor global
+    # error may have occurred.  Backoff entries are not actionable this cycle.
+    if (
+        cancelled
+        or (cancel_check and cancel_check())
+        or stop_after_global_error
+        or not scan_status["complete"]
+        or not final_flush_ok
+        or not state_persisted
+    ):
+        completion = MailScanCompletion.UNKNOWN
+    elif attempted_count < len(candidates):
+        completion = MailScanCompletion.REMAINING
+    else:
+        completion = MailScanCompletion.EXHAUSTED
+    email_indexer.last_mail_scan_completion = completion
+    finish_backlog = getattr(email_indexer, "finish_maintenance_backlog", None)
+    if callable(finish_backlog):
+        finish_backlog(
+            completion=completion.value,
+            checkpoint_succeeded=state_persisted,
+            cancelled=cancel_check,
+            memory_log=maintenance_memory_log,
+        )
     if migrate_count:
         logger.info("[mail_scanner] 포맷 마이그레이션 완료: 재인덱싱=%d건", migrate_count)
     logger.info(

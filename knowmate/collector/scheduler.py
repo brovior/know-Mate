@@ -553,9 +553,8 @@ class CollectorWorker(QThread):
         if pending_changed:
             save_state(self._state_file, state)
 
-        # 과거 실행에서 이미 쌓인 작은 fragment는 프로세스 최초 수집 사이클에만
-        # 테이블별 한 번 확인한다. 이 지점의 state는 이전/보류 삭제까지 저장된 상태다.
-        self._run_startup_maintenance()
+        # Startup optimize is intentionally absent: every decision is made only
+        # at a current durable state checkpoint below.
 
         from knowmate.collector import failure_state
         failures = failure_state.load_failures(self._failure_file)
@@ -802,6 +801,9 @@ class CollectorWorker(QThread):
                 pending_ids = previous.get("pending_delete_chunk_ids", [])
 
                 logger.debug("[단계3] 임베딩·저장 시작: %s", task.path)
+                marker = getattr(self._indexer, "mark_maintenance_backlog", None)
+                if callable(marker) and not marker():
+                    logger.warning("[lance_maintenance] 문서 backlog marker 저장 실패; 인덱싱은 계속")
                 chunk_ids = self._indexer.index_file(
                     path=task.path,
                     text=text,
@@ -888,8 +890,8 @@ class CollectorWorker(QThread):
                     task.mtime, task.size, self._get_now(),
                 )
 
-            maintenance_due = getattr(self._indexer, "maintenance_periodic_due", None)
-            if callable(maintenance_due) and maintenance_due() and not self._cancelled:
+            run_hard = getattr(self._indexer, "run_hard_limit_maintenance", None)
+            if callable(run_hard) and not self._cancelled:
                 try:
                     save_state(self._state_file, state)
                 except OSError as exc:
@@ -897,7 +899,7 @@ class CollectorWorker(QThread):
                         "[lance_maintenance] 문서 상태 저장 실패로 주기 optimize 연기: %s", exc,
                     )
                 else:
-                    self._run_periodic_maintenance(self._indexer)
+                    run_hard(**self._maintenance_kwargs())
 
             if com_used:
                 com_since_restart += 1
@@ -979,6 +981,21 @@ class CollectorWorker(QThread):
             self.indexing_needed.emit(f"일부 폴더 정리 건너뜀: {report.skipped_folders}")
 
         save_state(self._state_file, state)
+
+        # Documents are a finite streaming workload in this worker.  Close a
+        # durable marker before the optional final pass; an idle/no-mutation
+        # cycle still gets the steady check here rather than on startup.
+        if not self._cancelled:
+            finish_docs = getattr(self._indexer, "finish_maintenance_backlog", None)
+            if callable(finish_docs):
+                finish_docs(
+                    completion="EXHAUSTED", checkpoint_succeeded=True,
+                    **self._maintenance_kwargs(),
+                )
+            else:
+                run_steady = getattr(self._indexer, "run_steady_maintenance", None)
+                if callable(run_steady):
+                    run_steady(**self._maintenance_kwargs())
 
         # 실패 이력 저장 — 더 이상 존재하지 않는 파일 기록은 정리한 뒤 저장한다.
         # 이번 범위는 기록뿐이라, 여기 기록된 값으로 이번 사이클의 처리를
@@ -1079,13 +1096,19 @@ class CollectorWorker(QThread):
                 mail_state_persisted = False
                 logger.error("[mail_scanner] 메일 스캔 실패: %s", exc)
 
-        # run_mail_scan은 종료 전에 메일 상태를, 위 문서 경로는 cleanup 뒤 문서 상태를
-        # 저장했다. 취소가 없을 때만 잔여 mutation의 사이클 종료 최적화를 순차 실행한다.
-        self._run_cycle_end_maintenance((self._indexer,))
-        if mail_state_persisted:
-            self._run_cycle_end_maintenance((self._email_indexer,))
-        elif self._email_indexer is not None:
-            logger.warning("[lance_maintenance] 메일 상태 미저장으로 cycle-end optimize 연기")
+        # Mail completion owns its final optimize.  When mail scanning is
+        # disabled, exclusion deletion still receives a steady-only decision
+        # after its state checkpoint.
+        if self._email_indexer is not None and not self._config.get("mail", {}).get("enabled", False):
+            if mail_state_persisted and not self._cancelled:
+                run_hard = getattr(self._email_indexer, "run_hard_limit_maintenance", None)
+                if callable(run_hard):
+                    run_hard(**self._maintenance_kwargs())
+                run_steady = getattr(self._email_indexer, "run_steady_maintenance", None)
+                if callable(run_steady):
+                    run_steady(**self._maintenance_kwargs())
+            elif not mail_state_persisted:
+                logger.warning("[lance_maintenance] 메일 상태 미저장으로 steady optimize 연기")
 
         if memory_diagnostics is not None:
             memory_diagnostics.log("after_mail")
