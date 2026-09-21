@@ -6,10 +6,11 @@ import gc
 import logging
 import os
 from pathlib import Path
+import time
 import tracemalloc
 from collections.abc import Callable
 from ctypes import wintypes
-from typing import Any
+from typing import Any, Mapping
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +80,8 @@ class MemoryDiagnostics:
         *,
         private_bytes_reader: Callable[[], int | None] = get_process_private_bytes,
         arrow_pool_getter: Callable[[], Any] = _default_arrow_pool,
+        pid: int | None = None,
+        cycle_id: str | None = None,
     ) -> None:
         self.enabled = enabled
         self._private_bytes_reader = private_bytes_reader
@@ -87,6 +90,8 @@ class MemoryDiagnostics:
         self._started = False
         self._cycle_snapshot = None
         self._before_optimize_snapshot = None
+        self._pid = os.getpid() if pid is None else pid
+        self._cycle_id = cycle_id or f"{self._pid}-{time.time_ns()}"
 
     def start(self) -> None:
         """필요할 때만 tracemalloc 추적을 시작하고 사이클 peak를 초기화한다."""
@@ -98,7 +103,10 @@ class MemoryDiagnostics:
                 self._owns_tracing = True
             else:
                 logger.info(
-                    "[memory] external tracemalloc tracing detected; preserving its depth and lifetime"
+                    "[memory] pid=%d cycle_id=%s external tracemalloc tracing detected; "
+                    "preserving its depth and lifetime",
+                    self._pid,
+                    self._cycle_id,
                 )
             if self._owns_tracing:
                 tracemalloc.reset_peak()
@@ -107,7 +115,7 @@ class MemoryDiagnostics:
             logger.debug("[memory] tracemalloc 시작 실패", exc_info=True)
         self._started = True
 
-    def log(self, phase: str) -> None:
+    def log(self, phase: str, *, counters: Mapping[str, int] | None = None) -> None:
         """한 시점의 Private/Python/Arrow 메모리를 한 줄 INFO로 기록한다."""
         if not self.enabled:
             return
@@ -137,9 +145,14 @@ class MemoryDiagnostics:
         except Exception:
             logger.debug("[memory] PyArrow 메모리 풀 조회 실패", exc_info=True)
 
+        counter_text = "" if not counters else " " + " ".join(
+            f"{key}={value}" for key, value in sorted(counters.items())
+        )
         logger.info(
-            "[memory] phase=%s private_mib=%s python_current_mib=%s "
-            "python_peak_mib=%s arrow_current_mib=%s arrow_peak_mib=%s arrow_backend=%s",
+            "[memory] pid=%d cycle_id=%s phase=%s private_mib=%s python_current_mib=%s "
+            "python_peak_mib=%s arrow_current_mib=%s arrow_peak_mib=%s arrow_backend=%s%s",
+            self._pid,
+            self._cycle_id,
             phase,
             _format_mib(private_bytes),
             _format_mib(python_current),
@@ -147,6 +160,7 @@ class MemoryDiagnostics:
             _format_mib(arrow_current),
             _format_mib(arrow_peak),
             arrow_backend,
+            counter_text,
         )
         self._log_snapshot_diff(phase)
 
@@ -166,13 +180,17 @@ class MemoryDiagnostics:
         """Log top code-location deltas only; snapshots never leave process memory."""
         if not self.enabled or not tracemalloc.is_tracing():
             return
+        is_before_optimize = phase.startswith("before_optimize_")
+        is_after_optimize = phase.startswith("after_optimize_")
+        if not (is_before_optimize or is_after_optimize or phase in {"after_mail", "after_gc_collect"}):
+            return
         try:
             snapshot = tracemalloc.take_snapshot()
-            if phase.startswith("before_optimize_"):
+            if is_before_optimize:
                 self._before_optimize_snapshot = snapshot
                 return
-            baseline = self._before_optimize_snapshot if phase.startswith("after_optimize_") else self._cycle_snapshot
-            if baseline is None or not (phase.startswith("after_optimize_") or phase in {"after_mail", "after_gc_collect"}):
+            baseline = self._before_optimize_snapshot if is_after_optimize else self._cycle_snapshot
+            if baseline is None:
                 return
             stats = [
                 stat for stat in snapshot.compare_to(baseline, "lineno")
@@ -184,7 +202,10 @@ class MemoryDiagnostics:
                 for stat in stats if stat.traceback
             ]
             if items:
-                logger.info("[memory] snapshot_diff phase=%s top=%s", phase, " | ".join(items))
+                logger.info(
+                    "[memory] pid=%d cycle_id=%s snapshot_diff phase=%s top=%s",
+                    self._pid, self._cycle_id, phase, " | ".join(items),
+                )
         except Exception:
             logger.debug("[memory] tracemalloc snapshot diff failed", exc_info=True)
 

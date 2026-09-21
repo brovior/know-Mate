@@ -42,6 +42,9 @@ SCHEMA = pa.schema([
     pa.field("indexed_at", pa.string()),
     pa.field("chunk_index",pa.int32()),
     pa.field("chunk_total",pa.int32()),
+    pa.field("doc_uid",    pa.string()),   # 정규화 경로 기반 문서 식별자
+    pa.field("revision",   pa.string()),   # size·mtime_ns·index version
+    pa.field("generation_id", pa.string()),# 교체 단위(청크 ID와 별개)
     pa.field("text",       pa.string()),   # AES-256-GCM 암호화
     pa.field("vector",     pa.list_(pa.float32(), 1024)),
     pa.field("is_deleted", pa.bool_()),
@@ -60,11 +63,24 @@ SCHEMA = pa.schema([
 
 **수정 문서 교체 동작**
 
-수정된 문서는 새 청크 저장에 성공한 뒤 기존 청크를 즉시 물리 삭제한다. 삭제 전에 기존
-`chunk_ids`를 state의 `pending_delete_chunk_ids`로 원자적 저장하며, 삭제가 실패하면 이 목록을
-유지해 다음 수집 사이클 시작 시 다시 삭제한다. 새 청크 생성이 실패한 경우에는 state와 기존
-활성 청크를 변경하지 않는다. 이 교체 경로는 파일 미발견 여부를 재확인하는 위의 2단계 soft
-delete와 분리한다.
+`chunks`에는 정규화 경로의 `doc_uid`, 파일 크기·`mtime_ns`·인덱스 버전의 `revision`, 무작위
+`generation_id`를 함께 저장한다. 한 문서는 청크 수·인덱스(0..N-1)·revision·활성 상태가 모두
+일치하는 generation만 완료로 인정한다. 따라서 LanceDB `add()` 성공 뒤 JSON 저장 전에 종료돼도,
+다음 후보 처리 전 필요한 메타데이터 projection으로 완료 generation 하나를 확인해 state를 복구하고
+같은 revision을 다시 add하지 않는다. metadata 조회 실패는 중복을 피하기 위해 add를 중단한다.
+
+수정 문서는 새 generation 저장 후 DB에서 확인한 이전 generation ID만 정리한다. 청크 ID는 generation마다
+새 무작위값이라 이전 삭제가 새 행을 지울 수 없다. 같은 revision의 완료 generation이 둘 이상이면
+`indexed_at`, `generation_id` 순으로 하나를 남기고 나머지를 정리한다. legacy·불완전·soft-delete 행은
+완료 generation으로 쓰지 않으며, 교체나 orphan 정리로 안전하게 제거한다.
+
+state는 메모리 dict 하나를 유지하고 상태가 바뀐 경우에만 전체 상태를 묶어 `collector.state_flush_docs`
+(기본 50건) 또는 `collector.state_flush_seconds`(기본 30초) 확인 시 원자 저장하며, 사이클 종료·취소·오류에도
+flush한다. 저장 실패 중에는 다음 안전 지점까지 보류되므로 30초는 실시간 보장값이 아니다.
+삭제 대기 ID는 state에 먼저 넣고 삭제 성공 시에만 뺀다. 첫 DB add 전의 작은 recovery marker가 남아
+있거나 JSON이 없거나 손상됐는데 DB 행이 있을 때만 시작 시 전체 문서 **메타데이터 열만** 읽어, JSON에 없던
+삭제된 원본도 기존 orphan 경로로 복구한다. 유휴 상태에서는 이 전체 읽기를 하지 않는다. v3 스키마 upgrade는
+기존 행을 보존하며, legacy 행은 한 번의 문서 재인덱싱 뒤 교체·정리된다.
 
 ---
 
@@ -224,8 +240,10 @@ openpyxl이 `docProps/custom.xml` 타입 오류로 실패하면, custom.xml 파�
    identity·generation·마지막 결과·backlog marker·steady gate를 tmp→replace로 보관한다.
    활성 backlog는 1000개에서 hard-limit optimize, 실제 완료 때 300개에서 final optimize를
    한 번만 시도한다. 그 외에는 100개와 24시간 steady gate가 모두 충족될 때만 실행한다.
-   실패 cooldown과 no-effect 뒤 +300 growth 억제는 모든 트리거에 적용한다. optimize는
-   문서/mail state가 먼저 저장된 checkpoint에서만 시작하며 sidecar 오류는 indexing을 막지 않는다.
+   실패 cooldown과 no-effect 뒤 +300 growth 억제는 모든 트리거에 적용한다. hard-limit은
+   fragment 통계가 실제 optimize 필요를 확인한 경우에만 문서/mail state 저장 callback을 요청하고,
+   저장 성공 뒤에만 시작한다. 저장 실패는 due 상태를 유지해 다음 기회에 재시도하며 sidecar 오류는
+   indexing을 막지 않는다.
 5. **dry-run 모드**: `cleanup.dry_run: true`이면 대상 목록 로그만 출력 (기본값 true). 설정 패널에선 "제거된 폴더 데이터 자동 삭제" 토글(긍정형)로 노출.
 6. **사이클 리포트**: 스캔N / 신규a / 변경b / 마킹c / 물리삭제d / 스킵 폴더 목록 매 사이클 로그
 
@@ -277,8 +295,9 @@ chunks·emails 테이블 **전체**를 `to_arrow().to_pandas()`로 로드했고,
 **수집 사이클 메모리 진단** (`collector.memory_diagnostics_enabled`, 기본 `false`): 메모리 증가의
 소유 영역을 나누기 위해 `cycle_start` → `after_document_indexing` → `after_documents`(orphan·purge
 정리와 상태 저장 뒤) → `after_mail` → `after_gc_collect` 시점마다 한 줄 INFO 로그를 남긴다.
-로그에는 Windows Process Private Bytes, `tracemalloc` current/peak, PyArrow 기본 메모리 풀의
-current/peak/backend만 포함하며 문서·메일 내용은 포함하지 않는다. Windows Private Bytes는 번들에
+로그에는 PID·cycle ID, Windows Process Private Bytes, `tracemalloc` current/peak, PyArrow 기본 메모리
+풀의 current/peak/backend만 포함하며 문서·메일 내용은 포함하지 않는다. 메일 처리 중에는 50건마다
+attempted·commit·cache-hit·상태조회 누적값만 함께 표본화한다. Windows Private Bytes는 번들에
 새 의존성을 추가하지 않고 `GetProcessMemoryInfo`로 조회한다. 진단을 켠 사이클에서만
 `tracemalloc`과 마지막 `gc.collect()`를 실행하며, 운영 메모리 동작을 바꾸는 Arrow
 `release_unused()`는 호출하지 않는다. Arrow peak는 기본 메모리 풀 생성 이후의 누적 고수위다.
@@ -705,16 +724,14 @@ helper 분리가 최종 구조다.
 동시에 쓰면 락 충돌·데이터 유실 위험이 있다(원칙8 "수집기는 QThread 워커에서만 실행, multiprocessing
 금지"와 동일한 이유 — 동시 쓰기 자체가 문제).
 
-`QLocalServer`/`QLocalSocket`(명명된 로컬 소켓) 기반:
-- `main()`이 `QApplication` 생성 직후 `try_acquire_or_notify_existing()`을 호출해 기존 서버
-  (`AegisDeskSingleInstance`)에 연결을 시도한다.
-- **연결되면** 이미 다른 인스턴스가 떠 있는 것 → `"show"` 메시지를 보내고 새 프로세스는 창을 만들지
-  않고 즉시 종료한다.
-- **연결되지 않으면** 내가 첫 인스턴스 → `SingleInstanceServer`가 리슨을 시작하고, 이후 다른
-  프로세스가 접속해 `"show"`를 보내면 `show_requested` 시그널을 emit → `MainWindow._show_from_tray`
-  (트레이 복원과 동일 로직)로 연결돼 기존 창이 앞으로 나온다.
-- 이전 비정상 종료로 서버 이름이 남아있으면 `listen()` 전에 `QLocalServer.removeServer()`로 정리
-  후 재시도한다.
+`QLockFile` 권위 락 + `QLocalServer`/`QLocalSocket`(명명된 로컬 소켓) 기반:
+- `main()`은 `QApplication` 생성 직후 splash·상태 파일·LanceDB 초기화보다 먼저 사용자 AppData의
+  권위 락을 잡고 `listen(AegisDeskSingleInstance)`으로 이름을 선점한다. 락은 앱 수명 동안 유지한다.
+- 락을 잡지 못한 secondary 후보는 기존 endpoint에만 `"show"`를 보낸다. 초기화 중 들어온 show는
+  server가 보관했다가 MainWindow 준비 뒤 복원한다.
+- 권위 락은 장기 보유 중 시간만으로 stale로 보지 않으며, `tryLock()`의 PID 기반 stale 복구만 사용한다.
+  락 획득 실패 시에는 endpoint 연결을 짧게 재시도한 뒤 중단하고 lock 파일을 강제로 지우지 않는다.
+  **권위 락 보유자만** 연결 불가 stale endpoint를 한 번 정리하고 listen을 재시도할 수 있다.
 - QLocalServer/Socket은 `QCoreApplication` 인스턴스가 있어야 동작하므로 반드시 `QApplication` 생성
   이후에 호출해야 한다.
 

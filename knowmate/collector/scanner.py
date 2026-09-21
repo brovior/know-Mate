@@ -88,7 +88,11 @@ def iter_scan_folder(
                                 st.st_size / 1024 / 1024, max_file_size_mb, entry.path,
                             )
                             continue
-                        yield entry.path, {"mtime": st.st_mtime, "size": st.st_size}
+                        yield entry.path, {
+                            "mtime": st.st_mtime,
+                            "mtime_ns": st.st_mtime_ns,
+                            "size": st.st_size,
+                        }
                     except OSError as exc:
                         logger.warning("파일 stat 실패: %s (%s)", entry.path, exc)
         except OSError as exc:
@@ -131,7 +135,13 @@ def classify_changes(
             new.append(path)
         else:
             prev = saved[path]
-            if meta["mtime"] != prev.get("mtime") or meta["size"] != prev.get("size"):
+            previous_ns = prev.get("mtime_ns")
+            current_ns = meta.get("mtime_ns")
+            if (
+                meta["mtime"] != prev.get("mtime")
+                or meta["size"] != prev.get("size")
+                or (previous_ns is not None and current_ns is not None and current_ns != previous_ns)
+            ):
                 modified.append(path)
 
     for path in saved:

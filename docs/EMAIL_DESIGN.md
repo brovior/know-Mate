@@ -206,6 +206,10 @@ EMAIL_SCHEMA = pa.schema([
 후보가 하나라도 있으면 처리 전에 emails sidecar의 backlog marker를 연다. `REMAINING`/`UNKNOWN`은
 marker를 유지하고 final optimize를 하지 않는다. EXHAUSTED에서는 state checkpoint 뒤 marker close를
 원자 저장하고, close 저장 실패 시 in-memory marker만 닫고 optimize를 건너뛴다.
+처리 중 hard-limit 검사는 기본 100회 단위로 fragment 통계만 확인하고, 실제 optimize 임계에 도달한 경우에만
+메일 상태 checkpoint를 요청한다. 따라서 optimize가 필요 없는 500건 스캔은 최종 checkpoint 한 번만
+상태 파일을 저장한다. checkpoint가 실패하면 optimize를 시작하지 않고 다음 처리 기회에 같은 due를
+재시도한다. 삭제 대기열의 등록·삭제 성공 후 제거는 기존처럼 즉시 저장한다.
 
 ```python
 def get_or_create_emails_table(db):

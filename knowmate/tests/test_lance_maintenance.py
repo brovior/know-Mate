@@ -34,7 +34,7 @@ def test_real_lancedb_optimize_preserves_rows_and_reduces_small_fragments(tmp_pa
         table.add([{"id": value, "text": str(value)}])
 
     before = table.stats()["fragment_stats"]["num_small_fragments"]
-    assert maintenance.checkpoint_hard_limit()
+    assert maintenance.checkpoint_hard_limit(ensure_durable=lambda: True)
     after = table.stats()["fragment_stats"]["num_small_fragments"]
     assert after < before
     assert table.count_rows() == 21

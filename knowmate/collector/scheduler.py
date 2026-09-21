@@ -26,6 +26,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _flush_document_state_on_exit(method):
+    """Flush dirty document state when an unexpected cycle exception escapes."""
+    def wrapped(self, *args, **kwargs):
+        self._document_state_flush = None
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            flush = getattr(self, "_document_state_flush", None)
+            if callable(flush):
+                flush(force=True)
+            self._document_state_flush = None
+    return wrapped
+
+
 def _migrate_legacy_mail_failures(legacy_file: Path, failure_file: Path) -> bool:
     """기존 mail 전용 실패 이력을 공용 파일로 보존 병합하고 원본을 보관한다."""
     from knowmate.collector import failure_state
@@ -131,6 +145,7 @@ class IndexTask:
     com_rank: int = field(default=_PLAIN_RANK, compare=False)
     size: int = field(default=0, compare=False)  # COM 워치독 타임아웃(크기 비례) 산정용
     mtime: float = field(default=0.0, compare=False)  # 처리 중 외부 변경 감지용(스캔 시점 값)
+    mtime_ns: int = field(default=0, compare=False)  # revision 정확성 및 ns 단위 변경 감지용
 
 
 def _com_timeout_for_size(size_bytes: int, base: float, per_mb: float, cap: float) -> float:
@@ -154,7 +169,8 @@ class CollectorWorker(QThread):
 
     def __init__(self, config, indexer, extractor, state_file=None, email_indexer=None,
                  parent=None, get_idle_seconds=None, com_restart_fn=None,
-                 purge_meta_file=None, failure_file=None, get_now=None, mail_state_file=None):
+                 purge_meta_file=None, failure_file=None, get_now=None, mail_state_file=None,
+                 com_poison_recovery_fn=None):
         """수집기 워커를 초기화한다.
 
         get_idle_seconds: () -> float, 현재 OS 유휴 경과초 조회(테스트 주입용,
@@ -164,6 +180,8 @@ class CollectorWorker(QThread):
         com_restart_fn: () -> None, COM Office 주기 재기동 시 호출(테스트 주입용,
             기본은 secure.com_reader.quit_com_apps). COM 파일 N건 처리마다 Office를
             선제적으로 재기동해 장시간 사이클에서의 핸들·메모리 누수를 완화한다.
+        com_poison_recovery_fn: (exe: str) -> bool, 치명적인 Office RPC 단절 직후
+            해당 AegisDesk 소유 프로세스의 종료를 확인하는 함수(테스트 주입용).
         purge_meta_file: purge 스킵/reconciliation 상태 sidecar 경로(테스트 주입용,
             기본은 %APPDATA%/AegisDesk/index_state.meta.json). index_state.json과
             분리된 별도 파일이라 기존 state 스키마·소비자에 영향이 없다.
@@ -188,6 +206,10 @@ class CollectorWorker(QThread):
             from knowmate.secure.com_reader import quit_com_apps as _default_restart
             com_restart_fn = _default_restart
         self._com_restart_fn = com_restart_fn
+        if com_poison_recovery_fn is None:
+            from knowmate.secure.office_guard import recover_poisoned_office as _default_recovery
+            com_poison_recovery_fn = _default_recovery
+        self._com_poison_recovery_fn = com_poison_recovery_fn
         self._get_now = get_now or time.time
         from knowmate.config import get_data_dir
         default_state_file = get_data_dir() / "index_state.json"
@@ -226,6 +248,7 @@ class CollectorWorker(QThread):
         (수동 트리거 전용). 이력·연속 실패 횟수는 보존된다."""
         self._retry_requested = True
 
+    @_flush_document_state_on_exit
     def run(self):
         """증분 스캔 사이클 1회를 실행한다."""
         self._cancelled = False
@@ -530,6 +553,135 @@ class CollectorWorker(QThread):
         self._indexer._xlsx_max_rows_per_sheet = xlsx_max_rows_per_sheet
 
         state = load_state(self._state_file)
+        # A marker is deliberately much smaller than the state map.  It is
+        # written before the first DB add and cleared only after a successful
+        # batch checkpoint, so a crash cannot strand rows for a source which
+        # was deleted before the next scan.
+        recovery_marker = self._state_file.with_name(
+            f"{self._state_file.stem}.recovery{self._state_file.suffix}"
+        )
+        recovery_marker_active = recovery_marker.exists()
+        recovery_marker_written = recovery_marker_active
+        unresolved_adds: set[str] = {"previous-run"} if recovery_marker_active else set()
+        state_dirty = False
+        dirty_documents = 0
+        last_state_flush = time.monotonic()
+        from knowmate.config import document_state_flush_settings
+        state_flush_docs, state_flush_seconds = document_state_flush_settings(collector_cfg)
+        if state_flush_docs < 1 or state_flush_seconds <= 0:
+            raise ValueError("collector state flush configuration must be positive")
+
+        def mark_state_dirty(*, document: bool = False) -> None:
+            """Record an in-memory state mutation for the bounded checkpoint."""
+            nonlocal state_dirty, dirty_documents
+            state_dirty = True
+            if document:
+                dirty_documents += 1
+
+        def flush_document_state(*, force: bool = False) -> bool:
+            """Persist only dirty document state, then retire a recovery marker."""
+            nonlocal state_dirty, dirty_documents, last_state_flush, recovery_marker_written
+            if not state_dirty:
+                return True
+            if not force and dirty_documents < state_flush_docs and (
+                time.monotonic() - last_state_flush < state_flush_seconds
+            ):
+                return True
+            try:
+                save_state(self._state_file, state)
+            except OSError as exc:
+                logger.warning("[collector] 문서 상태 batch 저장 실패: %s", exc)
+                return False
+            state_dirty = False
+            dirty_documents = 0
+            last_state_flush = time.monotonic()
+            # The current worker has now durably paired this table with state;
+            # reuse of the same Indexer in a later cycle must not look like a
+            # newly recreated table again.
+            self._indexer.table_was_recreated = False
+            self._indexer.table_is_empty = False
+            if recovery_marker_written and not unresolved_adds:
+                try:
+                    recovery_marker.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning("[collector] 문서 복구 marker 제거 실패: %s", exc)
+                else:
+                    recovery_marker_written = False
+            return True
+
+        self._document_state_flush = flush_document_state
+
+        def ensure_recovery_marker() -> bool:
+            """Durably mark an uncertain run before its first document add."""
+            nonlocal recovery_marker_written
+            if recovery_marker_written:
+                return True
+            try:
+                save_state(recovery_marker, {"active": True})
+            except OSError as exc:
+                logger.error("[collector] 문서 복구 marker 저장 실패 — DB 쓰기 중단: %s", exc)
+                return False
+            recovery_marker_written = True
+            return True
+
+        # A newly recreated/confirmed-empty table cannot honour a prior JSON
+        # generation.  Invalidate only state that claims searchable chunks;
+        # an intentional empty-document checkpoint remains valid.  This is a
+        # once-per-worker repair, not a permanent empty-table reindex loop.
+        stale_rows_claimed = any(
+            isinstance(entry, dict) and bool(entry.get("chunk_ids"))
+            for entry in state.values()
+        )
+        if stale_rows_claimed and (
+            getattr(self._indexer, "table_was_recreated", False)
+            or getattr(self._indexer, "table_is_empty", False)
+        ):
+            for entry in state.values():
+                if not isinstance(entry, dict):
+                    continue
+                entry["chunk_ids"] = []
+                entry.pop("pending_delete_chunk_ids", None)
+                entry.pop("revision", None)
+                entry.pop("generation_id", None)
+                entry["index_version"] = ""
+            mark_state_dirty()
+
+        try:
+            state_missing_with_rows = not state and self._indexer.table.count_rows() > 0
+        except Exception as exc:
+            logger.error("[collector] 문서 DB 상태 확인 실패 — 이번 사이클 DB 쓰기 중단: %s", exc)
+            self.finished.emit("문서 인덱스 복구 확인 실패")
+            return
+        if recovery_marker_active or state_missing_with_rows:
+            try:
+                recovered = self._indexer.recover_document_state()
+            except Exception as exc:
+                # A failed metadata read is ambiguous.  Do not add documents
+                # until a later cycle can prove what the prior DB write did.
+                logger.error("[collector] 문서 DB 복구 조회 실패 — 이번 사이클 DB 쓰기 중단: %s", exc)
+                self.finished.emit("문서 인덱스 복구 확인 실패")
+                return
+            for generation in recovered:
+                path = generation.get("file_path")
+                if not isinstance(path, str) or not path:
+                    continue
+                # Recovery intentionally does not select a current generation
+                # by timestamp.  A live source is revalidated by exact
+                # revision below; a missing one uses these IDs for orphan
+                # cleanup.
+                state[path] = {
+                    "mtime": 0.0,
+                    "size": 0,
+                    "indexed_at": "",
+                    "chunk_ids": generation["chunk_ids"],
+                    "index_version": "",
+                    "method": "plain",
+                }
+                mark_state_dirty()
+            # Every projected DB row is now represented in memory.  The marker
+            # stays until that map is checkpointed, then normal idle cycles do
+            # no full metadata scan.
+            unresolved_adds.discard("previous-run")
 
         # 재인덱싱은 새 청크를 먼저 저장하고 기존 청크를 지운다. 이전 사이클에서
         # 기존 청크 삭제가 실패했다면 state에 남긴 ID를 스캔 전에 다시 정리한다.
@@ -551,7 +703,7 @@ class CollectorWorker(QThread):
                 entry.pop("pending_delete_chunk_ids", None)
                 pending_changed = True
         if pending_changed:
-            save_state(self._state_file, state)
+            mark_state_dirty()
 
         # Startup optimize is intentionally absent: every decision is made only
         # at a current durable state checkpoint below.
@@ -595,6 +747,7 @@ class CollectorWorker(QThread):
         # COM 추출 행오버 워치독 (base<=0이면 비활성)
         from knowmate.collector.com_watchdog import ComWatchdog
         from knowmate.secure import office_guard as _og
+        from knowmate.secure.com_reader import OfficeComPoisonError
         watchdog = ComWatchdog(terminate_fn=_og.terminate_stuck_office) if com_timeout_base > 0 else None
 
         logger.info("[collector] 작업 시작 — 폴더 스캔·인덱싱 파이프라인")
@@ -622,9 +775,18 @@ class CollectorWorker(QThread):
                         prev = state.get(path)
                         if prev is None:
                             action = "new"
-                        elif meta["mtime"] != prev.get("mtime") or meta["size"] != prev.get("size"):
+                        elif (
+                            meta["mtime"] != prev.get("mtime")
+                            or meta["size"] != prev.get("size")
+                            or (
+                                prev.get("mtime_ns") is not None
+                                and meta.get("mtime_ns") is not None
+                                and meta["mtime_ns"] != prev.get("mtime_ns")
+                            )
+                        ):
                             action = "modified"
-                        elif prev.get("index_version") != DOC_INDEX_VERSION:
+                        elif (prev.get("index_version") != DOC_INDEX_VERSION
+                              or not prev.get("revision") or not prev.get("generation_id")):
                             # 인덱싱 포맷 변경 → 1회 자동 재인덱싱
                             if not migrate_logged:
                                 logger.info("[collector] 문서 인덱싱 포맷 변경 감지 — 기존 문서 재인덱싱 시작")
@@ -673,6 +835,7 @@ class CollectorWorker(QThread):
                             IndexTask(
                                 priority, path, action, com_rank,
                                 size=meta.get("size", 0), mtime=meta.get("mtime", 0.0),
+                                mtime_ns=meta.get("mtime_ns", 0),
                             ),
                         ))
                         found += 1
@@ -693,6 +856,9 @@ class CollectorWorker(QThread):
         unreadable = []
         com_since_restart = 0
         restart_count = 0
+        poison_recovery_count = 0
+        poison_recovery_failed = 0
+        poisoned_exes: set[str] = set()
         changed_during = []  # 추출 도중 파일이 바뀌어 이번 사이클에 인덱싱하지 않은 경로들
         consumer_backoff_deferred = 0  # 소비자 재확인이 처리 직전에 걸러낸 건수(4차)
 
@@ -706,7 +872,7 @@ class CollectorWorker(QThread):
                 self.last_cycle_changed = True
                 self.finished.emit(f"인덱싱 취소됨 ({done}건 처리 완료)")
                 producer.join(timeout=5)
-                save_state(self._state_file, state)
+                flush_document_state(force=True)
                 failure_state.save_failures(self._failure_file, failures)
                 return
 
@@ -746,8 +912,83 @@ class CollectorWorker(QThread):
             total_known = producer_state["total"]
             self.progress.emit(done, total_known if total_known is not None else -2, filename)
 
+            # This query is the authority for a prior add whose JSON checkpoint
+            # may have been lost.  It runs before any extractor/COM work.  A
+            # metadata failure is fail-closed: adding another generation would
+            # turn an uncertain commit into duplicate searchable content.
+            from knowmate.rag.indexer import DOC_INDEX_VERSION
+            doc_uid = self._indexer.document_uid(task.path)
+            revision = self._indexer.document_revision(
+                task.path, mtime=task.mtime, size=task.size,
+                mtime_ns=task.mtime_ns or None,
+            )
+            try:
+                recovered_generation = self._indexer.recover_generation(doc_uid, revision)
+            except Exception as exc:
+                logger.error("[collector] 문서 DB 완전성 확인 실패 — add 건너뜀: %s (%s)", task.path, exc)
+                failed.append(task.path)
+                continue
+            if recovered_generation is not None:
+                if not ensure_recovery_marker():
+                    failed.append(task.path)
+                    continue
+                recovery_entry_key = f"recovered:{doc_uid}"
+                unresolved_adds.add(recovery_entry_key)
+                previous = state.get(task.path, {})
+                try:
+                    recovered_delete_ids = list(dict.fromkeys([
+                        *recovered_generation["old_chunk_ids"],
+                        *self._indexer.path_cleanup_ids(task.path),
+                        *previous.get("chunk_ids", []),
+                        *previous.get("pending_delete_chunk_ids", []),
+                    ]))
+                except Exception as exc:
+                    logger.error("[collector] 복구 generation 이전 행 조회 실패 — add 건너뜀: %s (%s)", task.path, exc)
+                    failed.append(task.path)
+                    continue
+                retained_ids = set(recovered_generation["chunk_ids"])
+                recovered_delete_ids = [
+                    chunk_id for chunk_id in recovered_delete_ids if chunk_id not in retained_ids
+                ]
+                recovered_entry = {
+                    "mtime": task.mtime,
+                    "mtime_ns": task.mtime_ns,
+                    "size": task.size,
+                    "indexed_at": recovered_generation["indexed_at"],
+                    "chunk_ids": recovered_generation["chunk_ids"],
+                    "index_version": DOC_INDEX_VERSION,
+                    "doc_uid": doc_uid,
+                    "revision": revision,
+                    "generation_id": recovered_generation["generation_id"],
+                    "method": (state.get(task.path) or {}).get("method", "plain"),
+                }
+                if recovered_delete_ids:
+                    recovered_entry["pending_delete_chunk_ids"] = recovered_delete_ids
+                state[task.path] = recovered_entry
+                mark_state_dirty(document=True)
+                unresolved_adds.discard(recovery_entry_key)
+                if recovered_delete_ids:
+                    try:
+                        self._indexer.delete_chunks_permanently(recovered_delete_ids)
+                    except Exception as exc:
+                        logger.warning("[collector] 복구된 이전 generation 삭제 실패: %s", exc)
+                    else:
+                        recovered_entry.pop("pending_delete_chunk_ids", None)
+                        mark_state_dirty()
+                flush_document_state()
+                failure_state.note_success(failures, task.path)
+                logger.info("[collector] 완전한 DB generation 복구: %s", task.path)
+                continue
+
             is_com = _classify_extract_method(task.path) == "com"
             com_used = False
+            task_exe = _og.process_for_ext(Path(task.path).suffix.lower())
+            if is_com and task_exe in poisoned_exes:
+                # 같은 Office만 이번 사이클 연기한다. 같은 파일을 즉시 재시도하지
+                # 않고 Word/PPT/plain 작업은 계속 진행한다.
+                deferred.append(task.path)
+                logger.warning("[collector] COM poison 복구 미확인으로 %s 연기: %s", task_exe, task.path)
+                continue
 
             try:
                 logger.debug("[단계1] 텍스트 추출 시작: %s", task.path)
@@ -758,6 +999,31 @@ class CollectorWorker(QThread):
                 _wd_fired_stage = None  # 이번 파일에서 워치독이 실제로 발화했다면 그 단계
                 if watchdog is not None and is_com:
                     _wd_exe = _og.process_for_ext(Path(task.path).suffix.lower())
+                def _dynamic_com_begin(exe: str) -> None:
+                    nonlocal _wd_exe
+                    if exe in poisoned_exes:
+                        raise OfficeBusyError(f"COM poison 복구 미확인으로 {exe} COM 진입 연기")
+                    _wd_exe = exe
+                    _og.begin_com_op(exe)
+                    if watchdog is not None:
+                        _timeout = _com_timeout_for_size(
+                            task.size, com_timeout_base, com_timeout_per_mb, com_timeout_cap
+                        )
+                        watchdog.arm(exe, _timeout)
+
+                def _dynamic_com_end() -> None:
+                    nonlocal _wd_exe, _wd_fired_stage
+                    try:
+                        if _wd_exe and watchdog is not None:
+                            _wd_fired_stage = watchdog.disarm()
+                    finally:
+                        if _wd_exe:
+                            _og.end_com_op()
+                            _wd_exe = None
+
+                dynamic_hooks = getattr(self._extractor, "set_com_operation_hooks", None)
+                if callable(dynamic_hooks) and not is_com:
+                    dynamic_hooks(_dynamic_com_begin, _dynamic_com_end)
                 try:
                     if _wd_exe:
                         _timeout = _com_timeout_for_size(
@@ -767,9 +1033,13 @@ class CollectorWorker(QThread):
                         watchdog.arm(_wd_exe, _timeout)
                     text = self._extractor.extract(task.path)
                 finally:
-                    if _wd_exe:
-                        _wd_fired_stage = watchdog.disarm()
-                        _og.end_com_op()
+                    if _wd_exe and is_com:
+                        try:
+                            _wd_fired_stage = watchdog.disarm()
+                        finally:
+                            _og.end_com_op()
+                    if callable(dynamic_hooks) and not is_com:
+                        dynamic_hooks(None, None)
                 extract_sec = time.perf_counter() - _extract_t0
                 logger.debug("[단계2] 텍스트 추출 완료: %s (%d자, %.2fs)", task.path, len(text), extract_sec)
                 stat = Path(task.path).stat()
@@ -782,6 +1052,7 @@ class CollectorWorker(QThread):
                 # mtime 해상도 오차로 인한 오탐(=영구 미인덱싱)을 피한다.
                 if task.mtime > 0 and (
                     abs(stat.st_mtime - task.mtime) > 1e-6 or stat.st_size != task.size
+                    or (task.mtime_ns and stat.st_mtime_ns != task.mtime_ns)
                 ):
                     logger.warning(
                         "[collector] 처리 중 파일 변경 감지 — 인덱싱 건너뜀(다음 사이클 재시도): %s",
@@ -797,10 +1068,23 @@ class CollectorWorker(QThread):
                 scope = get_scope(task.path)
 
                 previous = state.get(task.path, {})
-                old_ids = previous.get("chunk_ids", []) if task.action == "modified" else []
                 pending_ids = previous.get("pending_delete_chunk_ids", [])
+                try:
+                    old_ids = list(dict.fromkeys([
+                        *self._indexer.generation_cleanup_ids(doc_uid),
+                        *self._indexer.path_cleanup_ids(task.path),
+                        *previous.get("chunk_ids", []),
+                    ]))
+                except Exception as exc:
+                    logger.error("[collector] 이전 generation 조회 실패 — add 건너뜀: %s (%s)", task.path, exc)
+                    failed.append(task.path)
+                    continue
 
                 logger.debug("[단계3] 임베딩·저장 시작: %s", task.path)
+                if not ensure_recovery_marker():
+                    failed.append(task.path)
+                    continue
+                unresolved_adds.add(doc_uid)
                 marker = getattr(self._indexer, "mark_maintenance_backlog", None)
                 if callable(marker) and not marker():
                     logger.warning("[lance_maintenance] 문서 backlog marker 저장 실패; 인덱싱은 계속")
@@ -809,6 +1093,8 @@ class CollectorWorker(QThread):
                     text=text,
                     mtime=stat.st_mtime,
                     scope=scope,
+                    doc_uid=doc_uid,
+                    revision=revision,
                 )
                 logger.debug("[단계4] 임베딩·저장 완료: %s -> %d청크", task.path, len(chunk_ids))
                 from knowmate.rag.indexer import DOC_INDEX_VERSION
@@ -817,21 +1103,46 @@ class CollectorWorker(QThread):
                 method = _classify_extract_method(task.path)
                 new_entry = {
                     "mtime": stat.st_mtime,
+                    "mtime_ns": stat.st_mtime_ns,
                     "size": stat.st_size,
                     "indexed_at": datetime.now(timezone.utc).isoformat(),
                     "chunk_ids": chunk_ids,
                     "index_version": DOC_INDEX_VERSION,
+                    "doc_uid": doc_uid,
+                    "revision": revision,
+                    # index_file generated a random ID; read the durable
+                    # generation back from DB before state is allowed to claim
+                    # it, so a malformed/partial add cannot look committed.
+                    "generation_id": "",
                     "method": method,
                 }
                 delete_ids = list(dict.fromkeys([*pending_ids, *old_ids]))
+                if chunk_ids:
+                    committed = self._indexer.recover_generation(doc_uid, revision)
+                    if committed is None or set(committed["chunk_ids"]) != set(chunk_ids):
+                        raise RuntimeError("document add did not produce one complete generation")
+                    new_entry["generation_id"] = committed["generation_id"]
+                    unresolved_adds.discard(doc_uid)
+                    # Include any duplicate same-revision generation discovered
+                    # after the add, without ever targeting the chosen IDs.
+                    delete_ids = list(dict.fromkeys([*delete_ids, *committed["old_chunk_ids"]]))
+                else:
+                    # An empty extraction is a deliberate replacement with no
+                    # rows.  It is safe to checkpoint as state-only metadata;
+                    # if that checkpoint is lost, retrying it cannot duplicate
+                    # searchable content.
+                    new_entry["generation_id"] = "empty"
+                    unresolved_adds.discard(doc_uid)
                 if delete_ids:
                     new_entry["pending_delete_chunk_ids"] = delete_ids
                 state[task.path] = new_entry
+                mark_state_dirty(document=True)
 
-                # 새 청크와 정리 대상을 먼저 원자적으로 기록한다. 이후 삭제나 앱 종료가
-                # 실패해도 다음 사이클이 기존 청크 ID를 잃지 않는다.
+                # DB metadata can reconstruct the replacement if a process
+                # exits before this bounded checkpoint.  Keep pending IDs in
+                # memory before deletion; the next recovery derives them again
+                # from DB even if JSON never reaches disk.
                 if delete_ids:
-                    save_state(self._state_file, state)
                     try:
                         self._indexer.delete_chunks_permanently(delete_ids)
                     except Exception as exc:
@@ -841,13 +1152,44 @@ class CollectorWorker(QThread):
                         )
                     else:
                         new_entry.pop("pending_delete_chunk_ids", None)
-                        save_state(self._state_file, state)
+                        mark_state_dirty()
+                flush_document_state()
                 logger.info(
                     "[%s] %s -> %d청크 (extract=%.2fs)",
                     task.action, task.path, len(chunk_ids), extract_sec,
                 )
-                com_used = is_com
+                actual_com = getattr(self._extractor, "take_actual_com_used", None)
+                com_used = actual_com() if callable(actual_com) else is_com
                 failure_state.note_success(failures, task.path)
+            except OfficeComPoisonError as exc:
+                # poison은 OfficeBusy/Unreadable/일반 오류보다 먼저 처리해야 끊긴
+                # TLS 객체를 다음 파일이 재사용하지 않는다.
+                failed.append(task.path)
+                actual_com = getattr(self._extractor, "take_actual_com_used", None)
+                if callable(actual_com):
+                    actual_com()  # 상태를 소비하되 즉시 복구 파일은 주기 카운트에서 제외
+                com_used = False
+                _failed_stage = com_stage.take_last_failed_stage()
+                kind, error_code = failure_state.classify(
+                    exc, watchdog_stage=_wd_fired_stage, failed_stage=_failed_stage,
+                )
+                failure_state.note_failure(
+                    failures, task.path, kind, _wd_fired_stage or _failed_stage, error_code,
+                    task.mtime, task.size, self._get_now(),
+                )
+                try:
+                    recovered = self._com_poison_recovery_fn(exc.exe_name)
+                except Exception as recovery_exc:
+                    recovered = False
+                    logger.warning("[collector] COM poison 즉시 복구 실패: %s", recovery_exc)
+                if recovered:
+                    poison_recovery_count += 1
+                    com_since_restart = 0
+                    logger.warning("[collector] COM poison 즉시 복구 후 계속 진행: %s", exc.exe_name)
+                else:
+                    poison_recovery_failed += 1
+                    poisoned_exes.add(exc.exe_name)
+                    logger.warning("[collector] COM poison 복구 미확인 — %s만 이번 사이클 연기", exc.exe_name)
             except OfficeBusyError as exc:
                 # 사용자가 Office를 열어둔 상태 → 이번 사이클만 연기(실패 아님).
                 # state를 갱신하지 않으므로 다음 유휴 사이클에서 자동 재시도된다.
@@ -868,7 +1210,8 @@ class CollectorWorker(QThread):
                 # 일반 실패와 구분해 로그·요약에 표시 — "버그"가 아니라 DRM/손상임을 알림.
                 logger.warning("[collector] 판독불가(DRM/암호화·손상 추정): %s", exc)
                 unreadable.append(task.path)
-                com_used = is_com
+                actual_com = getattr(self._extractor, "take_actual_com_used", None)
+                com_used = actual_com() if callable(actual_com) else is_com
                 _failed_stage = com_stage.take_last_failed_stage()
                 kind, error_code = failure_state.classify(
                     exc, watchdog_stage=_wd_fired_stage, failed_stage=_failed_stage,
@@ -880,7 +1223,8 @@ class CollectorWorker(QThread):
             except Exception as exc:
                 logger.error("파일 처리 실패 (건너뜀): %s - %s", task.path, exc)
                 failed.append(task.path)
-                com_used = is_com
+                actual_com = getattr(self._extractor, "take_actual_com_used", None)
+                com_used = actual_com() if callable(actual_com) else is_com
                 _failed_stage = com_stage.take_last_failed_stage()
                 kind, error_code = failure_state.classify(
                     exc, watchdog_stage=_wd_fired_stage, failed_stage=_failed_stage,
@@ -892,14 +1236,10 @@ class CollectorWorker(QThread):
 
             run_hard = getattr(self._indexer, "run_hard_limit_maintenance", None)
             if callable(run_hard) and not self._cancelled:
-                try:
-                    save_state(self._state_file, state)
-                except OSError as exc:
-                    logger.warning(
-                        "[lance_maintenance] 문서 상태 저장 실패로 주기 optimize 연기: %s", exc,
-                    )
-                else:
-                    run_hard(**self._maintenance_kwargs())
+                run_hard(
+                    ensure_durable=lambda: flush_document_state(force=True),
+                    **self._maintenance_kwargs(),
+                )
 
             if com_used:
                 com_since_restart += 1
@@ -938,9 +1278,12 @@ class CollectorWorker(QThread):
         if not decision.should_run:
             logger.debug("[purge] 스킵(%s)", decision.reason)
         else:
+            state_paths_before_purge = set(state)
             result = self._purge_removed_folders(
                 normalized_watch_folders, state, dry_run=dry_run, max_delete_ratio=max_delete_ratio,
             )
+            if set(state) != state_paths_before_purge:
+                mark_state_dirty()
             if result == "success":
                 purge_meta_state = purge_meta.on_success(purge_meta_state, purge_op_sig, purge_meta_now)
             elif result == "blocked":
@@ -977,10 +1320,13 @@ class CollectorWorker(QThread):
         )
         report = cleanup.run(watch_folders, state)
 
+        if report.newly_marked or report.physically_deleted:
+            mark_state_dirty()
+
         if report.skipped_folders:
             self.indexing_needed.emit(f"일부 폴더 정리 건너뜀: {report.skipped_folders}")
 
-        save_state(self._state_file, state)
+        document_state_persisted = flush_document_state(force=True)
 
         # Documents are a finite streaming workload in this worker.  Close a
         # durable marker before the optional final pass; an idle/no-mutation
@@ -989,7 +1335,7 @@ class CollectorWorker(QThread):
             finish_docs = getattr(self._indexer, "finish_maintenance_backlog", None)
             if callable(finish_docs):
                 finish_docs(
-                    completion="EXHAUSTED", checkpoint_succeeded=True,
+                    completion="EXHAUSTED", checkpoint_succeeded=document_state_persisted,
                     **self._maintenance_kwargs(),
                 )
             else:
@@ -1085,6 +1431,7 @@ class CollectorWorker(QThread):
                     maintenance_memory_log=(
                         memory_diagnostics.log if memory_diagnostics is not None else None
                     ),
+                    memory_diagnostics=memory_diagnostics,
                     on_state_persisted=lambda persisted: mail_state_status.update(
                         persisted=bool(persisted)
                     ),
@@ -1103,7 +1450,7 @@ class CollectorWorker(QThread):
             if mail_state_persisted and not self._cancelled:
                 run_hard = getattr(self._email_indexer, "run_hard_limit_maintenance", None)
                 if callable(run_hard):
-                    run_hard(**self._maintenance_kwargs())
+                    run_hard(ensure_durable=lambda: True, **self._maintenance_kwargs())
                 run_steady = getattr(self._email_indexer, "run_steady_maintenance", None)
                 if callable(run_steady):
                     run_steady(**self._maintenance_kwargs())
@@ -1134,6 +1481,10 @@ class CollectorWorker(QThread):
             summary += f" / COM 시간초과 강제해제 {com_timeout_count}건"
         if restart_count:
             summary += f" / COM 재기동 {restart_count}회"
+        if poison_recovery_count:
+            summary += f" / COM 오류 즉시 복구 {poison_recovery_count}회"
+        if poison_recovery_failed:
+            summary += f" / COM 오류 복구 미확인 {poison_recovery_failed}회"
         backoff_deferred_total = producer_state.get("backoff_deferred", 0) + consumer_backoff_deferred
         if backoff_deferred_total:
             summary += f" / 재시도 대기 {backoff_deferred_total}건"

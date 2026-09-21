@@ -1,25 +1,12 @@
-"""단일 인스턴스 보장 — QLocalServer/QLocalSocket 기반.
+"""원자적 QLocalServer 선점으로 Aegis Desk 단일 인스턴스를 보장한다."""
+from __future__ import annotations
 
-트레이 상주 앱 특성상(닫아도 종료되지 않음) 사용자가 바로가기를 여러 번
-눌러 실수로 여러 인스턴스를 띄우기 쉽다. 두 인스턴스가 같은
-%APPDATA%/AegisDesk의 LanceDB·index_state.json·threads.json에 동시에
-쓰면 락 충돌·데이터 유실 위험이 있다(CLAUDE.md 원칙8 "수집기는 QThread
-워커에서만 실행, multiprocessing 금지"와 같은 이유 — 동시 쓰기 자체가
-문제).
-
-동작:
-  1. 앱 시작 시 명명된 로컬 소켓에 먼저 연결을 시도한다.
-  2. 연결되면 이미 다른 인스턴스가 떠 있는 것 → "show" 메시지를 보내고
-     새 프로세스는 즉시 종료한다(창을 만들지 않음).
-  3. 연결되지 않으면 내가 첫 인스턴스 → 서버로 리슨하며, 이후 다른
-     프로세스가 접속해 "show"를 보내면 기존 창을 복원한다.
-
-QLocalServer/Socket은 QCoreApplication 인스턴스가 있어야 하므로, 반드시
-QApplication 생성 이후에 호출해야 한다.
-"""
 import logging
+import os
+from dataclasses import dataclass
+from pathlib import Path
 
-from PyQt6.QtCore import QObject, pyqtSignal
+from PyQt6.QtCore import QLockFile, QObject, QStandardPaths, pyqtSignal
 from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 
 logger = logging.getLogger(__name__)
@@ -27,50 +14,167 @@ logger = logging.getLogger(__name__)
 _SERVER_NAME = "AegisDeskSingleInstance"
 _CONNECT_TIMEOUT_MS = 500
 _SHOW_MESSAGE = b"show"
+_LOCK_FILENAME = "single_instance.lock"
 
 
-def try_acquire_or_notify_existing() -> bool:
-    """이미 실행 중인 인스턴스가 있으면 알리고 False, 없으면(내가 1등) True를 반환한다.
+@dataclass(frozen=True)
+class SingleInstanceAcquireResult:
+    """원자적 선점 시도의 결과다."""
 
-    False가 반환되면 호출부는 새 창을 만들지 말고 즉시 프로세스를 종료해야 한다.
-    """
+    server: "SingleInstanceServer | None"
+    secondary_notified: bool = False
+
+    @property
+    def acquired(self) -> bool:
+        """이 프로세스가 유일한 primary인지 반환한다."""
+        return self.server is not None
+
+
+def _notify_existing() -> bool:
+    """실행 중인 primary에 창 표시 요청을 보내고 성공 여부를 반환한다."""
     socket = QLocalSocket()
-    socket.connectToServer(_SERVER_NAME)
-    if socket.waitForConnected(_CONNECT_TIMEOUT_MS):
+    try:
+        socket.connectToServer(_SERVER_NAME)
+        if not socket.waitForConnected(_CONNECT_TIMEOUT_MS):
+            return False
         socket.write(_SHOW_MESSAGE)
         socket.waitForBytesWritten(_CONNECT_TIMEOUT_MS)
-        socket.disconnectFromServer()
         logger.info("Aegis Desk가 이미 실행 중 — 기존 창을 표시하도록 알림")
-        return False
-    return True
+        return True
+    finally:
+        socket.disconnectFromServer()
+        socket.deleteLater()
+
+
+def _authority_lock_path() -> str:
+    """현재 사용자 AppData 아래의 단일 인스턴스 권위 락 경로를 반환한다."""
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        directory = Path(appdata) / "AegisDesk"
+    else:
+        directory = Path(QStandardPaths.writableLocation(
+            QStandardPaths.StandardLocation.AppLocalDataLocation,
+        ))
+    directory.mkdir(parents=True, exist_ok=True)
+    return str(directory / _LOCK_FILENAME)
+
+
+def _new_authority_lock() -> QLockFile:
+    """프로세스 수명 동안 보유할 사용자별 권위 락을 만든다."""
+    lock = QLockFile(_authority_lock_path())
+    lock.setStaleLockTime(0)
+    return lock
+
+
+def acquire_or_notify_existing(parent: QObject | None = None) -> SingleInstanceAcquireResult:
+    """권위 락 뒤에 서버를 원자적으로 선점하거나 기존 primary에 show를 요청한다.
+
+    authority lock을 얻은 프로세스만 stale endpoint를 제거할 수 있다. 락을 얻지
+    못한 secondary 후보는 notify만 재시도하고 끝까지 endpoint를 건드리지 않는다.
+    """
+    lock = _new_authority_lock()
+    if not lock.tryLock(0):
+        if _notify_existing():
+            return SingleInstanceAcquireResult(None, secondary_notified=True)
+        if _notify_existing():
+            return SingleInstanceAcquireResult(None, secondary_notified=True)
+        logger.critical("단일 인스턴스 권위 락을 확보할 수 없어 실행을 중단합니다")
+        return SingleInstanceAcquireResult(None)
+    return _listen_with_authority_lock(parent, lock)
+
+
+def _listen_with_authority_lock(
+    parent: QObject | None,
+    lock: QLockFile,
+) -> SingleInstanceAcquireResult:
+    """권위 락 보유자만 stale server endpoint를 정리하고 listen한다."""
+    server = SingleInstanceServer(parent, authority_lock=lock)
+    if server.listen():
+        return SingleInstanceAcquireResult(server)
+    if _notify_existing():
+        server.close()
+        return SingleInstanceAcquireResult(None, secondary_notified=True)
+
+    QLocalServer.removeServer(_SERVER_NAME)
+    if server.listen():
+        logger.info("단일 인스턴스의 오래된 로컬 endpoint를 정리하고 선점했습니다")
+        return SingleInstanceAcquireResult(server)
+
+    logger.critical("단일 인스턴스 선점 실패: %s", server.error_string())
+    server.close()
+    return SingleInstanceAcquireResult(None)
 
 
 class SingleInstanceServer(QObject):
-    """첫 인스턴스에서 리슨하며, 이후 실행 요청이 오면 show_requested를 emit한다."""
+    """원자적으로 선점된 local server와 초기화 전 show 요청을 보관한다."""
 
     show_requested = pyqtSignal()
 
-    def __init__(self, parent=None) -> None:
-        """서버를 시작한다. 이전 비정상 종료로 이름이 남아있으면 정리 후 재시도한다."""
+    def __init__(
+        self,
+        parent: QObject | None = None,
+        *,
+        authority_lock: QLockFile | None = None,
+    ) -> None:
+        """아직 listen하지 않은 server를 만든다."""
         super().__init__(parent)
         self._server = QLocalServer(self)
         self._server.newConnection.connect(self._on_new_connection)
-        QLocalServer.removeServer(_SERVER_NAME)
-        if not self._server.listen(_SERVER_NAME):
-            logger.warning("단일 인스턴스 서버 시작 실패(무시 — 중복 실행 방지 비활성): %s", self._server.errorString())
+        self._connections: dict[QLocalSocket, bytearray] = {}
+        self._show_pending = False
+        self._authority_lock = authority_lock
+
+    def listen(self) -> bool:
+        """이름을 원자적으로 선점하고 성공 여부를 반환한다."""
+        return self._server.listen(_SERVER_NAME)
+
+    def error_string(self) -> str:
+        """마지막 listen 오류를 반환한다."""
+        return self._server.errorString()
+
+    def take_pending_show(self) -> bool:
+        """창 준비 전 들어온 show 요청을 한 번 소비한다."""
+        pending = self._show_pending
+        self._show_pending = False
+        return pending
 
     def _on_new_connection(self) -> None:
-        conn = self._server.nextPendingConnection()
-        if conn is None:
-            return
-        conn.readyRead.connect(lambda: self._on_ready_read(conn))
+        """한 Qt 이벤트에 쌓인 모든 pending 연결을 보관하고 읽는다."""
+        while self._server.hasPendingConnections():
+            conn = self._server.nextPendingConnection()
+            if conn is None:
+                break
+            self._connections[conn] = bytearray()
+            conn.readyRead.connect(lambda conn=conn: self._on_ready_read(conn))
+            conn.disconnected.connect(lambda conn=conn: self._release_connection(conn))
+            if conn.bytesAvailable():
+                self._on_ready_read(conn)
 
-    def _on_ready_read(self, conn) -> None:
-        data = bytes(conn.readAll())
-        if data == _SHOW_MESSAGE:
+    def _on_ready_read(self, conn: QLocalSocket) -> None:
+        """완전한 show 메시지만 처리하고 연결을 닫는다."""
+        buffer = self._connections.get(conn)
+        if buffer is None:
+            return
+        buffer.extend(bytes(conn.readAll()))
+        if len(buffer) < len(_SHOW_MESSAGE):
+            return
+        if bytes(buffer) == _SHOW_MESSAGE:
+            self._show_pending = True
             self.show_requested.emit()
         conn.disconnectFromServer()
 
+    def _release_connection(self, conn: QLocalSocket) -> None:
+        """완료된 secondary 연결의 강한 참조와 Qt 객체를 함께 정리한다."""
+        self._connections.pop(conn, None)
+        conn.deleteLater()
+
     def close(self) -> None:
-        """서버를 닫는다(명시적 정리용 — 프로세스 종료 시에도 OS가 자동 회수한다)."""
+        """서버와 보류 중 연결을 닫는다."""
+        for conn in tuple(self._connections):
+            conn.disconnectFromServer()
+            conn.deleteLater()
+        self._connections.clear()
         self._server.close()
+        if self._authority_lock is not None:
+            self._authority_lock.unlock()
+            self._authority_lock = None

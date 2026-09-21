@@ -84,7 +84,7 @@ def _normalize_stage(stage: str | None) -> str | None:
 
 # COM 오류 중 "다른 프로세스가 지금 바쁘다"는 확실한 신호로만 좁게 분류한다.
 # RPC_E_CALL_REJECTED(0x80010001) · RPC_E_SERVERCALL_RETRYLATER(0x8001010A)
-_BUSY_HRESULTS = frozenset({-2147418111, -2147417846})
+_BUSY_HRESULTS = frozenset({0x80010001, 0x8001010A})
 
 
 @dataclass
@@ -365,10 +365,10 @@ def _hresult_of(exc: BaseException) -> int | None:
     """
     hresult = getattr(exc, "hresult", None)
     if isinstance(hresult, int):
-        return hresult
+        return hresult & 0xFFFFFFFF
     args = getattr(exc, "args", None)
     if args and isinstance(args[0], int):
-        return args[0]
+        return args[0] & 0xFFFFFFFF
     return None
 
 

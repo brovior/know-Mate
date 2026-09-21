@@ -1,6 +1,7 @@
 """secure 패키지 — TextExtractor 팩토리 + AutoReader."""
 import logging
 from pathlib import Path
+from typing import Callable
 
 from knowmate.secure.base import TextExtractor
 from knowmate.secure.fake_reader import FakeReader
@@ -38,6 +39,41 @@ class AutoReader:
         """
         self._plain = PlainReader()
         self._xlsx_block_rows = xlsx_block_rows
+        self._on_com_begin: Callable[[str], None] | None = None
+        self._on_com_end: Callable[[], None] | None = None
+        self._last_com_used = False
+
+    def set_com_operation_hooks(
+        self,
+        on_begin: Callable[[str], None] | None,
+        on_end: Callable[[], None] | None,
+    ) -> None:
+        """동적 COM 폴백 직전/직후 호출할 scheduler 훅을 설정한다."""
+        self._on_com_begin = on_begin
+        self._on_com_end = on_end
+
+    def take_actual_com_used(self) -> bool:
+        """직전 extract가 실제 COM 경로에 진입했는지 반환하고 상태를 비운다."""
+        used = self._last_com_used
+        self._last_com_used = False
+        return used
+
+    def _extract_with_com(self, path: str, ext: str) -> str:
+        """실제 COM 진입 구간만 scheduler에 알리고 추출한다."""
+        self._guard_office_busy(ext, path)
+        from knowmate.secure.office_guard import process_for_ext
+        exe = process_for_ext(ext)
+        try:
+            # on_begin이 begin_com_op 뒤 watchdog.arm에서 실패할 수 있어도, 이미
+            # 게시된 COM 작업 컨텍스트는 반드시 on_end로 해제해야 한다.
+            if self._on_com_begin is not None and exe is not None:
+                self._on_com_begin(exe)
+            self._last_com_used = True
+            from knowmate.secure.com_reader import ComReader
+            return ComReader(xlsx_block_rows=self._xlsx_block_rows).extract(path)
+        finally:
+            if self._on_com_end is not None and exe is not None:
+                self._on_com_end()
 
     def extract(self, path: str) -> str:
         """확장자에 따라 PlainReader 또는 ComReader로 파일을 파싱해 텍스트를 반환한다.
@@ -59,6 +95,7 @@ class AutoReader:
         OOXML(.docx 등)은 라이브러리로 파싱하므로 이 가드의 영향을 받지 않는다.
         """
         ext = Path(path).suffix.lower()
+        self._last_com_used = False
         if ext == ".xls":
             try:
                 return self._plain.extract(path)
@@ -66,19 +103,12 @@ class AutoReader:
                 logger.warning(
                     "xlrd 파싱 실패(%s: %s) → COM 폴백: %s", type(exc).__name__, exc, path
                 )
-                self._guard_office_busy(ext, path)
-                from knowmate.secure.com_reader import ComReader
-                return ComReader(xlsx_block_rows=self._xlsx_block_rows).extract(path)
+                return self._extract_with_com(path, ext)
         if ext in {".doc", ".ppt"}:
-            self._guard_office_busy(ext, path)
-            # COM 의존 코드: secure/ 안에서만 import
-            from knowmate.secure.com_reader import ComReader
-            return ComReader(xlsx_block_rows=self._xlsx_block_rows).extract(path)
+            return self._extract_with_com(path, ext)
         if ext in _OOXML_EXTS and not is_zip(path):
             logger.warning("확장자는 OOXML이나 실제 zip 아님(OLE2/DRM 등 추정) → COM 경유: %s", path)
-            self._guard_office_busy(ext, path)
-            from knowmate.secure.com_reader import ComReader
-            return ComReader(xlsx_block_rows=self._xlsx_block_rows).extract(path)
+            return self._extract_with_com(path, ext)
         return self._plain.extract(path)
 
     @staticmethod

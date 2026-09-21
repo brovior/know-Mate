@@ -10,6 +10,7 @@ import logging
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 from knowmate.secure import com_stage
 from knowmate.secure.text_util import format_table
@@ -21,6 +22,53 @@ _MSO_GROUP = 6  # msoGroup — 그룹 도형 Type 값
 
 class ComUnavailableError(RuntimeError):
     """win32com.client를 사용할 수 없는 환경에서 발생한다."""
+
+
+# Office가 이미 죽었거나 RPC 연결이 끊겼음을 뜻하는 HRESULT만 여기에 둔다.
+# 파일별 암호/손상 오류나 busy/retry 오류를 여기에 넣으면 정상 인스턴스까지
+# 불필요하게 죽여 사용자 작업과 재사용성을 해칠 수 있다.
+_FATAL_TRANSPORT_HRESULTS = frozenset({
+    0x800706BA,  # RPC_S_SERVER_UNAVAILABLE
+    0x800706BE,  # RPC_S_CALL_FAILED
+    0x800706BF,  # RPC_S_CALL_FAILED_DNE
+    0x80010006,  # RPC_E_CONNECTION_TERMINATED
+    0x80010007,  # RPC_E_SERVER_DIED
+    0x80010012,  # RPC_E_SERVER_DIED_DNE
+    0x80010108,  # RPC_E_DISCONNECTED
+    0x800401FD,  # CO_E_OBJNOTCONNECTED
+})
+
+
+def hresult_of(exc: BaseException) -> int | None:
+    """예외의 HRESULT를 unsigned 32-bit 정수로 반환한다(없으면 None)."""
+    value = getattr(exc, "hresult", None)
+    if not isinstance(value, int):
+        args = getattr(exc, "args", ())
+        value = args[0] if args and isinstance(args[0], int) else None
+    return (value & 0xFFFFFFFF) if isinstance(value, int) else None
+
+
+def is_fatal_transport_hresult(hresult: int | None) -> bool:
+    """HRESULT가 재사용 불가 Office RPC 전송 단절인지 판정한다."""
+    return isinstance(hresult, int) and (hresult & 0xFFFFFFFF) in _FATAL_TRANSPORT_HRESULTS
+
+
+class OfficeComPoisonError(RuntimeError):
+    """Office RPC 연결이 끊겨 해당 COM 인스턴스를 즉시 폐기해야 할 때 발생한다."""
+
+    def __init__(self, exe_name: str, hresult: int | None = None) -> None:
+        self.exe_name = exe_name.upper()
+        self.app_exe = self.exe_name
+        self.hresult = (hresult & 0xFFFFFFFF) if isinstance(hresult, int) else None
+        detail = f" (HRESULT=0x{self.hresult:08X})" if self.hresult is not None else ""
+        super().__init__(f"{self.exe_name} COM RPC 연결이 끊어졌습니다{detail}")
+
+
+def _poison_if_fatal(exc: BaseException, exe_name: str) -> None:
+    """fatal transport HRESULT면 원본을 보존한 poison 예외를 발생시킨다."""
+    hresult = hresult_of(exc)
+    if is_fatal_transport_hresult(hresult):
+        raise OfficeComPoisonError(exe_name, hresult) from exc
 
 
 def _require_win32com():
@@ -116,45 +164,83 @@ def _normalize_range_values(values, n_rows: int, n_cols: int) -> tuple:
     return (tuple(values),)
 
 
-def _close_quietly(timer: com_stage.StageTimer, obj, method_name: str, *args) -> None:
-    """obj가 None이 아니면 method_name(*args)를 CLOSE 단계로 계측하며 호출한다.
+def _close_quietly(timer: com_stage.StageTimer, obj: Any, method_name: str, *args) -> Exception | None:
+    """obj의 닫기 메서드를 CLOSE 단계로 호출하고 실패 예외를 반환한다.
 
-    닫기 자체의 예외는 로그만 남기고 삼킨다 — 이미 있는 원본 예외(예: 셀 순회 중
-    실패)를 덮어쓰지 않고, 닫기 실패로 사이클 전체를 막지 않기 위함이다. 항상
-    `finally`에서 호출돼 **오픈에 성공한 문서는 예외가 나도 반드시 닫히도록** 한다
-    (이전에는 정상 경로에서만 Close가 호출돼, 셀 읽기 중 예외가 나면 워크북이
-    열린 채 남았다).
+    호출자는 일반 닫기 오류는 기존 원본 예외를 유지한 채 무시할 수 있고, fatal
+    RPC 단절만 Office poison으로 승격할 수 있다. 항상 `finally`에서 호출돼 오픈에
+    성공한 문서는 일반 읽기 오류가 나도 닫기를 시도한다.
     """
     if obj is None:
-        return
+        return None
     try:
         with timer.stage(com_stage.STAGE_CLOSE):
             getattr(obj, method_name)(*args)
     except Exception as exc:
-        logger.debug("[com] 닫기 실패(무시): %s", exc)
+        logger.debug("[com] 닫기 실패: %s", exc)
+        return exc
+    return None
 
 
 def _dispatch_and_own(win32com, prog_id: str, exe_name: str):
-    """COM 앱을 Dispatch하고, 그로 인해 새로 뜬 프로세스 PID를 우리 소유로 등록한다.
+    """앱별 방식으로 COM을 생성하고 검증된 프로세스 PID만 소유 등록한다.
 
-    Dispatch 전후의 해당 exe PID를 비교해 '우리가 띄운' 인스턴스를 식별한다.
-    이렇게 등록해 두면 office_guard가 우리 자신을 점유로 오판하지 않는다
-    (자기 감지 스킵 방지). 사용자가 이미 열어둔 인스턴스에 붙은 경우엔 새
-    프로세스가 없어 아무것도 등록되지 않는다(그 경로는 가드가 먼저 차단).
+    Word·Excel은 DispatchEx로 기존 ROT 객체 재접속을 피하고, MultiUse인
+    PowerPoint는 Dispatch를 유지한다. 생성 전 PID baseline과 앱 HWND의 PID,
+    실행 파일명이 모두 일치할 때만 AegisDesk 소유로 등록한다. 검증할 수 없으면
+    사용자 Office일 가능성을 배제할 수 없으므로 안전하게 처리를 연기한다.
 
     Dispatch 직전에 Resiliency 표식을 지운다 — 이전 사이클에서 워치독이 강제
     종료한 흔적이 남아 있으면 이번 기동 때 "안전 모드로 시작할까요?" 프롬프트가
     뜨는데, 그 프롬프트는 Dispatch가 반환하기도 전에 떠서 DisplayAlerts 같은 앱
     수준 설정으로는 억제할 수 없다(강제 종료 ↔ 세이프모드 무한 루프의 고리).
     """
-    from knowmate.secure.office_guard import office_pids_live, register_owned_pids
+    from knowmate.secure.office_guard import (
+        OfficeBusyError, OfficeOwnershipProbeError, office_pids_live, register_owned_app,
+    )
     from knowmate.secure.office_resiliency import clear_resiliency_markers
 
     clear_resiliency_markers(exe_name)
     before = office_pids_live(exe_name)
-    app = win32com.Dispatch(prog_id)
-    register_owned_pids(office_pids_live(exe_name) - before)
+    dispatch = (
+        win32com.Dispatch if exe_name == "POWERPNT.EXE"
+        else getattr(win32com, "DispatchEx", win32com.Dispatch)
+    )
+    try:
+        app = dispatch(prog_id)
+    except Exception as exc:
+        _poison_if_fatal(exc, exe_name)
+        raise
+    # PowerPoint는 MultiUse라 Dispatch가 기존 사용자 프로세스를 반환할 수 있다.
+    # Windows에서 새 PID/HWND/exe를 모두 확인하지 못하면 소유로 추측하지 않고
+    # 이 자동화 요청 자체를 연기한다. 비Windows fake 객체는 office_guard의
+    # platform fallback으로 허용돼 기존 단위 테스트를 유지한다.
+    try:
+        owned = register_owned_app(exe_name, before, app)
+    except OfficeOwnershipProbeError as exc:
+        original = exc.__cause__ if isinstance(exc.__cause__, BaseException) else exc
+        _poison_if_fatal(original, exe_name)
+        owned = False
+    if not owned:
+        raise OfficeBusyError(f"{exe_name} 소유권을 검증할 수 없어 COM 파싱을 연기합니다")
     return app
+
+
+def _configure_app(app: Any, exe_name: str, assignments: tuple[tuple[Any, str, Any], ...]) -> None:
+    """초기 COM 설정을 적용하며 fatal RPC 오류만 호출자에게 전달한다."""
+    for obj, attr, value in assignments:
+        try:
+            setattr(obj, attr, value)
+        except Exception as exc:
+            _poison_if_fatal(exc, exe_name)
+
+
+def _configure_word_options(app: Any) -> None:
+    """Word Options 접근의 일반 호환성 오류는 무시하고 poison만 전달한다."""
+    try:
+        _configure_app(app, "WINWORD.EXE", ((app.Options, "ConfirmConversions", False),))
+    except Exception as exc:
+        _poison_if_fatal(exc, "WINWORD.EXE")
 
 
 def _get_word_app():
@@ -164,13 +250,11 @@ def _get_word_app():
         win32com = _require_win32com()
         app = _dispatch_and_own(win32com, "Word.Application", "WINWORD.EXE")
         # 모달 다이얼로그/매크로 경고/변환 확인창 억제
-        try:
-            app.Visible = False
-            app.DisplayAlerts = _WD_ALERTS_NONE
-            app.AutomationSecurity = _MSO_SEC_FORCE_DISABLE
-            app.Options.ConfirmConversions = False
-        except Exception:
-            pass
+        _configure_app(app, "WINWORD.EXE", (
+            (app, "Visible", False), (app, "DisplayAlerts", _WD_ALERTS_NONE),
+            (app, "AutomationSecurity", _MSO_SEC_FORCE_DISABLE),
+        ))
+        _configure_word_options(app)
         _tls.word = app
     return _tls.word
 
@@ -181,13 +265,11 @@ def _get_excel_app():
         _ensure_com_initialized()
         win32com = _require_win32com()
         app = _dispatch_and_own(win32com, "Excel.Application", "EXCEL.EXE")
-        try:
-            app.Visible = False
-            app.DisplayAlerts = _XL_ALERTS_OFF
-            app.AutomationSecurity = _MSO_SEC_FORCE_DISABLE
-            app.AskToUpdateLinks = False
-        except Exception:
-            pass
+        _configure_app(app, "EXCEL.EXE", (
+            (app, "Visible", False), (app, "DisplayAlerts", _XL_ALERTS_OFF),
+            (app, "AutomationSecurity", _MSO_SEC_FORCE_DISABLE),
+            (app, "AskToUpdateLinks", False),
+        ))
         _tls.excel = app
     return _tls.excel
 
@@ -198,11 +280,10 @@ def _get_ppt_app():
         _ensure_com_initialized()
         win32com = _require_win32com()
         app = _dispatch_and_own(win32com, "PowerPoint.Application", "POWERPNT.EXE")
-        try:
-            app.DisplayAlerts = 1  # ppAlertsNone 계열 (버전별 차이 → try)
-            app.AutomationSecurity = _MSO_SEC_FORCE_DISABLE
-        except Exception:
-            pass
+        _configure_app(app, "POWERPNT.EXE", (
+            (app, "DisplayAlerts", 1),  # ppAlertsNone 계열 (버전별 차이)
+            (app, "AutomationSecurity", _MSO_SEC_FORCE_DISABLE),
+        ))
         _tls.ppt = app
     return _tls.ppt
 
@@ -220,6 +301,8 @@ class WordComReader:
         """
         timer = com_stage.StageTimer(path)
         doc = None
+        poison: OfficeComPoisonError | None = None
+        primary_error: Exception | None = None
         try:
             with timer.stage(com_stage.STAGE_DISPATCH):
                 word = _get_word_app()
@@ -246,16 +329,40 @@ class WordComReader:
                     _m,               # DocumentDirection
                     True,             # NoEncodingDialog — 인코딩 선택창 억제(구형 .doc 단골 블로커)
                 )
+                if doc is None:
+                    raise OfficeComPoisonError("WINWORD.EXE")
             with timer.stage(com_stage.STAGE_READ):
                 text = doc.Content.Text
             return text
-        except Exception:
-            _tls.word = None  # 예외 시 이 스레드의 인스턴스 리셋
+        except OfficeComPoisonError as exc:
+            poison = exc
+            _tls.word = None
+            raise
+        except Exception as exc:
+            primary_error = exc
+            try:
+                _poison_if_fatal(exc, "WINWORD.EXE")
+            except OfficeComPoisonError as poison_exc:
+                poison = poison_exc
+                _tls.word = None
+                raise
             raise
         finally:
-            _close_quietly(timer, doc, "Close", False)
-            com_stage.clear()
-            timer.log_summary()
+            # RPC 단절 뒤 Close도 다시 RPC에 매달릴 수 있어 scheduler의 즉시 복구로
+            # 넘긴다. 일반 문서 오류는 기존처럼 Close를 유지한다.
+            try:
+                close_error = None if poison is not None else _close_quietly(timer, doc, "Close", False)
+                if close_error is not None:
+                    try:
+                        _poison_if_fatal(close_error, "WINWORD.EXE")
+                    except OfficeComPoisonError as close_poison:
+                        _tls.word = None
+                        if primary_error is not None:
+                            raise close_poison from primary_error
+                        raise
+            finally:
+                com_stage.clear()
+                timer.log_summary()
 
 
 class ExcelComReader:
@@ -317,6 +424,8 @@ class ExcelComReader:
         """
         timer = com_stage.StageTimer(path)
         wb = None
+        poison: OfficeComPoisonError | None = None
+        primary_error: Exception | None = None
         try:
             with timer.stage(com_stage.STAGE_DISPATCH):
                 excel = _get_excel_app()
@@ -342,6 +451,8 @@ class ExcelComReader:
                     _m,                      # Local
                     _XL_REPAIR_FILE,         # CorruptLoad — 손상 파일을 복구 확인창 없이 연다
                 )
+                if wb is None:
+                    raise OfficeComPoisonError("EXCEL.EXE")
             with timer.stage(com_stage.STAGE_SHEETS):
                 sheets = list(wb.Sheets)
             lines: list[str] = []
@@ -352,13 +463,33 @@ class ExcelComReader:
                         lines.append(f"=== 시트: {sheet.Name} ===")
                         lines.extend(sheet_lines)
             return "\n".join(lines)
-        except Exception:
+        except OfficeComPoisonError as exc:
+            poison = exc
             _tls.excel = None
             raise
+        except Exception as exc:
+            primary_error = exc
+            try:
+                _poison_if_fatal(exc, "EXCEL.EXE")
+            except OfficeComPoisonError as poison_exc:
+                poison = poison_exc
+                _tls.excel = None
+                raise
+            raise
         finally:
-            _close_quietly(timer, wb, "Close", False)
-            com_stage.clear()
-            timer.log_summary()
+            try:
+                close_error = None if poison is not None else _close_quietly(timer, wb, "Close", False)
+                if close_error is not None:
+                    try:
+                        _poison_if_fatal(close_error, "EXCEL.EXE")
+                    except OfficeComPoisonError as close_poison:
+                        _tls.excel = None
+                        if primary_error is not None:
+                            raise close_poison from primary_error
+                        raise
+            finally:
+                com_stage.clear()
+                timer.log_summary()
 
 
 def _ppt_shape_texts(shape) -> list[str]:
@@ -373,7 +504,8 @@ def _ppt_shape_texts(shape) -> list[str]:
             for child in shape.GroupItems:
                 out.extend(_ppt_shape_texts(child))
             return out
-    except Exception:
+    except Exception as exc:
+        _poison_if_fatal(exc, "POWERPNT.EXE")
         pass
 
     # 표 도형 → 셀(1-indexed) 순회 후 ' | ' 텍스트화
@@ -390,7 +522,8 @@ def _ppt_shape_texts(shape) -> list[str]:
                 )
             table_text = format_table(rows)
             return [table_text] if table_text else []
-    except Exception:
+    except Exception as exc:
+        _poison_if_fatal(exc, "POWERPNT.EXE")
         pass
 
     # 일반 텍스트 프레임
@@ -399,7 +532,8 @@ def _ppt_shape_texts(shape) -> list[str]:
             t = shape.TextFrame.TextRange.Text.strip()
             if t:
                 return [t]
-    except Exception:
+    except Exception as exc:
+        _poison_if_fatal(exc, "POWERPNT.EXE")
         pass
 
     return []
@@ -420,11 +554,15 @@ class PowerPointComReader:
         """
         timer = com_stage.StageTimer(path)
         prs = None
+        poison: OfficeComPoisonError | None = None
+        primary_error: Exception | None = None
         try:
             with timer.stage(com_stage.STAGE_DISPATCH):
                 ppt = _get_ppt_app()
             with timer.stage(com_stage.STAGE_OPEN):
                 prs = ppt.Presentations.Open(str(Path(path).resolve()), ReadOnly=True, WithWindow=False)
+                if prs is None:
+                    raise OfficeComPoisonError("POWERPNT.EXE")
             with timer.stage(com_stage.STAGE_READ):
                 slides: list[str] = []
                 slide_count = 0
@@ -445,23 +583,44 @@ class PowerPointComReader:
                 timer.note("슬라이드", slide_count)
                 timer.note("최장슬라이드", slowest_slide)
             return "\n\n".join(slides)
-        except Exception:
+        except OfficeComPoisonError as exc:
+            poison = exc
             _tls.ppt = None
             raise
+        except Exception as exc:
+            primary_error = exc
+            try:
+                _poison_if_fatal(exc, "POWERPNT.EXE")
+            except OfficeComPoisonError as poison_exc:
+                poison = poison_exc
+                _tls.ppt = None
+                raise
+            raise
         finally:
-            _close_quietly(timer, prs, "Close")
-            com_stage.clear()
-            timer.log_summary()
+            try:
+                close_error = None if poison is not None else _close_quietly(timer, prs, "Close")
+                if close_error is not None:
+                    try:
+                        _poison_if_fatal(close_error, "POWERPNT.EXE")
+                    except OfficeComPoisonError as close_poison:
+                        _tls.ppt = None
+                        if primary_error is not None:
+                            raise close_poison from primary_error
+                        raise
+            finally:
+                com_stage.clear()
+                timer.log_summary()
 
 
 
 
 def quit_com_apps(grace_sec: float = 5.0, wait_fn=None) -> None:
-    """현재 스레드의 COM 앱들을 Quit하고 thread-local을 비운다.
+    """현재 스레드의 Word/Excel 앱은 Quit하고 모든 COM 참조를 비운다.
 
     COM 객체는 생성한 스레드에서만 Quit할 수 있으므로(STA),
     반드시 COM 앱을 생성한 워커 스레드 내부에서 호출해야 한다.
-    누수된 WINWORD/EXCEL/POWERPNT 프로세스를 정리한다.
+    PowerPoint는 MultiUse라 사용자 창일 가능성을 배제할 수 없어 Quit·강제 종료하지
+    않고 참조 해제와 gc에 맡긴다. 검증 소유 Word/Excel 프로세스만 정리한다.
 
     `app.Quit()`은 종료를 요청할 뿐 즉시 반환한다 — 실제 종료(임시파일·애드인
     정리 등)까지는 수 초 걸릴 수 있어, 반환 직후 바로 프로세스를 조회하면
@@ -488,25 +647,32 @@ def quit_com_apps(grace_sec: float = 5.0, wait_fn=None) -> None:
         app = getattr(_tls, attr, None)
         if app is None:
             continue
-        try:
-            app.Quit()
-        except Exception:
-            pass
+        if attr != "ppt":
+            try:
+                app.Quit()
+            except Exception:
+                pass
         setattr(_tls, attr, None)
+        app = None
+
+    # PowerPoint는 Quit하지 않으므로 TLS와 루프 지역 참조를 비운 뒤 COM 래퍼를
+    # 즉시 수거해 자동화 서버가 자연 종료할 기회를 준다.
+    gc.collect()
 
     # 우리가 띄운 인스턴스 중 Quit 후에도 남아있으면 강제 종료 + 소유 목록 비움
     try:
         from knowmate.secure import office_guard
-        owned = office_guard.clear_owned_pids()
-        if not owned:
+        owned = office_guard.take_owned_processes()
+        terminable = {pid: record for pid, record in owned.items() if record.terminable}
+        if not terminable:
             return
         if wait_fn is None:
             wait_fn = office_guard.wait_for_owned_exit
         if grace_sec > 0:
-            still_alive, elapsed = wait_fn(owned, grace_sec)
+            still_alive, elapsed = wait_fn(terminable, grace_sec)
         else:
-            still_alive, elapsed = owned, 0.0
-        exited = len(owned) - len(still_alive)
+            still_alive, elapsed = set(terminable), 0.0
+        exited = len(terminable) - len(still_alive)
         if exited:
             logger.info("[com] Office 정상 종료 확인: %d개 (대기 %.1f초)", exited, elapsed)
         if still_alive:
@@ -514,7 +680,9 @@ def quit_com_apps(grace_sec: float = 5.0, wait_fn=None) -> None:
                 "[com] 유예 %.0f초 초과 — 강제 종료: %s (대기 %.1f초)",
                 grace_sec, sorted(still_alive), elapsed,
             )
-            office_guard.terminate_owned_office_processes(still_alive)
+            office_guard.terminate_owned_office_processes(
+                {pid: terminable[pid] for pid in still_alive if pid in terminable}
+            )
     except Exception as exc:
         logger.debug("COM 소유 프로세스 정리 실패(무시): %s", exc)
 

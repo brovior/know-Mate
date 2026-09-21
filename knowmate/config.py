@@ -124,7 +124,42 @@ def get_config() -> dict[str, Any]:
                     _save_config(_cache)
                 except OSError as exc:
                     logger.warning("lancedb_maintenance 설정 이전 저장 실패: %s", exc)
+        collector = _cache.setdefault("collector", {})
+        if isinstance(collector, dict):
+            defaults = _bundled_document_state_defaults()
+            changed = False
+            for key, value in defaults.items():
+                if key not in collector:
+                    collector[key] = value
+                    changed = True
+            if changed:
+                try:
+                    _save_config(_cache)
+                except OSError as exc:
+                    logger.warning("document state flush 설정 이전 저장 실패: %s", exc)
     return _cache
+
+
+def _bundled_document_state_defaults() -> dict[str, Any]:
+    """Read document checkpoint defaults from the bundled YAML source."""
+    with _bundled_config_source().open(encoding="utf-8") as handle:
+        bundled = yaml.safe_load(handle) or {}
+    collector = bundled.get("collector") if isinstance(bundled, dict) else None
+    if not isinstance(collector, dict):
+        raise RuntimeError("bundled collector configuration is missing")
+    return {
+        key: collector[key]
+        for key in ("state_flush_docs", "state_flush_seconds")
+    }
+
+
+def document_state_flush_settings(collector: dict[str, Any]) -> tuple[int, float]:
+    """Return flush settings, filling old in-memory mappings from bundled YAML."""
+    defaults = _bundled_document_state_defaults()
+    return (
+        int(collector.get("state_flush_docs", defaults["state_flush_docs"])),
+        float(collector.get("state_flush_seconds", defaults["state_flush_seconds"])),
+    )
 
 
 def update_watch_folders(folders: list[str]) -> None:

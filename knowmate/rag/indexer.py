@@ -1,5 +1,6 @@
 """LanceDB 스키마 및 Indexer 클래스 (CLAUDE.md 6-2, 6-3)."""
 import getpass
+import hashlib
 import logging
 import time
 import uuid
@@ -16,7 +17,7 @@ from knowmate.rag.lance_maintenance import LanceTableMaintenance
 logger = logging.getLogger(__name__)
 
 # 문서 인덱싱 포맷 버전 — 변경 시 기존 문서 자동 재인덱싱 (state.index_version 비교)
-DOC_INDEX_VERSION = "2"
+DOC_INDEX_VERSION = "3"
 
 SCHEMA = pa.schema(
     [
@@ -30,6 +31,12 @@ SCHEMA = pa.schema(
         pa.field("indexed_at", pa.string()),
         pa.field("chunk_index", pa.int32()),
         pa.field("chunk_total", pa.int32()),
+        # A generation is the atomic document replacement unit.  ``chunk_id``
+        # intentionally stays random so an old delete can never remove a new
+        # row which happens to reuse a deterministic identifier.
+        pa.field("doc_uid", pa.string()),
+        pa.field("revision", pa.string()),
+        pa.field("generation_id", pa.string()),
         pa.field("text", pa.string()),    # AES-256-GCM 암호화 저장 (CLAUDE.md 5장 4번)
         pa.field("vector", pa.list_(pa.float32(), VECTOR_DIM)),
         pa.field("is_deleted", pa.bool_()),
@@ -79,6 +86,7 @@ class Indexer:
         except Exception:
             self._table = self._db.create_table(TABLE_NAME, schema=SCHEMA)
             self.table_was_recreated = True
+        self._ensure_generation_schema()
         try:
             self.table_is_empty = self._table.count_rows() == 0
         except Exception:
@@ -99,10 +107,17 @@ class Indexer:
         text: str,
         mtime: float,
         scope: str,
+        *,
+        doc_uid: str | None = None,
+        revision: str | None = None,
+        generation_id: str | None = None,
         on_progress: Callable[[int, int], None] | None = None,
     ) -> list[str]:
         """파일 텍스트를 청킹·임베딩·암호화해 LanceDB에 저장하고 chunk_id 리스트를 반환한다."""
         file_type = Path(path).suffix.lower().lstrip(".")
+        doc_uid = doc_uid or self.document_uid(path)
+        revision = revision or self.document_revision(path, mtime=mtime, size=None)
+        generation_id = generation_id or str(uuid.uuid4())
         # 파일명·경로를 본문 앞에 붙여 제목/폴더명 언급 질의도 벡터 검색에 매칭되게 한다
         p = Path(path)
         meta_header = f"파일명: {p.name}\n경로: {p.parent}\n\n"
@@ -127,6 +142,8 @@ class Indexer:
             logger.debug("배치 임베딩 시작: %d~%d / %d", batch_start, batch_start + len(batch) - 1, total)
             t0 = time.perf_counter()
             vectors = self._embed.embed(batch)
+            if len(vectors) != len(batch):
+                raise ValueError("embedding result count does not match document chunks")
             embed_sec += time.perf_counter() - t0
             logger.debug("배치 임베딩 완료: %d~%d", batch_start, batch_start + len(batch) - 1)
 
@@ -146,6 +163,9 @@ class Indexer:
                         "indexed_at": indexed_at,
                         "chunk_index": global_idx,
                         "chunk_total": total,
+                        "doc_uid": doc_uid,
+                        "revision": revision,
+                        "generation_id": generation_id,
                         "text": self._crypto.encrypt(chunk_text_val),  # AES-256-GCM 암호화
                         "vector": [float(v) for v in vector],
                         "is_deleted": False,
@@ -171,6 +191,174 @@ class Indexer:
         )
         return chunk_ids
 
+    @staticmethod
+    def document_uid(path: str) -> str:
+        """Return the stable, case-insensitive identity for a document path."""
+        from knowmate.collector.scanner import normalize_path_key
+        return hashlib.sha256(normalize_path_key(path).encode("utf-8")).hexdigest()
+
+    @classmethod
+    def document_revision(
+        cls, path: str, *, mtime: float, size: int | None, mtime_ns: int | None = None,
+    ) -> str:
+        """Return the exact source revision used to validate a DB generation."""
+        if mtime_ns is None:
+            mtime_ns = int(mtime * 1_000_000_000)
+        material = f"{cls.document_uid(path)}|{size if size is not None else ''}|{mtime_ns}|{DOC_INDEX_VERSION}"
+        return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+    def recover_generation(self, doc_uid: str, revision: str) -> dict[str, Any] | None:
+        """Return one verified active generation for a source revision.
+
+        A database read failure is deliberately raised: callers must not add
+        another document while a prior commit is uncertain.
+        """
+        rows = self._document_metadata(doc_uid)
+        candidates = self._complete_generations(rows, revision=revision, active_only=True)
+        if not candidates:
+            return None
+        winner = self._pick_generation(candidates)
+        winner["old_chunk_ids"] = self._other_generation_ids(rows, winner["generation_id"])
+        return winner
+
+    def generation_cleanup_ids(self, doc_uid: str, keep_generation_id: str | None = None) -> list[str]:
+        """Return DB-derived stale IDs for one document, with no state dependency."""
+        return self._other_generation_ids(self._document_metadata(doc_uid), keep_generation_id)
+
+    def path_cleanup_ids(self, path: str) -> list[str]:
+        """Return legacy or malformed rows for an exact stored source path."""
+        return list(dict.fromkeys(
+            row["chunk_id"] for row in self._document_metadata_for_path(path)
+            if isinstance(row.get("chunk_id"), str) and row["chunk_id"]
+        ))
+
+    def recover_document_state(self) -> list[dict[str, Any]]:
+        """Return untrusted path cleanup entries after an unfinished run.
+
+        Startup does not select a generation by wall-clock timestamp.  A live
+        source is later matched to its exact revision by ``recover_generation``;
+        a missing source is handed to normal orphan cleanup with every row ID.
+        """
+        rows = self._document_metadata(None)
+        by_path: dict[str, list[str]] = {}
+        for row in rows:
+            cid, path = row.get("chunk_id"), row.get("file_path")
+            if isinstance(cid, str) and cid and isinstance(path, str) and path:
+                by_path.setdefault(path, []).append(cid)
+        return [
+            {"file_path": path, "chunk_ids": list(dict.fromkeys(ids)), "untrusted": True}
+            for path, ids in by_path.items()
+        ]
+
+    def _ensure_generation_schema(self) -> None:
+        """Add nullable generation columns without replacing existing Lance data."""
+        missing = [field for field in SCHEMA if field.name not in self._table.schema.names]
+        if not missing:
+            return
+        try:
+            self._table.add_columns(missing)
+        except Exception as exc:
+            # Old rows remain readable, but writes without these fields would
+            # make crash recovery ambiguous.  Fail closed rather than recreate
+            # or delete the user's table.
+            raise RuntimeError("chunks table generation schema migration failed") from exc
+
+    def _document_metadata(self, doc_uid: str | None) -> list[dict[str, Any]]:
+        """Read all document metadata with an explicit result bound."""
+        columns = [
+            "chunk_id", "file_path", "mtime", "indexed_at", "chunk_index", "chunk_total",
+            "doc_uid", "revision", "generation_id", "is_deleted",
+        ]
+        try:
+            # Explicit None disables Lance search's default result limit, so a
+            # generation or stale-document cleanup is never silently truncated.
+            query = self._table.search()
+            if doc_uid is not None:
+                safe = doc_uid.replace("'", "''")
+                query = query.where(f"doc_uid = '{safe}'")
+            arrow = query.select(columns).limit(None).to_arrow()
+            return arrow.to_pylist()
+        except Exception as exc:
+            logger.error("document generation metadata read failed: %s", exc)
+            raise RuntimeError("document generation metadata read failed") from exc
+
+    def _document_metadata_for_path(self, path: str) -> list[dict[str, Any]]:
+        """Read projected metadata for one legacy path without a default limit."""
+        columns = ["chunk_id", "file_path", "doc_uid", "generation_id"]
+        try:
+            safe = path.replace("'", "''")
+            return self._table.search().where(
+                f"file_path = '{safe}'"
+            ).select(columns).limit(None).to_arrow().to_pylist()
+        except Exception as exc:
+            logger.error("document legacy-path metadata read failed: %s", exc)
+            raise RuntimeError("document legacy-path metadata read failed") from exc
+
+    @staticmethod
+    def _complete_generations(
+        rows: list[dict[str, Any]], *, revision: str | None, active_only: bool,
+    ) -> list[dict[str, Any]]:
+        """Validate exact chunk coverage before treating rows as committed."""
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            generation = row.get("generation_id")
+            if isinstance(generation, str) and generation:
+                groups.setdefault(generation, []).append(row)
+        complete: list[dict[str, Any]] = []
+        for generation, group in groups.items():
+            first = group[0]
+            expected_revision = first.get("revision")
+            if not isinstance(expected_revision, str) or not expected_revision:
+                continue
+            if revision is not None and expected_revision != revision:
+                continue
+            if any(row.get("revision") != expected_revision for row in group):
+                continue
+            uid = first.get("doc_uid")
+            path = first.get("file_path")
+            if not isinstance(uid, str) or not uid or not isinstance(path, str) or not path:
+                continue
+            if any(
+                row.get("doc_uid") != uid
+                or row.get("file_path") != path
+                or row.get("mtime") != first.get("mtime")
+                or row.get("indexed_at") != first.get("indexed_at")
+                for row in group
+            ):
+                continue
+            if Indexer.document_uid(path) != uid:
+                continue
+            if active_only and any(row.get("is_deleted") is not False for row in group):
+                continue
+            total = first.get("chunk_total")
+            if type(total) is not int or total < 1 or any(row.get("chunk_total") != total for row in group):
+                continue
+            ids = [row.get("chunk_id") for row in group]
+            indices = [row.get("chunk_index") for row in group]
+            if (len(group) != total or len(set(ids)) != total or any(not isinstance(cid, str) or not cid for cid in ids)
+                    or set(indices) != set(range(total))):
+                continue
+            complete.append({
+                "generation_id": generation, "revision": expected_revision,
+                "chunk_ids": list(ids), "chunk_total": total,
+                "file_path": first.get("file_path"), "mtime": first.get("mtime"),
+                "indexed_at": first.get("indexed_at") or "",
+            })
+        return complete
+
+    @staticmethod
+    def _pick_generation(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+        """Choose a deterministic winner when a crash left duplicate generations."""
+        return max(candidates, key=lambda item: (str(item.get("indexed_at", "")), item["generation_id"]))
+
+    @staticmethod
+    def _other_generation_ids(rows: list[dict[str, Any]], winner: str) -> list[str]:
+        """Return every non-winner row ID, including incomplete and soft-deleted rows."""
+        return list(dict.fromkeys(
+            row["chunk_id"] for row in rows
+            if row.get("generation_id") != winner and isinstance(row.get("chunk_id"), str) and row["chunk_id"]
+        ))
+
     def delete_chunks(self, chunk_ids: list[str]) -> None:
         """chunk_id 목록을 2단계 soft delete한다.
 
@@ -187,6 +375,7 @@ class Indexer:
         df = (
             self._table.search()
             .where(f"chunk_id IN ({id_list})")
+            .select(["chunk_id", "miss_count"])
             .limit(len(chunk_ids) * 2)
             .to_arrow()
             .to_pandas()

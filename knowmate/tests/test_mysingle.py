@@ -2617,6 +2617,7 @@ class TestMailScanner:
         assert len(cycle_logs) == 1
         assert "files(enumerated=2 cache_hits=0 backoff_deferred=0 actionable=2 attempted=2 parsed=2)" in cycle_logs[0]
         assert "db(current=0 missing=2 stale=0 error=0)" in cycle_logs[0]
+        assert "status_queries=2" in cycle_logs[0]
         assert "embed(chunks=4 batches=1 embed_calls=3 split_retries=1)" in cycle_logs[0]
         assert "mail(commits=2 failures=0" in cycle_logs[0]
         assert secret_body not in caplog.text
