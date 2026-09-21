@@ -475,14 +475,17 @@ def main() -> None:
     if APP_ICON.exists():
         app.setWindowIcon(QIcon(str(APP_ICON)))
 
-    # 단일 인스턴스 보장 — 이미 실행 중이면 기존 창을 띄우도록 알리고 조용히 종료.
-    # 트레이 상주 앱이라 중복 실행이 쉬운데, 두 인스턴스가 같은 LanceDB·state
-    # 파일에 동시 쓰면 데이터 손상 위험이 있다(원칙8과 같은 이유).
-    from knowmate.app.single_instance import (
-        SingleInstanceServer, try_acquire_or_notify_existing,
-    )
-    if not try_acquire_or_notify_existing():
+    # splash·상태 파일·LanceDB보다 먼저 서버 이름을 선점해야 두 프로세스가 동시에
+    # "첫 인스턴스"라고 판단하는 경쟁을 막을 수 있다.
+    from knowmate.app.single_instance import acquire_or_notify_existing
+    instance_result = acquire_or_notify_existing(parent=app)
+    single_instance_server = instance_result.server
+    if single_instance_server is None:
+        if not instance_result.secondary_notified:
+            logger.critical("단일 인스턴스를 보장할 수 없어 실행을 중단합니다")
+            sys.exit(1)
         return
+    app.aboutToQuit.connect(single_instance_server.close)
 
     # 단일 인스턴스 확인 뒤 즉시 시작 화면을 보여준다. WebEngine·LanceDB·수집기 같은
     # 무거운 구성요소는 이 다음에 로드해 exe 시작 후 무반응으로 보이는 시간을 줄인다.
@@ -526,10 +529,11 @@ def main() -> None:
                 lancedb_version_warning=lancedb_version_warning,
                 startup_pump=pump_startup_events,
             )
-            single_instance_server = SingleInstanceServer(parent=win)
             single_instance_server.show_requested.connect(win._show_from_tray)
             runtime["window"] = win
             runtime["single_instance_server"] = single_instance_server
+            if single_instance_server.take_pending_show():
+                QTimer.singleShot(0, win._show_from_tray)
 
             startup_finished = False
 

@@ -141,32 +141,40 @@ class CleanupManager:
             self._indexer.delete_chunks(chunk_ids)
 
             # delete_chunks 이후 실제로 물리 삭제됐는지 확인
-            deleted_now = self._check_physically_deleted(chunk_ids)
+            deleted_now, remaining_ids = self._check_physically_deleted(chunk_ids)
             if deleted_now:
                 physically_deleted += deleted_now
-                # state 에서도 제거
-                state.pop(path_str, None)
+                if remaining_ids:
+                    # A mixed recovered generation can contain a row already
+                    # on its second miss and another on its first.  Keep the
+                    # latter IDs so the next orphan pass reaches them too.
+                    entry["chunk_ids"] = remaining_ids
+                else:
+                    state.pop(path_str, None)
             else:
                 newly_marked += len(chunk_ids)
 
         return newly_marked, physically_deleted
 
-    def _check_physically_deleted(self, chunk_ids: list[str]) -> int:
-        """물리 삭제된 chunk_ids 수를 DB 조회로 확인한다."""
+    def _check_physically_deleted(self, chunk_ids: list[str]) -> tuple[int, list[str]]:
+        """Return deleted count and the exact IDs still present in the DB."""
         if not chunk_ids:
-            return 0
+            return 0, []
         try:
             id_list = ", ".join(f"'{cid}'" for cid in chunk_ids)
             df = (
                 self._indexer.table.search()
                 .where(f"chunk_id IN ({id_list})")
+                .select(["chunk_id"])
                 .limit(len(chunk_ids) * 2)
                 .to_arrow()
                 .to_pandas()
             )
             # DB에 남아 있지 않은 것들이 물리 삭제된 것
             remaining = set(df["chunk_id"].tolist()) if not df.empty else set()
-            return len(set(chunk_ids) - remaining)
+            return len(set(chunk_ids) - remaining), [
+                chunk_id for chunk_id in chunk_ids if chunk_id in remaining
+            ]
         except Exception as exc:
             logger.warning("[cleanup] 삭제 확인 실패: %s", exc)
-            return 0
+            return 0, list(chunk_ids)

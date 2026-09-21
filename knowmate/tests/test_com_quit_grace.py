@@ -50,7 +50,11 @@ class TestQuitComAppsGraceLogic:
     """quit_com_apps()의 유예 분기를 wait_fn 주입으로 검증한다(ctypes 미의존)."""
 
     def _install_owned(self, monkeypatch, owned: set):
-        monkeypatch.setattr(office_guard, "clear_owned_pids", lambda: set(owned))
+        records = {
+            pid: office_guard.OwnedOfficeProcess("EXCEL.EXE", pid)
+            for pid in owned
+        }
+        monkeypatch.setattr(office_guard, "take_owned_processes", lambda: dict(records))
 
     def test_no_owned_pids_skips_wait_and_terminate(self, monkeypatch):
         """소유 PID가 없으면 대기도 강제종료도 하지 않는다."""
@@ -59,11 +63,11 @@ class TestQuitComAppsGraceLogic:
         terminate_calls = []
         monkeypatch.setattr(
             office_guard, "wait_for_owned_exit",
-            lambda owned, timeout: (wait_calls.append((owned, timeout)) or (set(), 0.0)),
+            lambda owned, timeout: (wait_calls.append((set(owned), timeout)) or (set(), 0.0)),
         )
         monkeypatch.setattr(
             office_guard, "terminate_owned_office_processes",
-            lambda owned: terminate_calls.append(owned),
+            lambda owned: terminate_calls.append(set(owned)),
         )
 
         com_reader.quit_com_apps(grace_sec=5.0)
@@ -81,7 +85,7 @@ class TestQuitComAppsGraceLogic:
         )
         monkeypatch.setattr(
             office_guard, "terminate_owned_office_processes",
-            lambda owned: terminate_calls.append(owned),
+            lambda owned: terminate_calls.append(set(owned)),
         )
 
         com_reader.quit_com_apps(grace_sec=5.0)
@@ -98,7 +102,7 @@ class TestQuitComAppsGraceLogic:
         )
         monkeypatch.setattr(
             office_guard, "terminate_owned_office_processes",
-            lambda owned: terminate_calls.append(owned),
+            lambda owned: terminate_calls.append(set(owned)),
         )
 
         com_reader.quit_com_apps(grace_sec=5.0)
@@ -112,11 +116,11 @@ class TestQuitComAppsGraceLogic:
         terminate_calls = []
         monkeypatch.setattr(
             office_guard, "wait_for_owned_exit",
-            lambda owned, timeout: (wait_calls.append((owned, timeout)) or (set(), 0.0)),
+            lambda owned, timeout: (wait_calls.append((set(owned), timeout)) or (set(), 0.0)),
         )
         monkeypatch.setattr(
             office_guard, "terminate_owned_office_processes",
-            lambda owned: terminate_calls.append(owned),
+            lambda owned: terminate_calls.append(set(owned)),
         )
 
         com_reader.quit_com_apps(grace_sec=0)
@@ -130,12 +134,12 @@ class TestQuitComAppsGraceLogic:
         terminate_calls = []
         monkeypatch.setattr(
             office_guard, "terminate_owned_office_processes",
-            lambda owned: terminate_calls.append(owned),
+            lambda owned: terminate_calls.append(set(owned)),
         )
         injected_calls = []
 
         def _injected_wait(owned, timeout):
-            injected_calls.append((owned, timeout))
+            injected_calls.append((set(owned), timeout))
             return set(), 0.1
 
         com_reader.quit_com_apps(grace_sec=3.0, wait_fn=_injected_wait)
@@ -170,7 +174,7 @@ class TestQuitComAppsGraceLogic:
         )
         monkeypatch.setattr(
             office_guard, "terminate_owned_office_processes",
-            lambda owned: terminate_calls.append(owned),
+            lambda owned: terminate_calls.append(set(owned)),
         )
 
         com_reader.quit_com_apps(grace_sec=5.0)  # 예외 없이 완료

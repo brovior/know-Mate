@@ -478,6 +478,31 @@ class TestCollectorWorker:
         assert str(f) in state
         assert len(state[str(f)]["chunk_ids"]) >= 1
 
+    def test_document_state_is_saved_before_hard_limit_checkpoint(self, tmp_path: Path, monkeypatch):
+        """문서는 DB 저장 뒤 즉시 state를 남겨 재시작 중복 add를 막는다."""
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        target = folder / "doc.txt"
+        target.write_text("document state durability", encoding="utf-8")
+        worker, indexer, state_file = _make_worker(tmp_path, str(folder))
+        hard_limit_states: list[dict] = []
+
+        def inspect_hard_limit(**_kwargs):
+            durable_state = load_state(state_file)
+            hard_limit_states.append(durable_state)
+            assert str(target) in durable_state
+            assert durable_state[str(target)]["chunk_ids"]
+            return False
+
+        monkeypatch.setattr(indexer, "run_hard_limit_maintenance", inspect_hard_limit)
+        worker.run()
+
+        assert hard_limit_states
+        rows_after_first = indexer.table.count_rows()
+        _make_worker_for_indexer(tmp_path, str(folder), indexer).run()
+        assert indexer.table.count_rows() == rows_after_first
+        assert str(target) in load_state(state_file)
+
     def test_modified_file_reindexed(self, tmp_path: Path):
         """파일 수정 후 run() -> 변경 파일 재인덱싱."""
         from knowmate.rag.embedding import EmbeddingClient
@@ -899,6 +924,97 @@ class TestComRestart:
         state = load_state(state_file)
         assert len(state) == 4
         assert len(finished_msgs) == 1
+
+    def test_poison_recovery_does_not_double_count_periodic_restart(self, tmp_path: Path):
+        """즉시 복구한 파일은 N건 주기 재기동 카운트에 다시 넣지 않는다."""
+        from knowmate.collector.scheduler import CollectorWorker
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.secure.com_reader import OfficeComPoisonError
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        (folder / "a.doc").write_bytes(b"legacy")
+        (folder / "b.doc").write_bytes(b"legacy")
+
+        class PoisonOnceExtractor:
+            def __init__(self):
+                self.calls = 0
+
+            def extract(self, path: str) -> str:
+                self.calls += 1
+                if self.calls == 1:
+                    raise OfficeComPoisonError("WINWORD.EXE", 0x800706BA)
+                return "정상 문서 내용"
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        periodic_restart = MagicMock()
+        poison_recovery = MagicMock(return_value=True)
+        worker = CollectorWorker(
+            config={
+                "collector": {
+                    "watch_folders": [str(folder)],
+                    "idle_seconds": 60,
+                    "com_restart_every_n_files": 1,
+                },
+                "cleanup": {"dry_run": True, "max_delete_ratio": 0.30},
+                "chunking": {"chunk_size": 400, "overlap": 80},
+            },
+            indexer=indexer,
+            extractor=PoisonOnceExtractor(),
+            state_file=tmp_path / "state.json",
+            com_restart_fn=periodic_restart,
+            com_poison_recovery_fn=poison_recovery,
+        )
+
+        worker.run()
+
+        poison_recovery.assert_called_once_with("WINWORD.EXE")
+        # 두 번째 정상 COM 문서 1건만 주기 카운트되어 1회 재기동한다.
+        assert periodic_restart.call_count == 1
+
+    def test_failed_poison_recovery_defers_same_office_only(self, tmp_path: Path):
+        """복구 확인 실패 후 같은 Office는 연기하되 plain 파일은 계속 처리한다."""
+        from knowmate.collector.scheduler import CollectorWorker
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.secure.com_reader import OfficeComPoisonError
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        (folder / "a.doc").write_bytes(b"legacy")
+        deferred_doc = folder / "b.doc"
+        deferred_doc.write_bytes(b"legacy")
+        plain = folder / "c.txt"
+        plain.write_text("plain", encoding="utf-8")
+
+        class PoisonWordExtractor:
+            def extract(self, path: str) -> str:
+                if Path(path).suffix.lower() == ".doc":
+                    raise OfficeComPoisonError("WINWORD.EXE", 0x800706BA)
+                return "정상 plain 내용"
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        worker = CollectorWorker(
+            config={
+                "collector": {"watch_folders": [str(folder)], "idle_seconds": 60},
+                "cleanup": {"dry_run": True, "max_delete_ratio": 0.30},
+                "chunking": {"chunk_size": 400, "overlap": 80},
+            },
+            indexer=indexer,
+            extractor=PoisonWordExtractor(),
+            state_file=tmp_path / "state.json",
+            com_poison_recovery_fn=MagicMock(return_value=False),
+        )
+
+        worker.run()
+
+        from knowmate.collector.state import load_state
+        state = load_state(tmp_path / "state.json")
+        assert str(plain) in state
+        assert str(deferred_doc) not in state
 
 
 # ============================================================
@@ -2408,27 +2524,34 @@ class TestSingleInstance:
     LanceDB/state 파일에 동시에 쓰는 것을 막기 위함(원칙8과 같은 이유)."""
 
     @pytest.fixture(autouse=True)
-    def _no_leftover_server(self):
-        """테스트 전후로 서버 이름이 남아있지 않도록 정리한다(테스트 간 격리)."""
+    def _no_leftover_server(self, tmp_path, monkeypatch):
+        """운영 AppData·endpoint와 분리한 이름으로 QLocalServer를 격리한다."""
         from PyQt6.QtNetwork import QLocalServer
-        from knowmate.app.single_instance import _SERVER_NAME
-        QLocalServer.removeServer(_SERVER_NAME)
+        from knowmate.app import single_instance
+
+        monkeypatch.setenv("APPDATA", str(tmp_path))
+        server_name = f"AegisDeskSingleInstance-{tmp_path.name}"
+        monkeypatch.setattr(single_instance, "_SERVER_NAME", server_name)
+        QLocalServer.removeServer(server_name)
         yield
-        QLocalServer.removeServer(_SERVER_NAME)
+        QLocalServer.removeServer(server_name)
 
     def test_first_instance_acquires(self):
-        """서버가 없으면 True(내가 1등 인스턴스)를 반환한다."""
-        from knowmate.app.single_instance import try_acquire_or_notify_existing
-        assert try_acquire_or_notify_existing() is True
+        """서버가 없으면 listen으로 선점한 primary server를 반환한다."""
+        from knowmate.app.single_instance import acquire_or_notify_existing
+        result = acquire_or_notify_existing()
+        try:
+            assert result.acquired
+            assert result.server is not None
+        finally:
+            if result.server is not None:
+                result.server.close()
 
     def test_server_emits_show_requested_on_message(self):
         """서버는 'show' 메시지를 받으면 show_requested를 발동한다.
 
-        try_acquire_or_notify_existing()을 그대로 써서 끝까지 검증할 수는 없다 —
-        그 함수의 QLocalSocket은 지역변수라 반환 즉시 GC되고, 같은 프로세스 안에서는
-        서버가 수락하기 전에 연결이 사라져 readyRead가 오지 않는다(별도 프로세스에서는
-        정상 동작한다). 그래서 테스트가 소켓을 직접 들고 살려 둔 채 서버 쪽만 검증한다.
-        "이미 떠 있으면 False" 쪽은 test_server_close_allows_new_acquisition이 덮는다.
+        원자 선점은 별도 테스트에서 덮고, 여기서는 소켓을 직접 유지해 수신 큐 처리만
+        검증한다.
         """
         from PyQt6.QtWidgets import QApplication
         from PyQt6.QtNetwork import QLocalSocket
@@ -2437,6 +2560,7 @@ class TestSingleInstance:
         )
 
         server = SingleInstanceServer()
+        assert server.listen()
         received = []
         server.show_requested.connect(lambda: received.append(True))
         sock = QLocalSocket()   # 지역변수여도 이 스코프가 끝날 때까지는 살아 있다
@@ -2455,6 +2579,8 @@ class TestSingleInstance:
                     break
                 time.sleep(0.02)
             assert received == [True]
+            assert server.take_pending_show()
+            assert not server.take_pending_show()
         finally:
             sock.disconnectFromServer()
             server.close()
@@ -2462,12 +2588,43 @@ class TestSingleInstance:
     def test_server_close_allows_new_acquisition(self):
         """서버를 닫으면 이후 다시 첫 인스턴스로 획득할 수 있다."""
         from knowmate.app.single_instance import (
-            SingleInstanceServer, try_acquire_or_notify_existing,
+            acquire_or_notify_existing,
         )
-        server = SingleInstanceServer()
-        assert try_acquire_or_notify_existing() is False
-        server.close()
-        assert try_acquire_or_notify_existing() is True
+        primary = acquire_or_notify_existing()
+        assert primary.acquired and primary.server is not None
+        secondary = acquire_or_notify_existing()
+        assert not secondary.acquired and secondary.secondary_notified
+        primary.server.close()
+        replacement = acquire_or_notify_existing()
+        try:
+            assert replacement.acquired and replacement.server is not None
+        finally:
+            if replacement.server is not None:
+                replacement.server.close()
+
+    def test_authority_lock_failure_is_fail_closed_without_stale_lock_removal(self, monkeypatch):
+        """secondary 후보는 권위 lock·endpoint 어느 쪽도 강제로 제거하지 않는다."""
+        from knowmate.app import single_instance
+
+        class _BusyLock:
+            stale_remove_called = False
+
+            def tryLock(self, _timeout):
+                return False
+
+            def removeStaleLockFile(self):
+                self.stale_remove_called = True
+                return True
+
+        lock = _BusyLock()
+        monkeypatch.setattr(single_instance, "_new_authority_lock", lambda: lock)
+        monkeypatch.setattr(single_instance, "_notify_existing", lambda: False)
+
+        result = single_instance.acquire_or_notify_existing()
+
+        assert not result.acquired
+        assert not result.secondary_notified
+        assert not lock.stale_remove_called
 
 
 # ============================================================

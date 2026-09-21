@@ -50,7 +50,7 @@ def test_3500_backlog_uses_three_hard_checks_and_one_final(tmp_path: Path) -> No
     for _ in range(3):
         table.small = 1000
         maintenance.record_mutation(1000)
-        assert maintenance.checkpoint_hard_limit()
+        assert maintenance.checkpoint_hard_limit(ensure_durable=lambda: True)
     table.small = 350
     assert maintenance.finish_backlog(completion="EXHAUSTED", checkpoint_succeeded=True)
     assert table.optimize_calls == 4
@@ -83,13 +83,13 @@ def test_failure_cooldown_and_wall_clock_state_survive_restart(tmp_path: Path) -
     mono, wall, table = _Clock(), _Clock(1000), _Table(1000, fail=True)
     maintenance = _maintenance(tmp_path, table, mono, wall)
     assert maintenance.mark_backlog_active()
-    assert not maintenance.checkpoint_hard_limit()
+    assert not maintenance.checkpoint_hard_limit(ensure_durable=lambda: True)
     restarted = _maintenance(tmp_path, table, mono, wall)
-    assert not restarted.checkpoint_hard_limit()
+    assert not restarted.checkpoint_hard_limit(ensure_durable=lambda: True)
     mono.value += 300
     wall.value += 300
     table.fail = False
-    assert restarted.checkpoint_hard_limit()
+    assert restarted.checkpoint_hard_limit(ensure_durable=lambda: True)
 
 
 def test_recreation_resets_a_previous_steady_gate(tmp_path: Path) -> None:
@@ -134,14 +134,14 @@ def test_hard_limit_stats_are_sampled_not_read_for_every_write(tmp_path: Path) -
     maintenance = _maintenance(tmp_path, table, mono, wall)
     assert maintenance.mark_backlog_active()
     # marker 직후 첫 checkpoint는 기존 fragment 복구를 위해 한 번 확인한다.
-    assert not maintenance.checkpoint_hard_limit()
+    assert not maintenance.checkpoint_hard_limit(ensure_durable=lambda: True)
     initial_calls = table.stats_calls
     for _ in range(99):
         maintenance.record_mutation()
-        assert not maintenance.checkpoint_hard_limit()
+        assert not maintenance.checkpoint_hard_limit(ensure_durable=lambda: True)
     assert table.stats_calls == initial_calls
     maintenance.record_mutation()
-    assert not maintenance.checkpoint_hard_limit()
+    assert not maintenance.checkpoint_hard_limit(ensure_durable=lambda: True)
     assert table.stats_calls == initial_calls + 1
 
 
@@ -167,7 +167,103 @@ def test_cancelled_checkpoint_never_starts_optimize(tmp_path: Path) -> None:
     assert maintenance.mark_backlog_active()
     maintenance.record_mutation(1000)
 
-    assert not maintenance.checkpoint_hard_limit(cancelled=lambda: True)
+    assert not maintenance.checkpoint_hard_limit(
+        ensure_durable=lambda: True,
+        cancelled=lambda: True,
+    )
+    assert table.optimize_calls == 0
+
+
+def test_hard_limit_defers_optimize_when_durable_checkpoint_fails(tmp_path: Path) -> None:
+    """상태 저장 실패는 optimize를 막고 다음 항목에서 같은 due를 재시도한다."""
+    mono, wall, table = _Clock(), _Clock(1000), _Table(1000)
+    maintenance = _maintenance(tmp_path, table, mono, wall)
+    assert maintenance.mark_backlog_active()
+    maintenance.record_mutation(1000)
+    saves: list[bool] = []
+
+    def fail_checkpoint() -> bool:
+        saves.append(False)
+        return False
+
+    def succeed_checkpoint() -> bool:
+        saves.append(True)
+        return True
+
+    assert not maintenance.checkpoint_hard_limit(ensure_durable=fail_checkpoint)
+    assert saves == [False]
+    assert table.optimize_calls == 0
+
+    assert maintenance.checkpoint_hard_limit(ensure_durable=succeed_checkpoint)
+    assert saves == [False, True]
+    assert table.optimize_calls == 1
+
+
+def test_hard_limit_callback_exception_and_cancel_keep_due_for_retry(tmp_path: Path) -> None:
+    """callback 예외·callback 뒤 취소는 optimize 없이 같은 due를 보존한다."""
+    mono, wall, table = _Clock(), _Clock(1000), _Table(1000)
+    maintenance = _maintenance(tmp_path, table, mono, wall)
+    assert maintenance.mark_backlog_active()
+    maintenance.record_mutation(1000)
+
+    def broken_checkpoint() -> bool:
+        raise OSError("state unavailable")
+
+    assert not maintenance.checkpoint_hard_limit(ensure_durable=broken_checkpoint)
+    assert table.optimize_calls == 0
+
+    cancelled = False
+
+    def checkpoint_then_cancel() -> bool:
+        nonlocal cancelled
+        cancelled = True
+        return True
+
+    assert not maintenance.checkpoint_hard_limit(
+        ensure_durable=checkpoint_then_cancel,
+        cancelled=lambda: cancelled,
+    )
+    assert table.optimize_calls == 0
+    cancelled = False
+    assert maintenance.checkpoint_hard_limit(ensure_durable=lambda: True)
+    assert table.optimize_calls == 1
+
+
+def test_hard_limit_stats_failure_waits_for_next_sampling_interval(tmp_path: Path) -> None:
+    """통계 오류는 매 항목 재조회 대신 다음 표본 간격까지 기다린다."""
+    class FailingStatsTable(_Table):
+        def __init__(self) -> None:
+            super().__init__(small=1000)
+            self.stats_calls = 0
+            self.fail_once = True
+
+        def stats(self) -> dict:
+            self.stats_calls += 1
+            if self.fail_once:
+                self.fail_once = False
+                raise RuntimeError("stats unavailable")
+            return super().stats()
+
+    mono, wall, table = _Clock(), _Clock(1000), FailingStatsTable()
+    maintenance = _maintenance(tmp_path, table, mono, wall)
+    assert maintenance.mark_backlog_active()
+    assert not maintenance.checkpoint_hard_limit(ensure_durable=lambda: True)
+    assert table.stats_calls == 1
+    assert not maintenance.checkpoint_hard_limit(ensure_durable=lambda: True)
+    assert table.stats_calls == 1
+    maintenance.record_mutation(100)
+    assert maintenance.checkpoint_hard_limit(ensure_durable=lambda: True)
+    assert table.stats_calls >= 2
+
+
+def test_hard_limit_requires_explicit_durable_callback(tmp_path: Path) -> None:
+    """실제 optimize는 callback 누락으로 내구성 계약을 우회하지 않는다."""
+    mono, wall, table = _Clock(), _Clock(1000), _Table(1000)
+    maintenance = _maintenance(tmp_path, table, mono, wall)
+    assert maintenance.mark_backlog_active()
+    maintenance.record_mutation(1000)
+
+    assert not maintenance.checkpoint_hard_limit()
     assert table.optimize_calls == 0
 
 
@@ -233,6 +329,7 @@ class _CompletionIndexer:
     def __init__(self) -> None:
         self.finishes: list[tuple[str, bool]] = []
         self.marker_calls = 0
+        self.hard_limit_calls = 0
 
     def mark_maintenance_backlog(self) -> bool:
         self.marker_calls += 1
@@ -240,6 +337,10 @@ class _CompletionIndexer:
 
     def finish_maintenance_backlog(self, **kwargs) -> bool:
         self.finishes.append((kwargs["completion"], kwargs["checkpoint_succeeded"]))
+        return False
+
+    def run_hard_limit_maintenance(self, **_kwargs) -> bool:
+        self.hard_limit_calls += 1
         return False
 
     def get_index_state(self, _mail_uid, _mtime):
@@ -308,3 +409,40 @@ def test_mail_scan_reports_only_proven_completion(
     assert indexer.last_mail_scan_completion is expected
     assert indexer.finishes == [(expected.value, save_ok if not cancelled else True)]
     assert indexer.marker_calls == 1
+
+
+def test_mail_scan_saves_state_once_when_hard_limit_is_not_due(tmp_path: Path, monkeypatch) -> None:
+    """500건 처리 중 no-op hard-limit 검사는 전체 상태 파일을 다시 쓰지 않는다."""
+    from knowmate.collector import mail_scanner
+    from knowmate.secure import mysingle_reader
+
+    items = [_mail_item(index) for index in range(500)]
+
+    def collect(*_args, **_kwargs):
+        scan_status = _args[-1]
+        scan_status["complete"] = True
+        return list(items), {item["path_key"] for item in items}, [], {}, 0
+
+    saves = 0
+    original_save = mail_scanner.save_mail_scan_state
+
+    def count_save(*args, **kwargs):
+        nonlocal saves
+        saves += 1
+        return original_save(*args, **kwargs)
+
+    monkeypatch.setattr(mail_scanner, "_collect_actionable_candidates", collect)
+    monkeypatch.setattr(mysingle_reader, "parse_mail_file", _parsed_mail)
+    monkeypatch.setattr(mail_scanner, "save_mail_scan_state", count_save)
+    indexer = _CompletionIndexer()
+
+    mail_scanner.run_mail_scan(
+        ["C:/mail"], indexer, {"mail": {"max_mails_per_scan": 500}},
+        state_file=tmp_path / "state.json", failure_file=tmp_path / "failures.json",
+        preloaded_state={
+            "schema_version": 3, "cursor": None, "files": {}, "pending_deletes": [],
+        },
+    )
+
+    assert saves == 1
+    assert indexer.hard_limit_calls == 500

@@ -211,8 +211,19 @@ class LanceTableMaintenance:
         self._mutations_since_fragment_check = self._fragment_check_interval
         return self._persist_state("open backlog")
 
-    def checkpoint_hard_limit(self, *, cancelled: Callable[[], bool] | None = None, memory_log: Callable[[str], None] | None = None) -> bool:
-        """Run active-backlog hard-limit maintenance after caller saved state."""
+    def checkpoint_hard_limit(
+        self,
+        *,
+        ensure_durable: Callable[[], bool] | None = None,
+        cancelled: Callable[[], bool] | None = None,
+        memory_log: Callable[[str], None] | None = None,
+    ) -> bool:
+        """Run hard-limit maintenance only after a needed durable checkpoint.
+
+        ``ensure_durable`` is called only after fragment statistics prove that
+        optimize will run. A failed checkpoint leaves the due budget intact so
+        the next write can retry without risking an ahead-of-state optimize.
+        """
         if not self.config.enabled or not self.backlog_active or (cancelled and cancelled()):
             return False
         # 실패 cooldown 중에는 stats 표본 예산을 소비하지 않는다. 그래야 새 write가
@@ -221,13 +232,37 @@ class LanceTableMaintenance:
             return False
         if self._mutations_since_fragment_check < self._fragment_check_interval:
             return False
-        self._mutations_since_fragment_check = 0
         try:
             small = self._fragment_stats()["num_small_fragments"]
         except Exception as exc:
+            self._mutations_since_fragment_check = 0
             logger.warning("[lance_maintenance] table=%s hard-limit stats failed: %s", self.table_name, exc)
             return False
         if small < self.config.backlog_hard_limit_small_fragments or not self._allowed(small):
+            self._mutations_since_fragment_check = 0
+            return False
+        if ensure_durable is None:
+            logger.warning(
+                "[lance_maintenance] table=%s durable checkpoint callback missing; hard-limit optimize deferred",
+                self.table_name,
+            )
+            return False
+        try:
+            durable = ensure_durable()
+        except Exception as exc:
+            logger.warning(
+                "[lance_maintenance] table=%s durable checkpoint raised; hard-limit optimize deferred: %s",
+                self.table_name,
+                exc,
+            )
+            return False
+        if not durable:
+            logger.warning(
+                "[lance_maintenance] table=%s durable checkpoint failed; hard-limit optimize deferred",
+                self.table_name,
+            )
+            return False
+        if cancelled and cancelled():
             return False
         return self._run_optimize("backlog_hard_limit", small, cancelled, memory_log)
 

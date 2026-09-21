@@ -30,6 +30,7 @@ from knowmate.collector.mail_scan_state import (
 )
 
 if TYPE_CHECKING:
+    from knowmate.collector.memory_diagnostics import MemoryDiagnostics
     from knowmate.rag.email_indexer import EmailIndexer
 
 logger = logging.getLogger(__name__)
@@ -96,6 +97,7 @@ class _MailScanMetrics:
     actionable: int = 0
     attempted: int = 0
     parsed: int = 0
+    db_status_queries: int = 0
     db_current: int = 0
     db_missing: int = 0
     db_stale: int = 0
@@ -299,6 +301,7 @@ def run_mail_scan(
     retry_failures: bool = False,
     cancel_check=None,
     maintenance_memory_log=None,
+    memory_diagnostics: "MemoryDiagnostics | None" = None,
     on_state_persisted=None,
     preloaded_state: dict | None = None,
     preloaded_state_load_s: float = 0.0,
@@ -347,6 +350,18 @@ def run_mail_scan(
         metrics.state_persists += 1
         return saved
 
+    state_dirty = state_needs_save(state)
+
+    def save_state_if_dirty() -> bool:
+        """변경된 상태만 저장하고 성공했을 때만 clean으로 전환한다."""
+        nonlocal state_dirty
+        if not state_dirty:
+            return True
+        if not save_state():
+            return False
+        state_dirty = False
+        return True
+
     def save_failures() -> None:
         """실패 이력 저장 시간을 사이클 집계에 더한다."""
         started = time.perf_counter()
@@ -354,13 +369,12 @@ def run_mail_scan(
         metrics.failure_persist_s += time.perf_counter() - started
         metrics.failure_persists += 1
 
-    state_dirty = state_needs_save(state)
     if invalidate_cache:
         # DB가 비어 있거나 재생성됐다는 사실을 메모리 플래그만으로 소비하면 안 된다.
         # 첫 DB 저장 뒤 상태 저장 전에 프로세스가 종료되면, 다음 시작에서 이전 성공
         # 캐시가 되살아 빈 DB를 정상으로 오인할 수 있다. 따라서 어떤 메일을 열거나
         # DB를 건드리기 전에 빈 상태를 먼저 디스크에 확정한다.
-        if not save_state():
+        if not save_state_if_dirty():
             logger.error("[mail_scanner] 캐시 무효화 상태를 저장하지 못해 이번 메일 스캔을 연기합니다")
             if on_state_persisted:
                 on_state_persisted(False)
@@ -384,7 +398,10 @@ def run_mail_scan(
     pending_changed = _retry_pending_deletes(state, email_indexer, metrics)
     metrics.pending_delete_retry_s = time.perf_counter() - pending_delete_started
     if pending_changed:
-        save_state()
+        # 재시도 삭제 성공은 이후 후보 열거보다 먼저 durable state에 반영한다.
+        # 중단돼도 이미 지운 ID를 다음 시작에서 안전하게 다시 시도할 수 있다.
+        state_dirty = True
+        save_state_if_dirty()
     excluded_keys = frozenset(
         normalize_path_key(path)
         for path in cfg.get("collector", {}).get("exclude_files", [])
@@ -410,7 +427,6 @@ def run_mail_scan(
     pruned = prune_missing_files(state, seen_keys) if roots_accessible else 0
     failure_pruned = failure_state.prune(failures) if roots_accessible else 0
     state_dirty = state_dirty or pruned > 0
-    state_dirty = pending_changed or state_dirty
     failures_dirty = failures_dirty or failure_pruned > 0
     for path in cached_failure_paths:
         failure_state.note_success(failures, path)
@@ -445,6 +461,24 @@ def run_mail_scan(
         if on_progress and last_resolved_item is not None and reported_count != resolved_count:
             on_progress(resolved_count, len(candidates), Path(last_resolved_item["path"]).name)
 
+    def log_memory_sample() -> None:
+        """진단 모드에서만 50건 단위의 익명 누적 작업량을 남긴다."""
+        if memory_diagnostics is None or metrics.attempted == 0 or metrics.attempted % 50:
+            return
+        memory_diagnostics.log(
+            "mail_sample",
+            counters={
+                "attempted": metrics.attempted,
+                "commits": metrics.commits,
+                "cache_hits": metrics.cache_hits,
+                "status_queries": metrics.db_status_queries,
+                "db_current": metrics.db_current,
+                "db_missing": metrics.db_missing,
+                "db_stale": metrics.db_stale,
+                "db_error": metrics.db_error,
+            },
+        )
+
     def mark_failure(item: dict, stage: str = "index") -> None:
         """캐시를 만들지 않은 채 source 하나를 다음 주기로 미룬다."""
         nonlocal failures_dirty, skipped_count
@@ -471,10 +505,12 @@ def run_mail_scan(
 
     def delete_captured_ids(item: dict, chunk_ids: tuple[str, ...]) -> None:
         """저장 성공이 확인된 기존 ID만 durable queue 뒤에 삭제한다."""
+        nonlocal state_dirty
         if not chunk_ids:
             return
         queue_pending_delete(state, chunk_ids)
-        if not save_state():
+        state_dirty = True
+        if not save_state_if_dirty():
             logger.error(
                 "[mail_scanner] 기존 메일 청크 삭제 대상을 저장하지 못해 삭제를 연기합니다: %s",
                 item["path"],
@@ -489,7 +525,8 @@ def run_mail_scan(
             )
         else:
             clear_pending_delete(state, deleted_ids)
-            save_state()
+            state_dirty = True
+            save_state_if_dirty()
 
     def finish_old_delete(pending: _PreparedMail, aliases: list[_MailAlias]) -> None:
         """새 세대 저장 후 primary·복사본별로 캡처한 이전 ID를 함께 정리한다."""
@@ -631,6 +668,7 @@ def run_mail_scan(
             work.outcome = None
 
         db_check_started = time.perf_counter()
+        metrics.db_status_queries += 1
         ignored = {
             chunk_id for chunk_id in state.get("pending_deletes", [])
             if isinstance(chunk_id, str)
@@ -835,15 +873,15 @@ def run_mail_scan(
         state_dirty = True
         run_maintenance = getattr(email_indexer, "run_hard_limit_maintenance", None)
         if callable(run_maintenance) and not (cancel_check and cancel_check()):
-            # DB 결과를 가리키는 성공 캐시·커서를 먼저 내구성 있게 저장한 뒤에만
-            # native optimize를 시작한다. 저장 실패 시 인덱싱은 유지하고 다음
-            # 체크포인트로 최적화를 미룬다.
-            if save_state():
-                state_dirty = False
-                run_maintenance(
-                    cancelled=cancel_check,
-                    memory_log=maintenance_memory_log,
-                )
+            # Lance maintenance가 fragment 상태를 확인한 뒤 실제 optimize가 필요할
+            # 때만 이 callback을 호출한다. 대부분의 write는 전체 JSON 저장 없이
+            # 마지막 checkpoint까지 state를 메모리에 모은다.
+            run_maintenance(
+                ensure_durable=save_state_if_dirty,
+                cancelled=cancel_check,
+                memory_log=maintenance_memory_log,
+            )
+        log_memory_sample()
         if stop_after_global_error:
             break
 
@@ -855,7 +893,7 @@ def run_mail_scan(
 
     report_final_progress()
 
-    state_persisted = not state_dirty or save_state()
+    state_persisted = save_state_if_dirty()
     if on_state_persisted:
         on_state_persisted(state_persisted)
     if failures_dirty:
@@ -893,7 +931,7 @@ def run_mail_scan(
         "parse=%.3fs db_check=%.3fs embed=%.3fs commit=%.3fs pending_delete=%.3fs "
         "persist(state=%d/%.3fs failure=%d/%.3fs); files(enumerated=%d cache_hits=%d "
         "backoff_deferred=%d actionable=%d attempted=%d parsed=%d); db(current=%d missing=%d "
-        "stale=%d error=%d); embed(chunks=%d batches=%d embed_calls=%d split_retries=%d); "
+        "stale=%d error=%d); status_queries=%d; embed(chunks=%d batches=%d embed_calls=%d split_retries=%d); "
         "mail(commits=%d failures=%d pending_delete_retries=%d indexed=%d skipped=%d migrations=%d "
         "cache_pruned=%d)",
         time.perf_counter() - cycle_started,
@@ -902,7 +940,7 @@ def run_mail_scan(
         metrics.state_persists, metrics.state_persist_s, metrics.failure_persists, metrics.failure_persist_s,
         metrics.enumerated, metrics.cache_hits, metrics.active_backoff_deferred, metrics.actionable,
         metrics.attempted, metrics.parsed, metrics.db_current, metrics.db_missing, metrics.db_stale,
-        metrics.db_error, metrics.embedding_input_chunks, metrics.embedding_batches,
+        metrics.db_error, metrics.db_status_queries, metrics.embedding_input_chunks, metrics.embedding_batches,
         metrics.embed_calls, metrics.embedding_split_retries, metrics.commits, metrics.failures,
         metrics.pending_delete_retries, indexed_count, skipped_count, migrate_count, pruned,
     )
