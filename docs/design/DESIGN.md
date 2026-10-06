@@ -292,6 +292,8 @@ chunks·emails 테이블 **전체**를 `to_arrow().to_pandas()`로 로드했고,
 있었는지)가 False면 `_on_worker_finished`가 DB를 아예 열지 않고 직전 캐시값을 재사용. 조회
 실패 시에도 0으로 튀지 않고 직전 값으로 폴백(부수 개선).
 
+앱 크래시 가설, 진단 로그의 한계와 추가 검증 순서는 [DIAGNOSTICS.md](../DIAGNOSTICS.md)를 따른다.
+
 **수집 사이클 메모리 진단** (`collector.memory_diagnostics_enabled`, 기본 `false`): 메모리 증가의
 소유 영역을 나누기 위해 `cycle_start` → `after_document_indexing` → `after_documents`(orphan·purge
 정리와 상태 저장 뒤) → `after_mail` → `after_gc_collect` 시점마다 한 줄 INFO 로그를 남긴다.
@@ -739,7 +741,7 @@ helper 분리가 최종 구조다.
 
 ## Knox 메일 인덱싱 (`Phase 5a`)
 
-상세 설계: `docs/EMAIL_DESIGN.md`
+상세 설계: `docs/design/EMAIL_DESIGN.md`
 
 **핵심 결정 요약**
 

@@ -5,7 +5,7 @@
 
 **충돌 시 우선순위**:
 `이 파일의 불변식(§2)` > `이 파일의 나머지` > `docs/dev/` 작업 지침
-> `UI_SPEC.md`와 `docs/DESIGN.md` 등 위임 문서 > `README.md`와 배포 안내 > 코드 주석
+> `UI_SPEC.md`와 `docs/design/DESIGN.md` 등 위임 문서 > `README.md`와 배포 안내 > 코드 주석
 
 ---
 
@@ -17,7 +17,7 @@
 - 사용자에게 답할 때는 [`docs/dev/response_style.md`](docs/dev/response_style.md)의
   결론 우선·간결한 표현 원칙을 따른다.
 - 코드의 기능이나 동작을 바꾸면 같은 변경에서 [`docs/UPDATE_NOTES.md`](docs/UPDATE_NOTES.md)를
-  갱신한다. 문서만 고치는 변경은 제외한다. 형식은 [`docs/WORKFLOW.md`](docs/WORKFLOW.md)를 따른다.
+  갱신한다. 문서만 고치는 변경은 제외한다. 형식은 [`docs/dev/WORKFLOW.md`](docs/dev/WORKFLOW.md)를 따른다.
 - 기존 작업 트리가 깨끗하지 않으면 사용자 변경을 보존하고, 요청과 무관한 파일은 수정하지 않는다.
 
 ---
@@ -97,15 +97,16 @@
 | 코드 작성·검토 태도 | [`docs/dev/karpathy_guidelines.md`](docs/dev/karpathy_guidelines.md) |
 | 사용자 응답 방식 | [`docs/dev/response_style.md`](docs/dev/response_style.md) |
 | 런타임 구조·디렉토리·문서 지도 | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) |
-| 상세 설계 결정·실패 처리·LanceDB 운용 | [`docs/DESIGN.md`](docs/DESIGN.md) |
-| 메일 파싱·저장·검색 계약 | [`docs/EMAIL_DESIGN.md`](docs/EMAIL_DESIGN.md) |
+| 상세 설계 결정·실패 처리·LanceDB 운용 | [`docs/design/DESIGN.md`](docs/design/DESIGN.md) |
+| 메일 파싱·저장·검색 계약 | [`docs/design/EMAIL_DESIGN.md`](docs/design/EMAIL_DESIGN.md) |
 | 현재 단계·남은 과제·보류 사유 | [`docs/ROADMAP.md`](docs/ROADMAP.md) |
-| 개발·배포 환경과 버전 고정 | [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md) |
+| 성능·크래시 원인 분석·개선 후보·검증 순서 | [`docs/DIAGNOSTICS.md`](docs/DIAGNOSTICS.md) |
+| 개발·배포 환경과 버전 고정 | [`docs/guides/ENVIRONMENT.md`](docs/guides/ENVIRONMENT.md) |
 | 화면 동작과 시각 규칙 | [`UI_SPEC.md`](UI_SPEC.md) |
-| 베타 배포와 사용자 안내 | [`docs/BETA_GUIDE.md`](docs/BETA_GUIDE.md) |
+| 베타 배포와 사용자 안내 | [`docs/guides/BETA_GUIDE.md`](docs/guides/BETA_GUIDE.md) |
 | 사용자 관점 변경 이력 | [`docs/UPDATE_NOTES.md`](docs/UPDATE_NOTES.md) |
-| 수정노트 작성 규칙 | [`docs/WORKFLOW.md`](docs/WORKFLOW.md) |
-| 쿼리 비동기화 보류 설계 | [`docs/ISSUE_B_query_async.md`](docs/ISSUE_B_query_async.md) |
+| 수정노트 작성 규칙 | [`docs/dev/WORKFLOW.md`](docs/dev/WORKFLOW.md) |
+| 쿼리 비동기화 보류 설계 | [`docs/design/ISSUE_B_query_async.md`](docs/design/ISSUE_B_query_async.md) |
 | 보안 패키지 운영·수동 검증 | [`knowmate/secure/README.md`](knowmate/secure/README.md) |
 
 `docs/ai-workflow/` 기반 설계 원장과 자동 GPT 리뷰 절차는 폐지됐다. 과거 판단이 필요하면 Git

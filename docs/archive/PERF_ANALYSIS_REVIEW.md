@@ -1,6 +1,10 @@
-# 교차검증 리포트 — docs/PERF_ANALYSIS.md
+# 교차검증 리포트 — docs/archive/PERF_ANALYSIS.md
 
-> 검토 대상: `docs/PERF_ANALYSIS.md` (커밋 `56256f9`)
+이 문서는 **과거 검증 기록**이다. 현재 진단은 [DIAGNOSTICS.md](../DIAGNOSTICS.md),
+수정 결과는 [UPDATE_NOTES.md](../UPDATE_NOTES.md)를 따른다.
+아래 결함 수·코드 경로·테스트 경로는 발견 당시 기록이며 현재 미수정 목록이 아니다.
+
+> 검토 대상: `docs/archive/PERF_ANALYSIS.md` (커밋 `56256f9`)
 > 최종 상태: **`CRITICALS_REMAIN`** · 3라운드 · 2026-09-06
 > 검토자: Claude Opus 5 (1M context) / Codex `gpt-5.x` via codex-cli 0.153.4, effort `high`
 > **문서는 고치지 않았다. 이 리포트는 지적 목록이다.**

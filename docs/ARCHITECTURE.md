@@ -1,6 +1,6 @@
 # ARCHITECTURE.md — Aegis Desk 구조·디렉토리
 
-> CLAUDE.md에서 분리한 구조 레퍼런스. 설계 *결정*의 근거는 `docs/DESIGN.md`, 여기는 "무엇이 어디에 있는가".
+> CLAUDE.md에서 분리한 구조 레퍼런스. 설계 *결정*의 근거는 `docs/design/DESIGN.md`, 여기는 "무엇이 어디에 있는가".
 
 ---
 
@@ -63,6 +63,20 @@ scripts/          diag_search.py(검색 0건 진단) · diag_embed_latency.py(�
 
 ## 문서 지도
 
+자주 보는 문서는 `docs/` 바로 아래에 두고, 상세 문서는 다음 폴더로 분류한다.
+
+```text
+docs/
+ ├─ ARCHITECTURE.md    # 전체 구조·문서 안내
+ ├─ ROADMAP.md         # 현재 작업·보류 조건
+ ├─ DIAGNOSTICS.md     # 성능·크래시 진단
+ ├─ UPDATE_NOTES.md    # 변경 이력
+ ├─ design/           # 구현·메일·질문 비동기화 설계
+ ├─ guides/           # 개발 환경·베타 배포 안내
+ ├─ dev/              # 개발·문서·응답·수정노트 작성 규칙
+ └─ archive/          # 과거 성능 분석·교차검증 기록
+```
+
 ### 작업 규칙 · 구조
 
 | 문서 | 내용 |
@@ -70,18 +84,23 @@ scripts/          diag_search.py(검색 0건 진단) · diag_embed_latency.py(�
 | `CLAUDE.md` | 공통 개발 계약(불변식·코드 변경 규칙) — 정본 |
 | `AGENTS.md` | Codex와 개발 에이전트용 진입 지침 — `CLAUDE.md`로 위임 |
 | `docs/ARCHITECTURE.md` | 이 문서 — 런타임 구조·디렉토리·문서 지도 |
-| `docs/WORKFLOW.md` | 모델 사용 정책·수정노트 작성 규칙 |
-| `docs/ENVIRONMENT.md` | 환경·패키지·버전 고정·배포·네트워크 드라이브 |
+| `docs/dev/WORKFLOW.md` | 모델 사용 정책·수정노트 작성 규칙 |
+| `docs/guides/ENVIRONMENT.md` | 환경·패키지·버전 고정·배포·네트워크 드라이브 |
 | `docs/ROADMAP.md` | 구현 단계·미착수 과제·5b 결론 |
+| `docs/DIAGNOSTICS.md` | 현행 성능·크래시 진단, 근거·가설·검증 순서와 개선 후보 |
 
 ### 설계
 
 | 문서 | 내용 |
 |---|---|
-| `docs/DESIGN.md` | **설계 결정 상세 (정본)** — 스키마·파서·워치독·실패 백오프 등 |
-| `docs/EMAIL_DESIGN.md` | 메일 인덱싱 (Knox `.mysingle` · `.eml`) |
-| `docs/ISSUE_B_query_async.md` | 질의 비동기화 검토 기록 |
+| `docs/design/DESIGN.md` | **설계 결정 상세 (정본)** — 스키마·파서·워치독·실패 백오프 등 |
+| `docs/design/EMAIL_DESIGN.md` | 메일 인덱싱 (Knox `.mysingle` · `.eml`) |
+| `docs/design/ISSUE_B_query_async.md` | 질의 비동기화 검토 기록 |
 | `knowmate/secure/README.md` | Windows·보안 의존 코드 운영 및 사내 검증 안내 |
+
+성능 조사는 [DIAGNOSTICS.md](DIAGNOSTICS.md)에서 시작한다.
+[과거 분석](archive/PERF_ANALYSIS.md)과 [교차검증](archive/PERF_ANALYSIS_REVIEW.md)은
+`archive/`에 보존한다.
 
 ### 화면 · 배포
 
@@ -89,5 +108,5 @@ scripts/          diag_search.py(검색 0건 진단) · diag_embed_latency.py(�
 |---|---|
 | `UI_SPEC.md` (루트) | 화면 사양 |
 | `knowmate/app/ui/mockup.html` · `mockup_failures.html` | 룩앤필 · [확인 필요한 문서] 화면 |
-| `docs/BETA_GUIDE.md` | 테스터 배포 가이드 |
+| `docs/guides/BETA_GUIDE.md` | 테스터 배포 가이드 |
 | `docs/UPDATE_NOTES.md` | 베타 수정노트 (요일별) |

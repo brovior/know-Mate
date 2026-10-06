@@ -27,9 +27,9 @@ Codex와 다른 개발 에이전트가 이 저장소에서 작업할 때 따르�
 ## 문서 찾기
 
 - 전체 구조와 문서 지도: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-- 상세 설계: [`docs/DESIGN.md`](docs/DESIGN.md)
+- 상세 설계: [`docs/design/DESIGN.md`](docs/design/DESIGN.md)
 - 현재 계획: [`docs/ROADMAP.md`](docs/ROADMAP.md)
-- 개발·배포 환경: [`docs/ENVIRONMENT.md`](docs/ENVIRONMENT.md)
+- 개발·배포 환경: [`docs/guides/ENVIRONMENT.md`](docs/guides/ENVIRONMENT.md)
 - 화면 사양: [`UI_SPEC.md`](UI_SPEC.md)
 
 폐지된 `docs/ai-workflow/` 절차는 사용하지 않는다. 과거 논의가 필요할 때만 Git 이력을 확인한다.
