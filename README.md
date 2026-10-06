@@ -84,7 +84,7 @@ build.bat fast     # 캐시 재사용 — 개발 중 반복 확인용, 배포 �
 # 빌드 출처를 검사한다(실패하면 배포 중단 + dist\selftest.log에 상세).
 # WebEngine 실제 렌더링은 배포 전 한 번 직접 실행해 확인할 것.
 # 이 폴더를 통째로 zip으로 압축해 테스터에게 배포 (exe 단독 배포 불가).
-# 배포 가이드: docs/BETA_GUIDE.md
+# 배포 가이드: docs/guides/BETA_GUIDE.md
 ```
 
 빌드 기본값이 '클린'인 이유: 배포용 결과물이라 PyInstaller 증분 캐시가 stale해져
