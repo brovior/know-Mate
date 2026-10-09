@@ -166,12 +166,8 @@ class TestWatchdogIntegration:
 
         monkeypatch.setattr(sys, "platform", "win32")
         monkeypatch.setattr(og, "_enumerate_processes", lambda: [("EXCEL.EXE", 4242)])
-        monkeypatch.setattr(
-            og, "_owned_for_exe",
-            lambda exe: {4242: og.OwnedOfficeProcess("EXCEL.EXE", 4242)},
-        )
-        monkeypatch.setattr(og, "_process_creation_identity", lambda pid: 4242)
-        monkeypatch.setattr(og, "_terminate_pid", lambda pid, expected=None: True)
+        monkeypatch.setattr(og, "_owned_pids", {4242: og.OwnedOfficeProcess("EXCEL.EXE", 4242)})
+        monkeypatch.setattr(og, "_terminate_and_confirm", lambda *_args: "terminated")
 
         cleared: list[str] = []
         monkeypatch.setattr(
@@ -189,12 +185,8 @@ class TestWatchdogIntegration:
 
         monkeypatch.setattr(sys, "platform", "win32")
         monkeypatch.setattr(og, "_enumerate_processes", lambda: [("EXCEL.EXE", 4242)])
-        monkeypatch.setattr(
-            og, "_owned_for_exe",
-            lambda exe: {4242: og.OwnedOfficeProcess("EXCEL.EXE", 4242)},
-        )
-        monkeypatch.setattr(og, "_process_creation_identity", lambda pid: 4242)
-        monkeypatch.setattr(og, "_terminate_pid", lambda pid, expected=None: True)
+        monkeypatch.setattr(og, "_owned_pids", {4242: og.OwnedOfficeProcess("EXCEL.EXE", 4242)})
+        monkeypatch.setattr(og, "_terminate_and_confirm", lambda *_args: "terminated")
 
         def _boom(exe):
             raise RuntimeError("레지스트리 정리 실패(시뮬레이션)")

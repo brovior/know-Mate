@@ -1,5 +1,6 @@
 """config.yaml 싱글톤 로더 + 앱 데이터 폴더 관리."""
 import logging
+import math
 import os
 import sys
 from copy import deepcopy
@@ -137,6 +138,20 @@ def get_config() -> dict[str, Any]:
                     _save_config(_cache)
                 except OSError as exc:
                     logger.warning("document state flush 설정 이전 저장 실패: %s", exc)
+        mail_cfg = _cache.setdefault("mail", {})
+        if isinstance(mail_cfg, dict) and "discovery_refresh_seconds" not in mail_cfg:
+            mail_cfg["discovery_refresh_seconds"] = mail_discovery_refresh_seconds(mail_cfg)
+            try:
+                _save_config(_cache)
+            except OSError as exc:
+                logger.warning("mail discovery 설정 이전 저장 실패: %s", exc)
+        collector = _cache.setdefault("collector", {})
+        if isinstance(collector, dict) and "com_quit_call_timeout_sec" not in collector:
+            collector["com_quit_call_timeout_sec"] = _bundled_com_quit_timeout_default()
+            try:
+                _save_config(_cache)
+            except OSError as exc:
+                logger.warning("COM Quit 시간제한 설정 이전 저장 실패: %s", exc)
     return _cache
 
 
@@ -160,6 +175,44 @@ def document_state_flush_settings(collector: dict[str, Any]) -> tuple[int, float
         int(collector.get("state_flush_docs", defaults["state_flush_docs"])),
         float(collector.get("state_flush_seconds", defaults["state_flush_seconds"])),
     )
+
+
+def mail_discovery_refresh_seconds(mail: dict[str, Any]) -> float:
+    """Read discovery interval, filling old mappings from bundled YAML."""
+    if "discovery_refresh_seconds" in mail:
+        return float(mail["discovery_refresh_seconds"])
+    with _bundled_config_source().open(encoding="utf-8") as handle:
+        bundled = yaml.safe_load(handle)
+    return float(bundled["mail"]["discovery_refresh_seconds"])
+
+
+def com_quit_call_timeout_seconds(collector: dict[str, Any]) -> float:
+    """Return a finite positive Quit timeout, falling back to bundled config."""
+    default = _bundled_com_quit_timeout_default()
+    value = collector.get("com_quit_call_timeout_sec", default)
+    try:
+        numeric = float(value) if not isinstance(value, bool) and isinstance(value, (int, float)) else 0.0
+        valid = numeric > 0 and math.isfinite(numeric)
+    except (OverflowError, ValueError):
+        valid = False
+        numeric = default
+    if not valid:
+        logger.warning("잘못된 collector.com_quit_call_timeout_sec 설정을 배포 기본값으로 복구합니다")
+        collector["com_quit_call_timeout_sec"] = default
+        if isinstance(_cache, dict) and _cache.get("collector") is collector:
+            try:
+                _save_config(_cache)
+            except OSError as exc:
+                logger.warning("COM Quit 시간제한 설정 복구 저장 실패: %s", exc)
+        return default
+    return numeric
+
+
+def _bundled_com_quit_timeout_default() -> float:
+    """Read the COM Quit timeout default from the bundled config source."""
+    with _bundled_config_source().open(encoding="utf-8") as handle:
+        bundled = yaml.safe_load(handle) or {}
+    return float(bundled["collector"]["com_quit_call_timeout_sec"])
 
 
 def update_watch_folders(folders: list[str]) -> None:

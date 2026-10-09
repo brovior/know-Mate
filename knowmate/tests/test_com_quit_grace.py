@@ -1,183 +1,324 @@
-"""COM 종료 유예(Quit → 대기 → 잔존만 강제종료) 단위 테스트.
-
-배경: `app.Quit()`은 종료를 요청만 하고 즉시 반환한다. 유예 없이 그 직후 바로
-프로세스를 조회하면, 스스로 정리 중인(임시파일·애드인 정리 등) Office까지 매번
-강제종료로 오판해 세이프모드 유발 표식이 반복 생성된다(레이스). `wait_for_owned_exit`
-(office_guard.py)로 실제 종료를 기다리고, `quit_com_apps`(com_reader.py)가 남은
-프로세스만 강제종료하도록 고쳤다.
-
-실제 `ctypes.windll`(OpenProcess/WaitForSingleObject)은 Windows에만 있어 사외
-Linux에서 직접 검증할 수 없다 — 이 저장소의 기존 관례(office_guard의 win32 ctypes
-내부는 `sys.platform != "win32"` 가드만 테스트하고, 실제 분기는 의존성 주입으로
-검증)를 따라 `wait_fn` 주입으로 quit_com_apps의 분기 로직을 검증한다.
-"""
+"""COM shutdown ownership and timeout race regression tests."""
 import sys
+import threading
+
+import pytest
 
 from knowmate.secure import com_reader, office_guard
 
 
-class TestWaitForOwnedExitPlatformGuard:
-    """ctypes.windll에 닿지 않는 플랫폼 가드만 사외에서 직접 검증 가능하다."""
-
-    def test_empty_owned_returns_immediately(self):
-        still_alive, elapsed = office_guard.wait_for_owned_exit(set(), 5.0)
-        assert still_alive == set()
-        assert elapsed == 0.0
-
-    def test_non_windows_returns_owned_unresolved(self, monkeypatch):
-        """비Windows에서는 대기하지 않고 owned를 그대로(미해결) 반환한다 —
-        판단 불가 시 보수적으로 "살아있음" 취급하는 이 모듈의 기존 관례와 동일."""
-        monkeypatch.setattr(sys, "platform", "linux")
-        still_alive, elapsed = office_guard.wait_for_owned_exit({111, 222}, 5.0)
-        assert still_alive == {111, 222}
-        assert elapsed == 0.0
-
-
 class _FakeApp:
-    """win32com Dispatch가 반환하는 Office 애플리케이션 객체 대역."""
-
-    def __init__(self, quit_raises: bool = False):
+    def __init__(self, on_quit=None, raises=False):
         self.quit_called = False
-        self._quit_raises = quit_raises
+        self.on_quit = on_quit
+        self.raises = raises
 
     def Quit(self):
         self.quit_called = True
-        if self._quit_raises:
-            raise RuntimeError("Quit 실패(시뮬레이션)")
+        if self.on_quit:
+            self.on_quit()
+        if self.raises:
+            raise RuntimeError("fake Quit failure")
 
 
-class TestQuitComAppsGraceLogic:
-    """quit_com_apps()의 유예 분기를 wait_fn 주입으로 검증한다(ctypes 미의존)."""
-
-    def _install_owned(self, monkeypatch, owned: set):
-        records = {
-            pid: office_guard.OwnedOfficeProcess("EXCEL.EXE", pid)
-            for pid in owned
-        }
-        monkeypatch.setattr(office_guard, "take_owned_processes", lambda: dict(records))
-
-    def test_no_owned_pids_skips_wait_and_terminate(self, monkeypatch):
-        """소유 PID가 없으면 대기도 강제종료도 하지 않는다."""
-        self._install_owned(monkeypatch, set())
-        wait_calls = []
-        terminate_calls = []
-        monkeypatch.setattr(
-            office_guard, "wait_for_owned_exit",
-            lambda owned, timeout: (wait_calls.append((set(owned), timeout)) or (set(), 0.0)),
-        )
-        monkeypatch.setattr(
-            office_guard, "terminate_owned_office_processes",
-            lambda owned: terminate_calls.append(set(owned)),
+def _register(pid=111, exe="EXCEL.EXE"):
+    with office_guard._owned_lock:
+        office_guard._ownership_generation += 1
+        office_guard._owned_pids[pid] = office_guard.OwnedOfficeProcess(
+            exe, pid * 10, True, office_guard._ownership_generation,
         )
 
-        com_reader.quit_com_apps(grace_sec=5.0)
 
-        assert wait_calls == []
-        assert terminate_calls == []
+@pytest.fixture(autouse=True)
+def _clean_state():
+    office_guard.clear_owned_pids()
+    for name in ("word", "excel", "ppt"):
+        setattr(com_reader._tls, name, None)
+    yield
+    office_guard.clear_owned_pids()
+    for name in ("word", "excel", "ppt"):
+        setattr(com_reader._tls, name, None)
 
-    def test_all_exit_within_grace_skips_terminate(self, monkeypatch):
-        """유예 안에 전부 스스로 종료하면 강제종료를 호출하지 않는다(핵심 회귀 방어)."""
-        self._install_owned(monkeypatch, {111, 222})
-        terminate_calls = []
-        monkeypatch.setattr(
-            office_guard, "wait_for_owned_exit",
-            lambda owned, timeout: (set(), 0.8),  # 아무도 안 남음, 0.8초 만에 종료
-        )
-        monkeypatch.setattr(
-            office_guard, "terminate_owned_office_processes",
-            lambda owned: terminate_calls.append(set(owned)),
-        )
 
-        com_reader.quit_com_apps(grace_sec=5.0)
+def test_normal_quit_uses_registry_and_removes_only_after_exit_confirmation(monkeypatch):
+    _register()
+    app = _FakeApp()
+    monkeypatch.setattr(com_reader._tls, "excel", app, raising=False)
+    calls = []
 
-        assert terminate_calls == []
+    def wait(snapshot, timeout):
+        calls.append((dict(snapshot), timeout))
+        return set(), 0.25
 
-    def test_still_alive_after_grace_terminates_only_those(self, monkeypatch):
-        """유예 초과 후 남은 PID만 강제종료한다(스스로 종료한 것은 건드리지 않음)."""
-        self._install_owned(monkeypatch, {111, 222, 333})
-        terminate_calls = []
-        monkeypatch.setattr(
-            office_guard, "wait_for_owned_exit",
-            lambda owned, timeout: ({222}, 5.0),  # 222만 유예 끝까지 살아남음
-        )
-        monkeypatch.setattr(
-            office_guard, "terminate_owned_office_processes",
-            lambda owned: terminate_calls.append(set(owned)),
-        )
+    result = com_reader.quit_com_apps(grace_sec=5, wait_fn=wait, quit_timeout_sec=5)
 
-        com_reader.quit_com_apps(grace_sec=5.0)
+    assert app.quit_called
+    assert calls[0][0][111].cleanup_pending
+    assert office_guard._owned_pids == {}
+    assert result.confirmed_exited == frozenset({111})
 
-        assert terminate_calls == [{222}]
 
-    def test_grace_sec_zero_skips_wait_fn_entirely(self, monkeypatch):
-        """grace_sec=0이면 대기 없이 즉시 강제종료(이전 동작과 동일 — 비상 스위치)."""
-        self._install_owned(monkeypatch, {111, 222})
-        wait_calls = []
-        terminate_calls = []
-        monkeypatch.setattr(
-            office_guard, "wait_for_owned_exit",
-            lambda owned, timeout: (wait_calls.append((set(owned), timeout)) or (set(), 0.0)),
-        )
-        monkeypatch.setattr(
-            office_guard, "terminate_owned_office_processes",
-            lambda owned: terminate_calls.append(set(owned)),
-        )
+def test_registered_office_is_retried_even_when_tls_app_reference_is_missing(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    _register()
+    monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: [("EXCEL.EXE", 111)])
+    monkeypatch.setattr(office_guard, "_terminate_and_confirm", lambda *_args: "terminated")
 
-        com_reader.quit_com_apps(grace_sec=0)
+    result = com_reader.quit_com_apps(grace_sec=0, quit_timeout_sec=1)
 
-        assert wait_calls == []  # 대기 함수 자체를 호출하지 않음
-        assert terminate_calls == [{111, 222}]  # owned 전체를 즉시 강제종료
+    assert result.forced_exited == frozenset({111})
+    assert 111 not in office_guard._owned_pids
 
-    def test_wait_fn_parameter_overrides_default(self, monkeypatch):
-        """wait_fn을 직접 주입하면 office_guard.wait_for_owned_exit 대신 그것을 쓴다."""
-        self._install_owned(monkeypatch, {111})
-        terminate_calls = []
-        monkeypatch.setattr(
-            office_guard, "terminate_owned_office_processes",
-            lambda owned: terminate_calls.append(set(owned)),
-        )
-        injected_calls = []
 
-        def _injected_wait(owned, timeout):
-            injected_calls.append((set(owned), timeout))
-            return set(), 0.1
+def test_partial_grace_exit_is_removed_while_remaining_process_is_retried(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    _register(111, "WINWORD.EXE")
+    _register(222, "EXCEL.EXE")
+    monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: [("WINWORD.EXE", 111), ("EXCEL.EXE", 222)])
+    monkeypatch.setattr(office_guard, "_terminate_and_confirm", lambda pid, *_args: "terminated")
 
-        com_reader.quit_com_apps(grace_sec=3.0, wait_fn=_injected_wait)
+    result = com_reader.quit_com_apps(
+        grace_sec=1, quit_timeout_sec=1,
+        wait_fn=lambda _owned, _timeout: ({222}, 1.0),
+    )
 
-        assert injected_calls == [({111}, 3.0)]
-        assert terminate_calls == []
+    assert result.confirmed_exited == frozenset({111, 222})
+    assert 111 not in office_guard._owned_pids
+    assert 222 not in office_guard._owned_pids
 
-    def test_apps_quit_called_before_owned_cleared(self, monkeypatch):
-        """word/excel/ppt에 앱이 설정돼 있으면 각각 Quit()을 호출하고 thread-local을 비운다."""
-        word_app = _FakeApp()
-        excel_app = _FakeApp()
-        monkeypatch.setattr(com_reader._tls, "word", word_app, raising=False)
-        monkeypatch.setattr(com_reader._tls, "excel", excel_app, raising=False)
-        self._install_owned(monkeypatch, set())
 
-        com_reader.quit_com_apps(grace_sec=5.0)
+def test_quit_exception_still_releases_tls_and_preserves_owner_until_confirmed(monkeypatch):
+    _register()
+    app = _FakeApp(raises=True)
+    monkeypatch.setattr(com_reader._tls, "excel", app, raising=False)
+    com_reader.quit_com_apps(grace_sec=0, quit_timeout_sec=5)
+    assert getattr(com_reader._tls, "excel") is None
+    assert 111 in office_guard._owned_pids
+    assert office_guard._owned_pids[111].cleanup_pending
 
-        assert word_app.quit_called is True
-        assert excel_app.quit_called is True
-        assert getattr(com_reader._tls, "word", None) is None
-        assert getattr(com_reader._tls, "excel", None) is None
 
-    def test_quit_exception_does_not_prevent_cleanup(self, monkeypatch):
-        """Quit() 자체가 예외를 던져도 소유 PID 정리는 계속 진행된다."""
-        word_app = _FakeApp(quit_raises=True)
-        monkeypatch.setattr(com_reader._tls, "word", word_app, raising=False)
-        self._install_owned(monkeypatch, {111})
-        terminate_calls = []
-        monkeypatch.setattr(
-            office_guard, "wait_for_owned_exit",
-            lambda owned, timeout: ({111}, 5.0),
-        )
-        monkeypatch.setattr(
-            office_guard, "terminate_owned_office_processes",
-            lambda owned: terminate_calls.append(set(owned)),
-        )
+def test_blocked_quit_is_released_by_timeout_callback(monkeypatch):
+    _register()
+    released = threading.Event()
+    quit_started = threading.Event()
+    app = _FakeApp(on_quit=lambda: (quit_started.set(), released.wait(2)))
 
-        com_reader.quit_com_apps(grace_sec=5.0)  # 예외 없이 완료
+    def cleanup(snapshot, timeout_sec=2):
+        released.set()
+        return office_guard.OfficeCleanupResult(remaining=frozenset(snapshot))
 
-        assert getattr(com_reader._tls, "word", None) is None
-        assert terminate_calls == [{111}]
+    monkeypatch.setattr(office_guard, "cleanup_owned_processes", cleanup)
+    def run_quit():
+        com_reader._tls.excel = app
+        com_reader.quit_com_apps(grace_sec=0, quit_timeout_sec=0.02)
+
+    thread = threading.Thread(target=run_quit, daemon=True)
+    thread.start()
+    assert quit_started.wait(1)
+    thread.join(1)
+    assert not thread.is_alive()
+    assert released.is_set()
+    assert 111 in office_guard._owned_pids
+
+
+def test_timeout_callback_exception_is_reported_and_owner_remains_pending(monkeypatch):
+    _register()
+    app = _FakeApp(on_quit=lambda: threading.Event().wait(0.06))
+    monkeypatch.setattr(com_reader._tls, "excel", app, raising=False)
+    monkeypatch.setattr(
+        office_guard, "cleanup_owned_processes",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("fake kill failure")),
+    )
+    com_reader.quit_com_apps(grace_sec=0, quit_timeout_sec=0.01)
+    assert 111 in office_guard._owned_pids
+    assert office_guard._owned_pids[111].cleanup_pending
+    with pytest.raises(office_guard.OfficeCleanupPendingError):
+        office_guard.ensure_office_available("EXCEL.EXE")
+
+
+def test_late_cancelled_timer_generation_cannot_cleanup(monkeypatch):
+    _register()
+    snapshot = office_guard.begin_owned_cleanup("EXCEL.EXE")
+    calls = []
+    monkeypatch.setattr(office_guard, "cleanup_owned_processes", lambda *args: calls.append(args))
+    watchdog = com_reader._OfficeQuitWatchdog(office_guard, "EXCEL.EXE", snapshot, 1)
+    watchdog.arm()
+    generation = watchdog._generation
+    watchdog.disarm()
+    watchdog._fire(generation)
+    assert calls == []
+    assert 111 in office_guard._owned_pids
+
+
+@pytest.mark.parametrize(
+    ("outcome", "kept", "forced"),
+    [("remaining", True, False), ("identity_unknown", True, False), ("terminated", False, True),
+     ("identity_changed", False, False)],
+)
+def test_cleanup_retains_unconfirmed_owner_and_removes_only_confirmed(monkeypatch, outcome, kept, forced):
+    monkeypatch.setattr(sys, "platform", "win32")
+    _register()
+    snapshot = office_guard.begin_owned_cleanup("EXCEL.EXE")
+    monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: [("EXCEL.EXE", 111)])
+    monkeypatch.setattr(office_guard, "_terminate_and_confirm", lambda *_args: outcome)
+    result = office_guard.cleanup_owned_processes(snapshot)
+    assert (111 in office_guard._owned_pids) is kept
+    assert (111 in result.forced_exited) is forced
+    if kept:
+        assert result.remaining | result.identity_unknown
+        retry_outcomes = iter(["terminated"])
+        monkeypatch.setattr(office_guard, "_terminate_and_confirm", lambda *_args: next(retry_outcomes))
+        retry = office_guard.cleanup_owned_processes(snapshot)
+        assert retry.confirmed_exited == frozenset({111})
+        assert 111 not in office_guard._owned_pids
+
+
+def test_pid_reuse_with_same_exe_never_kills_new_process(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    _register()
+    snapshot = office_guard.begin_owned_cleanup("EXCEL.EXE")
+    monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: [("EXCEL.EXE", 111)])
+    outcomes = []
+    monkeypatch.setattr(office_guard, "_terminate_and_confirm", lambda *_args: outcomes.append("called") or "identity_changed")
+    result = office_guard.cleanup_owned_processes(snapshot)
+    assert outcomes == ["called"]
+    assert result.confirmed_exited == frozenset({111})
+    assert result.forced_exited == frozenset()
+
+
+def test_powerpoint_is_never_quit_or_killed(monkeypatch):
+    app = _FakeApp()
+    monkeypatch.setattr(com_reader._tls, "ppt", app, raising=False)
+    with office_guard._owned_lock:
+        office_guard._owned_pids[333] = office_guard.OwnedOfficeProcess("POWERPNT.EXE", 3330, False)
+    com_reader.quit_com_apps()
+    assert not app.quit_called
+    assert 333 in office_guard._owned_pids
+
+
+class _ManualTimer:
+    """Let each test decide exactly when the timeout callback runs."""
+
+    callbacks = []
+
+    def __init__(self, _interval, callback):
+        self.callbacks.append(callback)
+
+    def start(self):
+        pass
+
+    def cancel(self):
+        pass
+
+
+def test_completed_timeout_cleanup_is_not_retried_or_reported_as_failed(monkeypatch):
+    """A successful timeout kill must stay successful even with zero grace."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(threading, "Timer", _ManualTimer)
+    _register()
+    kills = []
+    monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: [("EXCEL.EXE", 111)])
+    monkeypatch.setattr(office_guard, "_terminate_and_confirm", lambda *args: kills.append(args) or "terminated")
+    com_reader._tls.excel = _FakeApp(on_quit=lambda: _ManualTimer.callbacks[-1]())
+
+    result = com_reader.quit_com_apps(grace_sec=0, quit_timeout_sec=1)
+
+    assert len(kills) == 1
+    assert result.successful
+    assert result.confirmed_exited == result.forced_exited == frozenset({111})
+
+
+def test_inflight_timeout_remains_gated_after_owner_removed_without_duplicate_cleanup(monkeypatch):
+    """Disarming an active callback must neither join it nor launch a second kill."""
+    _register()
+    monkeypatch.setattr(threading, "Timer", _ManualTimer)
+    started = threading.Event()
+    release = threading.Event()
+    calls = []
+    callback_threads = []
+
+    def cleanup(snapshot, timeout_sec=2):
+        calls.append(snapshot)
+        office_guard.finish_owned_cleanup(snapshot, set())
+        started.set()
+        assert release.wait(2)
+        return office_guard.OfficeCleanupResult(confirmed_exited=frozenset(snapshot))
+
+    def quit_while_cleanup_runs():
+        thread = threading.Thread(target=_ManualTimer.callbacks[-1], daemon=True)
+        callback_threads.append(thread)
+        thread.start()
+        assert started.wait(1)
+
+    monkeypatch.setattr(office_guard, "cleanup_owned_processes", cleanup)
+    com_reader._tls.excel = _FakeApp(on_quit=quit_while_cleanup_runs)
+    try:
+        result = com_reader.quit_com_apps(grace_sec=0, quit_timeout_sec=1)
+        assert result.remaining == frozenset({111})
+        assert not result.successful
+        assert office_guard._owned_pids == {}
+        with pytest.raises(office_guard.OfficeCleanupPendingError):
+            office_guard.ensure_office_available("EXCEL.EXE")
+        assert len(calls) == 1
+    finally:
+        release.set()
+        for thread in callback_threads:
+            thread.join(1)
+            assert not thread.is_alive()
+    office_guard.ensure_office_available("EXCEL.EXE")
+
+
+def test_stale_cleanup_snapshot_cannot_kill_or_remove_new_registration(monkeypatch):
+    monkeypatch.setattr(sys, "platform", "win32")
+    _register()
+    snapshot = office_guard.begin_owned_cleanup("EXCEL.EXE")
+    _register()  # Same PID/identity, but a new registry generation.
+    calls = []
+    monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: [("EXCEL.EXE", 111)])
+    monkeypatch.setattr(office_guard, "_terminate_and_confirm", lambda *args: calls.append(args) or "terminated")
+
+    result = office_guard.cleanup_owned_processes(snapshot)
+
+    assert calls == []
+    assert not office_guard._owned_pids[111].cleanup_pending
+    assert result.failed == frozenset({111})
+
+
+def test_pending_retry_is_throttled_per_exe_and_does_not_gate_other_apps(monkeypatch):
+    _register()
+    snapshot = office_guard.begin_owned_cleanup("EXCEL.EXE")
+    calls = []
+    monkeypatch.setattr(office_guard, "cleanup_owned_processes", lambda *args, **kwargs: (
+        calls.append(args) or office_guard.OfficeCleanupResult(remaining=frozenset(snapshot))
+    ))
+    for _ in range(20):
+        with pytest.raises(office_guard.OfficeCleanupPendingError):
+            office_guard.ensure_office_available("EXCEL.EXE")
+    office_guard.ensure_office_available("WINWORD.EXE")
+    assert len(calls) == 1
+
+
+def test_pending_guard_precedes_user_busy_detection(monkeypatch):
+    """Unqueryable ownership must still reach cleanup retry instead of user-busy skip."""
+    from knowmate.secure import AutoReader
+    _register()
+    office_guard.begin_owned_cleanup("EXCEL.EXE")
+    calls = []
+    monkeypatch.setattr(office_guard, "is_office_busy_for_ext", lambda ext: calls.append(ext) or True)
+    with pytest.raises(office_guard.OfficeCleanupPendingError):
+        AutoReader._guard_office_busy(".xls", "sample.xls")
+    assert calls == []
+
+
+@pytest.mark.parametrize("identity", [3330, 4440, None])
+def test_powerpoint_record_is_pruned_only_after_confirmed_exit_or_reuse(monkeypatch, identity):
+    monkeypatch.setattr(sys, "platform", "win32")
+    with office_guard._owned_lock:
+        office_guard._owned_pids[333] = office_guard.OwnedOfficeProcess("POWERPNT.EXE", 3330, False)
+    monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: [("POWERPNT.EXE", 333)])
+    monkeypatch.setattr(office_guard, "_process_creation_identity", lambda pid: identity)
+    office_guard.prune_released_nonterminable_processes()
+    assert (333 in office_guard._owned_pids) is (identity != 4440)
+    monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: [])
+    office_guard.prune_released_nonterminable_processes()
+    assert 333 not in office_guard._owned_pids

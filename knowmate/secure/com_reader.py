@@ -6,14 +6,20 @@ fake 모드에서는 이 모듈을 import하지 않아야 한다.
 COM STA 주의: COM 객체는 생성한 스레드에서만 사용 가능하다.
 _ThreadLocalComApps를 통해 스레드별로 독립적인 COM 앱 인스턴스를 관리한다.
 """
+from __future__ import annotations
+
 import logging
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from types import ModuleType
+from typing import Any, TYPE_CHECKING
 
 from knowmate.secure import com_stage
 from knowmate.secure.text_util import format_table
+
+if TYPE_CHECKING:
+    from knowmate.secure.office_guard import OfficeCleanupResult, OwnedOfficeProcess
 
 logger = logging.getLogger(__name__)
 
@@ -182,6 +188,73 @@ def _close_quietly(timer: com_stage.StageTimer, obj: Any, method_name: str, *arg
     return None
 
 
+class _OfficeQuitWatchdog:
+    """Bound one Office Quit call and clean only its captured owned processes."""
+
+    def __init__(
+        self, office_guard: ModuleType, exe: str,
+        owned: dict[int, OwnedOfficeProcess], timeout_sec: float,
+    ) -> None:
+        self._guard = office_guard
+        self._exe = exe
+        self._owned = dict(owned)
+        self._timeout = timeout_sec
+        self._lock = threading.Lock()
+        self._generation = 0
+        self._active = False
+        self._fired = False
+        self._inflight = False
+        self._completed = False
+        self._result = None
+        self._timer = None
+
+    def arm(self) -> None:
+        """Start a daemon timer for this app's Quit call."""
+        with self._lock:
+            self._generation += 1
+            generation = self._generation
+            self._active = True
+            timer = threading.Timer(self._timeout, lambda: self._fire(generation))
+            timer.daemon = True
+            self._timer = timer
+        timer.start()
+
+    def _fire(self, generation: int) -> None:
+        """Claim this generation, then do process work outside the watchdog lock."""
+        with self._lock:
+            if not self._active or generation != self._generation:
+                return
+            self._active = False
+            self._fired = True
+            self._inflight = True
+            self._guard.begin_shutdown_cleanup(self._exe)
+        result = None
+        try:
+            logger.warning("[com] Office Quit 시간 초과 발화: exe=%s PID=%s", self._exe, sorted(self._owned))
+            result = self._guard.cleanup_owned_processes(self._owned)
+            self._guard._log_cleanup_result(self._exe, result, "Quit timeout")
+        except Exception as exc:
+            logger.error("[com] Quit timeout cleanup 예외: exe=%s error_type=%s", self._exe, type(exc).__name__)
+        finally:
+            self._guard.finish_shutdown_cleanup(self._exe)
+            with self._lock:
+                self._result = result
+                self._inflight = False
+                self._completed = True
+
+    def disarm(self) -> tuple[bool, bool, OfficeCleanupResult | None]:
+        """Cancel without joining and report whether timeout cleanup completed."""
+        with self._lock:
+            self._active = False
+            self._generation += 1
+            timer = self._timer
+            self._timer = None
+            fired, completed, result = self._fired, self._completed, self._result
+        if timer is not None:
+            timer.cancel()
+        return fired, completed, result
+
+
 def _dispatch_and_own(win32com, prog_id: str, exe_name: str):
     """앱별 방식으로 COM을 생성하고 검증된 프로세스 PID만 소유 등록한다.
 
@@ -197,9 +270,11 @@ def _dispatch_and_own(win32com, prog_id: str, exe_name: str):
     """
     from knowmate.secure.office_guard import (
         OfficeBusyError, OfficeOwnershipProbeError, office_pids_live, register_owned_app,
+        ensure_office_available,
     )
     from knowmate.secure.office_resiliency import clear_resiliency_markers
 
+    ensure_office_available(exe_name)
     clear_resiliency_markers(exe_name)
     before = office_pids_live(exe_name)
     dispatch = (
@@ -245,6 +320,8 @@ def _configure_word_options(app: Any) -> None:
 
 def _get_word_app():
     """현재 스레드의 Word.Application COM 인스턴스를 반환한다."""
+    from knowmate.secure.office_guard import ensure_office_available
+    ensure_office_available("WINWORD.EXE")
     if not getattr(_tls, "word", None):
         _ensure_com_initialized()
         win32com = _require_win32com()
@@ -261,6 +338,8 @@ def _get_word_app():
 
 def _get_excel_app():
     """현재 스레드의 Excel.Application COM 인스턴스를 반환한다."""
+    from knowmate.secure.office_guard import ensure_office_available
+    ensure_office_available("EXCEL.EXE")
     if not getattr(_tls, "excel", None):
         _ensure_com_initialized()
         win32com = _require_win32com()
@@ -614,7 +693,9 @@ class PowerPointComReader:
 
 
 
-def quit_com_apps(grace_sec: float = 5.0, wait_fn=None) -> None:
+def quit_com_apps(
+    grace_sec: float = 5.0, wait_fn=None, quit_timeout_sec: float | None = None,
+) -> OfficeCleanupResult:
     """현재 스레드의 Word/Excel 앱은 Quit하고 모든 COM 참조를 비운다.
 
     COM 객체는 생성한 스레드에서만 Quit할 수 있으므로(STA),
@@ -622,69 +703,113 @@ def quit_com_apps(grace_sec: float = 5.0, wait_fn=None) -> None:
     PowerPoint는 MultiUse라 사용자 창일 가능성을 배제할 수 없어 Quit·강제 종료하지
     않고 참조 해제와 gc에 맡긴다. 검증 소유 Word/Excel 프로세스만 정리한다.
 
-    `app.Quit()`은 종료를 요청할 뿐 즉시 반환한다 — 실제 종료(임시파일·애드인
-    정리 등)까지는 수 초 걸릴 수 있어, 반환 직후 바로 프로세스를 조회하면
-    스스로 꺼지는 중인 것까지 매번 강제 종료로 오판했다(레이스). `grace_sec`
-    만큼 실제 종료를 기다린 뒤, 그래도 남은 '우리 소유' 프로세스만 강제
-    종료한다 — 좀비가 다음 사이클의 가드를 오작동시키지 않게 한다(자기 감지
-    스킵 방지). 강제 종료는 Office에 세이프모드 유발 표식을 남기므로, 유예를
-    주는 것만으로 이 표식 생성 자체를 줄일 수 있다.
+    Quit 자체가 멈추면 별도 daemon 타이머가 캡처한 Word/Excel 프로세스만 정리한다.
+    반환 후에는 grace_sec 동안 자연 종료를 기다린다(0이면 유예 생략). 타이머가
+    이미 정리를 시작한 대상에는 워커가 중복 종료를 요청하지 않는다. 실제 종료를
+    확인하지 못한 소유 기록은 남겨 다음 COM 진입에서 제한적으로 재정리한다.
+    Quit 전후 GC는 순환 참조에 남은 COM 래퍼 해제를 돕는다.
 
-    Quit() 전 `gc.collect()`를 1회 호출한다 — 파이썬 쪽에서 COM 래퍼 참조를
-    깜빡 놓지 않고 있어(순환 참조 등) Office가 "아직 누가 쓰고 있다"고 보고
-    스스로 종료하지 못하는 경우를 미리 제거한다. 이 라인이 있어도 여전히
-    유예를 다 쓰고 강제 종료가 반복된다면, 원인은 레이스가 아니라 어딘가
-    COM 참조를 명시적으로 놓지 않는 코드가 있다는 신호다 — `대기 Ns` 로그로
-    운영 중 구분한다.
-
-    grace_sec=0이면 대기 없이 기존 동작(즉시 강제종료)과 동일하다(비상 스위치).
-    wait_fn: 테스트 주입용(기본 `office_guard.wait_for_owned_exit`).
+    quit_timeout_sec=None이면 배포 설정의 기본값을 사용한다. 잘못된 제한값도
+    같은 기본값으로 복구한다. wait_fn은 자연 종료 대기 함수의 테스트 주입용이다.
     """
     import gc
+    from knowmate.secure import office_guard
+    from knowmate.config import com_quit_call_timeout_seconds
+    quit_timeout_sec = com_quit_call_timeout_seconds(
+        {} if quit_timeout_sec is None else {"com_quit_call_timeout_sec": quit_timeout_sec}
+    )
+    owned = office_guard.begin_owned_cleanup()
+    results: list[OfficeCleanupResult] = []
+    timed_out_pids: set[int] = set()
     gc.collect()
-
-    for attr in ("word", "excel", "ppt"):
+    for attr, exe in (("word", "WINWORD.EXE"), ("excel", "EXCEL.EXE"), ("ppt", "POWERPNT.EXE")):
         app = getattr(_tls, attr, None)
         if app is None:
             continue
-        if attr != "ppt":
-            try:
-                app.Quit()
-            except Exception:
-                pass
-        setattr(_tls, attr, None)
-        app = None
-
-    # PowerPoint는 Quit하지 않으므로 TLS와 루프 지역 참조를 비운 뒤 COM 래퍼를
-    # 즉시 수거해 자동화 서버가 자연 종료할 기회를 준다.
+        watchdog = None
+        try:
+            if attr != "ppt":
+                snapshot = {pid: rec for pid, rec in owned.items() if rec.exe == exe}
+                terminable = {pid: record for pid, record in snapshot.items() if record.terminable}
+                if terminable:
+                    watchdog = _OfficeQuitWatchdog(office_guard, exe, terminable, quit_timeout_sec)
+                    watchdog.arm()
+                try:
+                    app.Quit()
+                    logger.info("[com] Office Quit 반환: exe=%s", exe)
+                except Exception as exc:
+                    logger.warning("[com] Office Quit 예외: exe=%s error_type=%s", exe, type(exc).__name__)
+                finally:
+                    if watchdog is not None:
+                        fired, completed, result = watchdog.disarm()
+                        if fired:
+                            timed_out_pids.update(terminable)
+                            logger.info(
+                                "[com] Quit timeout 상태: exe=%s callback_completed=%s",
+                                exe, completed,
+                            )
+                            # cancel()는 이미 실행 중인 콜백을 멈추지 못한다. 콜백이
+                            # 기록을 먼저 지워도 in-flight gate가 새 COM 진입을 막으며,
+                            # 이번 호출은 정리 완료 전까지 성공을 보고하지 않는다.
+                            if completed and result is not None:
+                                results.append(result)
+                            elif completed:
+                                results.append(office_guard.OfficeCleanupResult(failed=frozenset(terminable)))
+                            else:
+                                results.append(office_guard.OfficeCleanupResult(remaining=frozenset(terminable)))
+        finally:
+            # Quit 예외에도 스레드 로컬 COM 참조를 반드시 놓는다.
+            setattr(_tls, attr, None)
+            app = None
+    # PowerPoint 참조만 해제되고 Quit/강제종료되지 않는다.
     gc.collect()
-
-    # 우리가 띄운 인스턴스 중 Quit 후에도 남아있으면 강제 종료 + 소유 목록 비움
+    office_guard.prune_released_nonterminable_processes()
+    terminable = {
+        pid: record for pid, record in owned.items()
+        if record.terminable and pid not in timed_out_pids
+    }
+    if wait_fn is None:
+        wait_fn = office_guard.wait_for_owned_exit
     try:
-        from knowmate.secure import office_guard
-        owned = office_guard.take_owned_processes()
-        terminable = {pid: record for pid, record in owned.items() if record.terminable}
-        if not terminable:
-            return
-        if wait_fn is None:
-            wait_fn = office_guard.wait_for_owned_exit
-        if grace_sec > 0:
-            still_alive, elapsed = wait_fn(terminable, grace_sec)
+        still_alive, elapsed = (
+            wait_fn(terminable, grace_sec) if terminable and grace_sec > 0
+            else (set(terminable), 0.0)
+        )
+        unresolved = set(still_alive) & set(terminable)
+        office_guard.finish_owned_cleanup(terminable, unresolved)
+        observed_exited = set(terminable) - unresolved
+        if unresolved:
+            logger.warning("[com] Office Quit 후 종료 미확인: PID=%s grace=%.1fs", sorted(unresolved), grace_sec)
+            result = office_guard.cleanup_owned_processes(
+                {pid: terminable[pid] for pid in unresolved},
+            )
+            office_guard._log_cleanup_result("WORD/EXCEL", result, "grace cleanup")
+            cleanup_result = office_guard.OfficeCleanupResult(
+                confirmed_exited=frozenset(set(result.confirmed_exited) | observed_exited),
+                remaining=result.remaining,
+                identity_unknown=result.identity_unknown,
+                failed=result.failed,
+                forced_exited=result.forced_exited,
+            )
         else:
-            still_alive, elapsed = set(terminable), 0.0
-        exited = len(terminable) - len(still_alive)
-        if exited:
-            logger.info("[com] Office 정상 종료 확인: %d개 (대기 %.1f초)", exited, elapsed)
-        if still_alive:
-            logger.warning(
-                "[com] 유예 %.0f초 초과 — 강제 종료: %s (대기 %.1f초)",
-                grace_sec, sorted(still_alive), elapsed,
+            cleanup_result = office_guard.OfficeCleanupResult(
+                confirmed_exited=frozenset(observed_exited),
             )
-            office_guard.terminate_owned_office_processes(
-                {pid: terminable[pid] for pid in still_alive if pid in terminable}
-            )
+            if observed_exited:
+                logger.info("[com] Office 정상 종료 확인: count=%d wait=%.1fs", len(observed_exited), elapsed)
     except Exception as exc:
-        logger.debug("COM 소유 프로세스 정리 실패(무시): %s", exc)
+        logger.error("[com] Office 종료 정리 실패; 소유 기록 보존: error_type=%s", type(exc).__name__)
+        cleanup_result = office_guard.OfficeCleanupResult(
+            failed=frozenset(terminable),
+        )
+    results.append(cleanup_result)
+    return office_guard.OfficeCleanupResult(
+        confirmed_exited=frozenset().union(*(item.confirmed_exited for item in results)),
+        remaining=frozenset().union(*(item.remaining for item in results)),
+        identity_unknown=frozenset().union(*(item.identity_unknown for item in results)),
+        failed=frozenset().union(*(item.failed for item in results)),
+        forced_exited=frozenset().union(*(item.forced_exited for item in results)),
+    )
 
 
 class ComReader:

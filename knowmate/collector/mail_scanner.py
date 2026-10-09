@@ -11,9 +11,10 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Iterator, TYPE_CHECKING
+from typing import Iterable, Iterator, TYPE_CHECKING
 
 from knowmate.collector import failure_state
+from knowmate.collector.mail_discovery import MailDiscoverySnapshot
 from knowmate.collector.mail_scan_state import (
     cache_matches,
     cache_success,
@@ -92,6 +93,7 @@ class _MailScanMetrics:
     state_persist_s: float = 0.0
     failure_persist_s: float = 0.0
     enumerated: int = 0
+    active_file_checks: int = 0
     cache_hits: int = 0
     active_backoff_deferred: int = 0
     actionable: int = 0
@@ -103,6 +105,7 @@ class _MailScanMetrics:
     db_stale: int = 0
     db_error: int = 0
     embedding_input_chunks: int = 0
+    prepared_chunks: int = 0
     embedding_batches: int = 0
     embed_calls: int = 0
     embedding_split_retries: int = 0
@@ -184,11 +187,16 @@ def _iter_scanned_mail_items(
     watch_folders: list[str],
     exts: tuple[str, ...],
     scan_status: dict[str, bool] | None = None,
+    cancel_check=None,
 ) -> Iterator[dict]:
     """root만 실경로화하고 하위 파일 키는 문자열로 만들어 중복을 제거한다."""
     seen_paths: set[str] = set()
     root_keys: dict[str, str] = {}
     for folder_str in watch_folders:
+        if cancel_check and cancel_check():
+            if scan_status is not None:
+                scan_status["complete"] = False
+            return
         if not Path(folder_str).is_dir():
             logger.warning("[mail_scanner] 폴더 접근 불가, 건너뜀: %s", folder_str)
             if scan_status is not None:
@@ -199,6 +207,10 @@ def _iter_scanned_mail_items(
             root_key = canonicalize_external_path_key(folder_str)
             root_keys[folder_str] = root_key
         for raw_item in _iter_mail_files(folder_str, exts):
+            if cancel_check and cancel_check():
+                if scan_status is not None:
+                    scan_status["complete"] = False
+                return
             if isinstance(raw_item, _MailTraversalError):
                 if scan_status is not None:
                     scan_status["complete"] = False
@@ -247,6 +259,7 @@ def _collect_actionable_candidates(
     metrics: _MailScanMetrics | None = None,
     excluded_keys: frozenset[str] | None = None,
     scan_status: dict[str, bool] | None = None,
+    discovered_items: Iterable[dict] | None = None,
 ) -> tuple[list[dict], set[str], list[str], dict[str, float], int]:
     """한 번의 전체 순회에서 누락 정리용 경로와 실제 처리 후보만 분리한다."""
     exts = _mail_extensions(extensions)
@@ -256,7 +269,11 @@ def _collect_actionable_candidates(
     cached_uid_mtimes: dict[str, float] = {}
     skipped_count = 0
     excluded_keys = excluded_keys or frozenset()
-    for item in _iter_scanned_mail_items(watch_folders, exts, scan_status):
+    items = discovered_items if discovered_items is not None else _iter_scanned_mail_items(
+        watch_folders, exts, scan_status,
+    )
+    for discovered in items:
+        item = dict(discovered)
         if metrics is not None:
             metrics.enumerated += 1
         seen_keys.add(item["path_key"])
@@ -282,6 +299,8 @@ def _collect_actionable_candidates(
             skipped_count += 1
             continue
         item["cache_entry"] = cached
+        if discovered_items is not None:
+            item["discovery_item"] = discovered
         actionable.append(item)
     actionable.sort(key=lambda item: (-item["mtime"], item["path_key"]))
     if metrics is not None:
@@ -305,6 +324,8 @@ def run_mail_scan(
     on_state_persisted=None,
     preloaded_state: dict | None = None,
     preloaded_state_load_s: float = 0.0,
+    discovery_snapshot: MailDiscoverySnapshot | None = None,
+    discovery_get_now=None,
 ) -> tuple[int, int]:
     """메일을 순환 처리하되 한 수집 사이클의 실제 시도 수를 제한한다.
 
@@ -332,6 +353,8 @@ def run_mail_scan(
         failure_file = failure_file or data_dir / "mail_index_failure.json"
     table_was_recreated = bool(getattr(email_indexer, "table_was_recreated", False))
     invalidate_cache = table_was_recreated or bool(getattr(email_indexer, "table_is_empty", False))
+    if discovery_snapshot is not None and (invalidate_cache or retry_failures):
+        discovery_snapshot.invalidate()
     if preloaded_state is None:
         state_load_started = time.perf_counter()
         state = load_mail_scan_state(state_file, invalidate_cache=invalidate_cache)
@@ -407,13 +430,63 @@ def run_mail_scan(
         for path in cfg.get("collector", {}).get("exclude_files", [])
         if isinstance(path, str)
     )
+    if memory_diagnostics is not None:
+        memory_diagnostics.log("before_mail_discovery")
     enumerate_started = time.perf_counter()
     scan_status = {"complete": True}
+    discovery_mode = "fresh"
+    discovery_age = 0.0
+    discovered_items = None
+    if discovery_snapshot is not None:
+        from knowmate.config import mail_discovery_refresh_seconds
+        from knowmate.collector.mail_scan_state import SCHEMA_VERSION
+        from knowmate.rag import email_indexer as email_indexer_module
+        refresh_seconds = mail_discovery_refresh_seconds(mail_cfg)
+        discovery_now = (discovery_get_now or time.monotonic)()
+        signature = (
+            tuple(watch_folders), tuple(extensions), excluded_keys,
+            _email_index_version(), SCHEMA_VERSION, id(email_indexer),
+            id(getattr(email_indexer, "table", None)),
+            str(state_file), refresh_seconds, bool(mail_cfg.get("enabled", False)),
+            str(getattr(email_indexer_module, "EMAIL_SCHEMA", "")),
+            json.dumps(
+                {section: cfg.get(section, {}) for section in ("mail", "collector", "chunking")},
+                sort_keys=True, default=str,
+            ),
+        )
+        if discovery_snapshot.refreshed_at is not None:
+            discovery_age = max(discovery_now - discovery_snapshot.refreshed_at, 0.0)
+        if (
+            discovery_snapshot.signature == signature
+            and discovery_snapshot.refreshed_at is not None
+            and refresh_seconds > 0
+            and discovery_age < refresh_seconds
+        ):
+            discovery_mode = "reused"
+            discovered_items = discovery_snapshot.items
+        else:
+            discovery_snapshot.invalidate()
+            discovered_items = list(_iter_scanned_mail_items(
+                watch_folders, _mail_extensions(extensions), scan_status, cancel_check,
+            ))
+            if scan_status["complete"] and not (cancel_check and cancel_check()):
+                discovery_snapshot.items = discovered_items
+                discovery_snapshot.signature = signature
+                discovery_snapshot.refreshed_at = discovery_now
+            else:
+                scan_status["complete"] = False
     candidates, seen_keys, cached_failure_paths, cached_uid_mtimes, early_skipped_count = _collect_actionable_candidates(
         watch_folders, extensions, state, failures, now_fn(), policy, metrics, excluded_keys,
-        scan_status,
+        scan_status, discovered_items=discovered_items,
     )
     metrics.enumerate_filter_sort_s = time.perf_counter() - enumerate_started
+    if memory_diagnostics is not None:
+        memory_diagnostics.log("after_mail_discovery", counters={
+            "discovered_files": metrics.enumerated,
+            "actionable": metrics.actionable,
+            "discovery_reused": int(discovery_mode == "reused"),
+            "snapshot_files": len(discovery_snapshot.items) if discovery_snapshot is not None else 0,
+        })
     # A one-cycle import must survive a crash/restart even when it never reaches
     # the per-scan attempt limit.  Sidecar failure is warning-only for indexing.
     if candidates:
@@ -423,7 +496,10 @@ def run_mail_scan(
 
     if table_was_recreated:
         logger.info("[mail_scanner] 메일 테이블 재생성 감지 — 성공 캐시를 다시 구축합니다")
-    roots_accessible = bool(watch_folders) and scan_status["complete"]
+    roots_accessible = (
+        bool(watch_folders) and scan_status["complete"] and discovery_mode == "fresh"
+        and not (cancel_check and cancel_check())
+    )
     pruned = prune_missing_files(state, seen_keys) if roots_accessible else 0
     failure_pruned = failure_state.prune(failures) if roots_accessible else 0
     state_dirty = state_dirty or pruned > 0
@@ -446,6 +522,7 @@ def run_mail_scan(
     resolved_count = 0
     reported_count = 0
     last_resolved_item: dict | None = None
+    last_memory_window_attempt: int | None = None
 
     def report_resolved(item: dict) -> None:
         """실제 시도한 source의 최종 결과만 제한된 빈도로 진행률에 반영한다."""
@@ -461,12 +538,12 @@ def run_mail_scan(
         if on_progress and last_resolved_item is not None and reported_count != resolved_count:
             on_progress(resolved_count, len(candidates), Path(last_resolved_item["path"]).name)
 
-    def log_memory_sample() -> None:
-        """진단 모드에서만 50건 단위의 익명 누적 작업량을 남긴다."""
-        if memory_diagnostics is None or metrics.attempted == 0 or metrics.attempted % 50:
+    def log_mail_memory(phase: str) -> None:
+        """Record anonymous work volume without retaining payloads or vectors."""
+        if memory_diagnostics is None or not getattr(memory_diagnostics, "enabled", True):
             return
         memory_diagnostics.log(
-            "mail_sample",
+            phase,
             counters={
                 "attempted": metrics.attempted,
                 "commits": metrics.commits,
@@ -476,8 +553,18 @@ def run_mail_scan(
                 "db_missing": metrics.db_missing,
                 "db_stale": metrics.db_stale,
                 "db_error": metrics.db_error,
+                "prepared_chunks": metrics.prepared_chunks,
+                "embedding_input_chunks": metrics.embedding_input_chunks,
+                "embed_calls": metrics.embed_calls,
+                "pending_chunks": window_chunk_count,
+                "queued_mails": len(prepared_window),
             },
         )
+
+    def log_memory_sample() -> None:
+        """Record one lightweight sample per 50 attempted files."""
+        if metrics.attempted and metrics.attempted % 50 == 0:
+            log_mail_memory("mail_sample")
 
     def mark_failure(item: dict, stage: str = "index") -> None:
         """캐시를 만들지 않은 채 source 하나를 다음 주기로 미룬다."""
@@ -622,33 +709,51 @@ def run_mail_scan(
         release_job(primary)
         work.primary = None
 
-    def flush_window() -> bool:
+    def flush_window(*, force_memory_sample: bool = False) -> bool:
         """현재 윈도우만 embed→메일별 commit한다; global 오류면 False를 반환한다."""
-        nonlocal window_chunk_count
+        nonlocal window_chunk_count, last_memory_window_attempt
         if not prepared_window:
             return True
+        sample_memory = (
+            memory_diagnostics is not None and getattr(memory_diagnostics, "enabled", True)
+            and (force_memory_sample or last_memory_window_attempt is None
+                 or metrics.attempted - last_memory_window_attempt >= 50)
+        )
+        if sample_memory:
+            last_memory_window_attempt = metrics.attempted
+            log_mail_memory("before_mail_embed")
         embed_started = time.perf_counter()
-        batch_result = email_indexer.embed_mail_jobs([pending.job for pending in prepared_window])
-        metrics.embed_s += time.perf_counter() - embed_started
-        metrics.embedding_input_chunks += int(getattr(batch_result, "input_chunks", 0))
-        metrics.embedding_batches += int(getattr(batch_result, "batch_count", 0))
-        metrics.embed_calls += int(getattr(batch_result, "embed_calls", 0))
-        metrics.embedding_split_retries += int(getattr(batch_result, "split_retries", 0))
-        for pending in prepared_window:
-            work = uid_work[pending.parsed["mail_uid"]]
-            job = pending.job
-            if getattr(job, "content_error", None) or any(vector is None for vector in job.vectors):
-                reason = getattr(job, "content_error", None) or batch_result.blocking_error
-                logger.warning(
-                    "[mail_scanner] 메일 임베딩 실패, 다음 기회에 재시도: %s (%s)",
-                    pending.item["path"], reason,
-                )
-                finish_work(work, failed=True)
-            else:
-                # 전역 오류가 뒤 batch에서 났어도 이미 완결된 앞 메일은 안전하게 저장한다.
-                finish_work(work, failed=False)
-        prepared_window.clear()
-        window_chunk_count = 0
+        try:
+            batch_result = email_indexer.embed_mail_jobs([pending.job for pending in prepared_window])
+            metrics.embedding_input_chunks += int(getattr(batch_result, "input_chunks", 0))
+            metrics.embedding_batches += int(getattr(batch_result, "batch_count", 0))
+            metrics.embed_calls += int(getattr(batch_result, "embed_calls", 0))
+            metrics.embedding_split_retries += int(getattr(batch_result, "split_retries", 0))
+        finally:
+            metrics.embed_s += time.perf_counter() - embed_started
+            if sample_memory:
+                log_mail_memory("after_mail_embed")
+        if sample_memory:
+            log_mail_memory("before_mail_commit")
+        try:
+            for pending in prepared_window:
+                work = uid_work[pending.parsed["mail_uid"]]
+                job = pending.job
+                if getattr(job, "content_error", None) or any(vector is None for vector in job.vectors):
+                    reason = getattr(job, "content_error", None) or batch_result.blocking_error
+                    logger.warning(
+                        "[mail_scanner] 메일 임베딩 실패, 다음 기회에 재시도: %s (%s)",
+                        pending.item["path"], reason,
+                    )
+                    finish_work(work, failed=True)
+                else:
+                    # 전역 오류가 뒤 batch에서 났어도 이미 완결된 앞 메일은 안전하게 저장한다.
+                    finish_work(work, failed=False)
+            prepared_window.clear()
+            window_chunk_count = 0
+        finally:
+            if sample_memory:
+                log_mail_memory("after_mail_commit")
         return batch_result.blocking_error is None
 
     def begin_generation(
@@ -716,6 +821,7 @@ def run_mail_scan(
             work.primary = pending
             prepared_window.append(pending)
             window_chunk_count += len(job.chunks)
+            metrics.prepared_chunks += len(job.chunks)
             return window_chunk_count < email_indexer._batch_size or flush_window()
 
         try:
@@ -739,7 +845,15 @@ def run_mail_scan(
         return True
 
     stop_after_global_error = False
+    active_stat_failed = False
     cancelled = bool(cancel_check and cancel_check())
+
+    def advance_cursor(cursor_item: dict) -> None:
+        """Keep rotation in discovery order even after live metadata changes."""
+        nonlocal state_dirty
+        set_cursor(state, cursor_item)
+        state_dirty = True
+
     for item in _candidates_from_cursor(candidates, state.get("cursor")):
         if cancel_check and cancel_check():
             cancelled = True
@@ -749,6 +863,36 @@ def run_mail_scan(
             break
         attempted_count += 1
         metrics.attempted += 1
+        cursor_item = {"mtime": item["mtime"], "path_key": item["path_key"]}
+
+        if discovery_snapshot is not None:
+            metrics.active_file_checks += 1
+            try:
+                live_stat = os.stat(path)
+            except OSError as exc:
+                logger.warning("[mail_scanner] 처리 직전 stat 실패, 다음 전체 갱신까지 보존: %s (%s)", path, exc)
+                active_stat_failed = True
+                skipped_count += 1
+                report_resolved(item)
+                advance_cursor(cursor_item)
+                log_memory_sample()
+                continue
+            item["mtime"], item["size"] = live_stat.st_mtime, live_stat.st_size
+            item["discovery_item"].update(mtime=item["mtime"], size=item["size"])
+            if cache_matches(state["files"].get(item["path_key"]), item):
+                skipped_count += 1
+                report_resolved(item)
+                advance_cursor(cursor_item)
+                log_memory_sample()
+                continue
+            if failure_state.should_defer(
+                failures.get(path), path, item["mtime"], item["size"], now_fn(), policy,
+            ):
+                skipped_count += 1
+                report_resolved(item)
+                advance_cursor(cursor_item)
+                log_memory_sample()
+                continue
         cached = item.get("cache_entry")
         is_migration = isinstance(cached, dict) and cached.get("index_version") != _email_index_version()
         if is_migration and not migrate_logged:
@@ -869,8 +1013,7 @@ def run_mail_scan(
                 logger.warning("[mail_scanner] 인덱싱 실패, 다음 기회에 재시도: %s (%s)", path, exc)
                 mark_failure(item)
 
-        set_cursor(state, item)
-        state_dirty = True
+        advance_cursor(cursor_item)
         run_maintenance = getattr(email_indexer, "run_hard_limit_maintenance", None)
         if callable(run_maintenance) and not (cancel_check and cancel_check()):
             # Lance maintenance가 fragment 상태를 확인한 뒤 실제 optimize가 필요할
@@ -887,7 +1030,7 @@ def run_mail_scan(
 
     final_flush_ok = False
     if not stop_after_global_error and not cancelled and not (cancel_check and cancel_check()):
-        final_flush_ok = flush_window()
+        final_flush_ok = flush_window(force_memory_sample=True)
     elif not prepared_window:
         final_flush_ok = not stop_after_global_error and not cancelled
 
@@ -909,10 +1052,13 @@ def run_mail_scan(
         or not scan_status["complete"]
         or not final_flush_ok
         or not state_persisted
+        or active_stat_failed
     ):
         completion = MailScanCompletion.UNKNOWN
     elif attempted_count < len(candidates):
         completion = MailScanCompletion.REMAINING
+    elif discovery_mode == "reused":
+        completion = MailScanCompletion.UNKNOWN
     else:
         completion = MailScanCompletion.EXHAUSTED
     email_indexer.last_mail_scan_completion = completion
@@ -933,7 +1079,7 @@ def run_mail_scan(
         "backoff_deferred=%d actionable=%d attempted=%d parsed=%d); db(current=%d missing=%d "
         "stale=%d error=%d); status_queries=%d; embed(chunks=%d batches=%d embed_calls=%d split_retries=%d); "
         "mail(commits=%d failures=%d pending_delete_retries=%d indexed=%d skipped=%d migrations=%d "
-        "cache_pruned=%d)",
+        "cache_pruned=%d); discovery(mode=%s age=%.1fs remaining=%d active_file_checks=%d)",
         time.perf_counter() - cycle_started,
         metrics.state_load_s, metrics.enumerate_filter_sort_s, metrics.parse_s, metrics.db_check_s,
         metrics.embed_s, metrics.commit_s, metrics.pending_delete_retry_s,
@@ -943,6 +1089,7 @@ def run_mail_scan(
         metrics.db_error, metrics.db_status_queries, metrics.embedding_input_chunks, metrics.embedding_batches,
         metrics.embed_calls, metrics.embedding_split_retries, metrics.commits, metrics.failures,
         metrics.pending_delete_retries, indexed_count, skipped_count, migrate_count, pruned,
+        discovery_mode, discovery_age, max(len(candidates) - attempted_count, 0), metrics.active_file_checks,
     )
     return indexed_count, skipped_count
 

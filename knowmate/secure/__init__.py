@@ -113,10 +113,15 @@ class AutoReader:
 
     @staticmethod
     def _guard_office_busy(ext: str, path: str) -> None:
-        """대상 Office 앱이 실행 중이면 OfficeBusyError를 발생시킨다."""
-        from knowmate.secure.office_guard import OfficeBusyError, is_office_busy_for_ext, process_for_ext
+        """종료 대기를 먼저 확인한 뒤 사용자 Office 점유를 구분한다."""
+        from knowmate.secure.office_guard import (
+            OfficeBusyError, ensure_office_available,
+            is_office_busy_for_ext, process_for_ext,
+        )
+        proc = process_for_ext(ext)
+        if proc is not None:
+            ensure_office_available(proc)
         if is_office_busy_for_ext(ext):
-            proc = process_for_ext(ext)
             raise OfficeBusyError(
                 f"{proc} 실행 중 — {ext} COM 파싱을 이번 사이클에서 건너뜁니다: {path}"
             )

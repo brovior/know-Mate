@@ -15,7 +15,7 @@ from knowmate.collector.memory_diagnostics import MemoryDiagnostics
 from knowmate.collector.scanner import get_scope, iter_scan_folder, normalize_path_key
 from knowmate.collector.state import load_state, save_state
 from knowmate.secure import com_stage
-from knowmate.secure.office_guard import OfficeBusyError
+from knowmate.secure.office_guard import OfficeBusyError, OfficeCleanupPendingError
 from knowmate.secure.signature import UnreadableFormatError, is_ole2, is_zip
 
 if TYPE_CHECKING:
@@ -202,6 +202,7 @@ class CollectorWorker(QThread):
             from knowmate.collector.idle_util import get_idle_seconds as _default
             get_idle_seconds = _default
         self._get_idle_seconds = get_idle_seconds
+        self._default_com_restart = com_restart_fn is None
         if com_restart_fn is None:
             from knowmate.secure.com_reader import quit_com_apps as _default_restart
             com_restart_fn = _default_restart
@@ -224,6 +225,8 @@ class CollectorWorker(QThread):
         )
         self._mail_state_file = mail_state_file or default_mail_state_file
         self._mail_exclusions_reconciled: set[str] = set()
+        from knowmate.collector.mail_discovery import MailDiscoverySnapshot
+        self._mail_discovery = MailDiscoverySnapshot()
         # 사이클 안에서 억제·성공 상태를 sidecar 저장과 무관하게 즉시 반영하기 위한
         # 인메모리 캐시(설계 리뷰6 m-2) — 프로세스 재시작 전까지 sidecar 저장 실패가
         # 매 사이클 재조회를 유발하지 않도록 한다.
@@ -247,6 +250,7 @@ class CollectorWorker(QThread):
         """다음 사이클 시작 시 모든 실패 기록에 재시도(force_retry)를 요청한다
         (수동 트리거 전용). 이력·연속 실패 횟수는 보존된다."""
         self._retry_requested = True
+        self._mail_discovery.invalidate()
 
     @_flush_document_state_on_exit
     def run(self):
@@ -280,17 +284,25 @@ class CollectorWorker(QThread):
             logger.exception("수집기 예외 발생: %s", exc)
             self.error.emit(str(exc))
         finally:
+            memory_diagnostics.log("before_com_cleanup")
             try:
                 if _com_initialized:
                     # COM 앱 Quit은 반드시 생성 스레드(여기)에서 수행해야 한다(STA)
                     try:
                         from knowmate.secure.com_reader import quit_com_apps
-                        quit_com_apps(grace_sec=getattr(self, "_com_quit_grace_sec", 5.0))
+                        from knowmate.config import com_quit_call_timeout_seconds
+                        quit_com_apps(
+                            grace_sec=getattr(self, "_com_quit_grace_sec", 5.0),
+                            quit_timeout_sec=com_quit_call_timeout_seconds(
+                                self._config.get("collector", {})
+                            ),
+                        )
                     except Exception:
                         pass
                     import pythoncom  # type: ignore
                     pythoncom.CoUninitialize()
             finally:
+                memory_diagnostics.log("after_com_cleanup")
                 # COM 정리까지 끝난 뒤 GC 후 최종 표본을 남겨,
                 # 사이클 작업과 COM 자원 해제를 모두 반영한다.
                 memory_diagnostics.collect_and_log()
@@ -528,6 +540,8 @@ class CollectorWorker(QThread):
         # 스스로 정리 중인 Office까지 매번 강제종료로 오판해 세이프모드 표식이
         # 반복 생성된다(레이스). 0이면 대기 없이 기존 동작(즉시 강제종료).
         self._com_quit_grace_sec = float(collector_cfg.get("com_quit_grace_sec", 5.0))
+        from knowmate.config import com_quit_call_timeout_seconds
+        self._com_quit_call_timeout_sec = com_quit_call_timeout_seconds(collector_cfg)
 
         # purge(제거된 폴더 청크 정리) 스킵/강제 reconciliation 판정.
         # op_sig는 이번 사이클의 watch_folders
@@ -859,6 +873,8 @@ class CollectorWorker(QThread):
         poison_recovery_count = 0
         poison_recovery_failed = 0
         poisoned_exes: set[str] = set()
+        cleanup_pending_logged_exes: set[str] = set()
+        cleanup_pending_count = 0
         changed_during = []  # 추출 도중 파일이 바뀌어 이번 사이클에 인덱싱하지 않은 경로들
         consumer_backoff_deferred = 0  # 소비자 재확인이 처리 직전에 걸러낸 건수(4차)
 
@@ -1003,6 +1019,7 @@ class CollectorWorker(QThread):
                     nonlocal _wd_exe
                     if exe in poisoned_exes:
                         raise OfficeBusyError(f"COM poison 복구 미확인으로 {exe} COM 진입 연기")
+                    _og.ensure_office_available(exe)
                     _wd_exe = exe
                     _og.begin_com_op(exe)
                     if watchdog is not None:
@@ -1025,6 +1042,8 @@ class CollectorWorker(QThread):
                 if callable(dynamic_hooks) and not is_com:
                     dynamic_hooks(_dynamic_com_begin, _dynamic_com_end)
                 try:
+                    if is_com and task_exe is not None:
+                        _og.ensure_office_available(task_exe)
                     if _wd_exe:
                         _timeout = _com_timeout_for_size(
                             task.size, com_timeout_base, com_timeout_per_mb, com_timeout_cap
@@ -1190,6 +1209,17 @@ class CollectorWorker(QThread):
                     poison_recovery_failed += 1
                     poisoned_exes.add(exc.exe_name)
                     logger.warning("[collector] COM poison 복구 미확인 — %s만 이번 사이클 연기", exc.exe_name)
+            except OfficeCleanupPendingError as exc:
+                cleanup_pending_count += 1
+                com_stage.take_last_failed_stage()
+                actual_com = getattr(self._extractor, "take_actual_com_used", None)
+                if callable(actual_com):
+                    actual_com()
+                com_used = False
+                if exc.exe not in cleanup_pending_logged_exes:
+                    logger.warning("[collector] Office 종료 미확인으로 %s COM 연기", exc.exe)
+                    cleanup_pending_logged_exes.add(exc.exe)
+                deferred.append(task.path)
             except OfficeBusyError as exc:
                 # 사용자가 Office를 열어둔 상태 → 이번 사이클만 연기(실패 아님).
                 # state를 갱신하지 않으므로 다음 유휴 사이클에서 자동 재시도된다.
@@ -1245,12 +1275,28 @@ class CollectorWorker(QThread):
                 com_since_restart += 1
                 if com_restart_every > 0 and com_since_restart >= com_restart_every:
                     try:
-                        self._com_restart_fn(grace_sec=self._com_quit_grace_sec)
-                        restart_count += 1
-                        logger.info(
-                            "[collector] COM Office 주기 재기동: %d개 COM 파일 처리 후",
-                            com_since_restart,
-                        )
+                        if self._default_com_restart:
+                            result = self._com_restart_fn(
+                                grace_sec=self._com_quit_grace_sec,
+                                quit_timeout_sec=self._com_quit_call_timeout_sec,
+                            )
+                        else:
+                            result = self._com_restart_fn(grace_sec=self._com_quit_grace_sec)
+                        if result is None:  # legacy test/custom callback contract
+                            restart_count += 1
+                            logger.info("[collector] COM Office 주기 재기동 callback 완료: %d개 COM 파일 이후", com_since_restart)
+                        elif result.successful:
+                            restart_count += 1
+                            logger.info(
+                                "[collector] COM Office 주기 재기동 종료 확인: files=%d actual_exit=%s",
+                                com_since_restart, sorted(result.confirmed_exited),
+                            )
+                        else:
+                            logger.warning(
+                                "[collector] COM Office 주기 재기동 미확인: files=%d remaining=%s identity_unknown=%s failed=%s",
+                                com_since_restart, sorted(result.remaining),
+                                sorted(result.identity_unknown), sorted(result.failed),
+                            )
                     except Exception as exc:
                         logger.warning("[collector] COM 주기 재기동 실패(무시): %s", exc)
                     com_since_restart = 0
@@ -1380,6 +1426,8 @@ class CollectorWorker(QThread):
                     getattr(self._email_indexer, "table_was_recreated", False)
                     or getattr(self._email_indexer, "table_is_empty", False)
                 )
+                if invalidate_mail_cache:
+                    self._mail_discovery.invalidate()
                 mail_state = load_mail_scan_state(
                     self._mail_state_file,
                     invalidate_cache=invalidate_mail_cache,
@@ -1437,6 +1485,7 @@ class CollectorWorker(QThread):
                     ),
                     preloaded_state=mail_state,
                     preloaded_state_load_s=mail_state_load_s,
+                    discovery_snapshot=self._mail_discovery,
                 )
                 mail_state_persisted = mail_state_status["persisted"]
             except Exception as exc:
@@ -1467,8 +1516,11 @@ class CollectorWorker(QThread):
         )
         if mail_indexed:
             summary += f" / 메일 {mail_indexed}건"
-        if deferred:
-            summary += f" / Office 점유로 연기 {len(deferred)}건"
+        busy_deferred_count = len(deferred) - cleanup_pending_count
+        if busy_deferred_count:
+            summary += f" / Office 점유로 연기 {busy_deferred_count}건"
+        if cleanup_pending_count:
+            summary += f" / Office 종료 확인 대기로 연기 {cleanup_pending_count}건"
         if unreadable:
             summary += f" / 판독불가 {len(unreadable)}건"
         if changed_during:

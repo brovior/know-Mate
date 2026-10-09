@@ -1965,15 +1965,16 @@ class TestMailScanner:
         assert indexed == 1
 
     @pytest.mark.skipif(not _HAS_LANCEDB, reason="lancedb 미설치")
-    def test_cross_mail_embedding_uses_32_chunk_batches(self, tmp_path, monkeypatch):
-        """65개 단일 청크 메일은 메일 경계를 넘어 32개씩 세 번 임베딩한다."""
+    @pytest.mark.parametrize("diagnostics_enabled", [True, False])
+    def test_cross_mail_embedding_uses_32_chunk_batches(self, tmp_path, monkeypatch, diagnostics_enabled):
+        """진단 표본은 배치를 바꾸지 않으며 마지막 소규모 묶음도 기록한다."""
         from knowmate.collector.mail_scanner import run_mail_scan
         from knowmate.rag.email_indexer import EmailIndexer
         from knowmate.rag.embedding import VECTOR_DIM
 
         watch = tmp_path / "watch"
         watch.mkdir()
-        for index in range(65):
+        for index in range(165):
             (watch / f"{index:03d}.mysingle").write_bytes(b"x")
 
         def parse(path: str) -> dict:
@@ -1992,12 +1993,46 @@ class TestMailScanner:
 
         embed = RecordingEmbed()
         indexer = EmailIndexer(tmp_path / "db", embed, batch_size=32)
+
+        class RecordingMemory:
+            enabled = diagnostics_enabled
+
+            def __init__(self):
+                self.samples = []
+
+            def log(self, phase, *, counters=None):
+                if self.enabled:
+                    self.samples.append((phase, dict(counters or {})))
+
+        memory = RecordingMemory()
         indexed, _ = run_mail_scan(
-            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 65}},
+            [str(watch)], indexer, {"mail": {"max_mails_per_scan": 165}},
             state_file=tmp_path / "state.json", failure_file=tmp_path / "failures.json",
+            memory_diagnostics=memory,
         )
-        assert indexed == 65
-        assert [len(call) for call in embed.calls] == [32, 32, 1]
+        assert indexed == 165
+        assert indexer.table.count_rows() == 165
+        assert [len(call) for call in embed.calls] == [32, 32, 32, 32, 32, 5]
+        if not diagnostics_enabled:
+            assert memory.samples == []
+            return
+        phases = [phase for phase, _ in memory.samples]
+        assert phases[:2] == ["before_mail_discovery", "after_mail_discovery"]
+        embed_before = [counters for phase, counters in memory.samples if phase == "before_mail_embed"]
+        commit_after = [counters for phase, counters in memory.samples if phase == "after_mail_commit"]
+        # Avoid per-file/per-API tracing while covering first, periodic and final work.
+        assert 3 <= len(embed_before) <= 5
+        assert len(embed_before) == len(commit_after)
+        assert embed_before[0]["pending_chunks"] == 32
+        assert embed_before[-1]["attempted"] == 165
+        assert embed_before[-1]["pending_chunks"] == 5
+        assert commit_after[-1]["commits"] == 165
+        assert commit_after[-1]["prepared_chunks"] == 165
+        assert commit_after[-1]["embedding_input_chunks"] == 165
+        assert commit_after[-1]["embed_calls"] == 6
+        assert all(sample["pending_chunks"] == sample["queued_mails"] == 0 for sample in commit_after)
+        assert [sample["attempted"] for phase, sample in memory.samples if phase == "mail_sample"] == [50, 100, 150]
+        assert all(isinstance(value, int) for _, sample in memory.samples for value in sample.values())
 
     @pytest.mark.skipif(not _HAS_LANCEDB, reason="lancedb 미설치")
     def test_streaming_window_fills_batch_before_flushing(self, tmp_path, monkeypatch):

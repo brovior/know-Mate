@@ -129,14 +129,14 @@ def get_reader(path):
 라우팅과 일치시킨다. `.doc/.ppt`는 대응하는 순수 파이썬 라이브러리가 없어 그대로 COM만 사용한다
 (행오버는 COM 워치독이 보호).
 
-**COM 싱글톤 패턴 (★ 반드시 준수)**
+**COM 앱 재사용**
 
 ```python
 class WordComReader:
     _instance = None
     def get_app(self):
         if self._instance is None:
-            self._instance = win32com.client.Dispatch("Word.Application")
+            self._instance = _dispatch_and_own(win32com, "Word.Application", "WINWORD.EXE")
         return self._instance
     def parse(self, path):
         word = self.get_app()
@@ -149,7 +149,9 @@ class WordComReader:
             self._instance = None   # 예외 시 재생성
             raise
 ```
-> **매번 Quit() 하는 방식 절대 사용 금지.**
+Word·Excel은 워커 스레드 TLS 참조로 재사용한다. 실제 앱 생성은 `DispatchEx` 후 HWND→PID,
+실행파일명, 프로세스 생성 identity를 확인해 소유 등록한다. PowerPoint는 MultiUse라 `Dispatch`를
+사용하며 소유해도 Quit·강제종료 대상에 넣지 않는다.
 
 **Excel 셀 읽기 — 범위 단위 일괄 읽기 (`chunking.xlsx_block_rows`, 기본 1000)**
 
@@ -175,7 +177,7 @@ COM 호출은 프로세스 간 마샬링이라 왕복 1회가 수십~수백 µs�
 
 COM 자동화는 대상 Office 프로세스가 이미 떠 있으면 그 인스턴스에 붙는다(사용자당 1 인스턴스). 백그라운드
 인덱싱이 사용자가 열어둔 창을 점유해 응답없음을 유발하는 것을 막기 위해, `AutoReader`는 COM 라우팅
-(`.doc/.xls/.ppt` + OLE2 오라벨 docx) **직전** `is_office_busy_for_ext(ext)`로 대상 앱 실행 여부를
+(`.doc/.xls/.ppt` + OLE2 오라벨 docx) **직전** `is_office_busy_for_ext(ext)`로 사용자 앱 점유를
 확인한다. 실행 중이면 `OfficeBusyError`를 던져 그 확장자만 **이번 사이클에서 연기**하고, 소비자
 루프(`scheduler`)는 이를 실패가 아닌 연기로 처리(state 미갱신 → 다음 유휴 사이클 자동 재시도). 감지는
 Toolhelp32 **프로세스 열거만** 수행하며 COM 객체를 생성·연결하지 않는다(사용자 창 무간섭). 비Windows·
@@ -185,11 +187,12 @@ Toolhelp32 **프로세스 열거만** 수행하며 COM 객체를 생성·연결�
 **우리 자신 vs 사용자 구분 (자기 감지 스킵 방지)**: 인덱싱이 DRM/구형 문서를 읽으려고 COM으로 직접
 띄운 Office도 같은 실행 파일(WINWORD.EXE 등)이라, 단순히 "프로세스가 있나?"로 판정하면 *우리가 띄운
 인스턴스를 우리가 다시 점유로 오판*해 앞부분은 인덱싱되다가 뒷부분 문서가 전부 스킵되는 자기 감지
-버그가 생긴다. 이를 막기 위해 `com_reader._dispatch_and_own`이 Dispatch **전후의 PID 차이**로 우리가
-띄운 프로세스를 식별해 `office_guard.register_owned_pids`로 스레드별 "소유" 등록하고, 가드는 소유 PID를
-제외한 **외부(사용자) 프로세스가 있을 때만** 점유로 판정한다. `quit_com_apps`는 사이클 종료 시 Quit되지
-않고 남은 소유 프로세스를 `terminate_owned_office_processes`로 강제 종료해(PID 재활용 방지 위해 '지금도
-Office 실행 파일인' PID만) 좀비가 다음 사이클 가드를 오작동시키지 않게 한다.
+버그가 생긴다. Word·Excel은 DispatchEx로 만든 인스턴스의 HWND→PID·실행파일명·생성 identity가 모두
+일치할 때만 소유 등록한다. 가드는 소유 identity가 현재 프로세스와 일치할 때만 자기 프로세스로
+제외한다. 정리 중이거나 종료가 확인되지 않은 소유 프로세스는 registry에 남기고 같은 EXE의 새 COM
+진입을 막는다. PID·EXE·생성 identity를 같은 프로세스 핸들에서 재검증한 뒤 종료를 요청하고,
+유한 대기에서 실제 exit가 확인돼야 소유 기록을 제거한다. PID 재사용이 확인되면 옛 소유 기록만
+제거하고 새 프로세스는 건드리지 않는다. 조회 권한 실패·종료 미확인은 pending 상태로 남긴다.
 
 **xlsx 손상 복구 (`plain_reader._load_xlsx_sanitized`)**
 
@@ -298,11 +301,22 @@ chunks·emails 테이블 **전체**를 `to_arrow().to_pandas()`로 로드했고,
 소유 영역을 나누기 위해 `cycle_start` → `after_document_indexing` → `after_documents`(orphan·purge
 정리와 상태 저장 뒤) → `after_mail` → `after_gc_collect` 시점마다 한 줄 INFO 로그를 남긴다.
 로그에는 PID·cycle ID, Windows Process Private Bytes, `tracemalloc` current/peak, PyArrow 기본 메모리
-풀의 current/peak/backend만 포함하며 문서·메일 내용은 포함하지 않는다. 메일 처리 중에는 50건마다
-attempted·commit·cache-hit·상태조회 누적값만 함께 표본화한다. Windows Private Bytes는 번들에
+풀의 current/peak/backend와 직전 표본 대비 `private_delta_mib`를 포함한다. Python 값은 추적 시작
+이후의 살아 있는 추적 대상 할당이며 전체 Python 메모리가 아니다. `python_scope`는 자체 시작이면
+`cycle_since_start`, 외부 추적이면 `external_start_unknown`, 비활성이면 `inactive`다.
+`trace_started_at_ns`는 자체 추적 시작의 Unix 나노초 시각(외부 추적은 `n/a`), `tracemalloc_mib`는
+추적 기록을 관리하는 tracemalloc 자체 사용량이며 진단 비용 전체를 뜻하지 않는다.
+메일 처리 중에는 50건마다 attempted·commit·cache-hit·상태조회 누적값과 prepared_chunks·
+embedding_input_chunks·embed_calls·pending_chunks·queued_mails를 함께 표본화한다.
+메일 목록 조회 전후와 첫 임베딩 묶음·약 50건 진행 뒤의 묶음·마지막 남은 묶음의 임베딩/DB 저장
+전후도 기록한다. 이 표본은 추가 스냅샷을 만들지 않으며 본문·제목은 남기지 않는다.
+COM 정리·GC·추적 시작/종료·기준 스냅샷 전후, 스냅샷 비교 시작/완료를 표시하고 스냅샷 참조를
+해제한 뒤 마지막 표본을 남긴다. 전후 기록은 정상 성공뿐 아니라 예외로 돌아온 경우도 포함한다.
+Windows Private Bytes는 번들에
 새 의존성을 추가하지 않고 `GetProcessMemoryInfo`로 조회한다. 진단을 켠 사이클에서만
 `tracemalloc`과 마지막 `gc.collect()`를 실행하며, 운영 메모리 동작을 바꾸는 Arrow
-`release_unused()`는 호출하지 않는다. Arrow peak는 기본 메모리 풀 생성 이후의 누적 고수위다.
+`release_unused()`는 호출하지 않는다. Arrow 값은 기본 메모리 풀 범위이며 peak는 풀 생성 이후의
+누적 고수위다. Private에서 Python·Arrow를 빼서 네이티브 사용량을 확정하지 않는다.
 진단이 tracing을 시작할 때만 depth 10을 사용하고, 외부 tracing 중이면 depth/lifetime을 보존한다.
 cycle baseline과 optimize 전후, after_mail/after_gc_collect snapshot diff는 상위 코드 위치의
 size/count delta만 로그에 남기며 snapshot·원문·AppData/사용자 절대경로는 저장하지 않는다.
@@ -327,6 +341,13 @@ best-effort 보정(생산자·소비자가 동시에 도는 스트리밍 구조�
 매 성공 시 state에 기록된다.
 
 **유휴 감지 (`collector/idle_util.py` + `scheduler.IdleScheduler`)**
+
+설정 화면에서 자동 인덱싱 대기 시간은 30·60·90·120·150·180분만 선택한다.
+`collector.idle_seconds`는 초 단위이며 배포 기본 60초와 직접 편집한 다른 유효 값도 유지한다.
+선택지 밖의 값은 화면에 "직접 설정한 값"으로 표시하고, 시간을 새로 선택하기 전에는 다른 설정 저장 시
+이 값을 쓰지 않는다. 화면의 제출값 제한은 bridge에만 적용하며 일반 설정 로더/갱신 API는 제한하지 않는다.
+유휴 설정은 기존처럼 재시작 후 적용되며 DRM 480초 보호와 활동 복귀 캐치업은 유지한다.
+메일 목록의 주기적 전체 갱신은 유휴 대기 시간과 독립적이다([메일 설계](EMAIL_DESIGN.md#4-중복-판별)).
 
 `get_idle_seconds()`가 Windows `GetLastInputInfo`(시스템 전역 마지막 입력 이후 경과초)를
 **읽기 전용**으로 조회한다 — 입력을 발생시키거나 시스템 유휴 타이머를 리셋하지 않는다. 트레이
@@ -450,8 +471,8 @@ hard_exit 주입) 사외 단위 테스트가 가능하다.
 `ComWatchdog.arm(exe, timeout)`으로 무장하고, 정상 완료 시 `disarm()`한다. 타임아웃은 **파일 크기
 비례**(`_com_timeout_for_size` = `com_timeout_base_sec` + `com_timeout_per_mb_sec`×MB, 상한
 `com_timeout_max_sec`)로, 작은 파일 행오버는 빨리(≈60s) 잡고 셀 순회가 느린 대형 xls는 넉넉히
-보호한다. 발화 시 `office_guard.terminate_stuck_office(exe)`가 **우리 소유** Office 프로세스를(없으면
-`begin_com_op` baseline 이후 새로 뜬 것 = Dispatch-hang) 종료 → 갇힌 COM 호출이 오류 반환 →
+보호한다. 발화 시 `office_guard.terminate_stuck_office(exe)`가 **검증된 소유** Office 프로세스만 종료 →
+갇힌 COM 호출이 오류 반환 →
 그 파일만 실패 처리, **사이클은 계속**(로그·요약에 "COM 시간초과 강제해제 N건").
 
 **경합 방지**: ① **세대 토큰**으로 이미 끝난 파일의 타이머가 다음 파일의 Office를 죽이는 오사살
@@ -633,13 +654,24 @@ fail-closed)와 반대 방향이다. 백오프는 삭제를 막는 안전장치�
 연속 처리하면 핸들·메모리가 누적돼 후반부가 느려지거나 불안정해질 수 있다. 이를 선제적으로
 예방하기 위해 소비자 루프가 **실제로 COM을 사용한 파일**(`_classify_extract_method=="com"`이고
 `OfficeBusyError`로 연기되지 않은 경우)만 카운트해, `com_restart_every_n_files`건마다
-`com_reader.quit_com_apps()`를 호출해 word/excel/ppt 인스턴스를 일괄 종료한다(다음 COM 파일에서
-자동 재Dispatch). 앱별 개별 카운트 대신 **일괄 재기동**을 택한 건 외과적 정밀도 대비 복잡도 이득이
+`com_reader.quit_com_apps()`를 호출해 Word·Excel을 종료하고 PowerPoint 참조를 해제한다(다음 COM 파일에서
+Word·Excel은 자동 재Dispatch). 앱별 개별 카운트 대신 **일괄 재기동**을 택한 건 외과적 정밀도 대비 복잡도 이득이
 작기 때문이다. 재기동 실패는 삼키고 사이클을 계속한다(로그·요약에 "COM 재기동 N회"). 이 완화책은
 DRM COM Helper 프로세스 분리(아래) 착수 **전** 실측 단계이며, 최종적으로는 helper 분리가 격리를
 대체한다.
 
-**Quit() 유예(`collector.com_quit_grace_sec`, 2026-07-29)**: 사내 실사용 로그에서 46분간
+**Office 종료 복구 (`collector.com_quit_call_timeout_sec`, `collector.com_quit_grace_sec`)**: Word·Excel
+각각의 `Quit()` 직전에 PID·EXE·생성 identity와 cleanup generation을 고정해 캡처하고, 기본 10초 안에
+반환하지 않으면 daemon 타이머가 해당 스냅샷만 정리한다. COM 객체는 타이머에 전달하지 않는다.
+generation disarm과 EXE별 in-flight gate가 늦은 callback의 새 Office 오사살을 막는다. Quit 반환 뒤에는
+기본 5초 유예를 두며, 프로세스가 같은 핸들에서 실제 종료된 것이 확인되기 전까지 registry 소유 기록을
+보존한다. 실패·identity 불명·종료 대기 초과는 상태 전환 로그와 다음 제한 재시도에서 확인하고, 같은
+EXE의 COM 진입을 미룬다. 같은 EXE의 재시도는 30초 간격으로 제한하고 문서 실패 이력은 추가하지 않는다.
+Quit 제한 설정은 유한한 양수만 허용하며 기존 사용자 설정에는 배포 기본값을 채운다. 종료 유예는
+기존처럼 0으로 생략할 수 있다. 타이머가 이미 시작한 대상의 정리는 워커에서 중복 수행하지 않는다.
+강제종료 뒤 Resiliency 표식은 실제 종료가 확인된 경우에만 정리한다. PowerPoint는 Quit·강제종료하지 않는다.
+
+**과거 Quit 유예 도입 기록 (`collector.com_quit_grace_sec`, 2026-07-29)**: 사내 실사용 로그에서 46분간
 260여 파일 처리에 강제종료 16회(재기동 8회 × word/excel 2종)가 관측됐다 — 매 재기동마다
 Resiliency 표식이 다시 쌓이는 것도 함께 확인됨. 원인: `quit_com_apps()`가 `app.Quit()` 직후
 **유예 없이 곧바로** `terminate_owned_office_processes()`를 호출했다. `Quit()`은 종료를
@@ -650,7 +682,7 @@ Resiliency 표식이 다시 쌓이는 것도 함께 확인됨. 원인: `quit_com
 
 수정: `office_guard.wait_for_owned_exit(owned, timeout_sec)`가 `OpenProcess`+
 `WaitForSingleObject`로 실제 종료를 폴링 없이 기다린다(스스로 꺼지면 유예를 다 안 쓰고 즉시
-반환). `quit_com_apps(grace_sec=5.0)`가 `Quit()` → 유예 대기 → **그래도 남은 것만** 강제종료
+반환). `quit_com_apps()`가 `Quit()` → 유예 대기 → **그래도 남은 것만** 강제종료
 순으로 바뀌었다. `Quit()` 직전 `gc.collect()`도 추가했다 — 파이썬 쪽에서 COM 래퍼 참조를
 놓지 않고 있어(순환 참조 등) Office가 스스로 종료하지 못하는 경우를 미리 배제하기 위함이다.
 
