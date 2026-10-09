@@ -160,6 +160,18 @@ class Bridge(QObject):
         except json.JSONDecodeError:
             return json.dumps({"ok": False, "error": "invalid JSON"})
 
+        if not isinstance(patch, dict):
+            return json.dumps({"ok": False, "error": "invalid settings"})
+        collector = patch.get("collector")
+        if isinstance(collector, dict) and "idle_seconds" in collector:
+            idle_seconds = collector["idle_seconds"]
+            if (
+                isinstance(idle_seconds, bool)
+                or not isinstance(idle_seconds, int)
+                or idle_seconds not in {minutes * 60 for minutes in range(30, 181, 30)}
+            ):
+                return json.dumps({"ok": False, "error": "자동 인덱싱 시간은 30·60·90·120·150·180분 중 선택하세요."})
+
         # cleanup.auto_delete(UI 긍정형) -> cleanup.dry_run(실제 config 키, 부정형) 변환
         if "cleanup" in patch and isinstance(patch["cleanup"], dict) and "auto_delete" in patch["cleanup"]:
             auto_delete = patch["cleanup"].pop("auto_delete")

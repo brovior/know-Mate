@@ -653,11 +653,22 @@ function _fillSettingsForm(data) {
   document.getElementById("valTopK").textContent = topK + "건";
 
   document.getElementById("setIdleEnabled").checked = data.collector?.idle_enabled ?? true;
-  // config는 초 단위(idle_seconds)로 저장, UI는 분 단위로 표시 (1~30분, 최소 1분)
   const idleSec = data.collector?.idle_seconds ?? 60;
-  const idleMin = Math.min(30, Math.max(1, Math.round(idleSec / 60)));
-  document.getElementById("setIdleMinutes").value = idleMin;
-  document.getElementById("valIdleMinutes").textContent = idleMin + "분";
+  const idleSelect = document.getElementById("setIdleMinutes");
+  idleSelect.querySelector("option[data-custom]")?.remove();
+  const idleOption = Array.from(idleSelect.options).find(option => Number(option.value) * 60 === idleSec);
+  if (idleOption) {
+    idleSelect.value = idleOption.value;
+  } else {
+    const idleLabel = idleSec % 60 === 0 ? (idleSec / 60) + "분" : idleSec + "초";
+    const custom = new Option("직접 설정한 값: " + idleLabel, "custom", true, true);
+    custom.disabled = true;
+    custom.dataset.custom = "true";
+    idleSelect.prepend(custom);
+    idleSelect.value = "custom";
+  }
+  idleSelect.dataset.changed = "false";
+  idleSelect.onchange = () => { idleSelect.dataset.changed = "true"; };
 
   document.getElementById("setMailEnabled").checked = data.mail?.enabled ?? true;
 
@@ -705,8 +716,6 @@ function saveSettings() {
     },
     collector: {
       idle_enabled: document.getElementById("setIdleEnabled").checked,
-      // 분 단위 슬라이더 → 초 단위 config로 변환
-      idle_seconds: parseInt(document.getElementById("setIdleMinutes").value, 10) * 60,
     },
     mail: {
       enabled: document.getElementById("setMailEnabled").checked,
@@ -722,6 +731,11 @@ function saveSettings() {
     },
     log_level: _segValue("segLogLevel") || "INFO",
   };
+
+  const idleSelect = document.getElementById("setIdleMinutes");
+  if (idleSelect.dataset.changed === "true") {
+    patch.collector.idle_seconds = Number(idleSelect.value) * 60;
+  }
 
   bridge.saveSettings(JSON.stringify(patch)).then(json => {
     let result;

@@ -28,7 +28,7 @@ import logging
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -61,9 +61,40 @@ class OwnedOfficeProcess:
     exe: str
     creation_identity: int | None
     terminable: bool = True
+    generation: int = field(default=0, compare=False)
+    cleanup_pending: bool = False
+    cleanup_generation: int = field(default=0, compare=False)
 
 
 _owned_pids: dict[int, OwnedOfficeProcess] = {}
+_ownership_generation = 0
+_shutdown_generation = 0
+_cleanup_retry_at: dict[str, float] = {}
+_cleanup_inflight: dict[str, int] = {}
+
+
+@dataclass(frozen=True)
+class OfficeCleanupResult:
+    """Outcome of a single verified process cleanup attempt."""
+
+    confirmed_exited: frozenset[int] = frozenset()
+    remaining: frozenset[int] = frozenset()
+    identity_unknown: frozenset[int] = frozenset()
+    failed: frozenset[int] = frozenset()
+    forced_exited: frozenset[int] = frozenset()
+
+    @property
+    def successful(self) -> bool:
+        """Whether all target processes are confirmed gone or safely reused."""
+        return not (self.remaining or self.identity_unknown or self.failed)
+
+
+class OfficeCleanupPendingError(RuntimeError):
+    """An owned Office process is still shutting down, so COM must be deferred."""
+
+    def __init__(self, exe: str, detail: str) -> None:
+        self.exe = exe.upper()
+        super().__init__(detail)
 
 # 현재 진행 중인 COM 파싱 작업의 컨텍스트. Dispatch-hang 시에도 baseline 차집합만
 # 으로는 사용자 동시 실행과 구별할 수 없으므로, 이 정보는 진단용으로만 보존하며
@@ -335,29 +366,169 @@ def register_owned_app(exe: str, baseline: set[int], app: Any) -> bool:
         or confirmed_identity != creation_identity
     ):
         return False
+    global _ownership_generation
     with _owned_lock:
+        _ownership_generation += 1
         # PowerPoint MultiUse Dispatch는 동시 사용자 실행과 완전한 소유 증명이
         # 불가능하다. 세션 추적은 해 가드의 자기 감지만 피하되, 어떤 강제 종료
         # 경로에도 넣지 않는다.
-        _owned_pids[pid] = OwnedOfficeProcess(up, creation_identity, up != "POWERPNT.EXE")
+        _owned_pids[pid] = OwnedOfficeProcess(
+            up, creation_identity, up != "POWERPNT.EXE", _ownership_generation,
+        )
     logger.debug("우리 소유 Office PID 등록: %s=%d", up, pid)
     return True
 
 
 def clear_owned_pids() -> set[int]:
-    """소유 PID 집합을 반환하고 비운다(사이클 종료 정리용)."""
+    """테스트/명시적 초기화용으로 소유 기록과 재시도 시각을 비운다."""
     with _owned_lock:
         prev = set(_owned_pids)
         _owned_pids.clear()
+        _cleanup_retry_at.clear()
     return prev
 
 
 def take_owned_processes() -> dict[int, OwnedOfficeProcess]:
-    """정상 cycle cleanup용 검증 소유 프로세스 기록을 반환하고 비운다."""
+    """Legacy alias returning an owned-process snapshot without clearing records."""
     with _owned_lock:
-        prev = dict(_owned_pids)
-        _owned_pids.clear()
-    return prev
+        return dict(_owned_pids)
+
+
+def begin_owned_cleanup(exe: str | None = None) -> dict[int, OwnedOfficeProcess]:
+    """Mark owned Word/Excel records pending and return an immutable snapshot."""
+    global _shutdown_generation
+    with _owned_lock:
+        _shutdown_generation += 1
+        cleanup_generation = _shutdown_generation
+        snapshot: dict[int, OwnedOfficeProcess] = {}
+        for pid, record in tuple(_owned_pids.items()):
+            if record.exe in {"WINWORD.EXE", "EXCEL.EXE"} and (exe is None or record.exe == exe.upper()):
+                pending = OwnedOfficeProcess(
+                    record.exe, record.creation_identity, record.terminable,
+                    record.generation, True, cleanup_generation,
+                )
+                _owned_pids[pid] = pending
+                snapshot[pid] = pending
+        return snapshot
+
+
+def _record_matches(pid: int, record: OwnedOfficeProcess) -> bool:
+    """Check that a cleanup snapshot still refers to the current registry record."""
+    with _owned_lock:
+        current = _owned_pids.get(pid)
+        return (
+            current is not None and current.cleanup_pending
+            and current.exe == record.exe
+            and current.creation_identity == record.creation_identity
+            and current.terminable == record.terminable
+            and current.generation == record.generation
+            and current.cleanup_generation == record.cleanup_generation
+        )
+
+
+def _remove_owned_if_matches(pid: int, record: OwnedOfficeProcess) -> bool:
+    """Remove a record only if PID, identity, and registration generation still match."""
+    with _owned_lock:
+        current = _owned_pids.get(pid)
+        if current is None or not _record_matches_unlocked(current, record):
+            return False
+        _owned_pids.pop(pid, None)
+        return True
+
+
+def _record_matches_unlocked(current: OwnedOfficeProcess, record: OwnedOfficeProcess) -> bool:
+    """Compare record identity, including the non-comparing generation field."""
+    return (
+        current.exe == record.exe
+        and current.creation_identity == record.creation_identity
+        and current.terminable == record.terminable
+        and current.generation == record.generation
+        and current.cleanup_generation == record.cleanup_generation
+        and current.cleanup_pending == record.cleanup_pending
+    )
+
+
+def finish_owned_cleanup(snapshot: dict[int, OwnedOfficeProcess], unresolved: set[int]) -> None:
+    """Drop snapshot records confirmed gone by the identity-aware grace wait."""
+    for pid, record in snapshot.items():
+        if pid not in unresolved:
+            _remove_owned_if_matches(pid, record)
+
+
+def prune_released_nonterminable_processes() -> None:
+    """Remove vanished/reused PowerPoint records without quitting or killing Office."""
+    with _owned_lock:
+        snapshot = {pid: rec for pid, rec in _owned_pids.items() if not rec.terminable}
+    if not snapshot:
+        return
+    procs = _enumerate_processes()
+    if procs is None:
+        return
+    names = {pid: name for name, pid in procs}
+    for pid, record in snapshot.items():
+        identity = _process_creation_identity(pid) if names.get(pid) == record.exe else None
+        if names.get(pid) != record.exe or (
+            identity is not None and identity != record.creation_identity
+        ):
+            _remove_owned_if_matches(pid, record)
+
+
+def ensure_office_available(exe: str, retry_cooldown_sec: float = 30.0) -> None:
+    """Retry pending cleanup at most once per cooldown, then gate COM if unresolved."""
+    up = exe.upper()
+    with _owned_lock:
+        inflight = _cleanup_inflight.get(up, 0) > 0
+    if inflight:
+        raise OfficeCleanupPendingError(up, f"{up} 종료 정리 진행 중")
+    pending = {pid: rec for pid, rec in _owned_for_exe(up).items() if rec.cleanup_pending}
+    if not pending:
+        return
+    now = time.monotonic()
+    with _owned_lock:
+        retry_at = _cleanup_retry_at.get(up, 0.0)
+        if now >= retry_at:
+            _cleanup_retry_at[up] = now + retry_cooldown_sec
+            retry = True
+        else:
+            retry = False
+    if retry:
+        try:
+            result = cleanup_owned_processes(pending, timeout_sec=1.0)
+            _log_cleanup_result(up, result, "재시도")
+        except Exception as exc:
+            logger.error("Office 종료 재시도 예외: exe=%s error_type=%s", up, type(exc).__name__)
+    with _owned_lock:
+        unresolved = {pid for pid, rec in _owned_pids.items() if rec.exe == up and rec.cleanup_pending}
+        inflight = _cleanup_inflight.get(up, 0) > 0
+    if unresolved or inflight:
+        raise OfficeCleanupPendingError(up, f"{up} 종료 확인 대기 중: PID {sorted(unresolved)}")
+
+
+def begin_shutdown_cleanup(exe: str) -> None:
+    """Gate new Office activation while one timeout cleanup is in flight."""
+    with _owned_lock:
+        up = exe.upper()
+        _cleanup_inflight[up] = _cleanup_inflight.get(up, 0) + 1
+
+
+def finish_shutdown_cleanup(exe: str) -> None:
+    """Release one shutdown cleanup gate after its OS work has completed."""
+    with _owned_lock:
+        up = exe.upper()
+        count = _cleanup_inflight.get(up, 0)
+        if count <= 1:
+            _cleanup_inflight.pop(up, None)
+        else:
+            _cleanup_inflight[up] = count - 1
+
+
+def _log_cleanup_result(exe: str, result: OfficeCleanupResult, phase: str) -> None:
+    """Log cleanup status without including document content or paths."""
+    logger.info(
+        "[com] Office 정리 결과: exe=%s phase=%s actual_exit=%s remaining=%s identity_unknown=%s failed=%s",
+        exe, phase, sorted(result.confirmed_exited), sorted(result.remaining),
+        sorted(result.identity_unknown), sorted(result.failed),
+    )
 
 
 def is_office_busy_for_ext(ext: str) -> bool:
@@ -373,7 +544,16 @@ def is_office_busy_for_ext(ext: str) -> bool:
     if procs is None:  # 판단 불가 → 기존 동작 유지(차단하지 않음)
         return False
     running = _pids_for(proc, procs)
-    external = running - _owned_snapshot()  # 우리가 띄운 인스턴스 제외
+    if sys.platform != "win32":
+        return bool(running - _owned_snapshot())
+    with _owned_lock:
+        records = {pid: record for pid, record in _owned_pids.items() if pid in running}
+    proven_owned = {
+        pid for pid, record in records.items()
+        if record.exe == proc and record.creation_identity is not None
+        and _process_creation_identity(pid) == record.creation_identity
+    }
+    external = running - proven_owned
     return bool(external)
 
 
@@ -436,37 +616,21 @@ def terminate_stuck_office(exe: str) -> int:
     """
     if not exe or sys.platform != "win32":
         return 0
-    procs = _enumerate_processes()
-    if procs is None:
-        return 0
     up = exe.upper()
-    targets = {
-        pid: record for pid, record in _verified_owned_processes(up, procs, _owned_for_exe(up)).items()
-        if record.terminable
-    }
     # Dispatch 반환 전에는 HWND·생성 identity로 소유권을 검증할 수 없다. baseline
     # 차집합은 사용자가 같은 순간 연 Office일 수 있으므로 절대 강제 종료하지 않는다.
-    terminated = {
-        pid for pid, record in targets.items()
-        if _terminate_pid(pid, record.creation_identity)
-    }
-    if terminated:
+    owned = begin_owned_cleanup(up)
+    targets = {pid: rec for pid, rec in owned.items() if rec.terminable}
+    if not targets:
+        return 0
+    result = cleanup_owned_processes(targets)
+    if result.confirmed_exited:
         logger.warning(
-            "COM 행오버 추정 — %s 프로세스 %d개 강제 종료(블로킹 해제): %s",
-            up, len(terminated), sorted(terminated),
+            "COM 행오버 추정 — %s 프로세스 실제 종료 확인 %d개: %s",
+            up, len(result.confirmed_exited), sorted(result.confirmed_exited),
         )
-        # 강제 종료는 Office에 "비정상 종료" 표식을 남기고, 그 표식은 다음 기동 때
-        # 세이프모드 프롬프트 → 또 행오버 → 또 강제 종료의 루프를 만든다. 방금
-        # 우리가 만든 표식이므로 여기서 바로 지운다(다음 Dispatch 직전에도 한 번 더
-        # 지우지만, 그 사이 사용자가 Office를 열면 프롬프트를 보게 되므로 즉시 정리).
-        # 이 함수는 워치독 daemon 타이머에서 호출되므로 어떤 예외도 밖으로 내보내지
-        # 않는다 — 여기서 터지면 타이머 스레드가 조용히 죽는다.
-        try:
-            from knowmate.secure.office_resiliency import clear_resiliency_markers
-            clear_resiliency_markers(up)
-        except Exception as exc:
-            logger.debug("Resiliency 표식 정리 실패(무시): %s", exc)
-    return len(terminated)
+    # Resiliency 표식은 cleanup_owned_processes에서 강제종료 확인 후에만 정리한다.
+    return len(result.forced_exited)
 
 
 def recover_poisoned_office(exe: str, timeout_sec: float = 2.0) -> bool:
@@ -474,114 +638,44 @@ def recover_poisoned_office(exe: str, timeout_sec: float = 2.0) -> bool:
     if not exe or sys.platform != "win32":
         return False
     up = exe.upper()
-    procs = _enumerate_processes()
-    if procs is None:
-        return False
     registered = _owned_for_exe(up)
     if not registered:
         return False
-    live_names = {pid: name for name, pid in procs}
-    targets: dict[int, OwnedOfficeProcess] = {}
-    already_exited: set[int] = set()
-    identity_unknown: set[int] = set()
-    nonterminable: set[int] = set()
-    for pid, record in registered.items():
-        # PID가 사라졌거나 다른 EXE가 됐으면 원래 자동화 프로세스는 이미 끝났다.
-        if live_names.get(pid) != record.exe:
-            already_exited.add(pid)
-            continue
-        current_identity = _process_creation_identity(pid)
-        if current_identity is None:
-            # 권한/조회 실패를 "종료됨"으로 오판하면 고장 난 프로세스를 재사용한다.
-            identity_unknown.add(pid)
-            continue
-        if current_identity != record.creation_identity:
-            # 같은 PID가 사용자 프로세스로 재사용됐을 수 있으므로 제거만 한다.
-            already_exited.add(pid)
-            continue
-        if record.terminable:
-            targets[pid] = record
-        else:
-            nonterminable.add(pid)
-    # 비종료형 PowerPoint 세션은 poison 복구에서 kill하지 않는다. 앱 참조는
-    # 파서가 비우며, 남은 세션은 사용자 프로세스일 수 있어 자연 종료에 맡긴다.
-    for pid, record in targets.items():
-        _terminate_pid(pid, record.creation_identity)
-    remaining, _elapsed = (
-        wait_for_owned_exit(targets, timeout_sec) if targets else (set(), 0.0)
-    )
-    exited = already_exited | nonterminable | (set(targets) - remaining)
-    if exited:
-        with _owned_lock:
-            for pid in exited:
-                _owned_pids.pop(pid, None)
-        if set(targets) - remaining:
-            try:
-                from knowmate.secure.office_resiliency import clear_resiliency_markers
-                clear_resiliency_markers(up)
-            except Exception as exc:
-                logger.debug("Resiliency 표식 정리 실패(무시): %s", exc)
-    if nonterminable:
+    # PowerPoint MultiUse 세션은 절대 종료하지 않는다.
+    if any(not record.terminable for record in registered.values()):
         logger.warning("COM poison 복구 보류 — %s MultiUse 세션은 종료하지 않음", up)
         return False
-    if identity_unknown:
-        logger.warning("COM poison 복구 보류 — %s 생성 identity 확인 실패: %s", up, sorted(identity_unknown))
+    snapshot = begin_owned_cleanup(up)
+    if not snapshot:
         return False
-    if remaining:
-        logger.warning("COM poison 복구 종료 미확인: %s", sorted(remaining))
-        return False
-    logger.warning("COM poison 즉시 복구 완료: %s PID=%s", up, sorted(exited))
-    return True
+    result = cleanup_owned_processes(snapshot, timeout_sec=timeout_sec)
+    _log_cleanup_result(up, result, "poison recovery")
+    if result.successful:
+        logger.warning("COM poison 즉시 복구 완료: %s actual_exit=%s", up, sorted(result.confirmed_exited))
+        return True
+    return False
 
 
 _SYNCHRONIZE = 0x00100000
 _WAIT_OBJECT_0 = 0x00000000
 
 
-def wait_for_owned_exit(owned: set, timeout_sec: float) -> tuple[set, float]:
-    """owned PID들이 스스로 종료하기를 최대 timeout_sec초 기다린다.
+def wait_for_owned_exit(
+    owned: dict[int, OwnedOfficeProcess] | set[int], timeout_sec: float,
+) -> tuple[set[int], float]:
+    """Wait for natural exit within one deadline; retain unqueryable processes.
 
-    `Quit()`은 종료를 "요청"할 뿐 즉시 반환하므로, 반환 직후 프로세스 목록을
-    조회하면 아직 정리 중인(임시파일·애드인 정리 등) Office가 거의 항상 살아있는
-    것으로 잡혀 불필요하게 강제 종료된다(레이스). `OpenProcess`+`WaitForSingleObject`로
-    커널이 실제 종료를 알려줄 때까지 대기해, 스스로 꺼지면 유예 시간을 다 쓰지
-    않고 즉시 반환한다.
-
-    한 PID라도 이 시점에 `OpenProcess`가 실패하면(권한 문제 등 드문 경우 제외,
-    보통은 **이미 종료됨을 의미**) 폴링으로 5초를 기다리지 않는다 — 대신 프로세스
-    열거를 1회만 호출해 정말 살아있는지 확인한다(열거 자체가 실패하면 판단 불가로
-    보수적으로 "살아있음" 취급 — 기존 즉시 강제종료 동작과 동일하게 안전한 방향).
-
-    반환: (유예 종료 후에도 남아있는 PID 집합, 실제 대기한 시간(초)) — 후자는
-    로그로 남겨 "레이스였는지(빠르게 종료) vs 다른 원인인지(매번 유예 소진)"를
-    운영 중 구분할 수 있게 한다.
+    For verified records, creation identity and exit are checked on the same
+    handle. A reused PID belongs to someone else: the old process is already
+    gone, so neither waiting on nor terminating its replacement is appropriate.
     """
     if not owned or sys.platform != "win32":
         return set(owned), 0.0
 
-    identity_unknown: set[int] = set()
-    if isinstance(owned, dict):
-        procs = _enumerate_processes()
-        if procs is None:
-            return set(owned), 0.0
-        names = {pid: name for name, pid in procs}
-        verified: dict[int, OwnedOfficeProcess] = {}
-        for pid, record in owned.items():
-            if names.get(pid) != record.exe:
-                continue
-            identity = _process_creation_identity(pid)
-            if identity is None:
-                identity_unknown.add(pid)
-            elif identity == record.creation_identity:
-                verified[pid] = record
-        owned = verified
-        if not owned:
-            return identity_unknown, 0.0
-
     import ctypes
     from ctypes import wintypes
 
-    kernel32 = ctypes.windll.kernel32
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     kernel32.OpenProcess.restype = wintypes.HANDLE
     kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
@@ -589,100 +683,209 @@ def wait_for_owned_exit(owned: set, timeout_sec: float) -> tuple[set, float]:
     kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
     kernel32.CloseHandle.restype = wintypes.BOOL
     t0 = time.monotonic()
-
-    handles: dict[int, int] = {}
-    no_handle: set = set()
-    for pid in owned:
-        handle = kernel32.OpenProcess(_SYNCHRONIZE, False, pid)
-        if handle:
-            handles[pid] = handle
-        else:
-            no_handle.add(pid)
-
     deadline = t0 + timeout_sec
-    unresolved: set = set()
-    for pid, handle in handles.items():
-        remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+    unresolved: set[int] = set()
+    no_handle: set[int] = set()
+    records = owned if isinstance(owned, dict) else {}
+    for pid in owned:
+        record = records.get(pid)
+        handle = kernel32.OpenProcess(_SYNCHRONIZE | 0x1000, False, pid)
+        if not handle:
+            no_handle.add(pid)
+            continue
         try:
+            if record is not None:
+                identity = _process_creation_identity_from_handle(kernel32, handle)
+                if identity is None or record.creation_identity is None:
+                    unresolved.add(pid)
+                    logger.warning(
+                        "Office 종료 유예 identity 확인 실패: PID=%d exe=%s error=%d",
+                        pid, record.exe, ctypes.get_last_error(),
+                    )
+                    continue
+                if identity != record.creation_identity:
+                    continue
+            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
             result = kernel32.WaitForSingleObject(handle, remaining_ms)
             if result != _WAIT_OBJECT_0:
                 unresolved.add(pid)
+                if result == 0xFFFFFFFF:
+                    logger.warning("Office 종료 유예 대기 실패: PID=%d error=%d", pid, ctypes.get_last_error())
+        except Exception as exc:
+            unresolved.add(pid)
+            logger.warning("Office 종료 유예 확인 실패: PID=%d error_type=%s", pid, type(exc).__name__)
         finally:
             kernel32.CloseHandle(handle)
 
-    still_alive = set(unresolved) | identity_unknown
     if no_handle:
+        # OpenProcess 실패만으로 종료를 단정하지 않는다. 열거 불가이면 보존한다.
         procs = _enumerate_processes()
         if procs is None:
-            # 판단 불가 → 기존 즉시 강제종료 동작과 동일하게 보수적으로 취급
-            still_alive |= no_handle
+            unresolved.update(no_handle)
         else:
-            still_alive |= {pid for (name, pid) in procs if pid in no_handle and name in _OFFICE_EXES}
+            names = {pid: name for name, pid in procs}
+            for pid in no_handle:
+                record = records.get(pid)
+                if record is not None:
+                    if names.get(pid) == record.exe:
+                        unresolved.add(pid)
+                elif names.get(pid) in _OFFICE_EXES:
+                    unresolved.add(pid)
+    return unresolved, time.monotonic() - t0
 
-    return still_alive, time.monotonic() - t0
+
+def cleanup_owned_processes(owned: dict[int, OwnedOfficeProcess], timeout_sec: float = 2.0) -> OfficeCleanupResult:
+    """Run verified process cleanup behind EXE gates until all OS work finishes."""
+    exes = {record.exe for record in owned.values() if record.exe in {"WINWORD.EXE", "EXCEL.EXE"}}
+    for exe in exes:
+        begin_shutdown_cleanup(exe)
+    try:
+        return _cleanup_owned_processes_impl(owned, timeout_sec)
+    finally:
+        for exe in exes:
+            finish_shutdown_cleanup(exe)
 
 
-def terminate_owned_office_processes(owned) -> None:
+def _cleanup_owned_processes_impl(
+    owned: dict[int, OwnedOfficeProcess], timeout_sec: float,
+) -> OfficeCleanupResult:
+    """Terminate identity-matched owned Office processes and confirm actual exit."""
+    if not owned:
+        return OfficeCleanupResult()
+    if sys.platform != "win32":
+        return OfficeCleanupResult(remaining=frozenset(owned))
+    procs = _enumerate_processes()
+    if procs is None:
+        return OfficeCleanupResult(identity_unknown=frozenset(owned))
+    names = {pid: name for name, pid in procs}
+    exited: set[int] = set()
+    remaining: set[int] = set()
+    unknown: set[int] = set()
+    failed: set[int] = set()
+    forced_exited: set[int] = set()
+    for pid, record in owned.items():
+        if not _record_matches(pid, record):
+            failed.add(pid)
+            continue
+        if names.get(pid) != record.exe:
+            if _remove_owned_if_matches(pid, record):
+                exited.add(pid)
+            continue
+        if not record.terminable:
+            remaining.add(pid)
+            continue
+        state = _terminate_and_confirm(pid, record, timeout_sec)
+        if state in {"exited", "terminated", "identity_changed"}:
+            if _remove_owned_if_matches(pid, record):
+                exited.add(pid)
+                if state == "terminated":
+                    forced_exited.add(pid)
+        elif state == "identity_unknown":
+            unknown.add(pid)
+        elif state == "remaining":
+            remaining.add(pid)
+        else:
+            failed.add(pid)
+    result = OfficeCleanupResult(
+        frozenset(exited), frozenset(remaining), frozenset(unknown), frozenset(failed),
+        frozenset(forced_exited),
+    )
+    if forced_exited:
+        try:
+            from knowmate.secure.office_resiliency import clear_resiliency_markers
+            for exe in {owned[pid].exe for pid in forced_exited}:
+                clear_resiliency_markers(exe)
+        except Exception as exc:
+            logger.warning("Office Resiliency 표식 정리 실패: %s", exc)
+    return result
+
+
+def terminate_owned_office_processes(owned) -> OfficeCleanupResult:
     """생성 identity까지 일치하는 검증 소유 Office만 강제 종료한다.
 
     quit_com_apps에서 Quit이 실패해 남은 좀비 프로세스를 정리한다. PID 재활용
     위험을 피하려 '지금 그 PID가 Office 실행 파일'인 경우에만 종료한다
     (다른 프로세스에 재할당된 PID를 실수로 죽이지 않도록)."""
-    if not owned or sys.platform != "win32":
-        return
-    procs = _enumerate_processes()
-    if procs is None:
-        return
     if not isinstance(owned, dict):
         # 구 API가 넘긴 단순 PID set은 creation identity가 없으므로 안전상 종료하지
-        # 않는다. 현행 quit_com_apps는 take_owned_processes() dict를 사용한다.
-        return
-    alive_office = {
-        pid: record for pid, record in _verified_owned_processes(procs=procs, owned=owned).items()
-        if record.terminable
-    }
-    for pid, record in alive_office.items():
-        _terminate_pid(pid, record.creation_identity)
+        # 않는다. 현행 quit_com_apps는 begin_owned_cleanup() 사본을 사용한다.
+        return OfficeCleanupResult(failed=frozenset(owned or ()))
+    return cleanup_owned_processes(owned)
 
 
-def _terminate_pid(pid: int, expected_creation_identity: int | None = None) -> bool:
-    """같은 핸들에서 생성 identity를 재검증한 뒤 PID를 종료한다.
-
-    identity 확인과 종료 사이 PID 재사용 경합을 막기 위해 별도 조회 후 다시 여는
-    방식을 쓰지 않는다. 확인 불가·불일치·종료 실패 시 False를 반환한다.
-    """
+def _terminate_and_confirm(pid: int, record: OwnedOfficeProcess, timeout_sec: float) -> str:
+    """Verify, terminate, and wait using one process handle; return a safe outcome."""
+    if record.creation_identity is None:
+        logger.warning("생성 identity 없는 Office 종료 거부: PID=%d exe=%s", pid, record.exe)
+        return "identity_unknown"
+    handle = None
+    kernel32 = None
     try:
         import ctypes
         from ctypes import wintypes
 
         PROCESS_TERMINATE = 0x0001
         PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
         kernel32.OpenProcess.restype = wintypes.HANDLE
         kernel32.TerminateProcess.argtypes = [wintypes.HANDLE, wintypes.UINT]
         kernel32.TerminateProcess.restype = wintypes.BOOL
+        kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        kernel32.WaitForSingleObject.restype = wintypes.DWORD
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel32.CloseHandle.restype = wintypes.BOOL
         handle = kernel32.OpenProcess(
-            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, False, pid,
+            PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION | _SYNCHRONIZE, False, pid,
         )
         if not handle:
-            return False
-        try:
-            if expected_creation_identity is None:
-                logger.warning("생성 identity 없는 Office PID 종료 거부: PID=%d", pid)
-                return False
-            current_identity = _process_creation_identity_from_handle(kernel32, handle)
-            if current_identity != expected_creation_identity:
-                logger.warning("Office PID 생성 identity 불일치로 종료 거부: PID=%d", pid)
-                return False
-            if not kernel32.TerminateProcess(handle, 1):
-                return False
-            logger.info("잔존 Office 프로세스 강제 종료(좀비 정리): PID=%d", pid)
-            return True
-        finally:
-            kernel32.CloseHandle(handle)
+            logger.warning(
+                "Office 프로세스 핸들 열기 실패: PID=%d exe=%s error=%d",
+                pid, record.exe, ctypes.get_last_error(),
+            )
+            return "identity_unknown"
+        identity = _process_creation_identity_from_handle(kernel32, handle)
+        if identity is None:
+            logger.warning(
+                "Office 생성 identity 확인 실패: PID=%d exe=%s error=%d",
+                pid, record.exe, ctypes.get_last_error(),
+            )
+            return "identity_unknown"
+        if identity != record.creation_identity:
+            return "identity_changed"
+        if not kernel32.TerminateProcess(handle, 1):
+            error = ctypes.get_last_error()
+            immediate = kernel32.WaitForSingleObject(handle, 0)
+            if immediate == _WAIT_OBJECT_0:
+                logger.info("Office 종료 요청 전 실제 종료 확인: PID=%d exe=%s", pid, record.exe)
+                return "exited"
+            if immediate == 0xFFFFFFFF:
+                logger.warning(
+                    "Office 종료 요청·상태 확인 실패: PID=%d exe=%s error=%d wait_error=%d",
+                    pid, record.exe, error, ctypes.get_last_error(),
+                )
+                return "failed"
+            logger.warning("Office 종료 요청 실패: PID=%d exe=%s error=%d", pid, record.exe, error)
+            return "failed"
+        wait_ms = max(1, int(max(0.0, timeout_sec) * 1000))
+        wait_result = kernel32.WaitForSingleObject(handle, wait_ms)
+        if wait_result == 0x00000102:  # WAIT_TIMEOUT
+            logger.warning("Office 종료 확인 시간 초과: PID=%d exe=%s", pid, record.exe)
+            return "remaining"
+        if wait_result == 0xFFFFFFFF:  # WAIT_FAILED
+            logger.warning(
+                "Office 종료 대기 실패: PID=%d exe=%s error=%d",
+                pid, record.exe, ctypes.get_last_error(),
+            )
+            return "failed"
+        if wait_result != _WAIT_OBJECT_0:
+            logger.warning("Office 종료 대기 예기치 않은 결과: PID=%d exe=%s result=%d", pid, record.exe, wait_result)
+            return "failed"
+        logger.info("Office 실제 종료 확인: PID=%d exe=%s", pid, record.exe)
+        return "terminated"
     except Exception as exc:
-        logger.debug("프로세스 종료 실패(무시) PID=%d: %s", pid, exc)
-        return False
+        logger.warning("Office 종료 확인 실패: PID=%d exe=%s error_type=%s", pid, record.exe, type(exc).__name__)
+        return "failed"
+    finally:
+        if handle and kernel32 is not None:
+            kernel32.CloseHandle(handle)

@@ -399,12 +399,17 @@ class TestOfficeGuard:
             lambda: [("WINWORD.EXE", 200), ("CHROME.EXE", 202)],
         )
         killed = []
+        og.clear_owned_pids()
+        og._owned_pids.update({
+            200: og.OwnedOfficeProcess("WINWORD.EXE", 1200),
+            201: og.OwnedOfficeProcess("WINWORD.EXE", 1201),
+            202: og.OwnedOfficeProcess("WINWORD.EXE", 1202),
+        })
         monkeypatch.setattr(
-            og, "_terminate_pid",
-            lambda pid, expected=None: (killed.append(pid) or True),
+            og, "_terminate_and_confirm",
+            lambda pid, _record, _timeout: (killed.append(pid) or "terminated"),
         )
-        owned = {200: og.OwnedOfficeProcess("WINWORD.EXE", 1200)}
-        monkeypatch.setattr(og, "_process_creation_identity", lambda pid: 1200 if pid == 200 else None)
+        owned = og.begin_owned_cleanup("WINWORD.EXE")
         og.terminate_owned_office_processes(owned)
         assert killed == [200]  # 201(죽음)·202(재활용)는 건드리지 않음
 
@@ -418,8 +423,8 @@ class TestOfficeGuard:
         )
         killed = []
         monkeypatch.setattr(
-            og, "_terminate_pid",
-            lambda pid, expected=None: (killed.append(pid) or True),
+            og, "_terminate_and_confirm",
+            lambda pid, _record, _timeout: (killed.append(pid) or "terminated"),
         )
         og._owned_pids[500] = og.OwnedOfficeProcess("EXCEL.EXE", 1500)
         monkeypatch.setattr(og, "_process_creation_identity", lambda pid: 1500 if pid == 500 else None)
@@ -432,8 +437,8 @@ class TestOfficeGuard:
         monkeypatch.setattr(og.sys, "platform", "win32")
         killed = []
         monkeypatch.setattr(
-            og, "_terminate_pid",
-            lambda pid, expected=None: (killed.append(pid) or True),
+            og, "_terminate_and_confirm",
+            lambda pid, _record, _timeout: (killed.append(pid) or "identity_changed"),
         )
         # begin 시점: 300(사용자)만 존재 → baseline={300}
         monkeypatch.setattr(og, "_enumerate_processes", lambda: [("WINWORD.EXE", 300)])

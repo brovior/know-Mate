@@ -343,8 +343,9 @@ def _make_worker_for_indexer(tmp_path: Path, watch_folder: str, indexer):
     )
 
 
-def test_memory_diagnostics_cover_collector_cycle_phases(tmp_path: Path, monkeypatch):
-    """활성화 시 문서·정리·메일·GC 경계의 표본 순서를 보장한다."""
+@pytest.mark.parametrize("cycle_fails", [False, True])
+def test_memory_diagnostics_cover_collector_cycle_phases(tmp_path: Path, monkeypatch, cycle_fails):
+    """사이클 실패 시에도 COM 정리·GC·진단 종료 경계를 남긴다."""
     from knowmate.collector import scheduler
 
     events: list[str] = []
@@ -370,15 +371,21 @@ def test_memory_diagnostics_cover_collector_cycle_phases(tmp_path: Path, monkeyp
     worker, _, _ = _make_worker(tmp_path, str(folder))
     worker._config["collector"]["memory_diagnostics_enabled"] = True
     monkeypatch.setattr(scheduler, "MemoryDiagnostics", _FakeMemoryDiagnostics)
+    if cycle_fails:
+        def fail_cycle():
+            raise RuntimeError("injected cycle failure")
+        monkeypatch.setattr(worker, "_run_cycle", fail_cycle)
 
     worker.run()
 
-    assert events == [
-        "start",
-        "cycle_start",
+    cycle_phases = [] if cycle_fails else [
         "after_document_indexing",
         "after_documents",
         "after_mail",
+    ]
+    assert events == ["start", "cycle_start", *cycle_phases,
+        "before_com_cleanup",
+        "after_com_cleanup",
         "after_gc_collect",
         "stop",
     ]
@@ -414,6 +421,32 @@ class TestCollectorWorker:
         worker.run()
 
         assert loads == [worker._mail_state_file]
+
+    def test_automatic_cycles_reuse_worker_discovery_and_manual_request_refreshes(self, tmp_path, monkeypatch):
+        """The production worker path owns discovery across automatic starts."""
+        from knowmate.collector import mail_scanner
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        worker, _, _ = _make_worker(tmp_path, str(folder))
+        worker._email_indexer = self._IdleEmailIndexer()
+        worker._config["mail"] = {"enabled": True, "max_mails_per_scan": 1}
+        traversals = []
+        original = mail_scanner._iter_mail_files
+
+        def recording_traversal(*args):
+            traversals.append(args[0])
+            yield from original(*args)
+
+        monkeypatch.setattr(mail_scanner, "_iter_mail_files", recording_traversal)
+        worker.run()
+        snapshot_items = worker._mail_discovery.items
+        worker.run()
+        assert traversals == [str(folder)]
+        assert worker._mail_discovery.items is snapshot_items
+        worker.request_failure_retry()
+        worker.run()
+        assert traversals == [str(folder), str(folder)]
 
     def test_corrupt_mail_state_blocks_exclusion_db_work(self, tmp_path):
         """strict 상태 로드 실패 시 제외 청크 조회·삭제를 시작하지 않는다."""
@@ -883,6 +916,47 @@ class TestComRestart:
         worker.run()
 
         spy.assert_not_called()
+
+    def test_cleanup_pending_is_deferred_without_failure_and_plain_continues(self, tmp_path: Path):
+        """Unconfirmed Office cleanup does not add file failures or block plain extraction."""
+        from knowmate.rag.embedding import EmbeddingClient
+        from knowmate.rag.indexer import Indexer
+        from knowmate.collector.scheduler import CollectorWorker
+        from knowmate.secure.office_guard import OfficeCleanupPendingError
+        from knowmate.collector.failure_state import load_failures
+
+        folder = tmp_path / "docs"
+        folder.mkdir()
+        deferred_doc = folder / "pending.doc"
+        deferred_doc.write_bytes(b"legacy")
+        plain = folder / "normal.txt"
+        plain.write_text("plain text", encoding="utf-8")
+
+        class PendingExtractor:
+            def extract(self, path: str) -> str:
+                if Path(path).suffix == ".doc":
+                    raise OfficeCleanupPendingError("WINWORD.EXE", "cleanup pending")
+                return "plain text"
+
+        embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
+        indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
+        state_file = tmp_path / "state.json"
+        failure_file = tmp_path / "failure.json"
+        worker = CollectorWorker(
+            config={
+                "collector": {"watch_folders": [str(folder)], "idle_seconds": 60},
+                "cleanup": {"dry_run": True, "max_delete_ratio": 0.30},
+                "chunking": {"chunk_size": 400, "overlap": 80},
+            },
+            indexer=indexer, extractor=PendingExtractor(), state_file=state_file,
+            failure_file=failure_file,
+        )
+
+        worker.run()
+
+        assert str(plain) in load_state(state_file)
+        assert str(deferred_doc) not in load_state(state_file)
+        assert str(deferred_doc) not in load_failures(failure_file)
 
     def test_restart_failure_does_not_stop_cycle(self, tmp_path: Path):
         """com_restart_fn이 예외를 던져도 사이클은 계속 완료된다."""

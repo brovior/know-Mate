@@ -90,6 +90,8 @@ class MemoryDiagnostics:
         self._started = False
         self._cycle_snapshot = None
         self._before_optimize_snapshot = None
+        self._trace_started_at_ns: int | None = None
+        self._last_private_bytes: int | None = None
         self._pid = os.getpid() if pid is None else pid
         self._cycle_id = cycle_id or f"{self._pid}-{time.time_ns()}"
 
@@ -97,10 +99,12 @@ class MemoryDiagnostics:
         """필요할 때만 tracemalloc 추적을 시작하고 사이클 peak를 초기화한다."""
         if not self.enabled or self._started:
             return
+        self.log("before_tracemalloc_start")
         try:
             if not tracemalloc.is_tracing():
                 tracemalloc.start(10)
                 self._owns_tracing = True
+                self._trace_started_at_ns = time.time_ns()
             else:
                 logger.info(
                     "[memory] pid=%d cycle_id=%s external tracemalloc tracing detected; "
@@ -110,7 +114,15 @@ class MemoryDiagnostics:
                 )
             if self._owns_tracing:
                 tracemalloc.reset_peak()
-            self._cycle_snapshot = tracemalloc.take_snapshot() if tracemalloc.is_tracing() else None
+            self.log("after_tracemalloc_start")
+            if tracemalloc.is_tracing():
+                self.log("before_cycle_snapshot")
+                try:
+                    self._cycle_snapshot = tracemalloc.take_snapshot()
+                finally:
+                    self.log("after_cycle_snapshot", counters={
+                        "snapshot_ok": int(self._cycle_snapshot is not None),
+                    })
         except Exception:
             logger.debug("[memory] tracemalloc 시작 실패", exc_info=True)
         self._started = True
@@ -123,6 +135,8 @@ class MemoryDiagnostics:
         private_bytes: int | None = None
         python_current: int | None = None
         python_peak: int | None = None
+        tracer_bytes: int | None = None
+        trace_scope = "inactive"
         arrow_current: int | None = None
         arrow_peak: int | None = None
         arrow_backend = "n/a"
@@ -133,7 +147,9 @@ class MemoryDiagnostics:
             logger.debug("[memory] Windows Private Bytes 조회 실패", exc_info=True)
         try:
             if tracemalloc.is_tracing():
+                trace_scope = "cycle_since_start" if self._owns_tracing else "external_start_unknown"
                 python_current, python_peak = tracemalloc.get_traced_memory()
+                tracer_bytes = tracemalloc.get_tracemalloc_memory()
         except Exception:
             logger.debug("[memory] tracemalloc 조회 실패", exc_info=True)
         try:
@@ -148,9 +164,15 @@ class MemoryDiagnostics:
         counter_text = "" if not counters else " " + " ".join(
             f"{key}={value}" for key, value in sorted(counters.items())
         )
+        private_delta = (
+            private_bytes - self._last_private_bytes
+            if private_bytes is not None and self._last_private_bytes is not None else None
+        )
+        self._last_private_bytes = private_bytes
         logger.info(
             "[memory] pid=%d cycle_id=%s phase=%s private_mib=%s python_current_mib=%s "
-            "python_peak_mib=%s arrow_current_mib=%s arrow_peak_mib=%s arrow_backend=%s%s",
+            "python_peak_mib=%s arrow_current_mib=%s arrow_peak_mib=%s arrow_backend=%s "
+            "private_delta_mib=%s python_scope=%s trace_started_at_ns=%s tracemalloc_mib=%s%s",
             self._pid,
             self._cycle_id,
             phase,
@@ -160,6 +182,10 @@ class MemoryDiagnostics:
             _format_mib(arrow_current),
             _format_mib(arrow_peak),
             arrow_backend,
+            _format_mib(private_delta),
+            trace_scope,
+            self._trace_started_at_ns if self._trace_started_at_ns is not None else "n/a",
+            _format_mib(tracer_bytes),
             counter_text,
         )
         self._log_snapshot_diff(phase)
@@ -184,8 +210,11 @@ class MemoryDiagnostics:
         is_after_optimize = phase.startswith("after_optimize_")
         if not (is_before_optimize or is_after_optimize or phase in {"after_mail", "after_gc_collect"}):
             return
+        logger.info("[memory] pid=%d cycle_id=%s snapshot_diff phase=%s action=start", self._pid, self._cycle_id, phase)
+        status = "failed"
         try:
             snapshot = tracemalloc.take_snapshot()
+            status = "ok"
             if is_before_optimize:
                 self._before_optimize_snapshot = snapshot
                 return
@@ -207,12 +236,16 @@ class MemoryDiagnostics:
                     self._pid, self._cycle_id, phase, " | ".join(items),
                 )
         except Exception:
+            status = "failed"
             logger.debug("[memory] tracemalloc snapshot diff failed", exc_info=True)
+        finally:
+            logger.info("[memory] pid=%d cycle_id=%s snapshot_diff phase=%s action=end status=%s", self._pid, self._cycle_id, phase, status)
 
     def collect_and_log(self) -> None:
         """진단 모드에서만 Python GC를 실행한 뒤 마지막 메모리를 기록한다."""
         if not self.enabled:
             return
+        self.log("before_gc_collect")
         try:
             gc.collect()
         except Exception:
@@ -221,12 +254,24 @@ class MemoryDiagnostics:
 
     def stop(self) -> None:
         """이 계측기가 시작한 tracemalloc 추적만 종료한다."""
+        if not self.enabled:
+            return
         try:
-            if self._owns_tracing and tracemalloc.is_tracing():
-                tracemalloc.stop()
+            if self._owns_tracing:
+                self.log("before_tracemalloc_stop")
+                if tracemalloc.is_tracing():
+                    tracemalloc.stop()
+                self.log("after_tracemalloc_stop")
+            else:
+                self.log(
+                    "tracemalloc_preserved_external" if tracemalloc.is_tracing()
+                    else "tracemalloc_inactive"
+                )
         except Exception:
             logger.debug("[memory] tracemalloc 종료 실패", exc_info=True)
         self._owns_tracing = False
         self._started = False
         self._cycle_snapshot = None
         self._before_optimize_snapshot = None
+        self._trace_started_at_ns = None
+        self.log("cycle_diagnostics_released")

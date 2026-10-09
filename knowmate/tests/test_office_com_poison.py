@@ -129,8 +129,8 @@ def test_recover_poison_keeps_other_owned_apps(monkeypatch):
     monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: list(live))
     killed = []
     monkeypatch.setattr(
-        office_guard, "_terminate_pid",
-        lambda pid, expected=None: (killed.append(pid) or True),
+        office_guard, "_terminate_and_confirm",
+        lambda pid, record, timeout: (killed.append(pid) or "terminated"),
     )
     monkeypatch.setattr(office_guard, "_process_creation_identity", lambda pid: {10: 1010, 20: 2020}.get(pid))
     monkeypatch.setattr(office_guard, "wait_for_owned_exit", lambda pids, timeout: (set(), 0.0))
@@ -292,10 +292,7 @@ def test_identity_mismatch_never_kills_reused_pid(monkeypatch):
     monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: [("EXCEL.EXE", 10)])
     monkeypatch.setattr(office_guard, "_process_creation_identity", lambda pid: 200)
     killed = []
-    monkeypatch.setattr(
-        office_guard, "_terminate_pid",
-        lambda pid, expected=None: (killed.append(pid) or True),
-    )
+    monkeypatch.setattr(office_guard, "_terminate_and_confirm", lambda *_args: "identity_changed")
     assert office_guard.terminate_stuck_office("EXCEL.EXE") == 0
     assert killed == []
 
@@ -309,14 +306,11 @@ def test_identity_probe_failure_defers_recovery_without_kill(monkeypatch):
     monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: [("EXCEL.EXE", 10)])
     monkeypatch.setattr(office_guard, "_process_creation_identity", lambda pid: None)
     killed = []
-    monkeypatch.setattr(
-        office_guard, "_terminate_pid",
-        lambda pid, expected=None: (killed.append(pid) or True),
-    )
+    monkeypatch.setattr(office_guard, "_terminate_and_confirm", lambda *_args: "identity_unknown")
 
     assert office_guard.recover_poisoned_office("EXCEL.EXE") is False
     assert killed == []
-    assert office_guard._owned_pids == {10: record}
+    assert office_guard._owned_pids[10].cleanup_pending is True
 
 
 def test_powerpoint_multiuse_is_tracked_but_never_terminable(monkeypatch):
@@ -330,10 +324,7 @@ def test_powerpoint_multiuse_is_tracked_but_never_terminable(monkeypatch):
     assert office_guard.register_owned_app("POWERPNT.EXE", set(), app) is True
     assert office_guard._owned_pids[30].terminable is False
     killed = []
-    monkeypatch.setattr(
-        office_guard, "_terminate_pid",
-        lambda pid, expected=None: (killed.append(pid) or True),
-    )
+    monkeypatch.setattr(office_guard, "_terminate_and_confirm", lambda pid, *_args: killed.append(pid) or "terminated")
     assert office_guard.terminate_stuck_office("POWERPNT.EXE") == 0
     office_guard.terminate_owned_office_processes(dict(office_guard._owned_pids))
     assert killed == []
@@ -348,11 +339,9 @@ def test_cycle_cleanup_releases_ppt_without_quit(monkeypatch):
 
     ppt = _Ppt()
     monkeypatch.setattr(com_reader._tls, "ppt", ppt, raising=False)
-    monkeypatch.setattr(
-        office_guard,
-        "take_owned_processes",
-        lambda: {30: office_guard.OwnedOfficeProcess("POWERPNT.EXE", 3030, False)},
-    )
+    monkeypatch.setattr(office_guard, "_owned_pids", {
+        30: office_guard.OwnedOfficeProcess("POWERPNT.EXE", 3030, False),
+    })
     com_reader.quit_com_apps(grace_sec=0)
     assert ppt.quit_called is False
     assert getattr(com_reader._tls, "ppt", None) is None
@@ -367,12 +356,12 @@ def test_ppt_poison_recovery_defers_same_cycle_without_kill(monkeypatch):
     monkeypatch.setattr(office_guard, "_process_creation_identity", lambda pid: 3030)
     killed = []
     monkeypatch.setattr(
-        office_guard, "_terminate_pid",
-        lambda pid, expected=None: (killed.append(pid) or True),
+        office_guard, "_terminate_and_confirm",
+        lambda pid, record, timeout: (killed.append(pid) or "terminated"),
     )
     assert office_guard.recover_poisoned_office("POWERPNT.EXE") is False
     assert killed == []
-    assert office_guard._owned_pids == {}
+    assert office_guard._owned_pids == {30: office_guard.OwnedOfficeProcess("POWERPNT.EXE", 3030, False)}
 
 
 def test_fatal_hwnd_probe_becomes_poison(monkeypatch):

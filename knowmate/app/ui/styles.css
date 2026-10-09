@@ -236,6 +236,7 @@ html, body { height: 100%; font-family: 'Malgun Gothic', sans-serif; font-size: 
   font-size: 13px; font-family: inherit; color: var(--text-main);
 }
 .settings-field input[type=range] { width: 100%; accent-color: var(--primary); }
+.settings-field select { width: 100%; padding: 8px; border: 1px solid var(--border); border-radius: 6px; color: var(--text-main); background: var(--bg); }
 .settings-row { display: flex; align-items: center; justify-content: space-between; padding: 8px 0; }
 .settings-row-label { font-size: 13px; color: var(--text-main); }
 .settings-row-hint  { font-size: 11px; color: var(--text-hint); margin-top: 2px; }

@@ -80,9 +80,18 @@ Outlook은 그 위에 얹는다. 스키마는 **Outlook까지 고려한 풀 스�
 `mail_scan_state.json`의 최상위 `pending_deletes` 대기열에 먼저 기록하고 다음 사이클에
 원본 파일·성공 캐시·인덱스 버전과 무관하게 재시도한다. 스캔 단계는
 `mail_scan_state.json`의 `source_file`+`mtime`+size+버전 성공 캐시를 먼저 확인해 정상 메일의 DB 조회와
-파싱을 피한다. 스캔은 모든 파일을 확인해 캐시 정리·실패 이력을 유지하지만, 성공 캐시 적중과 활성 백오프
-파일은 정렬·보관할 처리 후보에서 즉시 제외한다. 캐시가 없는 기존 설치는 사이클당 처리 한도 안에서만
+파싱을 피한다. 매 사이클 현재 성공 상태·제외·실패 백오프로 실제 처리 후보를 다시 선별한다.
+캐시가 없는 기존 설치는 사이클당 처리 한도 안에서만
 `get_index_state`로 점진적으로 캐시를 만든다.
+
+**메일 목록 재사용**: 공유 QThread 워커는 완료된 전체 열거의 경로·경로 키·mtime·size 목록 한 개만
+메모리에 보관한다. 본문·벡터를 넣거나 JSON으로 저장하지 않는다. 자동 사이클은 목록을 재사용하고,
+`mail.discovery_refresh_seconds`마다 유휴 간격과 별개로 전체 열거한다(배포 기본 3시간, 0 이하면 매번 열거).
+앱 재시작·수동 인덱싱/재시도·감시 폴더/확장자/제외 및 수집 설정 변경·인덱스 버전/스키마 변경·DB 초기화는
+목록을 무효화한다. 수동 요청은 기존 실패 이력과 이번 한 번의 백오프 무시 동작을 유지한다.
+선택한 작업만 파싱 직전 다시 stat하여 현재 mtime·size로 DB와 성공 캐시를 확인하고 목록의 메타데이터도
+갱신한다. 나머지 새 파일·이미 성공한 파일의 수정은 다음 전체 갱신이나 수동 요청에서 발견한다.
+열거 취소·접근 실패 목록은 재사용하지 않으며, 누락 캐시/실패 정리는 새 전체 열거가 완료됐을 때만 수행한다.
 
 `mail_uid` 정규화: Knox → `knox:{UniqueID}`, eml → `eml:{Message-ID}`, Outlook → `outlook:{EntryID}` (소스 접두사로 통일). v4 재인덱싱 때는 BOM 오파싱으로 과거에 생성된 같은 `source_file`의 `knox:{절대경로}` 활성 청크만, 새 정상 청크 저장 성공 뒤 `pending_deletes`를 거쳐 정리한다. 같은 UID 복사본은 source별 legacy ID를 함께 캡처하되 정상 UID 행과 다른 source는 건드리지 않으며, 저장 뒤 queue 기록 전 중단된 경우에는 정상 현재 버전 행 확인 후 남은 같은 source의 legacy ID만 재시도한다. v5에서는 공백·유니코드 제어문자만 있는 본문을 손상으로 거부한다. 이 전용 오류가 `.mysingle`에서 발생하면 새 본문을 저장하지 않고도 같은 `source_file`과 `knox:{절대경로}`가 모두 일치하는 활성 legacy 청크만 `pending_deletes`에 먼저 저장한 뒤 정리한다. 조회 또는 상태 저장에 실패하면 삭제하지 않으며, 정상 Knox UID와 다른 source는 건드리지 않는다.
 
@@ -202,7 +211,9 @@ EMAIL_SCHEMA = pa.schema([
 
 메일 스캔 결과는 `REMAINING` / `EXHAUSTED` / `UNKNOWN` 세 상태다. `EXHAUSTED`는 root 열거가
 완료되고 현재 actionable 후보를 모두 시도했으며, 마지막 embedding flush와 mail state checkpoint가
-성공하고 취소·전역 오류가 없을 때만 쓴다. Backoff 대상은 현재 actionable backlog가 아니다.
+성공하고 취소·전역 오류가 없을 때만 쓴다. 재사용 목록에서 후보가 끝났거나 선택 파일의 stat이 실패한
+사이클은 `UNKNOWN`을 유지하고 다음 완료된 전체 열거에서만 최종 정리를 판단한다.
+Backoff 대상은 현재 actionable backlog가 아니다.
 후보가 하나라도 있으면 처리 전에 emails sidecar의 backlog marker를 연다. `REMAINING`/`UNKNOWN`은
 marker를 유지하고 final optimize를 하지 않는다. EXHAUSTED에서는 state checkpoint 뒤 marker close를
 원자 저장하고, close 저장 실패 시 in-memory marker만 닫고 optimize를 건너뛴다.
@@ -291,6 +302,7 @@ mail:
   - .mysingle
   - .eml
   max_mails_per_scan: 500  # 스캔당 실제 처리 시도 상한 (파싱·DB 확인·인덱싱, 다음 순환에서 계속)
+  discovery_refresh_seconds: 10800  # 전체 메일 목록 갱신 간격(초), 0 이하면 매번 열거
   progress_report_every: 50  # 최종 결과 기반 진행률 알림 최소 간격(성공 캐시·백오프 skip 제외)
 ```
 

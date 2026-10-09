@@ -114,3 +114,30 @@ def test_atomic_config_replace_failure_keeps_previous_file(tmp_path, monkeypatch
         config_module._save_config({"collector": {"exclude_files": ["new.xlsx"]}})
 
     assert yaml.safe_load(config_path.read_text(encoding="utf-8"))["collector"]["exclude_files"] == ["old.xlsx"]
+
+
+@pytest.mark.parametrize("value", [True, False, 0, -1, float("nan"), float("inf"), "10"])
+def test_invalid_com_quit_timeout_uses_bundled_default(value, caplog):
+    """Invalid timeout values recover to the config.yaml deployment default."""
+    import knowmate.config as config_module
+
+    collector = {"com_quit_call_timeout_sec": value}
+    assert config_module.com_quit_call_timeout_seconds(collector) == 10.0
+    assert collector["com_quit_call_timeout_sec"] == 10
+    assert "배포 기본값으로 복구" in caplog.text
+
+
+def test_existing_config_backfills_com_quit_timeout(tmp_path, monkeypatch):
+    """An old AppData config receives the bundled timeout without losing its values."""
+    import knowmate.config as config_module
+
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("collector:\n  idle_enabled: true\n", encoding="utf-8")
+    monkeypatch.setattr(config_module, "_cache", None)
+    monkeypatch.setattr(config_module, "_get_config_path", lambda: config_path)
+
+    cfg = config_module.get_config()
+
+    assert cfg["collector"]["idle_enabled"] is True
+    assert cfg["collector"]["com_quit_call_timeout_sec"] == 10
+    assert yaml.safe_load(config_path.read_text(encoding="utf-8"))["collector"]["com_quit_call_timeout_sec"] == 10
