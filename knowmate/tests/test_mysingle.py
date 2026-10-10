@@ -101,7 +101,9 @@ class TestParseMysingle:
         with pytest.raises(ValueError):
             parse_mysingle(str(p))
 
-    @pytest.mark.parametrize("body", [b"\x00" * 300_000, b" \t\r\n\x00\x1f\x7f"])
+    @pytest.mark.parametrize(
+        "body", [b"\x00" * 300_000, b" \t\r\n\x00\x1f\x7f"], ids=["large-nul", "mixed-controls"],
+    )
     def test_control_only_body_raises_corrupt_body_error(self, tmp_path, body):
         """NUL·제어문자뿐인 본문은 청킹 전에 전용 ValueError로 거부한다."""
         from knowmate.secure.mysingle_reader import CorruptMailBodyError, parse_mail_file
@@ -551,7 +553,7 @@ class TestMailScanStateV3:
         }, ensure_ascii=False), encoding="utf-8")
 
         state = load_mail_scan_state(path)
-        key = os.path.normcase(os.path.abspath(source))
+        key = normalize_stored_path_key(source)
         assert state_needs_save(state)
         assert state["cursor"] == {
             "mtime": 44.5,
@@ -794,6 +796,7 @@ class TestMailScanStateV3:
         from knowmate.collector import mail_scan_state
 
         source = r"\\?\C:\Mail\A.mysingle"
+        expected_key = mail_scan_state.normalize_stored_path_key(r"C:\Mail\A.mysingle")
         calls = []
         monkeypatch.setattr(mail_scan_state.os, "name", "nt")
         monkeypatch.setattr(
@@ -805,10 +808,10 @@ class TestMailScanStateV3:
             lambda path: calls.append(("realpath", path)) or path,
         )
 
-        assert mail_scan_state.canonicalize_external_path_key(source) == (
-            mail_scan_state.normalize_stored_path_key(r"C:\Mail\A.mysingle")
-        )
-        assert calls == [("abspath", source), ("realpath", source)]
+        assert mail_scan_state.canonicalize_external_path_key(source) == expected_key
+        assert calls[:2] == [("abspath", source), ("realpath", source)]
+        # Windows에서는 저장 키 정규화의 ntpath.abspath도 같은 spy를 통과한다.
+        assert all(call == ("abspath", r"C:\Mail\A.mysingle") for call in calls[2:])
 
     def test_preloaded_state_skips_second_state_file_load(self, tmp_path, monkeypatch):
         """스케줄러가 연 상태를 넘기면 run_mail_scan은 같은 파일을 다시 읽지 않는다."""
@@ -1155,7 +1158,7 @@ class TestMailScanner:
         self, tmp_path, monkeypatch, extensions,
     ):
         """None/[]도 .mysingle·.eml 기본값으로 스캔해 성공 캐시를 유지한다."""
-        from knowmate.collector.mail_scan_state import load_mail_scan_state
+        from knowmate.collector.mail_scan_state import load_mail_scan_state, normalize_stored_path_key
         from knowmate.collector.mail_scanner import run_mail_scan, scan_mail_folders
 
         watch = tmp_path / "watch"
@@ -1174,7 +1177,7 @@ class TestMailScanner:
             [str(watch)], self._fake_mail_indexer(monkeypatch), cfg,
             state_file=state_file, failure_file=tmp_path / "failures.json",
         ) == (0, 1)
-        assert os.path.normcase(os.path.abspath(str(path))) in load_mail_scan_state(state_file)["files"]
+        assert normalize_stored_path_key(str(path)) in load_mail_scan_state(state_file)["files"]
 
     def test_changed_state_is_saved_once_and_steady_cache_is_not_rewritten(
         self, tmp_path, monkeypatch,
@@ -1319,20 +1322,31 @@ class TestMailScanner:
     def test_recreated_table_defers_scan_when_cache_clear_cannot_save(self, tmp_path, monkeypatch):
         """빈 캐시를 확정하지 못하면 재생성된 DB에 어떤 메일도 쓰지 않는다."""
         from knowmate.collector import mail_scanner
+        from knowmate.collector.mail_scan_state import cache_success, save_mail_scan_state
 
         watch = tmp_path / "watch"
         watch.mkdir()
         _write_mail(watch / "mail.mysingle", uid="2026062600555555", msgid="save-failure")
         indexer = self._fake_mail_indexer(monkeypatch, recreated=True, empty=True)
+        state_file = tmp_path / "mail_scan_state.json"
+        path = watch / "mail.mysingle"
+        previous_state = {"files": {}, "cursor": None, "pending_deletes": []}
+        cache_success(previous_state, {
+            "path": str(path), "mtime": path.stat().st_mtime, "size": path.stat().st_size,
+        }, "knox:2026062600555555")
+        assert save_mail_scan_state(state_file, previous_state)
+        previous_bytes = state_file.read_bytes()
         monkeypatch.setattr(mail_scanner, "save_mail_scan_state", lambda *_args: False)
 
         assert mail_scanner.run_mail_scan(
             [str(watch)], indexer, {"mail": {"max_mails_per_scan": 1}},
-            state_file=tmp_path / "mail_scan_state.json",
+            state_file=state_file,
             failure_file=tmp_path / "mail_index_failure.json",
         ) == (0, 0)
         assert indexer.state_check_calls == 0
+        assert not indexer.indexed
         assert indexer.table_was_recreated
+        assert state_file.read_bytes() == previous_bytes
 
     def test_db_state_error_records_failure_without_index_mutation(self, tmp_path, monkeypatch):
         """DB 상태 조회 ERROR면 저장·삭제 없이 failure_state에만 실패를 기록한다."""
@@ -2660,6 +2674,7 @@ class TestMailScanner:
     def test_early_filter_retains_only_actionable_candidates_and_resolves_root_once(self, tmp_path, monkeypatch):
         """대량 캐시를 훑어도 실경로 조회는 파일별이 아니라 root 한 번만 수행한다."""
         from knowmate.collector import failure_state, mail_scanner
+        from knowmate.collector.mail_scan_state import normalize_stored_path_key
 
         monkeypatch.setitem(
             sys.modules, "knowmate.rag.email_indexer", types.SimpleNamespace(EMAIL_INDEX_VERSION="3"),
@@ -2669,7 +2684,7 @@ class TestMailScanner:
         paths = [str(watch / f"{index:04d}.mysingle") for index in range(1_000)]
         state = {"files": {}, "pending_deletes": []}
         for index, path in enumerate(paths[:980]):
-            state["files"][os.path.normcase(os.path.abspath(path))] = {
+            state["files"][normalize_stored_path_key(path)] = {
                 "path": path, "mtime": float(index), "size": 1,
                 "mail_uid": f"knox:cached-{index}", "index_version": "3",
                 "uid_resolution_version": 2,
@@ -2947,7 +2962,9 @@ class TestMailScanner:
 
     def test_cached_newer_duplicate_uid_keeps_older_changed_alias_as_shadow(self, tmp_path, monkeypatch):
         """후보에서 제외한 최신 alias가 오래된 변경 본문의 세대 되돌림을 막는다."""
-        from knowmate.collector.mail_scan_state import load_mail_scan_state, save_mail_scan_state
+        from knowmate.collector.mail_scan_state import (
+            load_mail_scan_state, normalize_stored_path_key, save_mail_scan_state,
+        )
         from knowmate.collector.mail_scanner import run_mail_scan
 
         watch = tmp_path / "watch"
@@ -2982,7 +2999,7 @@ class TestMailScanner:
         ) == (0, 2)
         assert indexer.state_check_calls == 0
         state = load_mail_scan_state(state_file)
-        assert os.path.normcase(os.path.abspath(str(old_path))) in state["files"]
+        assert normalize_stored_path_key(str(old_path)) in state["files"]
 
     def test_actionable_cursor_reaches_more_than_limit_all_new_mail(self, tmp_path, monkeypatch):
         """500건을 넘는 신규 backlog도 actionable 커서로 모두 한 번씩 처리한다."""

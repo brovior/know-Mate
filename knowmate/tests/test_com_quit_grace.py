@@ -88,6 +88,7 @@ def test_partial_grace_exit_is_removed_while_remaining_process_is_retried(monkey
 
 
 def test_quit_exception_still_releases_tls_and_preserves_owner_until_confirmed(monkeypatch):
+    monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: None)
     _register()
     app = _FakeApp(raises=True)
     monkeypatch.setattr(com_reader._tls, "excel", app, raising=False)
@@ -187,6 +188,7 @@ def test_pid_reuse_with_same_exe_never_kills_new_process(monkeypatch):
 
 
 def test_powerpoint_is_never_quit_or_killed(monkeypatch):
+    monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: None)
     app = _FakeApp()
     monkeypatch.setattr(com_reader._tls, "ppt", app, raising=False)
     with office_guard._owned_lock:
@@ -301,6 +303,7 @@ def test_pending_retry_is_throttled_per_exe_and_does_not_gate_other_apps(monkeyp
 def test_pending_guard_precedes_user_busy_detection(monkeypatch):
     """Unqueryable ownership must still reach cleanup retry instead of user-busy skip."""
     from knowmate.secure import AutoReader
+    monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: None)
     _register()
     office_guard.begin_owned_cleanup("EXCEL.EXE")
     calls = []
