@@ -10,6 +10,35 @@ import pytest
 from knowmate.secure import com_reader, office_guard as guard
 
 
+@pytest.mark.parametrize("kind,value_type,is_callable,is_none,reason", [
+    ("none", "NoneType", False, True, "invalid_value"),
+    ("text", "str", False, False, "invalid_value"),
+    ("zero", "int", False, False, "zero"),
+    ("method", "method", True, False, "invalid_value"),
+    ("object", "ProtectedValue", True, False, "invalid_value"),
+])
+def test_hwnd_diagnostics_do_not_invoke_or_log_returned_values(caplog, kind, value_type, is_callable, is_none, reason):
+    class ProtectedValue:
+        def __repr__(self):
+            raise AssertionError("HWND diagnostics must not format the returned object")
+
+        def __call__(self):
+            raise AssertionError("HWND diagnostics must not invoke the returned object")
+
+    value = {
+        "none": None, "text": "CONFIDENTIAL_HWND_VALUE", "zero": 0,
+        "method": ProtectedValue().__call__, "object": ProtectedValue(),
+    }[kind]
+    caplog.set_level("INFO")
+    assert guard._app_hwnd(SimpleNamespace(Hwnd=value, HWND=value), "POWERPNT.EXE") is None
+    messages = [record.getMessage() for record in caplog.records]
+    assert len(messages) == 2
+    for attr, message in zip(("Hwnd", "HWND"), messages):
+        assert f"exe=POWERPNT.EXE property={attr} reason={reason}" in message
+        assert f"value_type={value_type} callable={is_callable} is_none={is_none}" in message
+    assert "CONFIDENTIAL" not in caplog.text
+
+
 @pytest.fixture
 def ppt_probe(monkeypatch):
     events = []

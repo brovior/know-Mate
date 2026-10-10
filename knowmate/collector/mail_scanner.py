@@ -711,7 +711,11 @@ def run_mail_scan(
 
     def flush_window(*, force_memory_sample: bool = False) -> bool:
         """현재 윈도우만 embed→메일별 commit한다; global 오류면 False를 반환한다."""
-        nonlocal window_chunk_count, last_memory_window_attempt
+        nonlocal window_chunk_count, last_memory_window_attempt, cancelled
+        from knowmate.rag.embedding_cancel import EmbeddingCancelledError
+        if cancel_check and cancel_check():
+            cancelled = True
+            return False
         if not prepared_window:
             return True
         sample_memory = (
@@ -733,10 +737,17 @@ def run_mail_scan(
             metrics.embed_s += time.perf_counter() - embed_started
             if sample_memory:
                 log_mail_memory("after_mail_embed")
+        if (cancel_check and cancel_check()) or isinstance(batch_result.blocking_error, EmbeddingCancelledError):
+            cancelled = True
+            logger.info("[mail_scanner] 임베딩 취소: 미저장 메일은 다음 사이클에 재시도")
+            return False
         if sample_memory:
             log_mail_memory("before_mail_commit")
         try:
             for pending in prepared_window:
+                if cancel_check and cancel_check():
+                    cancelled = True
+                    return False
                 work = uid_work[pending.parsed["mail_uid"]]
                 job = pending.job
                 if getattr(job, "content_error", None) or any(vector is None for vector in job.vectors):

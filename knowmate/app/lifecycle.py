@@ -35,8 +35,7 @@ HardExit = Callable[[int], NoReturn]
 
 # 취소 플래그 확인 후 정상 종료를 기다리는 시간(현재 처리 중인 파일 완료 여유)
 _WAIT_GRACEFUL_MS = 8000
-# LanceDB optimize는 시작 후 취소할 수 없다. 진행 중인 경우만 bounded 유예를 늘려
-# fragment 파일 쓰기 중 QThread.terminate()가 호출될 위험을 낮춘다.
+# DB 정리·임베딩 연결·Office 정리가 진행 중이면 제한된 유예를 늘린다.
 _WAIT_MAINTENANCE_MS = 60000
 # terminate() 후 스레드가 실제로 사라지길 기다리는 시간
 _WAIT_AFTER_TERMINATE_MS = 3000
@@ -158,25 +157,31 @@ def stop_worker(worker, hard_exit: HardExit = _default_hard_exit) -> bool:
     worker.cancel()
     # 현재 처리 중인 파일 완료 후 정상 종료 대기
     try:
-        maintenance_in_progress = bool(getattr(worker, "maintenance_in_progress", False))
+        maintenance_in_progress = bool(
+            getattr(worker, "maintenance_in_progress", False)
+            or getattr(worker, "blocking_shutdown_work", False)
+        )
     except Exception:
         maintenance_in_progress = False
     wait_ms = _WAIT_MAINTENANCE_MS if maintenance_in_progress else _WAIT_GRACEFUL_MS
     if worker.wait(wait_ms):
         return False
 
-    # cancel 직후에는 아직 False였지만 첫 8초 대기 중 optimize가 시작될 수 있다.
-    # 이 TOCTOU 구간에서 native compaction을 terminate로 자르지 않도록 남은 유예를 준다.
+    # 첫 8초 대기 중 임베딩·Office·DB 정리가 시작되면 남은 유예를 준다.
     if not maintenance_in_progress:
         try:
             maintenance_in_progress = bool(getattr(worker, "maintenance_in_progress", False))
+            maintenance_in_progress = maintenance_in_progress or bool(getattr(worker, "blocking_shutdown_work", False))
         except Exception:
             maintenance_in_progress = False
         if maintenance_in_progress and worker.wait(_WAIT_MAINTENANCE_MS - _WAIT_GRACEFUL_MS):
             return False
 
-    # COM Open 등에 블로킹돼 취소 플래그를 못 본 상태 → 스레드 강제 종료
-    logger.warning("워커가 제때 종료되지 않음(COM 블로킹 추정) — 스레드 강제 종료")
+    try:
+        stage = getattr(worker, "work_stage", "unknown")
+    except Exception:
+        stage = "unknown"
+    logger.warning("워커가 제때 종료되지 않음 — stage=%s; 스레드 강제 종료", stage)
     worker.terminate()
     if worker.wait(_WAIT_AFTER_TERMINATE_MS):
         # terminate()가 스레드를 멈추는 데는 성공했지만, 임의 지점에서 강제 중단된 것이라
