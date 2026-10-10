@@ -357,8 +357,18 @@ class TestOfficeGuard:
         """우리가 띄운(소유) 프로세스뿐이면 점유로 보지 않는다(자기 감지 방지)."""
         import knowmate.secure.office_guard as og
         monkeypatch.setattr(og, "_cached_processes", lambda: [("WINWORD.EXE", 200)])
-        og.register_owned_pids({200})
+        monkeypatch.setattr(og.sys, "platform", "win32")
+        monkeypatch.setattr(og, "_process_creation_identity", lambda pid: 2000)
+        og._owned_pids[200] = og.OwnedOfficeProcess("WINWORD.EXE", 2000)
         assert og.is_office_busy_for_ext(".doc") is False
+
+    def test_unverified_legacy_pid_is_still_busy_on_windows(self, monkeypatch):
+        """PID 번호만 등록한 기존 API는 Windows 소유권 증명을 대체하지 않는다."""
+        import knowmate.secure.office_guard as og
+        monkeypatch.setattr(og.sys, "platform", "win32")
+        monkeypatch.setattr(og, "_cached_processes", lambda: [("WINWORD.EXE", 200)])
+        og.register_owned_pids({200})
+        assert og.is_office_busy_for_ext(".doc") is True
 
     def test_busy_true_when_external_and_owned_coexist(self, monkeypatch):
         """우리 소유 인스턴스가 있어도 사용자(외부) 인스턴스가 별도로 있으면 True."""
@@ -367,7 +377,9 @@ class TestOfficeGuard:
             og, "_cached_processes",
             lambda: [("WINWORD.EXE", 200), ("WINWORD.EXE", 201)],
         )
-        og.register_owned_pids({200})  # 200은 우리 것, 201은 사용자 것
+        monkeypatch.setattr(og.sys, "platform", "win32")
+        monkeypatch.setattr(og, "_process_creation_identity", lambda pid: pid * 10)
+        og._owned_pids[200] = og.OwnedOfficeProcess("WINWORD.EXE", 2000)
         assert og.is_office_busy_for_ext(".doc") is True
 
     def test_busy_false_for_non_office_ext_even_if_running(self, monkeypatch):
@@ -580,6 +592,17 @@ class TestSignature:
 # ── AutoReader OLE2/DRM 폴백 라우팅 ──────────────────────────────
 
 class TestAutoReaderOle2Fallback:
+    @pytest.fixture(autouse=True)
+    def _isolate_office_guard(self, monkeypatch):
+        """경로 전환 검증은 호스트 Office와 다른 테스트의 정리 상태에 의존하지 않는다."""
+        from knowmate.secure import office_guard
+        monkeypatch.setattr(office_guard, "_owned_pids", {})
+        monkeypatch.setattr(office_guard, "_unverified_cleanup", {})
+        monkeypatch.setattr(office_guard, "_cleanup_inflight", {})
+        monkeypatch.setattr(office_guard, "_cleanup_retry_at", {})
+        monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: [])
+        monkeypatch.setattr(office_guard, "_cached_processes", lambda: [])
+
     def test_ole2_labeled_xlsx_routes_to_com(self, tmp_path, monkeypatch):
         """확장자는 .xlsx인데 실제 OLE2면 ComReader로 폴백한다."""
         import knowmate.secure.com_reader as com_mod

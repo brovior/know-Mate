@@ -209,13 +209,22 @@ class TestComReaderWiring:
             lambda exe: order.append(f"clear:{exe}") or 0,
         )
         monkeypatch.setattr(og, "office_pids_live", lambda exe: set())
-        monkeypatch.setattr(og, "register_owned_pids", lambda pids: None)
+        monkeypatch.setattr(og, "ensure_office_available", lambda exe: None)
+
+        app = object()
+
+        def register(exe, baseline, candidate):
+            assert exe == "EXCEL.EXE" and baseline == set() and candidate is app
+            order.append(f"register:{exe}")
+            return True
+
+        monkeypatch.setattr(og, "register_owned_app", register)
 
         class _FakeWin32Com:
             def Dispatch(self, prog_id):
                 order.append(f"dispatch:{prog_id}")
-                return object()
+                return app
 
         com_mod._dispatch_and_own(_FakeWin32Com(), "Excel.Application", "EXCEL.EXE")
 
-        assert order == ["clear:EXCEL.EXE", "dispatch:Excel.Application"]
+        assert order == ["clear:EXCEL.EXE", "dispatch:Excel.Application", "register:EXCEL.EXE"]
