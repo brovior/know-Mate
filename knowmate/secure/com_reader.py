@@ -9,6 +9,7 @@ _ThreadLocalComApps를 통해 스레드별로 독립적인 COM 앱 인스턴스�
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 import threading
 import time
 from pathlib import Path
@@ -107,6 +108,32 @@ def _ensure_com_initialized() -> bool:
 
 # 스레드별 COM 앱 인스턴스를 저장한다 (STA 요구사항 준수)
 _tls = threading.local()
+
+
+@dataclass
+class _PendingOwnershipCleanup:
+    """생성한 워커에서만 접근하는 미검증 COM 앱과 문서 참조."""
+
+    app: Any
+    document: Any = None
+
+
+def _retain_unverified_app(exe: str, app: Any, document: Any = None) -> None:
+    """소유를 확인 못한 COM 참조와 EXE 차단을 생성 워커에 보존한다."""
+    from knowmate.secure.office_guard import begin_unverified_cleanup
+
+    candidates = getattr(_tls, "ownership_cleanup", None)
+    if candidates is None:
+        candidates = _tls.ownership_cleanup = {}
+    if exe not in candidates:
+        begin_unverified_cleanup(exe)
+    candidates[exe] = _PendingOwnershipCleanup(app, document)
+
+
+def release_unverified_com_refs() -> None:
+    """워커 종료 전에 COM 참조를 해제하되 미확인 EXE 차단 상태는 보존한다."""
+    candidates = getattr(_tls, "ownership_cleanup", {})
+    candidates.clear()
 
 
 # COM 상수 (모달 다이얼로그 억제용)
@@ -269,12 +296,15 @@ def _dispatch_and_own(win32com, prog_id: str, exe_name: str):
     수준 설정으로는 억제할 수 없다(강제 종료 ↔ 세이프모드 무한 루프의 고리).
     """
     from knowmate.secure.office_guard import (
-        OfficeBusyError, OfficeOwnershipProbeError, office_pids_live, register_owned_app,
-        ensure_office_available,
+        OfficeOwnershipProbeError, OfficeOwnershipCleanupError,
+        OfficeCleanupPendingError, office_pids_live, register_owned_app,
+        ensure_office_available, unverified_cleanup_pending,
     )
     from knowmate.secure.office_resiliency import clear_resiliency_markers
 
     ensure_office_available(exe_name)
+    if exe_name not in unverified_cleanup_pending():
+        getattr(_tls, "ownership_cleanup", {}).pop(exe_name, None)
     clear_resiliency_markers(exe_name)
     before = office_pids_live(exe_name)
     dispatch = (
@@ -290,14 +320,48 @@ def _dispatch_and_own(win32com, prog_id: str, exe_name: str):
     # Windows에서 새 PID/HWND/exe를 모두 확인하지 못하면 소유로 추측하지 않고
     # 이 자동화 요청 자체를 연기한다. 비Windows fake 객체는 office_guard의
     # platform fallback으로 허용돼 기존 단위 테스트를 유지한다.
-    try:
-        owned = register_owned_app(exe_name, before, app)
-    except OfficeOwnershipProbeError as exc:
-        original = exc.__cause__ if isinstance(exc.__cause__, BaseException) else exc
-        _poison_if_fatal(original, exe_name)
-        owned = False
+    owned = False
+    for attempt in range(3):
+        try:
+            owned = register_owned_app(exe_name, before, app)
+        except OfficeOwnershipCleanupError as exc:
+            if exc.registered is None:
+                _retain_unverified_app(exe_name, app, exc.document)
+            logger.warning(
+                "[com] 소유 확인용 문서 정리 실패; 등록 재시도 중단: exe=%s probe_error=%s close_error=%s",
+                exe_name, type(exc.probe_error).__name__, type(exc.close_error).__name__,
+            )
+            for error in (exc.probe_error, exc.close_error):
+                while error is not None:
+                    _poison_if_fatal(error, exe_name)
+                    error = error.__cause__
+            raise OfficeCleanupPendingError(
+                exe_name, f"{exe_name} 소유 확인용 문서 종료 확인 대기 중",
+            ) from exc
+        except OfficeOwnershipProbeError as exc:
+            original = exc.__cause__ if isinstance(exc.__cause__, BaseException) else exc
+            error = exc
+            while error is not None:
+                if is_fatal_transport_hresult(hresult_of(error)):
+                    _retain_unverified_app(exe_name, app, exc.document)
+                _poison_if_fatal(error, exe_name)
+                error = error.__cause__
+            logger.warning(
+                "[com] 소유권 확인 오류: exe=%s attempt=%d error_type=%s HRESULT=%s",
+                exe_name, attempt + 1, type(original).__name__, hresult_of(original),
+            )
+        except Exception as exc:
+            _retain_unverified_app(exe_name, app)
+            _poison_if_fatal(exc, exe_name)
+            raise
+        if owned:
+            break
+        if attempt < 2:
+            time.sleep(0.1)
     if not owned:
-        raise OfficeBusyError(f"{exe_name} 소유권을 검증할 수 없어 COM 파싱을 연기합니다")
+        _retain_unverified_app(exe_name, app)
+        logger.warning("[com] 소유 등록 재시도 소진; 미검증 앱 정리 대기: exe=%s", exe_name)
+        raise OfficeCleanupPendingError(exe_name, f"{exe_name} 소유권 확인 실패로 정리 대기 중")
     return app
 
 
@@ -718,6 +782,7 @@ def quit_com_apps(
     quit_timeout_sec = com_quit_call_timeout_seconds(
         {} if quit_timeout_sec is None else {"com_quit_call_timeout_sec": quit_timeout_sec}
     )
+    office_guard.prune_unverified_cleanup()
     owned = office_guard.begin_owned_cleanup()
     results: list[OfficeCleanupResult] = []
     timed_out_pids: set[int] = set()
@@ -809,6 +874,7 @@ def quit_com_apps(
         identity_unknown=frozenset().union(*(item.identity_unknown for item in results)),
         failed=frozenset().union(*(item.failed for item in results)),
         forced_exited=frozenset().union(*(item.forced_exited for item in results)),
+        ownership_pending=office_guard.unverified_cleanup_pending(),
     )
 
 

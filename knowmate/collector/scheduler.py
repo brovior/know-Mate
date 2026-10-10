@@ -299,6 +299,8 @@ class CollectorWorker(QThread):
                         )
                     except Exception:
                         pass
+                    from knowmate.secure.com_reader import release_unverified_com_refs
+                    release_unverified_com_refs()
                     import pythoncom  # type: ignore
                     pythoncom.CoUninitialize()
             finally:

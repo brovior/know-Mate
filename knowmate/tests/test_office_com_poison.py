@@ -10,6 +10,13 @@ from knowmate.collector import failure_state
 from knowmate.secure import com_reader, office_guard
 
 
+@pytest.fixture(autouse=True)
+def _isolate_unverified_cleanup(monkeypatch):
+    """미검증 정리 상태와 스레드 COM 참조를 테스트 사이에 분리한다."""
+    monkeypatch.setattr(office_guard, "_unverified_cleanup", {})
+    monkeypatch.setattr(com_reader._tls, "ownership_cleanup", {}, raising=False)
+
+
 def test_windows_process_enumerator_uses_available_ansi_toolhelp_exports(monkeypatch):
     """ANSI Toolhelp는 A 접미사 없는 Process32First/Next를 사용한다."""
     import ctypes
@@ -26,6 +33,7 @@ def test_windows_process_enumerator_uses_available_ansi_toolhelp_exports(monkeyp
         Process32First=_Fn(False),
         Process32Next=_Fn(False),
         CloseHandle=_Fn(True),
+        GetLastError=_Fn(18),
     )
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr(
@@ -33,6 +41,43 @@ def test_windows_process_enumerator_uses_available_ansi_toolhelp_exports(monkeyp
     )
 
     assert office_guard._enumerate_processes() == []
+
+
+@pytest.mark.parametrize("first_ok", [False, True])
+def test_process_enumeration_error_preserves_unverified_gate(monkeypatch, first_ok):
+    """First/Next가 EOF 이외 오류면 빈 목록이나 부분 목록으로 gate를 해제하지 않는다."""
+    import ctypes
+
+    class _Fn:
+        def __init__(self, callback):
+            self.callback = callback
+
+        def __call__(self, *args):
+            return self.callback(*args)
+
+    def first(handle, entry):
+        entry._obj.szExeFile = b"EXCEL.EXE"
+        entry._obj.th32ProcessID = 20
+        return first_ok
+
+    kernel32 = SimpleNamespace(
+        CreateToolhelp32Snapshot=_Fn(lambda *args: 1),
+        Process32First=_Fn(first),
+        Process32Next=_Fn(lambda *args: False),
+        CloseHandle=_Fn(lambda *args: True),
+        GetLastError=_Fn(lambda: 5),  # ERROR_ACCESS_DENIED
+    )
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(kernel32=kernel32), raising=False)
+    office_guard.begin_unverified_cleanup("WINWORD.EXE")
+    assert office_guard._enumerate_processes() is None
+    assert not office_guard.office_processes_absent("WINWORD.EXE")
+    office_guard.prune_unverified_cleanup()
+    assert office_guard.unverified_cleanup_pending() == frozenset({"WINWORD.EXE"})
+    kernel32.GetLastError = _Fn(lambda: 18)
+    assert office_guard._enumerate_processes() == ([("EXCEL.EXE", 20)] if first_ok else [])
+    office_guard.prune_unverified_cleanup()
+    assert not office_guard.unverified_cleanup_pending()
 
 
 class _OpenCollection:
@@ -155,6 +200,68 @@ def test_register_owned_app_requires_new_matching_hwnd_pid(monkeypatch):
 
     assert office_guard.register_owned_app("EXCEL.EXE", {10}, app) is True
     assert office_guard._owned_pids == {20: office_guard.OwnedOfficeProcess("EXCEL.EXE", 2020)}
+
+
+@pytest.mark.parametrize("baseline", [set(), {20}])
+def test_word_without_application_hwnd_uses_unsaved_window(monkeypatch, baseline):
+    """실제 Word처럼 Application.Hwnd가 없어도 창으로 검증하고 빈 문서를 닫는다."""
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(office_guard, "_owned_pids", {})
+    monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: [("WINWORD.EXE", 20)])
+    monkeypatch.setattr(office_guard, "_cached_processes", lambda: [("WINWORD.EXE", 20)])
+    monkeypatch.setattr(office_guard, "_pid_from_hwnd", lambda hwnd: 20 if hwnd == 123 else None)
+    monkeypatch.setattr(office_guard, "_process_creation_identity", lambda pid: 2020)
+    closed = []
+    document = SimpleNamespace(
+        Windows=SimpleNamespace(Item=lambda index: SimpleNamespace(Hwnd=123)),
+        Close=lambda save: closed.append(save),
+    )
+    app = SimpleNamespace(Documents=SimpleNamespace(Add=lambda: document))
+    assert office_guard.register_owned_app("WINWORD.EXE", baseline, app) is (not baseline)
+    assert app.AutomationSecurity == 3
+    assert closed == [False]
+    assert office_guard.is_office_busy_for_ext(".doc") is bool(baseline)
+
+
+def test_hwnd_unsupported_com_member_tries_uppercase(monkeypatch):
+    """late binding의 member-not-found 예외도 PowerPoint HWND 폴백을 허용한다."""
+    class _MissingMember(Exception):
+        hresult = -2147352573  # DISP_E_MEMBERNOTFOUND
+
+    class _Ppt:
+        HWND = 123
+
+        @property
+        def Hwnd(self):
+            raise _MissingMember()
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(office_guard, "_owned_pids", {})
+    monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: [("POWERPNT.EXE", 20)])
+    monkeypatch.setattr(office_guard, "_pid_from_hwnd", lambda hwnd: 20)
+    monkeypatch.setattr(office_guard, "_process_creation_identity", lambda pid: 2020)
+    assert office_guard.register_owned_app("POWERPNT.EXE", set(), _Ppt())
+    assert office_guard._owned_pids[20].terminable is False
+
+
+def test_dispatch_retries_ownership_on_same_app_and_baseline(monkeypatch):
+    """지연 준비된 HWND는 재생성 없이 같은 COM 앱·원래 baseline으로 재검증한다."""
+    app = object()
+    dispatched = []
+    probes = []
+    monkeypatch.setattr("knowmate.secure.office_resiliency.clear_resiliency_markers", lambda exe: None)
+    monkeypatch.setattr(office_guard, "office_pids_live", lambda exe: {10})
+    monkeypatch.setattr(com_reader.time, "sleep", lambda seconds: None)
+
+    def register(exe, baseline, candidate):
+        probes.append((baseline, candidate))
+        return len(probes) == 2
+
+    monkeypatch.setattr(office_guard, "register_owned_app", register)
+    client = SimpleNamespace(Dispatch=lambda prog_id: dispatched.append(prog_id) or app)
+    assert com_reader._dispatch_and_own(client, "PowerPoint.Application", "POWERPNT.EXE") is app
+    assert dispatched == ["PowerPoint.Application"]
+    assert probes == [({10}, app), ({10}, app)]
 
 
 def test_register_owned_app_rejects_existing_or_wrong_exe_pid(monkeypatch):
@@ -419,3 +526,433 @@ def test_dynamic_com_begin_failure_still_calls_end(monkeypatch):
         reader.extract("C:/private/fallback.xls")
     assert calls == [("begin", "EXCEL.EXE"), ("end", None)]
     assert reader.take_actual_com_used() is False
+
+
+@pytest.mark.parametrize(("probe_fatal", "close_fatal"), [(True, False), (False, True)])
+def test_word_probe_and_close_errors_preserve_fatal_rpc(monkeypatch, probe_fatal, close_fatal):
+    """조회·닫기 오류가 겹쳐도 어느 쪽의 fatal RPC도 Busy로 숨기지 않는다."""
+    class _Fatal(Exception):
+        hresult = -2147023174
+
+    fatal = _Fatal("rpc disconnected")
+    added = []
+    closed = []
+
+    class _Window:
+        @property
+        def Hwnd(self):
+            if probe_fatal:
+                raise fatal
+            return 123
+
+    class _Document:
+        Windows = SimpleNamespace(Item=lambda index: _Window())
+
+        def Close(self, save):
+            closed.append(save)
+            raise fatal if close_fatal else RuntimeError("close failed")
+
+    app = SimpleNamespace(Documents=SimpleNamespace(Add=lambda: added.append(1) or _Document()))
+    client = SimpleNamespace(Dispatch=lambda prog_id: app)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(office_guard, "_owned_pids", {})
+    monkeypatch.setattr(office_guard, "office_pids_live", lambda exe: set())
+    monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: [("WINWORD.EXE", 20)])
+    monkeypatch.setattr(office_guard, "_pid_from_hwnd", lambda hwnd: 20)
+    monkeypatch.setattr(office_guard, "_process_creation_identity", lambda pid: 2020)
+    monkeypatch.setattr("knowmate.secure.office_resiliency.clear_resiliency_markers", lambda exe: None)
+    with pytest.raises(com_reader.OfficeComPoisonError) as raised:
+        com_reader._dispatch_and_own(client, "Word.Application", "WINWORD.EXE")
+    assert raised.value.__cause__ is fatal
+    assert added == [1]
+    assert closed == ([] if probe_fatal else [False])
+    if close_fatal:
+        assert office_guard._owned_pids[20].cleanup_pending
+    else:
+        assert not office_guard._owned_pids
+
+
+def test_word_close_failure_gates_next_dispatch_without_more_blank_documents(monkeypatch):
+    """검증 뒤 닫기 실패는 해당 PID를 정리 대기로 남겨 문서·프로세스 누적을 막는다."""
+    added = []
+    dispatched = []
+    closed = []
+
+    def close(save):
+        closed.append(save)
+        raise RuntimeError("close failed")
+
+    document = SimpleNamespace(
+        Windows=SimpleNamespace(Item=lambda index: SimpleNamespace(Hwnd=123)), Close=close,
+    )
+    app = SimpleNamespace(Documents=SimpleNamespace(Add=lambda: added.append(1) or document))
+    client = SimpleNamespace(Dispatch=lambda prog_id: dispatched.append(prog_id) or app)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(office_guard, "_owned_pids", {
+        30: office_guard.OwnedOfficeProcess("WINWORD.EXE", 3030),
+        40: office_guard.OwnedOfficeProcess("EXCEL.EXE", 4040),
+    })
+    monkeypatch.setattr(office_guard, "_cleanup_retry_at", {})
+    monkeypatch.setattr(office_guard, "_cleanup_inflight", {})
+    monkeypatch.setattr(office_guard, "office_pids_live", lambda exe: {30})
+    monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: [("WINWORD.EXE", 20)])
+    monkeypatch.setattr(office_guard, "_pid_from_hwnd", lambda hwnd: 20)
+    monkeypatch.setattr(office_guard, "_process_creation_identity", lambda pid: 2020)
+    monkeypatch.setattr("knowmate.secure.office_resiliency.clear_resiliency_markers", lambda exe: None)
+    snapshots = []
+
+    def cleanup(owned, timeout_sec):
+        snapshots.append(owned)
+        return office_guard.OfficeCleanupResult(remaining=frozenset(owned))
+
+    monkeypatch.setattr(office_guard, "cleanup_owned_processes", cleanup)
+    for _ in range(2):
+        with pytest.raises(office_guard.OfficeCleanupPendingError):
+            com_reader._dispatch_and_own(client, "Word.Application", "WINWORD.EXE")
+    assert added == [1]
+    assert dispatched == ["Word.Application"]
+    assert closed == [False]
+    assert list(snapshots[0]) == [20]
+    assert office_guard._owned_pids[20].cleanup_pending
+    assert not office_guard._owned_pids[30].cleanup_pending
+    assert not office_guard._owned_pids[40].cleanup_pending
+
+
+@pytest.mark.parametrize("hresult", [
+    0x800706BA, 0x800706BE, 0x800706BF, 0x80010006,
+    0x80010007, 0x80010012, 0x80010108, 0x800401FD,
+])
+@pytest.mark.parametrize("probe_read", [1, 2])
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_word_fatal_ownership_probe_skips_blocking_close(monkeypatch, hresult, probe_read, wrapped):
+    """RPC 단절 뒤 멈추는 Close 없이 워커가 poison·문서 보존·정리 대기로 끝난다."""
+    import threading
+
+    fatal = RuntimeError(hresult - (1 << 32), "rpc disconnected")
+    close_entered = threading.Event()
+    release_close = threading.Event()
+    outcome = {}
+    reads = []
+    added = []
+    dispatched = []
+
+    class _Window:
+        @property
+        def Hwnd(self):
+            reads.append(1)
+            if len(reads) == probe_read:
+                if wrapped:
+                    try:
+                        raise fatal
+                    except RuntimeError as exc:
+                        raise office_guard.OfficeOwnershipProbeError("wrapped probe") from exc
+                raise fatal
+            return 123
+
+    def close(save):
+        close_entered.set()
+        release_close.wait()
+
+    document = SimpleNamespace(Windows=SimpleNamespace(Item=lambda index: _Window()), Close=close)
+    app = SimpleNamespace(Documents=SimpleNamespace(Add=lambda: added.append(1) or document))
+    client = SimpleNamespace(Dispatch=lambda prog_id: dispatched.append(prog_id) or app)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(office_guard, "_owned_pids", {})
+    monkeypatch.setattr(office_guard, "_cleanup_inflight", {})
+    monkeypatch.setattr(office_guard, "_cleanup_retry_at", {})
+    monkeypatch.setattr(office_guard, "office_pids_live", lambda exe: set())
+    monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: [("WINWORD.EXE", 20)])
+    monkeypatch.setattr(office_guard, "_pid_from_hwnd", lambda hwnd: 20)
+    monkeypatch.setattr(office_guard, "_process_creation_identity", lambda pid: 2020)
+    monkeypatch.setattr("knowmate.secure.office_resiliency.clear_resiliency_markers", lambda exe: None)
+
+    def run():
+        try:
+            com_reader._dispatch_and_own(client, "Word.Application", "WINWORD.EXE")
+        except Exception as exc:
+            outcome["error"] = exc
+            outcome["candidate"] = getattr(com_reader._tls, "ownership_cleanup", {}).get("WINWORD.EXE")
+            try:
+                com_reader._dispatch_and_own(client, "Word.Application", "WINWORD.EXE")
+            except office_guard.OfficeCleanupPendingError:
+                outcome["blocked"] = True
+            outcome["cleanup"] = com_reader.quit_com_apps(grace_sec=0)
+        finally:
+            com_reader.release_unverified_com_refs()
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    try:
+        worker.join(timeout=1)
+        assert not worker.is_alive(), "fatal probe must not wait for Close"
+        assert not close_entered.is_set()
+        error = outcome["error"]
+        assert isinstance(error, com_reader.OfficeComPoisonError)
+        assert error.hresult == hresult and error.__cause__ is fatal
+        candidate = outcome["candidate"]
+        assert candidate.app is app and candidate.document is document
+        assert outcome["blocked"]
+        assert added == [1] and dispatched == ["Word.Application"]
+        assert len(reads) == probe_read
+        assert not office_guard._owned_pids
+        assert office_guard.unverified_cleanup_pending() == frozenset({"WINWORD.EXE"})
+        assert not outcome["cleanup"].successful
+        assert outcome["cleanup"].ownership_pending == frozenset({"WINWORD.EXE"})
+    finally:
+        release_close.set()
+        worker.join(timeout=1)
+
+
+@pytest.mark.parametrize("baseline", [set(), {20}])
+def test_unregistered_word_close_failure_preserves_gate_without_new_com_calls(monkeypatch, baseline):
+    """등록 전 이중 오류도 EXE 차단을 보존하고 종료 중 COM을 재조회하지 않는다."""
+    from knowmate.secure import AutoReader
+
+    class _Busy(Exception):
+        hresult = -2147418111  # RPC_E_CALL_REJECTED
+
+    reads = []
+    state = {"busy": True}
+
+    class _Window:
+        @property
+        def Hwnd(self):
+            reads.append(1)
+            if state["busy"]:
+                raise _Busy()
+            return 123
+
+    added = []
+    closed = []
+    dispatched = []
+    killed = []
+    live = [("WINWORD.EXE", 20)]
+
+    def close(save):
+        closed.append(save)
+        raise _Busy()
+
+    document = SimpleNamespace(Windows=SimpleNamespace(Item=lambda index: _Window()), Close=close)
+    app = SimpleNamespace(Documents=SimpleNamespace(Add=lambda: added.append(1) or document))
+    client = SimpleNamespace(Dispatch=lambda prog_id: dispatched.append(prog_id) or app)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(office_guard, "_owned_pids", {})
+    monkeypatch.setattr(office_guard, "_cleanup_inflight", {})
+    monkeypatch.setattr(office_guard, "_cleanup_retry_at", {})
+    monkeypatch.setattr(office_guard, "office_pids_live", lambda exe: baseline)
+    monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: list(live))
+    monkeypatch.setattr(office_guard, "_cached_processes", lambda: list(live))
+    monkeypatch.setattr(office_guard, "_pid_from_hwnd", lambda hwnd: 20)
+    monkeypatch.setattr(office_guard, "_process_creation_identity", lambda pid: 2020)
+    monkeypatch.setattr("knowmate.secure.office_resiliency.clear_resiliency_markers", lambda exe: None)
+    monkeypatch.setattr(com_reader._tls, "word", None, raising=False)
+    monkeypatch.setattr(com_reader._tls, "excel", None, raising=False)
+    monkeypatch.setattr(com_reader._tls, "ppt", None, raising=False)
+
+    def terminate(pid, record, timeout):
+        killed.append(pid)
+        live.clear()
+        return "terminated"
+
+    monkeypatch.setattr(office_guard, "_terminate_and_confirm", terminate)
+    with pytest.raises(office_guard.OfficeCleanupPendingError):
+        com_reader._dispatch_and_own(client, "Word.Application", "WINWORD.EXE")
+    candidate = com_reader._tls.ownership_cleanup["WINWORD.EXE"]
+    assert candidate.app is app and candidate.document is document
+    with pytest.raises(office_guard.OfficeCleanupPendingError):
+        AutoReader._guard_office_busy(".doc", "sample.doc")
+    with pytest.raises(office_guard.OfficeCleanupPendingError):
+        com_reader._dispatch_and_own(client, "Word.Application", "WINWORD.EXE")
+    assert added == [1] and closed == [False] and dispatched == ["Word.Application"]
+    assert not office_guard._owned_pids
+
+    state["busy"] = False
+    before_cleanup_reads = len(reads)
+    result = com_reader.quit_com_apps(grace_sec=0)
+    assert added == [1] and closed == [False]
+    assert len(reads) == before_cleanup_reads
+    assert com_reader._tls.ownership_cleanup["WINWORD.EXE"] is candidate
+    com_reader.release_unverified_com_refs()
+    assert not com_reader._tls.ownership_cleanup
+    assert not result.successful
+    assert result.ownership_pending == frozenset({"WINWORD.EXE"})
+    assert killed == []
+    with pytest.raises(office_guard.OfficeCleanupPendingError):
+        office_guard.ensure_office_available("WINWORD.EXE")
+    live.clear()
+    office_guard.ensure_office_available("WINWORD.EXE")
+    assert not office_guard._owned_pids
+    assert not office_guard.unverified_cleanup_pending()
+
+
+def test_unverified_gate_only_clears_after_successful_absence_probe(monkeypatch):
+    """열거 실패나 다른 Office 프로세스는 미검증 gate 해제 근거가 아니다."""
+    monkeypatch.setattr(office_guard, "_owned_pids", {})
+    monkeypatch.setattr(office_guard, "_cleanup_inflight", {})
+    office_guard.begin_unverified_cleanup("WINWORD.EXE")
+    for procs in (None, [("WINWORD.EXE", 99)]):
+        monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: procs)
+        with pytest.raises(office_guard.OfficeCleanupPendingError):
+            office_guard.ensure_office_available("WINWORD.EXE")
+        office_guard.ensure_office_available("EXCEL.EXE")
+    monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: [])
+    office_guard.ensure_office_available("WINWORD.EXE")
+    assert not office_guard.unverified_cleanup_pending()
+
+
+def test_unverified_cleanup_token_does_not_clear_other_request():
+    """이전 워커 요청 해제가 같은 EXE의 새 정리 요청을 지우지 않는다."""
+    first = office_guard.begin_unverified_cleanup("WINWORD.EXE")
+    second = office_guard.begin_unverified_cleanup("WINWORD.EXE")
+    office_guard.finish_unverified_cleanup("WINWORD.EXE", first)
+    assert office_guard.unverified_cleanup_pending() == frozenset({"WINWORD.EXE"})
+    office_guard.finish_unverified_cleanup("WINWORD.EXE", second)
+    assert not office_guard.unverified_cleanup_pending()
+
+
+def test_unverified_document_does_not_block_other_office_quit(monkeypatch):
+    """미검증 문서 COM은 건드리지 않고 다른 Office 종료를 진행한다."""
+    class _Document:
+        @property
+        def Windows(self):
+            raise AssertionError("cleanup must not query COM")
+
+    quit_calls = []
+    monkeypatch.setattr(office_guard, "_owned_pids", {})
+    monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: [("WINWORD.EXE", 20)])
+    office_guard.begin_unverified_cleanup("WINWORD.EXE")
+    com_reader._tls.ownership_cleanup["WINWORD.EXE"] = com_reader._PendingOwnershipCleanup(
+        object(), _Document(),
+    )
+    monkeypatch.setattr(com_reader._tls, "word", None, raising=False)
+    monkeypatch.setattr(com_reader._tls, "ppt", None, raising=False)
+    monkeypatch.setattr(com_reader._tls, "excel", SimpleNamespace(Quit=lambda: quit_calls.append("excel")), raising=False)
+    result = com_reader.quit_com_apps(grace_sec=0)
+    assert quit_calls == ["excel"]
+    assert result.ownership_pending == frozenset({"WINWORD.EXE"})
+    assert not result.successful
+    com_reader.release_unverified_com_refs()
+    assert not com_reader._tls.ownership_cleanup
+
+
+def test_unverified_absence_snapshot_preserves_new_token(monkeypatch):
+    """부재 확인과 요청 해제 사이 추가된 정리 토큰은 보존한다."""
+    office_guard.begin_unverified_cleanup("WINWORD.EXE")
+
+    def absent(exe):
+        office_guard.begin_unverified_cleanup(exe)
+        return True
+
+    monkeypatch.setattr(office_guard, "office_processes_absent", absent)
+    office_guard.prune_unverified_cleanup()
+    assert office_guard.unverified_cleanup_pending() == frozenset({"WINWORD.EXE"})
+
+
+@pytest.mark.parametrize(("exe", "prog_id", "ext"), [
+    ("WINWORD.EXE", "Word.Application", ".doc"),
+    ("EXCEL.EXE", "Excel.Application", ".xls"),
+    ("POWERPNT.EXE", "PowerPoint.Application", ".ppt"),
+])
+@pytest.mark.parametrize("failure", ["false", "probe", "fatal", "unexpected"])
+def test_all_registration_failures_retain_app_and_gate(monkeypatch, exe, prog_id, ext, failure):
+    """일반·fatal·예상 밖 등록 실패 모두 앱 보존과 정확한 정리 대기 결과로 끝난다."""
+    from knowmate.secure import AutoReader
+
+    class _Fatal(Exception):
+        hresult = -2147023174
+
+    app = object()
+    dispatched = []
+    attempts = []
+
+    def register(exe, baseline, candidate):
+        attempts.append(candidate)
+        if failure == "false":
+            return False
+        if failure == "unexpected":
+            raise ValueError("unexpected probe failure")
+        original = _Fatal() if failure == "fatal" else RuntimeError("probe rejected")
+        raise office_guard.OfficeOwnershipProbeError("probe") from original
+
+    client = SimpleNamespace(Dispatch=lambda prog_id: dispatched.append(prog_id) or app)
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(office_guard, "_owned_pids", {})
+    monkeypatch.setattr(office_guard, "_cleanup_inflight", {})
+    monkeypatch.setattr(office_guard, "_cleanup_retry_at", {})
+    monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: [(exe, 20)])
+    monkeypatch.setattr(office_guard, "_cached_processes", lambda: [(exe, 20)])
+    monkeypatch.setattr(office_guard, "office_pids_live", lambda exe: set())
+    monkeypatch.setattr(office_guard, "register_owned_app", register)
+    monkeypatch.setattr(com_reader.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr("knowmate.secure.office_resiliency.clear_resiliency_markers", lambda exe: None)
+    for attr in ("word", "excel", "ppt"):
+        monkeypatch.setattr(com_reader._tls, attr, None, raising=False)
+    expected = (com_reader.OfficeComPoisonError if failure == "fatal" else
+                ValueError if failure == "unexpected" else office_guard.OfficeCleanupPendingError)
+    with pytest.raises(expected):
+        com_reader._dispatch_and_own(client, prog_id, exe)
+    assert com_reader._tls.ownership_cleanup[exe].app is app
+    assert len(attempts) == (1 if failure in {"fatal", "unexpected"} else 3)
+    with pytest.raises(office_guard.OfficeCleanupPendingError):
+        AutoReader._guard_office_busy(ext, "sample" + ext)
+    with pytest.raises(office_guard.OfficeCleanupPendingError):
+        com_reader._dispatch_and_own(client, prog_id, exe)
+    assert dispatched == [prog_id]
+    assert not office_guard._owned_pids
+    result = com_reader.quit_com_apps(grace_sec=0)
+    assert not result.successful
+    assert result.ownership_pending == frozenset({exe})
+    com_reader.release_unverified_com_refs()
+    assert not com_reader._tls.ownership_cleanup
+    assert office_guard.unverified_cleanup_pending() == frozenset({exe})
+
+
+def test_ppt_hwnd_not_ready_exhaustion_is_pending_not_external_busy(monkeypatch):
+    """실제 등록 경로의 HWND=0 재시도 소진도 PPT 앱을 보존하고 새 생성을 차단한다."""
+    from knowmate.secure import AutoReader
+    ready = {"value": False}
+    reads = []
+    dispatched = []
+
+    class _Ppt:
+        @property
+        def Hwnd(self):
+            reads.append(1)
+            return 123 if ready["value"] else 0
+
+        def Quit(self):
+            raise AssertionError("unverified PPT must not be quit")
+
+    app = _Ppt()
+    client = SimpleNamespace(Dispatch=lambda prog_id: dispatched.append(prog_id) or app)
+    live = [("POWERPNT.EXE", 20)]
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(office_guard, "_owned_pids", {})
+    monkeypatch.setattr(office_guard, "_cleanup_inflight", {})
+    monkeypatch.setattr(office_guard, "_cleanup_retry_at", {})
+    monkeypatch.setattr(office_guard, "office_pids_live", lambda exe: set())
+    monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: list(live))
+    monkeypatch.setattr(office_guard, "_cached_processes", lambda: list(live))
+    monkeypatch.setattr(office_guard, "_pid_from_hwnd", lambda hwnd: 20 if hwnd else None)
+    monkeypatch.setattr(office_guard, "_process_creation_identity", lambda pid: 2020)
+    monkeypatch.setattr(com_reader.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr("knowmate.secure.office_resiliency.clear_resiliency_markers", lambda exe: None)
+    for attr in ("word", "excel", "ppt"):
+        monkeypatch.setattr(com_reader._tls, attr, None, raising=False)
+    with pytest.raises(office_guard.OfficeCleanupPendingError):
+        com_reader._dispatch_and_own(client, "PowerPoint.Application", "POWERPNT.EXE")
+    assert com_reader._tls.ownership_cleanup["POWERPNT.EXE"].app is app
+    ready["value"] = True
+    before_cleanup_reads = len(reads)
+    with pytest.raises(office_guard.OfficeCleanupPendingError):
+        AutoReader._guard_office_busy(".ppt", "next.ppt")
+    result = com_reader.quit_com_apps(grace_sec=0)
+    assert not result.successful
+    assert result.ownership_pending == frozenset({"POWERPNT.EXE"})
+    assert len(reads) == before_cleanup_reads
+    assert dispatched == ["PowerPoint.Application"]
+    assert not office_guard._owned_pids
+    com_reader.release_unverified_com_refs()
+    live.clear()
+    AutoReader._guard_office_busy(".ppt", "next.ppt")
+    assert not office_guard.unverified_cleanup_pending()

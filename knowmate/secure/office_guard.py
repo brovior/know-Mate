@@ -25,11 +25,12 @@ COM 라우팅 로직에 영향을 주지 않는다.
 CLAUDE.md 원칙3(보안·Office 의존 코드는 secure/ 안에 격리) 준수.
 """
 import logging
+from contextlib import contextmanager
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
-from typing import Any
+from dataclasses import dataclass, field, replace
+from typing import Any, Callable, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,7 @@ _ownership_generation = 0
 _shutdown_generation = 0
 _cleanup_retry_at: dict[str, float] = {}
 _cleanup_inflight: dict[str, int] = {}
+_unverified_cleanup: dict[str, set[int]] = {}
 
 
 @dataclass(frozen=True)
@@ -82,11 +84,12 @@ class OfficeCleanupResult:
     identity_unknown: frozenset[int] = frozenset()
     failed: frozenset[int] = frozenset()
     forced_exited: frozenset[int] = frozenset()
+    ownership_pending: frozenset[str] = frozenset()
 
     @property
     def successful(self) -> bool:
         """Whether all target processes are confirmed gone or safely reused."""
-        return not (self.remaining or self.identity_unknown or self.failed)
+        return not (self.remaining or self.identity_unknown or self.failed or self.ownership_pending)
 
 
 class OfficeCleanupPendingError(RuntimeError):
@@ -109,6 +112,21 @@ class OfficeBusyError(RuntimeError):
 
 class OfficeOwnershipProbeError(RuntimeError):
     """HWND 소유권 확인 중 COM 오류가 나 원본 예외를 호출자에게 전달할 때 발생한다."""
+
+    def __init__(self, message: str, document: Any = None) -> None:
+        self.document = document
+        super().__init__(message)
+
+
+class OfficeOwnershipCleanupError(OfficeOwnershipProbeError):
+    """소유 확인용 문서를 닫지 못해 같은 앱의 등록 재시도를 중단한다."""
+
+    def __init__(self, probe_error: Exception | None, close_error: Exception, document: Any) -> None:
+        self.probe_error = probe_error
+        self.close_error = close_error
+        self.document = document
+        self.registered: tuple[int, OwnedOfficeProcess] | None = None
+        super().__init__("Word 소유권 확인용 문서 닫기 실패", document)
 
 
 def process_for_ext(ext: str) -> str | None:
@@ -169,6 +187,8 @@ def _enumerate_processes():
         kernel32.Process32Next.restype = wintypes.BOOL
         kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
         kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.GetLastError.argtypes = []
+        kernel32.GetLastError.restype = wintypes.DWORD
         snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
         if snapshot == INVALID_HANDLE_VALUE:
             return None
@@ -177,12 +197,12 @@ def _enumerate_processes():
             entry = PROCESSENTRY32()
             entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
             if not kernel32.Process32First(snapshot, ctypes.byref(entry)):
-                return out
+                return out if kernel32.GetLastError() == 18 else None  # ERROR_NO_MORE_FILES
             while True:
                 name = entry.szExeFile.decode("ascii", "ignore").upper()
                 out.append((name, int(entry.th32ProcessID)))
                 if not kernel32.Process32Next(snapshot, ctypes.byref(entry)):
-                    break
+                    return out if kernel32.GetLastError() == 18 else None
         finally:
             kernel32.CloseHandle(snapshot)
         return out
@@ -309,48 +329,90 @@ def _process_creation_identity_from_handle(kernel32, handle) -> int | None:
         return None
 
 
-def register_owned_app(exe: str, baseline: set[int], app: Any) -> bool:
-    """새 COM 앱의 PID/HWND/exe가 모두 확인됐을 때만 소유 등록한다.
-
-    비Windows 또는 프로세스 열거 불가 fake 경로에서는 기존 테스트 호환을 위해
-    등록 없이 성공 처리한다. Windows에서 검증할 수 없으면 사용자 앱일 수 있어
-    False를 반환하며 호출자는 자동화를 연기해야 한다.
-    """
-    if sys.platform != "win32":
-        return True
-    current_procs = _enumerate_processes()
-    if current_procs is None:
-        return False
-    hwnd = None
-    hwnd_attr = None
-    probe_error: Exception | None = None
+def _app_hwnd(app: Any) -> int | None:
+    """앱 HWND를 읽고 COM의 미지원 속성 오류만 건너뛴다."""
     for attr in ("Hwnd", "HWND"):
         try:
             hwnd = getattr(app, attr)
-            hwnd_attr = attr
-            break
         except AttributeError:
             continue
         except Exception as exc:
-            probe_error = exc
-            break
-    if probe_error is not None:
-        raise OfficeOwnershipProbeError("Office HWND 소유권 확인 실패") from probe_error
+            code = getattr(exc, "hresult", None)
+            if isinstance(code, int) and (code & 0xFFFFFFFF) in {0x80020003, 0x80020006}:
+                continue
+            raise OfficeOwnershipProbeError("Office HWND 소유권 확인 실패") from exc
+        if isinstance(hwnd, int) and hwnd != 0:
+            return hwnd
+    return None
+
+
+@contextmanager
+def _ownership_window(exe: str, app: Any) -> Iterator[Callable[[], int | None]]:
+    """Word는 저장하지 않는 빈 문서 창으로 COM 인스턴스 HWND를 확인한다."""
+    from knowmate.secure.com_reader import hresult_of, is_fatal_transport_hresult
+
+    hwnd = _app_hwnd(app)
+    if hwnd is not None or exe.upper() != "WINWORD.EXE":
+        yield lambda: _app_hwnd(app)
+        return
+    document = None
+    probe_error: Exception | None = None
+    try:
+        app.AutomationSecurity = 3
+        document = app.Documents.Add()
+        yield lambda: document.Windows.Item(1).Hwnd
+    except OfficeOwnershipProbeError as exc:
+        probe_error = exc
+        exc.document = document
+        raise
+    except Exception as exc:
+        probe_error = exc
+        raise OfficeOwnershipProbeError("Word 빈 문서 창 소유권 확인 실패", document) from exc
+    finally:
+        error = probe_error
+        fatal_probe = False
+        while error is not None and not fatal_probe:
+            fatal_probe = is_fatal_transport_hresult(hresult_of(error))
+            error = error.__cause__
+        # 이미 끊어진 RPC에 Close를 다시 요청하면 소유 등록 전 워커가 멈출 수 있다.
+        # 닫지 않은 문서는 probe 예외로 전달해 생성 워커의 TLS에 보존한다.
+        if document is not None and not fatal_probe:
+            try:
+                document.Close(False)
+            except Exception as exc:
+                raise OfficeOwnershipCleanupError(probe_error, exc, document) from exc
+
+
+def _register_owned_window(
+    exe: str, baseline: set[int], read_hwnd: Callable[[], int | None],
+) -> tuple[int, OwnedOfficeProcess] | None:
+    """창의 PID·EXE·생성 identity를 검증하고 등록한 프로세스 기록을 반환한다."""
+    current_procs = _enumerate_processes()
+    if current_procs is None:
+        return None
+    hwnd = read_hwnd()
     if hwnd is None:
-        return False
+        logger.warning("Office 소유 등록 실패: exe=%s reason=hwnd_unavailable", exe)
+        return None
     pid = _pid_from_hwnd(hwnd)
     up = exe.upper()
     current = _pids_for(up, current_procs)
     creation_identity = _process_creation_identity(pid) if pid is not None else None
     if pid is None or pid in baseline or pid not in current or creation_identity is None:
-        return False
+        logger.warning(
+            "Office 소유 등록 실패: exe=%s PID=%s baseline=%s live=%s identity_available=%s",
+            up, pid, pid in baseline, pid in current, creation_identity is not None,
+        )
+        return None
 
     # HWND→PID 확인과 생성 identity 조회 사이 원래 프로세스가 끝나 PID가 사용자
     # Office에 재사용될 수 있다. identity 획득 뒤 COM 객체의 HWND, PID, EXE,
     # identity를 한 번 더 확인해 연결이 바뀐 경우 소유 등록을 거부한다. 이후 종료
     # 시점에도 같은 identity를 동일 프로세스 핸들에서 다시 검증한다.
     try:
-        confirmed_hwnd = getattr(app, hwnd_attr) if hwnd_attr is not None else None
+        confirmed_hwnd = read_hwnd()
+    except OfficeOwnershipProbeError:
+        raise
     except Exception as exc:
         raise OfficeOwnershipProbeError("Office HWND 소유권 재확인 실패") from exc
     confirmed_pid = _pid_from_hwnd(confirmed_hwnd)
@@ -365,18 +427,92 @@ def register_owned_app(exe: str, baseline: set[int], app: Any) -> bool:
         or pid not in _pids_for(up, confirmed_procs)
         or confirmed_identity != creation_identity
     ):
-        return False
+        logger.warning("Office 소유 등록 실패: exe=%s PID=%s reason=confirmation_changed", up, pid)
+        return None
     global _ownership_generation
     with _owned_lock:
         _ownership_generation += 1
         # PowerPoint MultiUse Dispatch는 동시 사용자 실행과 완전한 소유 증명이
         # 불가능하다. 세션 추적은 해 가드의 자기 감지만 피하되, 어떤 강제 종료
         # 경로에도 넣지 않는다.
-        _owned_pids[pid] = OwnedOfficeProcess(
+        record = OwnedOfficeProcess(
             up, creation_identity, up != "POWERPNT.EXE", _ownership_generation,
         )
+        _owned_pids[pid] = record
     logger.debug("우리 소유 Office PID 등록: %s=%d", up, pid)
-    return True
+    return pid, record
+
+
+def register_owned_app(exe: str, baseline: set[int], app: Any) -> bool:
+    """앱에 연결된 창의 PID·EXE·생성 identity를 검증해 소유 등록한다."""
+    if sys.platform != "win32":
+        return True
+    registered = None
+    try:
+        with _ownership_window(exe, app) as read_hwnd:
+            registered = _register_owned_window(exe, baseline, read_hwnd)
+    except OfficeOwnershipCleanupError as exc:
+        exc.registered = registered
+        if registered is not None:
+            pid, record = registered
+            _mark_owned_cleanup_pending(pid, record)
+        raise
+    return registered is not None
+
+
+def _mark_owned_cleanup_pending(pid: int, record: OwnedOfficeProcess) -> OwnedOfficeProcess | None:
+    """등록 generation이 같은 기록만 정리 대기로 바꾼다."""
+    global _shutdown_generation
+    with _owned_lock:
+        current = _owned_pids.get(pid)
+        if current is None or not _record_matches_unlocked(current, record):
+            return None
+        _shutdown_generation += 1
+        pending = replace(record, cleanup_pending=True, cleanup_generation=_shutdown_generation)
+        _owned_pids[pid] = pending
+        return pending
+
+
+def begin_unverified_cleanup(exe: str) -> int:
+    """소유권 미확인 정리를 EXE 단위로 차단하고 해제용 토큰을 반환한다."""
+    global _shutdown_generation
+    with _owned_lock:
+        _shutdown_generation += 1
+        token = _shutdown_generation
+        _unverified_cleanup.setdefault(exe.upper(), set()).add(token)
+        return token
+
+
+def finish_unverified_cleanup(exe: str, token: int) -> None:
+    """일치하는 미검증 정리 요청만 해제한다."""
+    with _owned_lock:
+        tokens = _unverified_cleanup.get(exe.upper())
+        if tokens is not None:
+            tokens.discard(token)
+            if not tokens:
+                _unverified_cleanup.pop(exe.upper(), None)
+
+
+def unverified_cleanup_pending() -> frozenset[str]:
+    """소유권 미확인으로 차단된 Office EXE 목록을 반환한다."""
+    with _owned_lock:
+        return frozenset(_unverified_cleanup)
+
+
+def office_processes_absent(exe: str) -> bool:
+    """열거에 성공하고 해당 Office 프로세스가 하나도 없을 때만 True를 반환한다."""
+    procs = _enumerate_processes()
+    return procs is not None and not _pids_for(exe, procs)
+
+
+def prune_unverified_cleanup() -> None:
+    """COM 호출 없이 실제 Office 부재가 확인된 미검증 요청만 해제한다."""
+    with _owned_lock:
+        snapshot = {exe: set(tokens) for exe, tokens in _unverified_cleanup.items()}
+    for exe, tokens in snapshot.items():
+        if office_processes_absent(exe):
+            for token in tokens:
+                finish_unverified_cleanup(exe, token)
 
 
 def clear_owned_pids() -> set[int]:
@@ -385,6 +521,7 @@ def clear_owned_pids() -> set[int]:
         prev = set(_owned_pids)
         _owned_pids.clear()
         _cleanup_retry_at.clear()
+        _unverified_cleanup.clear()
     return prev
 
 
@@ -476,6 +613,16 @@ def prune_released_nonterminable_processes() -> None:
 def ensure_office_available(exe: str, retry_cooldown_sec: float = 30.0) -> None:
     """Retry pending cleanup at most once per cooldown, then gate COM if unresolved."""
     up = exe.upper()
+    with _owned_lock:
+        tokens = set(_unverified_cleanup.get(up, ()))
+    if tokens:
+        if office_processes_absent(up):
+            for token in tokens:
+                finish_unverified_cleanup(up, token)
+        with _owned_lock:
+            unresolved_ownership = bool(_unverified_cleanup.get(up))
+        if unresolved_ownership:
+            raise OfficeCleanupPendingError(up, f"{up} 소유권 미확인 문서 정리 대기 중")
     with _owned_lock:
         inflight = _cleanup_inflight.get(up, 0) > 0
     if inflight:
