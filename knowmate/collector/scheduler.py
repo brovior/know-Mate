@@ -170,7 +170,7 @@ class CollectorWorker(QThread):
     def __init__(self, config, indexer, extractor, state_file=None, email_indexer=None,
                  parent=None, get_idle_seconds=None, com_restart_fn=None,
                  purge_meta_file=None, failure_file=None, get_now=None, mail_state_file=None,
-                 com_poison_recovery_fn=None):
+                 com_poison_recovery_fn=None, com_cleanup_fn=None):
         """수집기 워커를 초기화한다.
 
         get_idle_seconds: () -> float, 현재 OS 유휴 경과초 조회(테스트 주입용,
@@ -180,6 +180,7 @@ class CollectorWorker(QThread):
         com_restart_fn: () -> None, COM Office 주기 재기동 시 호출(테스트 주입용,
             기본은 secure.com_reader.quit_com_apps). COM 파일 N건 처리마다 Office를
             선제적으로 재기동해 장시간 사이클에서의 핸들·메모리 누수를 완화한다.
+        com_cleanup_fn: 문서 완료·사이클 종료 시 Office를 정리하는 함수(테스트 주입용).
         com_poison_recovery_fn: (exe: str) -> bool, 치명적인 Office RPC 단절 직후
             해당 AegisDesk 소유 프로세스의 종료를 확인하는 함수(테스트 주입용).
         purge_meta_file: purge 스킵/reconciliation 상태 sidecar 경로(테스트 주입용,
@@ -198,6 +199,10 @@ class CollectorWorker(QThread):
         self._extractor = extractor
         self._email_indexer = email_indexer
         self._cancelled = False
+        from knowmate.rag.embedding_cancel import EmbeddingCancellation
+        self._embedding_cancel = EmbeddingCancellation()
+        self._work_phase = "idle"
+        self._office_cleanup_in_progress = False
         if get_idle_seconds is None:
             from knowmate.collector.idle_util import get_idle_seconds as _default
             get_idle_seconds = _default
@@ -207,6 +212,10 @@ class CollectorWorker(QThread):
             from knowmate.secure.com_reader import quit_com_apps as _default_restart
             com_restart_fn = _default_restart
         self._com_restart_fn = com_restart_fn
+        if com_cleanup_fn is None:
+            from knowmate.secure.com_reader import quit_com_apps
+            com_cleanup_fn = quit_com_apps
+        self._com_cleanup_fn = com_cleanup_fn
         if com_poison_recovery_fn is None:
             from knowmate.secure.office_guard import recover_poisoned_office as _default_recovery
             com_poison_recovery_fn = _default_recovery
@@ -256,6 +265,8 @@ class CollectorWorker(QThread):
     def run(self):
         """증분 스캔 사이클 1회를 실행한다."""
         self._cancelled = False
+        from knowmate.rag.embedding_cancel import EmbeddingCancellation, EmbeddingCancelledError, embedding_cancellation_scope
+        self._embedding_cancel = EmbeddingCancellation()
         start = time.time()
         memory_diagnostics = MemoryDiagnostics(
             enabled=self._config.get("collector", {}).get("memory_diagnostics_enabled", False)
@@ -279,7 +290,10 @@ class CollectorWorker(QThread):
             logger.warning("COM 초기화 경고: %s", exc)
 
         try:
-            self._run_cycle()
+            with embedding_cancellation_scope(self._embedding_cancel):
+                self._run_cycle()
+        except EmbeddingCancelledError:
+            logger.info("[collector] 임베딩 취소로 사이클 중단: stage=%s", self._work_phase)
         except Exception as exc:
             logger.exception("수집기 예외 발생: %s", exc)
             self.error.emit(str(exc))
@@ -289,14 +303,7 @@ class CollectorWorker(QThread):
                 if _com_initialized:
                     # COM 앱 Quit은 반드시 생성 스레드(여기)에서 수행해야 한다(STA)
                     try:
-                        from knowmate.secure.com_reader import quit_com_apps
-                        from knowmate.config import com_quit_call_timeout_seconds
-                        quit_com_apps(
-                            grace_sec=getattr(self, "_com_quit_grace_sec", 5.0),
-                            quit_timeout_sec=com_quit_call_timeout_seconds(
-                                self._config.get("collector", {})
-                            ),
-                        )
+                        self._cleanup_com_apps("cycle_end")
                     except Exception:
                         pass
                     from knowmate.secure.com_reader import release_unverified_com_refs
@@ -310,13 +317,54 @@ class CollectorWorker(QThread):
                 memory_diagnostics.collect_and_log()
                 memory_diagnostics.stop()
                 self._memory_diagnostics = None
+                self._work_phase = "idle"
             elapsed = time.time() - start
             logger.info("수집기 사이클 완료: %.1f초", elapsed)
 
     def cancel(self):
-        """취소 플래그를 설정한다. 현재 처리 중인 파일 완료 후 중단된다."""
+        """취소를 요청하고 활성 임베딩 응답 대기를 중단한다."""
+        stage = self.work_stage
         self._cancelled = True
-        logger.info("수집기 취소 요청됨")
+        self._embedding_cancel.cancel()
+        logger.info("수집기 취소 요청됨: stage=%s", stage)
+
+    @property
+    def work_stage(self) -> str:
+        """종료 진단용으로 현재 COM·임베딩·DB·수집 단계를 반환한다."""
+        if self._office_cleanup_in_progress:
+            return "office_cleanup"
+        if self.maintenance_in_progress:
+            return "db_maintenance"
+        if self._embedding_cancel.in_progress:
+            return "embedding"
+        stage = com_stage.current_stage_name()
+        return f"com_{stage}" if stage != "unknown" else self._work_phase
+
+    @property
+    def blocking_shutdown_work(self) -> bool:
+        """진행 중인 임베딩·Office 정리에 제한된 종료 유예가 필요한지 반환한다."""
+        return self._office_cleanup_in_progress or self._embedding_cancel.in_progress
+
+    def _cleanup_com_apps(self, phase: str) -> None:
+        """생성 워커에서 Office 정리를 시도하고 미확인 결과를 기록한다."""
+        from knowmate.config import com_quit_call_timeout_seconds
+        self._office_cleanup_in_progress = True
+        try:
+            logger.info("[collector] Office 정리 시작: phase=%s", phase)
+            result = self._com_cleanup_fn(
+                grace_sec=getattr(self, "_com_quit_grace_sec", 5.0),
+                quit_timeout_sec=com_quit_call_timeout_seconds(self._config.get("collector", {})),
+            )
+            if result is not None:
+                logger.info(
+                    "[collector] Office 정리 체크포인트: phase=%s successful=%s remaining=%s identity_unknown=%s failed=%s ownership_pending=%s",
+                    phase, result.successful, sorted(result.remaining), sorted(result.identity_unknown),
+                    sorted(result.failed), sorted(result.ownership_pending),
+                )
+        except Exception as exc:
+            logger.warning("[collector] Office 정리 예외: phase=%s error_type=%s", phase, type(exc).__name__)
+        finally:
+            self._office_cleanup_in_progress = False
 
     @property
     def maintenance_in_progress(self) -> bool:
@@ -477,6 +525,8 @@ class CollectorWorker(QThread):
         """스캔 -> 분류 -> 인덱싱 -> orphan 정리 -> 저장 순으로 사이클을 실행한다."""
         from datetime import datetime, timezone
         collector_cfg = self._config.get("collector", {})
+        self._work_phase = "document_indexing"
+        from knowmate.rag.embedding_cancel import EmbeddingCancelledError
         cleanup_cfg = self._config.get("cleanup", {})
         chunk_cfg = self._config.get("chunking", {})
 
@@ -1182,6 +1232,13 @@ class CollectorWorker(QThread):
                 actual_com = getattr(self._extractor, "take_actual_com_used", None)
                 com_used = actual_com() if callable(actual_com) else is_com
                 failure_state.note_success(failures, task.path)
+            except EmbeddingCancelledError:
+                self._cancelled = True
+                deferred.append(task.path)
+                actual_com = getattr(self._extractor, "take_actual_com_used", None)
+                if callable(actual_com):
+                    actual_com()
+                logger.info("[collector] 문서 임베딩 취소: %s", task.path)
             except OfficeComPoisonError as exc:
                 # poison은 OfficeBusy/Unreadable/일반 오류보다 먼저 처리해야 끊긴
                 # TLS 객체를 다음 파일이 재사용하지 않는다.
@@ -1276,6 +1333,7 @@ class CollectorWorker(QThread):
             if com_used:
                 com_since_restart += 1
                 if com_restart_every > 0 and com_since_restart >= com_restart_every:
+                    self._office_cleanup_in_progress = True
                     try:
                         if self._default_com_restart:
                             result = self._com_restart_fn(
@@ -1301,10 +1359,14 @@ class CollectorWorker(QThread):
                             )
                     except Exception as exc:
                         logger.warning("[collector] COM 주기 재기동 실패(무시): %s", exc)
+                    finally:
+                        self._office_cleanup_in_progress = False
                     com_since_restart = 0
 
         # 생산자 스레드 정리 (정상 종료 시 이미 끝나 있음)
         producer.join(timeout=5)
+        self._cleanup_com_apps("documents_complete")
+        self._work_phase = "document_maintenance"
 
         memory_diagnostics = self._memory_diagnostics
         if memory_diagnostics is not None:
@@ -1409,6 +1471,7 @@ class CollectorWorker(QThread):
 
         # 메일 제외 정리는 신규 메일 인덱싱 설정과 무관하게 수행한다. mail.enabled가
         # 꺼져 있어도 기존 메일은 검색되므로 제외·보류 삭제 복구가 멈추면 안 된다.
+        self._work_phase = "mail_indexing"
         mail_indexed = 0
         mail_exclusion_changed = False
         mail_maintenance_ok = True

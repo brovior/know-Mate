@@ -393,8 +393,9 @@ def _app_hwnd(app: Any, exe: str = "") -> int | None:
         if isinstance(hwnd, int) and hwnd != 0:
             return hwnd
         logger.info(
-            "Office HWND 조회: exe=%s property=%s reason=%s",
+            "Office HWND 조회: exe=%s property=%s reason=%s value_type=%s callable=%s is_none=%s",
             exe, attr, "zero" if isinstance(hwnd, int) and hwnd == 0 else "invalid_value",
+            type(hwnd).__name__, callable(hwnd), hwnd is None,
         )
     return None
 

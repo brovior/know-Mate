@@ -5,9 +5,13 @@ import logging
 import math
 import os
 import random
+import threading
 import time
+from contextlib import nullcontext
 from typing import Any
 from urllib.parse import urlparse
+
+from knowmate.rag.embedding_cancel import EmbeddingCancellation, EmbeddingCancelledError, current_embedding_cancellation
 
 logger = logging.getLogger(__name__)
 
@@ -101,10 +105,21 @@ class EmbeddingClient:
         self._conn_host = parsed.hostname
         self._conn_port = parsed.port
         self._conn_path_prefix = parsed.path.rstrip("/")
-        self._conn: http.client.HTTPConnection | None = None
+        self._connections = threading.local()
+
+    @property
+    def _conn(self) -> http.client.HTTPConnection | None:
+        return getattr(self._connections, "connection", None)
+
+    @_conn.setter
+    def _conn(self, connection: http.client.HTTPConnection | None) -> None:
+        self._connections.connection = connection
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         """텍스트 리스트를 임베딩 벡터 리스트로 변환한다."""
+        cancellation = current_embedding_cancellation()
+        if cancellation is not None:
+            cancellation.check()
         if not texts:
             return []
         if self._fake:
@@ -142,6 +157,7 @@ class EmbeddingClient:
             else http.client.HTTPConnection
         )
         conn = conn_cls(self._conn_host, self._conn_port, timeout=30)
+        self._conn = conn
         t0 = time.perf_counter()
         conn.connect()   # 명시적으로 연결만 수행 — 수립 시간을 따로 재기 위해
         elapsed = time.perf_counter() - t0
@@ -149,6 +165,22 @@ class EmbeddingClient:
         return conn, elapsed
 
     def _call_api(self, texts: list[str]) -> list[list[float]]:
+        """현재 워커의 취소 범위 안에서 API를 호출한다."""
+        cancellation = current_embedding_cancellation()
+        with cancellation.request() if cancellation is not None else nullcontext():
+            try:
+                return self._call_api_request(texts, cancellation)
+            except EmbeddingCancelledError:
+                connection = self._conn
+                self._conn = None
+                if connection is not None:
+                    connection.close()
+                logger.info("[embed] 요청 취소: retry=False")
+                raise
+
+    def _call_api_request(
+        self, texts: list[str], cancellation: EmbeddingCancellation | None,
+    ) -> list[list[float]]:
         """사내 임베딩 API를 호출해 벡터 리스트를 반환한다.
 
         인스턴스 수명 동안 HTTP 연결을 재사용한다(배치마다 재연결하면 인덱싱이
@@ -176,10 +208,14 @@ class EmbeddingClient:
 
         last_exc: Exception | None = None
         for attempt in range(2):
+            if cancellation is not None:
+                cancellation.check()
             call_t0 = time.perf_counter()
             connect_sec = ttfb_sec = read_sec = 0.0
             try:
                 conn, connect_sec = self._get_connection()
+                if cancellation is not None:
+                    cancellation.bind_socket(getattr(conn, "sock", None))
 
                 t0 = time.perf_counter()
                 conn.request("POST", path, body=data, headers=headers)
@@ -187,7 +223,18 @@ class EmbeddingClient:
                 ttfb_sec = time.perf_counter() - t0
 
                 t0 = time.perf_counter()
-                body_bytes = resp.read()
+                try:
+                    if cancellation is not None:
+                        cancellation.check()
+                    body_bytes = resp.read()
+                finally:
+                    if cancellation is not None:
+                        # HTTPResponse가 소켓을 인계받은 경우에도 파일 참조를 해제한다.
+                        close_response = getattr(resp, "close", None)
+                        if callable(close_response):
+                            close_response()
+                if cancellation is not None:
+                    cancellation.check()
                 read_sec = time.perf_counter() - t0
 
                 if resp.status >= 400:
@@ -197,6 +244,8 @@ class EmbeddingClient:
                 except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                     raise EmbeddingProtocolError("임베딩 API 응답 JSON이 올바르지 않습니다") from exc
                 result = _vectors_in_request_order(body, len(texts))
+                if cancellation is not None:
+                    cancellation.check()
                 self._log_if_slow(
                     len(texts), time.perf_counter() - call_t0,
                     connect_sec, ttfb_sec, read_sec, attempt,
@@ -205,6 +254,8 @@ class EmbeddingClient:
             except (EmbeddingContentError, EmbeddingTransientError, EmbeddingProtocolError):
                 raise
             except (http.client.HTTPException, OSError) as exc:
+                if cancellation is not None:
+                    cancellation.check()
                 # 연결이 끊겼을 가능성 — 폐기 후 재연결 시도.
                 # WARNING으로 올린다(이전엔 DEBUG): 재시도 자체가 느린 호출의
                 # 원인일 수 있는데, 기본 로그 레벨(INFO)에서 안 보여 진단이 막혔다.
