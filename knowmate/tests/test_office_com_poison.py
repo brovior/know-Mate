@@ -251,9 +251,10 @@ def test_dispatch_retries_ownership_on_same_app_and_baseline(monkeypatch):
     probes = []
     monkeypatch.setattr("knowmate.secure.office_resiliency.clear_resiliency_markers", lambda exe: None)
     monkeypatch.setattr(office_guard, "office_pids_live", lambda exe: {10})
+    monkeypatch.setattr(office_guard, "prepare_powerpoint_dispatch", lambda: ({10}, {}))
     monkeypatch.setattr(com_reader.time, "sleep", lambda seconds: None)
 
-    def register(exe, baseline, candidate):
+    def register(exe, baseline, candidate, expected_owned=None):
         probes.append((baseline, candidate))
         return len(probes) == 2
 
@@ -348,7 +349,7 @@ def test_word_excel_use_dispatchex_and_ppt_uses_dispatch(monkeypatch):
     """Word/Excel은 독립 인스턴스, MultiUse PPT는 기존 Dispatch 정책을 쓴다."""
     monkeypatch.setattr("knowmate.secure.office_resiliency.clear_resiliency_markers", lambda exe: None)
     monkeypatch.setattr(office_guard, "office_pids_live", lambda exe: set())
-    monkeypatch.setattr(office_guard, "register_owned_app", lambda exe, baseline, app: True)
+    monkeypatch.setattr(office_guard, "register_owned_app", lambda exe, baseline, app, expected_owned=None: True)
     calls = []
 
     class _Client:
@@ -437,7 +438,7 @@ def test_powerpoint_multiuse_is_tracked_but_never_terminable(monkeypatch):
     assert killed == []
 
 
-def test_cycle_cleanup_releases_ppt_without_quit(monkeypatch):
+def test_cycle_cleanup_releases_ppt_without_quit(monkeypatch, caplog):
     """PPT MultiUse 세션은 cycle end에도 Quit/강제종료 대신 참조만 해제한다."""
     class _Ppt:
         quit_called = False
@@ -445,6 +446,7 @@ def test_cycle_cleanup_releases_ppt_without_quit(monkeypatch):
             self.quit_called = True
 
     ppt = _Ppt()
+    caplog.set_level("INFO")
     monkeypatch.setattr(com_reader._tls, "ppt", ppt, raising=False)
     monkeypatch.setattr(office_guard, "_owned_pids", {
         30: office_guard.OwnedOfficeProcess("POWERPNT.EXE", 3030, False),
@@ -452,6 +454,7 @@ def test_cycle_cleanup_releases_ppt_without_quit(monkeypatch):
     com_reader.quit_com_apps(grace_sec=0)
     assert ppt.quit_called is False
     assert getattr(com_reader._tls, "ppt", None) is None
+    assert "quit_requested=False reason=multiuse_protection" in caplog.text
 
 
 def test_ppt_poison_recovery_defers_same_cycle_without_kill(monkeypatch):
@@ -865,7 +868,7 @@ def test_all_registration_failures_retain_app_and_gate(monkeypatch, exe, prog_id
     dispatched = []
     attempts = []
 
-    def register(exe, baseline, candidate):
+    def register(exe, baseline, candidate, expected_owned=None):
         attempts.append(candidate)
         if failure == "false":
             return False
@@ -883,6 +886,7 @@ def test_all_registration_failures_retain_app_and_gate(monkeypatch, exe, prog_id
     monkeypatch.setattr(office_guard, "_cached_processes", lambda: [(exe, 20)])
     monkeypatch.setattr(office_guard, "office_pids_live", lambda exe: set())
     monkeypatch.setattr(office_guard, "register_owned_app", register)
+    monkeypatch.setattr(office_guard, "prepare_powerpoint_dispatch", lambda: (set(), {}))
     monkeypatch.setattr(com_reader.time, "sleep", lambda seconds: None)
     monkeypatch.setattr("knowmate.secure.office_resiliency.clear_resiliency_markers", lambda exe: None)
     for attr in ("word", "excel", "ppt"):
@@ -931,6 +935,7 @@ def test_ppt_hwnd_not_ready_exhaustion_is_pending_not_external_busy(monkeypatch)
     monkeypatch.setattr(office_guard, "_cleanup_inflight", {})
     monkeypatch.setattr(office_guard, "_cleanup_retry_at", {})
     monkeypatch.setattr(office_guard, "office_pids_live", lambda exe: set())
+    monkeypatch.setattr(office_guard, "prepare_powerpoint_dispatch", lambda: (set(), {}))
     monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: list(live))
     monkeypatch.setattr(office_guard, "_cached_processes", lambda: list(live))
     monkeypatch.setattr(office_guard, "_pid_from_hwnd", lambda hwnd: 20 if hwnd else None)
