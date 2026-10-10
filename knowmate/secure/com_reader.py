@@ -133,7 +133,13 @@ def _retain_unverified_app(exe: str, app: Any, document: Any = None) -> None:
 def release_unverified_com_refs() -> None:
     """워커 종료 전에 COM 참조를 해제하되 미확인 EXE 차단 상태는 보존한다."""
     candidates = getattr(_tls, "ownership_cleanup", {})
+    exes = tuple(candidates)
     candidates.clear()
+    for exe in exes:
+        logger.info(
+            "[com] 미검증 COM 참조 해제: exe=%s quit_requested=False reason=unverified_ownership cleanup_gate_action=unchanged",
+            exe,
+        )
 
 
 # COM 상수 (모달 다이얼로그 억제용)
@@ -287,7 +293,9 @@ def _dispatch_and_own(win32com, prog_id: str, exe_name: str):
 
     Word·Excel은 DispatchEx로 기존 ROT 객체 재접속을 피하고, MultiUse인
     PowerPoint는 Dispatch를 유지한다. 생성 전 PID baseline과 앱 HWND의 PID,
-    실행 파일명이 모두 일치할 때만 AegisDesk 소유로 등록한다. 검증할 수 없으면
+    실행 파일명이 모두 일치할 때만 AegisDesk 소유로 등록한다. PowerPoint는 최신
+    OS 목록에서 외부 앱을 먼저 차단하고, 이전 소유 기록이 같은 경우 재접속한다.
+    검증할 수 없으면
     사용자 Office일 가능성을 배제할 수 없으므로 안전하게 처리를 연기한다.
 
     Dispatch 직전에 Resiliency 표식을 지운다 — 이전 사이클에서 워치독이 강제
@@ -299,6 +307,7 @@ def _dispatch_and_own(win32com, prog_id: str, exe_name: str):
         OfficeOwnershipProbeError, OfficeOwnershipCleanupError,
         OfficeCleanupPendingError, office_pids_live, register_owned_app,
         ensure_office_available, unverified_cleanup_pending,
+        prepare_powerpoint_dispatch,
     )
     from knowmate.secure.office_resiliency import clear_resiliency_markers
 
@@ -306,7 +315,11 @@ def _dispatch_and_own(win32com, prog_id: str, exe_name: str):
     if exe_name not in unverified_cleanup_pending():
         getattr(_tls, "ownership_cleanup", {}).pop(exe_name, None)
     clear_resiliency_markers(exe_name)
-    before = office_pids_live(exe_name)
+    expected_owned = None
+    if exe_name == "POWERPNT.EXE":
+        before, expected_owned = prepare_powerpoint_dispatch()
+    else:
+        before = office_pids_live(exe_name)
     dispatch = (
         win32com.Dispatch if exe_name == "POWERPNT.EXE"
         else getattr(win32com, "DispatchEx", win32com.Dispatch)
@@ -317,13 +330,16 @@ def _dispatch_and_own(win32com, prog_id: str, exe_name: str):
         _poison_if_fatal(exc, exe_name)
         raise
     # PowerPoint는 MultiUse라 Dispatch가 기존 사용자 프로세스를 반환할 수 있다.
-    # Windows에서 새 PID/HWND/exe를 모두 확인하지 못하면 소유로 추측하지 않고
+    # Windows에서 새 PID 또는 같은 기존 소유 기록과 HWND/exe를 확인하지 못하면 추측하지 않고
     # 이 자동화 요청 자체를 연기한다. 비Windows fake 객체는 office_guard의
     # platform fallback으로 허용돼 기존 단위 테스트를 유지한다.
     owned = False
     for attempt in range(3):
         try:
-            owned = register_owned_app(exe_name, before, app)
+            if expected_owned is not None:
+                owned = register_owned_app(exe_name, before, app, expected_owned)
+            else:
+                owned = register_owned_app(exe_name, before, app)
         except OfficeOwnershipCleanupError as exc:
             if exc.registered is None:
                 _retain_unverified_app(exe_name, app, exc.document)
@@ -331,8 +347,10 @@ def _dispatch_and_own(win32com, prog_id: str, exe_name: str):
                 "[com] 소유 확인용 문서 정리 실패; 등록 재시도 중단: exe=%s probe_error=%s close_error=%s",
                 exe_name, type(exc.probe_error).__name__, type(exc.close_error).__name__,
             )
-            for error in (exc.probe_error, exc.close_error):
+            for error in (exc.probe_error, exc.close_error, exc.restore_error):
                 while error is not None:
+                    if exe_name == "POWERPNT.EXE" and is_fatal_transport_hresult(hresult_of(error)):
+                        _retain_unverified_app(exe_name, app, exc.document)
                     _poison_if_fatal(error, exe_name)
                     error = error.__cause__
             raise OfficeCleanupPendingError(
@@ -822,6 +840,10 @@ def quit_com_apps(
                                 results.append(office_guard.OfficeCleanupResult(failed=frozenset(terminable)))
                             else:
                                 results.append(office_guard.OfficeCleanupResult(remaining=frozenset(terminable)))
+            else:
+                logger.info(
+                    "[com] PowerPoint 종료 정책: action=release_reference quit_requested=False reason=multiuse_protection",
+                )
         finally:
             # Quit 예외에도 스레드 로컬 COM 참조를 반드시 놓는다.
             setattr(_tls, attr, None)
