@@ -7,6 +7,7 @@ import os
 import random
 import threading
 import time
+import tracemalloc
 from contextlib import nullcontext
 from typing import Any
 from urllib.parse import urlparse
@@ -211,11 +212,13 @@ class EmbeddingClient:
             if cancellation is not None:
                 cancellation.check()
             call_t0 = time.perf_counter()
+            cpu_t0 = time.thread_time()
             connect_sec = ttfb_sec = read_sec = 0.0
             try:
                 conn, connect_sec = self._get_connection()
                 if cancellation is not None:
                     cancellation.bind_socket(getattr(conn, "sock", None))
+                setup_sec = max(time.perf_counter() - call_t0 - connect_sec, 0.0)
 
                 t0 = time.perf_counter()
                 conn.request("POST", path, body=data, headers=headers)
@@ -239,16 +242,21 @@ class EmbeddingClient:
 
                 if resp.status >= 400:
                     raise _classify_http_error(resp.status, body_bytes)
+                t0 = time.perf_counter()
                 try:
                     body = json.loads(body_bytes.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError) as exc:
                     raise EmbeddingProtocolError("임베딩 API 응답 JSON이 올바르지 않습니다") from exc
+                json_sec = time.perf_counter() - t0
+                t0 = time.perf_counter()
                 result = _vectors_in_request_order(body, len(texts))
+                validate_sec = time.perf_counter() - t0
                 if cancellation is not None:
                     cancellation.check()
                 self._log_if_slow(
                     len(texts), time.perf_counter() - call_t0,
                     connect_sec, ttfb_sec, read_sec, attempt,
+                    setup_sec, json_sec, validate_sec, time.thread_time() - cpu_t0,
                 )
                 return result
             except (EmbeddingContentError, EmbeddingTransientError, EmbeddingProtocolError):
@@ -270,21 +278,26 @@ class EmbeddingClient:
     def _log_if_slow(
         self, batch_size: int, total_sec: float,
         connect_sec: float, ttfb_sec: float, read_sec: float, attempt: int,
+        setup_sec: float, json_sec: float, validate_sec: float, cpu_sec: float,
     ) -> None:
         """느린 호출만 구간별로 남긴다(정상 호출은 로그를 더럽히지 않는다).
 
-        판정 가이드 — connect가 크면 연결 수립(네트워크·EDR), ttfb가 크면 서버
-        처리, 어느 구간도 아닌데 total만 크면 프로세스 밖 요인(GIL 경합·머신 부하)
-        이다. 텍스트 내용은 남기지 않고 건수만 남긴다(원칙7).
+        setup은 연결 준비·취소 소켓 등록, json은 응답 해석, validate는 벡터 검증이다.
+        cpu는 호출 스레드의 CPU 시간이며 구간 합계에 더하지 않는다. 미계측은 남은
+        경과시간일 뿐 원인을 뜻하지 않는다. 내용과 벡터 값은 기록하지 않는다.
         """
         if total_sec < SLOW_EMBED_CALL_LOG_SEC:
             return
+        tracing = tracemalloc.is_tracing()
+        trace_depth = tracemalloc.get_traceback_limit() if tracing else 0
         logger.warning(
             "[embed] 느린 호출 %.2f초 (청크 %d개, 시도 %d): "
-            "connect=%.2f ttfb=%.2f read=%.2f / 미계측=%.2f",
+            "connect=%.2f ttfb=%.2f read=%.2f setup=%.2f json=%.2f validate=%.2f "
+            "/ 미계측=%.2f cpu=%.2f tracing=%s trace_depth=%d",
             total_sec, batch_size, attempt,
-            connect_sec, ttfb_sec, read_sec,
-            max(total_sec - connect_sec - ttfb_sec - read_sec, 0.0),
+            connect_sec, ttfb_sec, read_sec, setup_sec, json_sec, validate_sec,
+            max(total_sec - connect_sec - ttfb_sec - read_sec - setup_sec - json_sec - validate_sec, 0.0),
+            cpu_sec, tracing, trace_depth,
         )
 
 
