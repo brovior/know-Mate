@@ -16,7 +16,7 @@ SQLite 전환이나 추적 수명 변경은 아직 구현하기로 결정하지 
 | 유휴 폴더 확인 | 폴더 순회 후 삭제 확인에서 파일 존재를 다시 조회 | 로컬·SMB별 순회·존재 확인 비용 측정 |
 | 검색 규모 | 검색용 벡터 인덱스 생성 코드 없음, 질의 처리는 동기 실행 | 청크 수와 검색·LLM 시간을 측정한 뒤 개선 선택 |
 | 임베딩·Office 지연 | 32청크 호출에서 미계측 4.82~5.52초 보고, 응답 처리·CPU 계측 보강 | 새 구간 로그와 메모리 진단 설정 확보, Office open 편차 실측 |
-| PowerPoint COM 읽기 | 같은 파일의 read가 VDI 117.82초·사내 PC 424초로 보고됨, 상세 계측 구현 | 아래 PPT 진단의 구간별 시간·건수 및 추출 결과 비교 |
+| PowerPoint COM 읽기 | 후속 VDI read 118.44초 중 셀 읽기 91.45초(77.2%) 보고, Office 2016·폐쇄망용 비교 도구 준비 | 합성 변환·사내 허용된 내부 추가 기능의 동일 결과·시간 비교. Office·DRM 실측 대기 |
 
 2026-10-09에는 Word·Excel `Quit()` 미반환 또는 후속 종료 미확인으로 소유 registry가 지워져 다음
 사이클이 같은 Office를 재사용하거나 사용자 점유로 오판할 수 있는 경로를 보강했다. 보고된 장시간
@@ -167,7 +167,8 @@ tracing·trace_depth는 느린 호출 기록 시점의 메모리 추적 상태�
 사내 로그 분석 보고에서 PPTX 추출은 전체 8201.9초 중 5578.9초(68.0%)이며, COM 단계의
 read가 5507초로 보고됐다. 사용자가 같은 느린 파일을 VDI에서 측정한 결과는 전체 122.6초,
 read 117.82초, 27장, 최장 슬라이드 17.79초다. 사내 PC의 같은 파일 read는 424초다.
-실행 환경별 차이와 표·그룹·특정 개체·DRM 지연 중 원인은 아직 확정하지 않았다.
+후속 상세 계측에서 셀 읽기 구간이 주 병목으로 좁혀졌다. 실행 환경별 차이와 각 조회 안의
+DRM 처리·COM 왕복·Python 래퍼 비용은 아직 분리하지 않았다.
 
 `[ppt] 슬라이드 읽기`는 1부터 시작하는 순회 번호와 실제 방문한 도형·그룹·표·셀 개수,
 최대 그룹 깊이, 오류 건수 및 구간 합계를 INFO에 기록한다. `operations`는
@@ -191,6 +192,92 @@ read 117.82초, 27장, 최장 슬라이드 17.79초다. 사내 PC의 같은 파�
 VDI의 기존 측정 스크립트에서 수정된 `PowerPointComReader.parse()`를 호출해 같은 파일을
 비교한다. 완료된 슬라이드 요약과 느린 도형·진행 로그만 공유하고 추출 본문은 남기지 않는다.
 추출 내용·표 셀·그룹 순서가 같음을 확인한 뒤 지연 구간을 기준으로 후속 최적화를 선택한다.
+
+#### VDI 후속 실측과 일괄 읽기 조사
+
+사용자 보고: 전체 추출 123.26초, read 118.44초, 표 셀 8,299개 읽기 91.45초
+(read의 77.2%), 일반 텍스트 도형 1,682개 읽기 12.21초, 오류 0건이다.
+10번 슬라이드는 표 1,550셀·17.83초, 17번은 그룹 포함 도형 913개·12.55초다.
+직전 전체 122.6초와 비슷하며 계측 보강만으로 속도 향상을 확인한 것은 아니다.
+오류 0건은 기존 추출 내용과 동일하다는 검증을 대신하지 않는다.
+
+현재 셀 읽기는 `Cell(row, col).Shape.TextFrame.TextRange.Text` 전체를 한 구간으로 잰다.
+8,299회는 셀 읽기 구간 횟수이며 정확한 COM 호출 수가 아니다. 셀당 평균 약 11ms에는
+객체 접근·문자열 반환·Python 처리가 함께 포함되므로 DRM 비용이 없다고 결론내리지 않는다.
+
+2026-10-11에 공식 API와 공개 구현을 확인한 결과:
+
+| 경로 | 일괄 읽기의 의미 | 적용 조건 |
+|---|---|---|
+| 기존 PowerPoint COM | 문서화된 Table API는 Cell 접근을 제공하며 전체 값 배열 API는 찾지 못함 | 속성 조회 준비 비용 감소만으로 셀별 왕복을 없앨 수 없음 |
+| Office.js Table.values | 표 전체 값을 string[][]로 로드. 표 목록 확보 후 여러 표의 load를 큐에 넣고 한 번 sync할 수 있음 | PowerPointApi 1.8. 확인된 사내 Office 2016에서는 미지원으로 현재 후보 제외 |
+| PowerPoint 내부 추출 함수 | 외부의 한 번 요청에 내부 함수가 셀·그룹을 순회하고 문자열/배열을 한꺼번에 반환하는 설계 후보 | 승인된 추가 기능 설치·로드·스레드 처리 검증. 내부 셀 순회와 DRM 처리 비용 자체는 남음 |
+| 파일/메모리 스트림 직접 파싱 | PPTX를 읽어 로컬 메모리에서 셀·그룹을 순회하며 COM을 사용하지 않음 | DRM 문서의 읽기 가능한 바이트를 승인된 경로로 확보할 수 있어야 함 |
+
+Office.js의 [Table.values](https://learn.microsoft.com/en-us/javascript/api/powerpoint/powerpoint.table?view=powerpoint-js-1.8)는 공식 일괄 값 조회 API다.
+[지원표](https://learn.microsoft.com/en-us/javascript/api/requirement-sets/powerpoint/powerpoint-api-requirement-sets)의 Windows 최소 버전은
+2504·빌드 18730.20030이며 볼륨 라이선스 영구/LTSC 제품에는 1.8이 제공되지 않는다.
+사내 제품은 Office 2016으로 확인됐고 VDI 제품·정확한 빌드는 미확인이다. SDK 내부의 실제 조회 비용과 DRM 호환성은 미검증이다.
+사내 추가 기능은 [Office.js 로컬 참조](https://learn.microsoft.com/en-us/office/dev/add-ins/develop/referencing-the-javascript-api-for-office-library-from-its-cdn)를 사용할 수 있지만
+관련 파일과 실행 환경을 포함한 폐쇄망·숨김 문서 연동 검증이 필요하다.
+
+내부 함수 후보는 [추가 기능의 COM 객체 노출](https://learn.microsoft.com/en-us/visualstudio/vsto/calling-code-in-vsto-add-ins-from-other-office-solutions?view=visualstudio)을 통해
+외부에서 호출할 수 있다. 외부 호출을 Office 주 스레드로 전달해야 하며,
+[VSTO 구조 문서](https://learn.microsoft.com/en-us/visualstudio/vsto/architecture-of-vsto-add-ins?view=visualstudio)는
+자동화로 시작한 Office에서 정상 작동을 보장하지 않는다. 실제 로드·원문 미변경·사용자 문서
+보호를 먼저 검증한다. 전체 문서 반환은 취소 간격·메모리 비용도 비교해 반환 단위를 정한다.
+[Application.Run](https://learn.microsoft.com/en-us/office/vba/api/powerpoint.application.run)으로 별도 VBA 함수를
+호출하는 시제품도 가능하지만 현재는 AutomationSecurity=3으로 매크로를 차단한다.
+성능 실험을 위해 운영 보안 설정을 낮추거나 대상 문서에 코드를 주입하지 않는다.
+
+유사 도구의 공개 구현:
+
+- [Microsoft MarkItDown](https://github.com/microsoft/markitdown/blob/main/packages/markitdown/src/markitdown/converters/_pptx_converter.py): python-pptx로 파일 스트림을 열고 table.rows와 row.cells를 순회한다. COM 일괄 조회가 아니다.
+- [Unstructured](https://github.com/Unstructured-IO/unstructured/blob/main/unstructured/partition/pptx.py): python-pptx로 파일/스트림을 열고 셀 텍스트 행렬을 만든다. COM을 사용하지 않는다.
+- [Apache POI](https://github.com/apache/poi/blob/trunk/poi/src/main/java/org/apache/poi/sl/extractor/SlideShowExtractor.java): 로드한 슬라이드 객체의 표를 행·열별로 순회하고 그룹을 재귀 처리한다.
+- [Aspose.Slides](https://docs.aspose.com/slides/net/extracting-text-on-cloud-platforms-using-aspose-slides/): 파일/스트림에서 GetPresentationText를 호출해 슬라이드별 텍스트를 얻는 Office 독립 라이브러리다. 사내 DRM을 읽거나 현재 표 구조·순서를 동일하게 보존한다는 증거는 없다.
+- [공개 VSTO 텍스트 추출 사례](https://note.com/mikan05/n/n9b644efd1e10): 추가 기능 안에서 표 셀을 순회해 하나의 문자열로 조합한다. 속도 수치는 없으며 예시의 클립보드 반환과 위치 정렬은 그대로 적용하지 않는다.
+
+셀 순회 자체보다 PowerPoint 밖에서 매 셀마다 프로세스 간 요청을 반복하는지를 구분한다.
+Office 2016에서는 승인된 내부 추가 기능 배포 가능 여부를 확인한다. 가능한 경로의
+VDI 시제품을 기존 리더와 같은 파일로 비교해 전체·표 읽기 시간, 행·열·셀 수와 실제 문자열
+동일성을 메모리에서 검증한다. 병합 셀·빈 셀·셀 내 줄바꿈·중첩 그룹도 비교한다.
+내부 함수가 외부 왕복 비용을 줄일 것이라는 판단은 구조상 가설이며 아직 실측하지 않았다.
+사내 PowerPoint에서의 시제품 실행·DRM 속도 비교는 미실행이다.
+
+대안 중 [getFileAsync](https://learn.microsoft.com/en-us/office/dev/add-ins/develop/get-the-whole-document-from-an-add-in-for-powerpoint-or-word?tabs=powerpoint)는
+전체 파일을 얻지만 공식 문서상 로컬 임시 복사본을 만든다. 평문 파일 비저장 계약을 충족한다고
+가정하지 않는다. [형식 지원표](https://learn.microsoft.com/en-us/javascript/api/office/office.document?view=common-js)에서
+PowerPoint는 Text 형식을 지원하지 않는다. 클립보드 Copy는 공유 클립보드를 변경하며
+표 전체의 문자열/HTML 제공 보장과 DRM 허용 여부를 확인하지 못해 우선순위에서 제외한다.
+
+#### 사전 검증 도구 확인 결과 (2026-10-11)
+
+Office 없이 비교 계약·실문서 변환 차단·본문 미출력·오류 시 중단을 검증했다.
+전체 회귀는 1,095건 통과·3건 건너뜀이며, 이후 추가·최종화한 PPT 회귀 24건도 통과했다.
+C# 시제품은 .NET Framework 컴파일과 가짜 개체를 이용한 실제 순회 코드 검증을 통과했다.
+PowerShell 등록 스크립트는 구문만 확인했다. 실행 정책으로 Build 실행이 제한돼 정책 변경 없이
+컴파일러를 직접 사용했으며, 추가 기능 설치·등록 해제는 수행하지 않았다.
+
+자체 검사 결과의 `performance_verified=false`처럼 위 결과는 성능 향상의 증거가 아니다.
+Office 2016의 실제 로드·스레드 전달, 합성 PPT 변환, 사내 DRM 문서의 내용 보존·시간·종료 안전성은
+미검증이다. 두 후보는 사전 비교 대상이며 운영 적용은 사내 실측 후 결정한다.
+
+#### 다음 검증
+
+사용자가 사내 Office 2016·인터넷 폐쇄망 조건을 확인했다. `Table.values`의 PowerPointApi 1.8은
+Office 2016에서 사용할 수 없어 현재 시제품 후보에서 제외한다.
+
+`scripts/diag_ppt_read.py`와 시험용 C# COM 추가 기능으로 기존 읽기·PPTX 변환·내부 순회를
+비교한다. 실행·등록·판독은 [PPT 검증 안내](guides/PPT_PROBE.md)를 따른다. 운영 코드는 변경하지
+않았다. 변환은 합성 파일만 허용하고 실제 문서는 저장 없이 기존 COM/내부 읽기와 비교한다.
+추가 기능 등록은 사내 허용 후 사용자가 수행하며 자동 설치·정책 변경은 없다.
+사내 Office·DRM 실측은 미실행이다. 같은 파일의 내용·표/그룹 순서·건수와 전체 시간 비교가 완료 기준이다.
+
+추가 제안인 COM→PPTX 사본 저장→XML 읽기는 외부 셀 호출을 줄일 수 있으나
+현재 대상은 이미 DRM PPTX다. 사본이 DRM으로 보호되면 직접 파싱 가능 여부를 확인해야
+하며, 복호화 사본을 저장하면 CLAUDE.md의 평문 파일 비저장 계약과 충돌한다.
+운영 경로에 임시 평문 저장을 도입하지 않는다. 이번에는 변환 실험을 실행하지 않았다.
 
 ## 4. Office 종료 정리 확인
 
