@@ -17,6 +17,7 @@ from types import ModuleType
 from typing import Any, TYPE_CHECKING
 
 from knowmate.secure import com_stage
+from knowmate.secure.ppt_diagnostics import PptReadDiagnostics
 from knowmate.secure.text_util import format_table
 
 if TYPE_CHECKING:
@@ -653,51 +654,82 @@ class ExcelComReader:
                 timer.log_summary()
 
 
-def _ppt_shape_texts(shape) -> list[str]:
-    """PowerPoint 도형 하나에서 텍스트를 추출한다. 그룹은 재귀, 표는 셀을 펼친다.
+def _ppt_shape_texts(
+    shape: Any, diagnostics: PptReadDiagnostics | None = None,
+    slide: int = 0, position: tuple[int, ...] = (),
+) -> list[str]:
+    """그룹·표·텍스트 추출 순서를 유지하며 기존 COM 읽기를 계측한다."""
+    def read(operation, action, row=0, column=0):
+        if diagnostics is None:
+            return action()
+        return diagnostics.read(operation, action, slide, position, row, column)
 
-    COM 속성 접근은 도형 타입별로 예외가 날 수 있어 각 분기를 try로 감싼다.
-    """
-    # 그룹 도형(조직도) → 내부 도형 재귀
+    started = time.monotonic()
+    kind = "other"
+    shape_type = -1
+    rows = columns = 0
+    if diagnostics is not None:
+        diagnostics.shape_started(slide, position)
     try:
-        if shape.Type == _MSO_GROUP:
-            out: list[str] = []
-            for child in shape.GroupItems:
-                out.extend(_ppt_shape_texts(child))
-            return out
-    except Exception as exc:
-        _poison_if_fatal(exc, "POWERPNT.EXE")
-        pass
-
-    # 표 도형 → 셀(1-indexed) 순회 후 ' | ' 텍스트화
-    try:
-        if shape.HasTable:
-            table = shape.Table
-            rows: list[list[str]] = []
-            for r in range(1, table.Rows.Count + 1):
-                rows.append(
-                    [
-                        table.Cell(r, c).Shape.TextFrame.TextRange.Text
-                        for c in range(1, table.Columns.Count + 1)
-                    ]
+        try:
+            shape_type = read("type", lambda: shape.Type)
+            if shape_type == _MSO_GROUP:
+                kind = "group"
+                if diagnostics is not None:
+                    diagnostics.count(slide, "groups")
+                children = read("group_items", lambda: shape.GroupItems)
+                items = (
+                    enumerate(children, 1) if diagnostics is None
+                    else diagnostics.items(children, "group", slide, position)
                 )
-            table_text = format_table(rows)
-            return [table_text] if table_text else []
-    except Exception as exc:
-        _poison_if_fatal(exc, "POWERPNT.EXE")
-        pass
+                out: list[str] = []
+                for index, child in items:
+                    out.extend(_ppt_shape_texts(child, diagnostics, slide, position + (index,)))
+                return out
+        except Exception as exc:
+            _poison_if_fatal(exc, "POWERPNT.EXE")
 
-    # 일반 텍스트 프레임
-    try:
-        if shape.HasTextFrame:
-            t = shape.TextFrame.TextRange.Text.strip()
-            if t:
-                return [t]
-    except Exception as exc:
-        _poison_if_fatal(exc, "POWERPNT.EXE")
-        pass
+        try:
+            if read("has_table", lambda: shape.HasTable):
+                kind = "table"
+                if diagnostics is not None:
+                    diagnostics.count(slide, "tables")
+                table = read("table", lambda: shape.Table)
+                rows = read("table_rows", lambda: table.Rows.Count)
+                columns = read("table_columns", lambda: table.Columns.Count) if rows else 0
+                grid: list[list[str]] = []
+                for row in range(1, rows + 1):
+                    cells: list[str] = []
+                    for column in range(1, columns + 1):
+                        if diagnostics is not None:
+                            diagnostics.count(slide, "cells")
+                        cells.append(read(
+                            "cell_text", lambda: table.Cell(row, column).Shape.TextFrame.TextRange.Text,
+                            row, column,
+                        ))
+                    grid.append(cells)
+                table_text = format_table(grid)
+                return [table_text] if table_text else []
+        except Exception as exc:
+            _poison_if_fatal(exc, "POWERPNT.EXE")
 
-    return []
+        try:
+            if read("has_text_frame", lambda: shape.HasTextFrame):
+                kind = "text"
+                if diagnostics is not None:
+                    diagnostics.count(slide, "text_frames")
+                text = read("text", lambda: shape.TextFrame.TextRange.Text).strip()
+                if text:
+                    return [text]
+        except Exception as exc:
+            _poison_if_fatal(exc, "POWERPNT.EXE")
+        return []
+    finally:
+        if diagnostics is not None:
+            diagnostics.shape_finished(
+                slide, position, kind, started, rows, columns,
+                shape_type if isinstance(shape_type, int) else -1,
+            )
 
 
 class PowerPointComReader:
@@ -708,10 +740,8 @@ class PowerPointComReader:
 
         단계(dispatch/open/read/close)별 소요시간을 계측한다(COM 처리 안정화).
 
-        슬라이드 순회는 건수·최대 1건 소요시간을 함께 남긴다: 실기에서 DRM ppt의
-        전체 처리시간이 실행마다 크게 흔들리는데, `read` 합계만으로는 "슬라이드가
-        많아서"와 "특정 슬라이드 하나에서 멈춰서"를 구분할 수 없다. 대응이 완전히
-        달라지는 구분이라(사전 판별 vs 순회 방식 교체) 계측이 선행돼야 한다.
+        슬라이드·도형별 건수와 구간 시간을 기록한다. 진행 로그 스레드는 COM을
+        호출하지 않고 현재 읽기 위치만 보고하며 read 단계 시작시각은 유지한다.
         """
         timer = com_stage.StageTimer(path)
         prs = None
@@ -724,19 +754,24 @@ class PowerPointComReader:
                 prs = ppt.Presentations.Open(str(Path(path).resolve()), ReadOnly=True, WithWindow=False)
                 if prs is None:
                     raise OfficeComPoisonError("POWERPNT.EXE")
-            with timer.stage(com_stage.STAGE_READ):
+            with timer.stage(com_stage.STAGE_READ), PptReadDiagnostics(path) as diagnostics:
                 slides: list[str] = []
                 slide_count = 0
                 slowest_slide = 0.0
-                for slide in prs.Slides:
+                slide_collection = diagnostics.read("slides", lambda: prs.Slides, 0)
+                for slide_index, slide in diagnostics.items(slide_collection, "slides", 0):
                     # 슬라이드마다 com_stage.begin()을 다시 부르지는 않는다 — 그러면
                     # 단계 시작시각이 갱신돼 워치독이 보는 "몇 초째 멈췄는지"가
                     # 초기화되고, 한 슬라이드에서 멈춘 행오버를 놓친다.
                     _t0 = time.monotonic()
                     texts: list[str] = []
-                    for shape in slide.Shapes:
-                        texts.extend(_ppt_shape_texts(shape))
-                    slowest_slide = max(slowest_slide, time.monotonic() - _t0)
+                    try:
+                        shapes = diagnostics.read("shapes", lambda: slide.Shapes, slide_index)
+                        for shape_index, shape in diagnostics.items(shapes, "shapes", slide_index):
+                            texts.extend(_ppt_shape_texts(shape, diagnostics, slide_index, (shape_index,)))
+                    finally:
+                        slowest_slide = max(slowest_slide, time.monotonic() - _t0)
+                        diagnostics.slide_finished(slide_index)
                     slide_count += 1
                     texts = [t for t in texts if t.strip()]
                     if texts:

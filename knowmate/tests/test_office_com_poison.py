@@ -376,6 +376,7 @@ def test_xls_dynamic_fallback_reports_actual_com_and_hooks(monkeypatch):
     from knowmate.secure import AutoReader
 
     reader = AutoReader()
+    monkeypatch.setattr(reader, "_guard_office_busy", lambda *_: None)
     monkeypatch.setattr(reader._plain, "extract", lambda path: (_ for _ in ()).throw(RuntimeError("xlrd")))
     calls = []
 
@@ -517,6 +518,7 @@ def test_dynamic_com_begin_failure_still_calls_end(monkeypatch):
     from knowmate.secure import AutoReader
 
     reader = AutoReader()
+    monkeypatch.setattr(reader, "_guard_office_busy", lambda *_: None)
     monkeypatch.setattr(reader._plain, "extract", lambda path: (_ for _ in ()).throw(RuntimeError("xlrd")))
     calls = []
 

@@ -67,6 +67,7 @@ Phase 1~4 완료(RAG 지식검색), 5a 완료(Knox `.mysingle` + 표준 `.eml` �
 | 메일 처리 중 종료 후 Office 잔류 | 문서 완료 시 Office 정리·임베딩 취소·단계별 종료 로그 구현, fake·localhost 회귀 통과 | [진단 §4](DIAGNOSTICS.md#4-office-종료-정리-확인)의 사내 종료·PID 확인 대기 |
 | 상태 JSON·유휴 스캔 | 단계별 실측 대기 | JSON 처리와 실제 파일 접근 비용을 구분한 뒤 개선 선택 |
 | 검색·임베딩·COM 성능 | 실측 대기 | 진단 문서의 검증 자료 확보 |
+| PowerPoint COM 슬라이드 읽기 | 슬라이드·도형·표 읽기 구간과 진행 위치 계측 구현 | [PowerPoint 진단](DIAGNOSTICS.md#powerpoint-com-슬라이드-읽기-2026-10-11)의 같은 VDI 파일로 추출 결과·시간 비교 |
 | 질문 비동기화 | 미착수 | [상세 설계](design/ISSUE_B_query_async.md)에 따른 별도 변경·검증 |
 | 실패 원인 판별 6b | 보류 | 오류 코드 실측, 워치독 밖 probe I/O의 행오버 위험 해소 |
 | 공용 인덱스 5b | 예정 | 로컬 캐시 복사 배포 설계·검증 |
