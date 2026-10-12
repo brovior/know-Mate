@@ -244,7 +244,8 @@ def test_conversion_uses_savecopyas_and_never_overwrites_source(tmp_path, monkey
     assert "save" in result.seconds and result.seconds["total"] >= result.seconds["save"]
 
 
-def test_csharp_internal_reader_contract_without_office_or_registration(tmp_path):
+@pytest.mark.parametrize("harness_name", ["ppt_probe_harness.cs", "ppt_probe_connection_harness.cs"])
+def test_csharp_contract_without_office_or_registration(tmp_path, harness_name):
     compiler = Path(os.environ.get("WINDIR", "")) / "Microsoft.NET/Framework/v4.0.30319/csc.exe"
     if os.name != "nt" or not compiler.is_file():
         pytest.skip("Windows .NET Framework compiler required; no Office needed")
@@ -255,7 +256,7 @@ def test_csharp_internal_reader_contract_without_office_or_registration(tmp_path
         [str(compiler), "/nologo", "/target:library", f"/out:{dll}",
          "/reference:Microsoft.CSharp.dll", "/reference:System.Core.dll",
          "/reference:System.Web.Extensions.dll", str(root / "scripts/ppt_addin/PptReadProbe.cs")],
-        [str(compiler), "/nologo", f"/out:{harness}", str(root / "knowmate/tests/ppt_probe_harness.cs")],
+        [str(compiler), "/nologo", f"/out:{harness}", str(root / "knowmate/tests" / harness_name)],
         [str(harness), str(dll)],
     ]
     for command in commands:

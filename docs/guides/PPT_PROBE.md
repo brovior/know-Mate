@@ -156,6 +156,44 @@ powershell -NoProfile -File scripts\ppt_addin\manage.ps1 -Action Remove -OfficeB
 이 절차는 시험용이다. 다른 PC의 권한·보안정책·Office/DRM 호환성이나 일괄 배포 가능성을
 증명하지 않는다. 실제 문서 본문이나 추출 결과를 파일로 저장하지 않는다.
 
+### 로드 중 충돌한 뒤 수정본 재시험
+
+COM 객체 생성과 Office의 연결 콜백은 별도 단계다. 객체 생성이 성공해도 추가 기능을
+연결할 때 PowerPoint가 종료되면 로드 성공으로 취급하지 않는다. PowerPoint를 정상 종료하고
+설치 때와 같은 Scope·OfficeBitness로 Remove한다. 보안정책이나 Office의 다른 추가 기능은 변경하지 않는다.
+
+연결 규약 수정본은 DLL 재빌드가 필요하다. COM 객체 생성에 사용했던 PowerShell도 종료해
+이전 DLL 참조를 해제한다. 아래는 저장소 루트의 관리자 CMD·Office 64비트 예시다.
+먼저 수정된 C# 소스와 테스트를 내려받고 기존 시험용 등록을 해제한 상태에서 진행한다.
+
+```cmd
+powershell -NoProfile -File scripts\ppt_addin\manage.ps1 -Action Build
+powershell -NoProfile -Command "[Reflection.AssemblyName]::GetAssemblyName((Resolve-Path 'scripts\ppt_addin\bin\PptReadProbe.dll').Path).Version.ToString()"
+.venv\Scripts\python.exe -m pytest knowmate\tests\test_ppt_probe.py -v
+```
+
+DLL 버전은 `0.1.1.0`이어야 한다. 다른 버전이면 재등록하지 않고 빌드 결과를 확인한다.
+Windows .NET Framework 컴파일러가 있으면 두 C# 하네스도 실행된다. 연결 하네스는 실제
+COM callable wrapper의 Dual vtable을 통해 연결·해제·시작·종료·실패 콜백을 호출한다.
+Office를 실행하거나 등록하지 않으며 내부 순회 하네스와 별개다. Linux에서 이 항목이
+skip된 결과는 네이티브 COM 검증 통과를 의미하지 않는다. 테스트가 실패하면 재등록하지 않는다.
+
+테스트를 통과한 뒤 컴퓨터 영역에 다시 등록한다.
+
+```cmd
+powershell -NoProfile -File scripts\ppt_addin\manage.ps1 -Action Install -OfficeBitness 64 -Scope Machine
+```
+
+PowerPoint가 앞선 충돌로 시험용 추가 기능을 비활성화했을 수 있다. 사용자 등록·컴퓨터 등록을
+반복해서 바꾸지 말고, PowerPoint의 추가 기능 화면에서 이 시험용 항목만 확인한다. Office가
+비활성 항목의 복구를 제공하면 수정 DLL의 테스트 통과 후 해당 항목만 복구한다. 체크를 연결할 때
+다시 종료되면 반복 활성화를 중단하고 같은 범위로 Remove한다. Office의 충돌 차단 기록을
+레지스트리에서 일괄 삭제하거나 Trust 정책을 우회하지 않는다.
+
+PowerPoint의 정상 실행·연결·종료를 먼저 확인하고 위 합성 시험을 repeat 1로 실행한다.
+성공한 뒤 repeat 3으로 늘린다. 수정은 COM 연결 규약 불일치를 해소한 것이며 실제 Office/DRM
+환경의 모든 충돌이 해결됐다는 뜻은 아니다. 시험 후 같은 범위로 Remove한다.
+
 도구와 등록 스크립트는 PowerPoint를 Quit·강제 종료하지 않는다. 사용자 PowerPoint가 실행 중이면
 기존 소유권 가드로 읽기를 연기한다. COM 호출 자체가 멈추면 즉시 취소가 보장되지 않는다.
 숨김 문서·DRM 추가 기능 공존·실제 Office 스레드 전달·잔류 프로세스는 사내 확인 대상이다.
