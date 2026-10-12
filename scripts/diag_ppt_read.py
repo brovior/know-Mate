@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from knowmate.secure import com_reader
+from knowmate.secure.ppt_diagnostics import probe_error_details
 from scripts.ppt_probe.readers import (
     PROG_ID, ProbeCloseFailure, ProbeFailure, Snapshot, compare, convert_synthetic, decode_slide,
     opened, read_addin, read_baseline, read_plain,
@@ -132,7 +133,8 @@ def benchmark(app: Any, path: Path, args: argparse.Namespace, scratch: Path) -> 
                 failures = True
                 _emit({"method": method, "iteration": iteration + 1, "status": "error",
                        "failed_stage": name, "error_type": type(exc).__name__,
-                       "hresult": com_reader.hresult_of(exc)})
+                       "hresult": com_reader.hresult_of(exc),
+                       **probe_error_details(exc)})
                 break
             verdict = compare(result["baseline"], result[method])
             total = result[method].seconds["total"]

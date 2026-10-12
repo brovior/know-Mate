@@ -10,6 +10,21 @@ import pytest
 from scripts import diag_ppt_read as cli
 from scripts.ppt_probe import readers
 from scripts.ppt_probe.fixture import create_pptx
+from knowmate.secure.ppt_diagnostics import probe_error_details
+
+
+def test_probe_error_details_keep_codes_without_arbitrary_content():
+    exc = RuntimeError("SECRET")
+    exc.excepinfo = (0, "SECRET_SOURCE", "SECRET_BODY", "SECRET_HELP", 0, -2147467259)
+    assert probe_error_details(exc) == {"inner_hresult": 0x80004005}
+    exc.excepinfo = (0, "SECRET_SOURCE", "probe_extract_failed:application:80004002", None, 0, -2147467259)
+    assert probe_error_details(exc) == {
+        "inner_hresult": 0x80004005, "probe_error": "probe_extract_failed",
+        "probe_stage": "application", "probe_inner_hresult": 0x80004002,
+    }
+    exc.excepinfo = (0, None, "probe_extract_failed:SECRET:80004002", None, 0, 0)
+    assert "SECRET" not in str(probe_error_details(exc))
+    assert probe_error_details(RuntimeError("SECRET")) == {}
 
 
 def _reply(nodes=None, **changes):
