@@ -1,11 +1,12 @@
 ﻿<#
 Build는 컴파일만 한다. Install/Remove는 사내 허용 후 사용자가 직접 실행한다.
-실험용 고유 CLSID·ProgID의 현재 사용자 레지스트리만 변경한다.
+선택한 범위의 실험용 고유 CLSID·ProgID·PowerPoint Addins 키만 변경한다.
 #>
-[CmdletBinding()]
+[CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [ValidateSet('Build', 'Install', 'Remove')][string]$Action = 'Build',
-    [ValidateSet('32', '64')][string]$OfficeBitness
+    [ValidateSet('32', '64')][string]$OfficeBitness,
+    [ValidateSet('User', 'Machine')][string]$Scope = 'User'
 )
 $ErrorActionPreference = 'Stop'
 $probeClassId = '{02BE8BA9-C02B-48AD-ADBB-9B5686D72B1E}'
@@ -14,6 +15,7 @@ $probeDll = Join-Path $PSScriptRoot 'bin\PptReadProbe.dll'
 
 if ($Action -eq 'Build') {
     $probeCompiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
+    if (!$PSCmdlet.ShouldProcess($probeDll, 'Compile probe DLL (no registration)')) { return }
     New-Item -ItemType Directory -Path (Split-Path -Parent $probeDll) -Force | Out-Null
     & $probeCompiler /nologo /target:library /platform:anycpu /optimize+ "/out:$probeDll" `
         /reference:Microsoft.CSharp.dll /reference:System.Core.dll /reference:System.Web.Extensions.dll `
@@ -30,28 +32,50 @@ if (Get-Process -Name POWERPNT -ErrorAction SilentlyContinue) {
 $probeView = if ($OfficeBitness -eq '32') {
     [Microsoft.Win32.RegistryView]::Registry32
 } else { [Microsoft.Win32.RegistryView]::Registry64 }
-$probeRoot = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
-    [Microsoft.Win32.RegistryHive]::CurrentUser, $probeView)
+$probeHive = if ($Scope -eq 'Machine') {
+    [Microsoft.Win32.RegistryHive]::LocalMachine
+} else { [Microsoft.Win32.RegistryHive]::CurrentUser }
 $probeClassKey = "Software\Classes\CLSID\$probeClassId"
 $probeProgKey = "Software\Classes\$probeProgId"
 $probeOfficeKey = "Software\Microsoft\Office\PowerPoint\Addins\$probeProgId"
+$probeTarget = "$probeHive ($OfficeBitness-bit): $probeClassKey; $probeProgKey; $probeOfficeKey"
+if (!$PSCmdlet.ShouldProcess($probeTarget, "$Action probe registration")) { return }
+if ($Scope -eq 'Machine') {
+    $probeIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    try {
+        $probePrincipal = [Security.Principal.WindowsPrincipal]::new($probeIdentity)
+        if (!$probePrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+            throw 'Machine 범위 등록·해제는 관리자 권한이 필요합니다. 사용자 범위로 자동 전환하지 않습니다.'
+        }
+    } finally { $probeIdentity.Dispose() }
+}
+$probeRoot = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+    $probeHive, $probeView)
 try {
     if ($Action -eq 'Remove') {
         foreach ($probeKey in @($probeOfficeKey, $probeProgKey, $probeClassKey)) {
             $probeRoot.DeleteSubKeyTree($probeKey, $false)
         }
-        Write-Output 'Probe registration removed; other add-ins unchanged.'
+        Write-Output "Probe registration removed: Scope=$Scope OfficeBitness=$OfficeBitness; other scopes/add-ins unchanged."
         return
     }
     if (!(Test-Path -LiteralPath $probeDll -PathType Leaf)) { throw 'Build를 먼저 실행하세요.' }
-    $probeAssembly = [Reflection.AssemblyName]::GetAssemblyName($probeDll).FullName
-    $probeValues = @{
+    $probeAssemblyName = [Reflection.AssemblyName]::GetAssemblyName($probeDll)
+    $probeAssembly = $probeAssemblyName.FullName
+    # RegAsm과 같은 버전별 CLR 등록 정보. 사용자·컴퓨터 범위에 동일하게 쓴다.
+    $probeManagedValues = @{
+        Class = 'AegisDesk.PptProbe.Connect'; Assembly = $probeAssembly
+        RuntimeVersion = 'v4.0.30319'; CodeBase = ([Uri]$probeDll).AbsoluteUri
+    }
+    # Office 목록에는 CLR·ProgID 등록을 마친 뒤 마지막으로 노출한다.
+    $probeValues = [ordered]@{
         $probeClassKey = @{ '' = 'Aegis Desk PPT read probe' }
         "$probeClassKey\InprocServer32" = @{
             '' = 'mscoree.dll'; ThreadingModel = 'Both'; Class = 'AegisDesk.PptProbe.Connect'
             Assembly = $probeAssembly; RuntimeVersion = 'v4.0.30319'
             CodeBase = ([Uri]$probeDll).AbsoluteUri
         }
+        "$probeClassKey\InprocServer32\$($probeAssemblyName.Version)" = $probeManagedValues
         "$probeClassKey\ProgId" = @{ '' = $probeProgId }
         $probeProgKey = @{ '' = 'Aegis Desk PPT read probe' }
         "$probeProgKey\CLSID" = @{ '' = $probeClassId }
@@ -72,5 +96,5 @@ try {
             }
         } finally { $probeRegistry.Dispose() }
     }
-    Write-Output 'Probe registered for current user; restart PowerPoint. Trust policy is not changed.'
+    Write-Output "Probe registered: Scope=$Scope OfficeBitness=$OfficeBitness; restart PowerPoint. Trust policy is not changed."
 } finally { $probeRoot.Dispose() }
