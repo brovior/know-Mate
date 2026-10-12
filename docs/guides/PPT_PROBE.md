@@ -94,7 +94,7 @@ Office 64비트이면 `-OfficeBitness 64`로 바꾼다. Python 비트수와 구�
 powershell -NoProfile -File scripts\ppt_addin\manage.ps1 -Action Install -OfficeBitness 32
 ```
 
-현재 사용자의 시험용 CLSID·ProgID·PowerPoint Addins 키만 등록한다. 매크로·서명·신뢰 정책을
+기본 `-Scope User`는 현재 사용자의 시험용 CLSID·ProgID·PowerPoint Addins 키만 등록한다. 매크로·서명·신뢰 정책을
 변경하지 않는다. Office에서 등록을 거부하거나 로드하지 못하면 도구는 unavailable로 보고하며
 Connect를 강제로 켜지 않는다. 등록된 DLL 경로를 옮기지 않는다.
 
@@ -103,6 +103,58 @@ Connect를 강제로 켜지 않는다. 등록된 DLL 경로를 옮기지 않는�
 ```cmd
 powershell -NoProfile -File scripts\ppt_addin\manage.ps1 -Action Remove -OfficeBitness 32
 ```
+
+### 컴퓨터 단위 등록 시험
+
+관리자 권한으로 실행하면서 UAC가 비활성인 환경에서는 COM이 사용자 등록을 무시하고
+컴퓨터 등록만 사용할 수 있다([Microsoft 설명](https://learn.microsoft.com/en-us/windows/win32/sysinfo/merged-view-of-hkey-classes-root)).
+`-Scope Machine`은 관리자 권한으로 지정한 Office 비트수의 HKLM 영역에 이 시험용 추가 기능만
+등록한다. 기본 User와 Machine은 서로 독립적이며, Remove도 지정한 범위만 해제한다.
+UAC·서명·신뢰 정책을 변경하거나 관리자 권한을 자동 요청하지 않는다.
+
+PowerPoint를 모두 정상 종료하고 저장소 루트의 **관리자 권한 CMD**에서 실행한다.
+아래는 Office 64비트이며, 32비트 Office에서는 모든 명령의 OfficeBitness를 32로 바꾼다.
+
+```cmd
+rem 두 범위의 같은 ProgID가 시험 결과에 영향을 주지 않도록 기존 사용자 등록을 먼저 해제
+powershell -NoProfile -File scripts\ppt_addin\manage.ps1 -Action Remove -OfficeBitness 64 -Scope User
+rem 등록할 범위·키를 미리 확인(레지스트리 변경 없음)
+powershell -NoProfile -File scripts\ppt_addin\manage.ps1 -Action Install -OfficeBitness 64 -Scope Machine -WhatIf
+powershell -NoProfile -File scripts\ppt_addin\manage.ps1 -Action Install -OfficeBitness 64 -Scope Machine
+```
+
+DLL은 기존 Build 결과를 사용하며 실행 중 다운로드하지 않는다. Install은 기본 CLR 정보와
+실제 어셈블리 버전별 하위키를 함께 등록한다. 버전 하위키의 존재만으로 로드 성공을 판정하지 않는다.
+
+등록 후 새 64비트 Windows PowerShell에서 COM 생성만 먼저 시험한다.
+
+```powershell
+try {
+    $probeType = [Type]::GetTypeFromProgID('AegisDesk.PptReadProbe', $true)
+    $null = [Activator]::CreateInstance($probeType)
+    'COM 객체 생성 성공'
+} catch {
+    $_.Exception.GetBaseException().Message
+}
+```
+
+COM 생성에 성공하면 PowerPoint의 COM 추가 기능에서 `Aegis Desk PPT read probe`의 연결을
+확인한다. 체크가 유지되지 않으면 표시된 로드 오류를 확인하며 재시험 성공으로 취급하지 않는다.
+PowerPoint를 정상 종료한 뒤 기존 Python 환경에서 최소 합성 시험을 실행한다.
+
+```cmd
+.venv\Scripts\python.exe scripts\diag_ppt_read.py --synthetic --method addin --repeat 1
+```
+
+시험 후 PowerPoint를 정상 종료하고 **설치 때와 같은 Machine 범위·Office 비트수**로 해제한다.
+DLL 파일을 옮기거나 삭제하기 전에 등록을 해제한다.
+
+```cmd
+powershell -NoProfile -File scripts\ppt_addin\manage.ps1 -Action Remove -OfficeBitness 64 -Scope Machine
+```
+
+이 절차는 시험용이다. 다른 PC의 권한·보안정책·Office/DRM 호환성이나 일괄 배포 가능성을
+증명하지 않는다. 실제 문서 본문이나 추출 결과를 파일로 저장하지 않는다.
 
 도구와 등록 스크립트는 PowerPoint를 Quit·강제 종료하지 않는다. 사용자 PowerPoint가 실행 중이면
 기존 소유권 가드로 읽기를 연기한다. COM 호출 자체가 멈추면 즉시 취소가 보장되지 않는다.
