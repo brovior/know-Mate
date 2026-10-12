@@ -7,22 +7,29 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Web.Script.Serialization;
 
-[assembly: AssemblyVersion("0.1.0.0")]
+[assembly: AssemblyVersion("0.1.1.0")]
 [assembly: ComVisible(false)]
 
 namespace AegisDesk.PptProbe
 {
     /// <summary>Office 추가 기능의 연결·해제 콜백 계약.</summary>
-    [ComImport, Guid("B65AD801-ABAF-11D0-BB8B-00A0C90F2744")]
-    [InterfaceType(ComInterfaceType.InterfaceIsIDispatch)]
+    [ComImport, ComVisible(true), Guid("B65AD801-ABAF-11D0-BB8B-00A0C90F2744")]
+    // Office 연결 계약은 IDispatch와 직접 vtable 호출을 모두 지원한다.
+    // 동일 IID를 dispinterface로 선언하면 직접 호출의 ABI가 달라진다.
+    [InterfaceType(ComInterfaceType.InterfaceIsDual)]
     public interface IDTExtensibility2
     {
-        [DispId(1)] void OnConnection([MarshalAs(UnmanagedType.IDispatch)] object application,
-            int connectMode, [MarshalAs(UnmanagedType.IDispatch)] object addin, ref Array custom);
-        [DispId(2)] void OnDisconnection(int removeMode, ref Array custom);
-        [DispId(3)] void OnAddInsUpdate(ref Array custom);
-        [DispId(4)] void OnStartupComplete(ref Array custom);
-        [DispId(5)] void OnBeginShutdown(ref Array custom);
+        [DispId(1)] void OnConnection([In, MarshalAs(UnmanagedType.IDispatch)] object application,
+            [In] int connectMode, [In, MarshalAs(UnmanagedType.IDispatch)] object addin,
+            [In, Out, MarshalAs(UnmanagedType.SafeArray, SafeArraySubType = VarEnum.VT_VARIANT)] ref Array custom);
+        [DispId(2)] void OnDisconnection([In] int removeMode,
+            [In, Out, MarshalAs(UnmanagedType.SafeArray, SafeArraySubType = VarEnum.VT_VARIANT)] ref Array custom);
+        [DispId(3)] void OnAddInsUpdate(
+            [In, Out, MarshalAs(UnmanagedType.SafeArray, SafeArraySubType = VarEnum.VT_VARIANT)] ref Array custom);
+        [DispId(4)] void OnStartupComplete(
+            [In, Out, MarshalAs(UnmanagedType.SafeArray, SafeArraySubType = VarEnum.VT_VARIANT)] ref Array custom);
+        [DispId(5)] void OnBeginShutdown(
+            [In, Out, MarshalAs(UnmanagedType.SafeArray, SafeArraySubType = VarEnum.VT_VARIANT)] ref Array custom);
     }
 
     /// <summary>외부 비교 스크립트에 노출하는 최소 추출 계약.</summary>
@@ -47,21 +54,32 @@ namespace AegisDesk.PptProbe
         /// <summary>Office가 로드할 때 주 STA와 자동화 객체를 연결한다.</summary>
         public void OnConnection(object app, int connectMode, object addin, ref Array custom)
         {
+            application = null;
+            mainThread = 0;
             if (Thread.CurrentThread.GetApartmentState() != ApartmentState.STA)
                 throw new COMException("probe_requires_office_sta");
+            if (app == null || addin == null)
+                throw new COMException("probe_missing_host");
             application = app;
             mainThread = Thread.CurrentThread.ManagedThreadId;
-            ((dynamic)addin).Object = this;
+            try { ((dynamic)addin).Object = this; }
+            catch (Exception exc)
+            {
+                // 연결 실패 뒤 ProtocolVersion이 정상 연결로 오판하지 않게 한다.
+                application = null;
+                mainThread = 0;
+                throw new COMException("probe_connect_failed", Marshal.GetHRForException(exc));
+            }
         }
 
         /// <summary>Office 연결이 끝나면 보유 참조만 해제한다.</summary>
-        public void OnDisconnection(int removeMode, ref Array custom) { application = null; }
+        public void OnDisconnection(int removeMode, ref Array custom) { application = null; mainThread = 0; }
         /// <summary>추가 기능 목록 변경에는 작업하지 않는다.</summary>
         public void OnAddInsUpdate(ref Array custom) { }
         /// <summary>Office 시작 완료에는 문서를 열거나 읽지 않는다.</summary>
         public void OnStartupComplete(ref Array custom) { }
         /// <summary>Office 종료에는 보유 참조만 해제한다.</summary>
-        public void OnBeginShutdown(ref Array custom) { application = null; }
+        public void OnBeginShutdown(ref Array custom) { application = null; mainThread = 0; }
 
         private void RequireHostThread()
         {
