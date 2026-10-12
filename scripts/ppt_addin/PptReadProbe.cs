@@ -114,11 +114,13 @@ namespace AegisDesk.PptProbe
             RequireHostThread();
             if (reading) throw new COMException("probe_reentrant_request");
             reading = true;
+            string stage = "application";
             try
             {
                 dynamic prs = presentation;
                 if (!SameApplication((object)prs.Application))
                     throw new COMException("probe_wrong_application");
+                stage = "slide_count";
                 if (slide < 1 || slide > (int)prs.Slides.Count)
                     throw new COMException("probe_invalid_slide");
                 var watch = Stopwatch.StartNew();
@@ -126,7 +128,9 @@ namespace AegisDesk.PptProbe
                 var counts = new Dictionary<string, int> {
                     {"shapes", 0}, {"groups", 0}, {"tables", 0}, {"cells", 0}, {"errors", 0}
                 };
+                stage = "shapes";
                 dynamic shapes = prs.Slides[slide].Shapes;
+                stage = "read_shapes";
                 foreach (object shape in shapes) ReadShape(shape, nodes, counts);
                 watch.Stop();
                 var payload = new Dictionary<string, object> {
@@ -134,13 +138,17 @@ namespace AegisDesk.PptProbe
                     {"seconds", watch.Elapsed.TotalSeconds}
                 };
                 var serializer = new JavaScriptSerializer { MaxJsonLength = 32 * 1024 * 1024 };
+                stage = "serialize";
                 return serializer.Serialize(payload);
             }
             catch (Exception exc)
             {
                 if (IsFatal(exc)) throw;
                 // COM 예외에 셀 내용·경로·JSON을 포함하지 않는다.
-                throw new COMException("probe_extract_failed", unchecked((int)0x80004005));
+                // 고정 단계와 숫자 코드만 반환하고 예외 본문은 외부에 노출하지 않는다.
+                string code = unchecked((uint)Marshal.GetHRForException(exc)).ToString("X8");
+                throw new COMException("probe_extract_failed:" + stage + ":" + code,
+                    unchecked((int)0x80004005));
             }
             finally { reading = false; }
         }

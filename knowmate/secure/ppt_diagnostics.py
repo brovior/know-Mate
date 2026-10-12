@@ -1,5 +1,6 @@
 """PowerPoint 읽기 위치·개수·시간만 기록하며 COM 객체는 보관하지 않는다."""
 import logging
+import re
 import threading
 import time
 from collections import Counter
@@ -10,6 +11,34 @@ logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 _PROGRESS_INTERVAL_SEC = 10.0
 _SLOW_SHAPE_SEC = 1.0
+
+
+def probe_error_details(exc: BaseException) -> dict[str, Any]:
+    """COM 내부 코드와 허용된 probe 표식만 반환하고 임의 예외 문구는 버린다."""
+    info = getattr(exc, "excepinfo", None)
+    if not isinstance(info, (tuple, list)) or len(info) < 6:
+        return {}
+    result: dict[str, Any] = {}
+    if isinstance(info[5], int):
+        result["inner_hresult"] = info[5] & 0xFFFFFFFF
+    description = info[2]
+    # Office 예외 문구에는 문서 내용이 포함될 수 있어 원문을 출력하지 않는다.
+    allowed = {
+        "probe_wrong_thread_or_disconnected", "probe_reentrant_request",
+        "probe_extract_failed", "probe_wrong_application", "probe_invalid_slide",
+    }
+    if isinstance(description, str):
+        if description in allowed:
+            result["probe_error"] = description
+        else:
+            match = re.fullmatch(
+                r"probe_extract_failed:(application|slide_count|shapes|read_shapes|serialize):([0-9A-F]{8})",
+                description,
+            )
+            if match:
+                result.update(probe_error="probe_extract_failed", probe_stage=match[1],
+                              probe_inner_hresult=int(match[2], 16))
+    return result
 
 
 @dataclass
