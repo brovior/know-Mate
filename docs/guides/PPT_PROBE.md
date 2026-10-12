@@ -180,6 +180,12 @@ skip된 결과는 네이티브 COM 검증 통과를 의미하지 않는다. 테�
 
 테스트를 통과한 뒤 컴퓨터 영역에 다시 등록한다.
 
+연결 하네스의 `probe_missing_host`는 호스트가 없는 입력을 거부하는 의도적 실패 시험에 사용된다.
+정상 콜백의 배열 왕복은 각 콜백 직후 확인하며 실패 시험에서는 정상 출력 배열을 요구하지 않는다.
+배열 검사 실패는 `after_connect_array_null`, `after_shutdown_get_hr_0x…`처럼 단계와 코드로 구분한다.
+검사 실패를 Office 로드 성공으로 해석하지 않는다. 검증 하네스만 수정된 경우 DLL 재빌드는
+필요 없지만 갱신된 테스트로 다시 통과해야 재등록한다.
+
 ```cmd
 powershell -NoProfile -File scripts\ppt_addin\manage.ps1 -Action Install -OfficeBitness 64 -Scope Machine
 ```

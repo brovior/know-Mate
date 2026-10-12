@@ -48,8 +48,16 @@ public static class ConnectionHarness
         return Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(table, number * IntPtr.Size), signature);
     }
 
-    private static void CustomValue(IntPtr array, bool write)
+    private static void ArrayResult(int result, string stage)
     {
+        // 의도적인 COM 실패의 IErrorInfo가 남을 수 있으므로 배열 API의 HRESULT만 사용한다.
+        if (result < 0)
+            throw new COMException(stage + "_hr_0x" + unchecked((uint)result).ToString("X8"), result);
+    }
+
+    private static void CustomValue(IntPtr array, bool write, string stage)
+    {
+        if (array == IntPtr.Zero) throw new Exception(stage + "_array_null");
         IntPtr variant = Marshal.AllocCoTaskMem(32); // x86·x64 VARIANT 크기 이상.
         for (int offset = 0; offset < 32; offset += 8) Marshal.WriteInt64(variant, offset, 0);
         try
@@ -58,11 +66,11 @@ public static class ConnectionHarness
             if (write)
             {
                 Marshal.GetNativeVariantForObject(42, variant);
-                Marshal.ThrowExceptionForHR(SafeArrayPutElement(array, ref index, variant));
+                ArrayResult(SafeArrayPutElement(array, ref index, variant), stage + "_put");
             }
             else
             {
-                Marshal.ThrowExceptionForHR(SafeArrayGetElement(array, ref index, variant));
+                ArrayResult(SafeArrayGetElement(array, ref index, variant), stage + "_get");
                 if (!Object.Equals(Marshal.GetObjectForNativeVariant(variant), 42))
                     throw new Exception("native_custom_array_changed");
             }
@@ -114,6 +122,24 @@ public static class ConnectionHarness
         Disconnected(type, instance);
     }
 
+    private static void ManagedArrayErrors()
+    {
+        // 앞선 콜백 오류가 남아도 성공 코드와 배열 API의 실제 실패 코드를 혼동하지 않는다.
+        Marshal.GetHRForException(new COMException("SECRET_PREVIOUS_ERROR", unchecked((int)0x80004005)));
+        ArrayResult(0, "array_check");
+        try
+        {
+            ArrayResult(unchecked((int)0x8002000B), "array_check");
+            throw new Exception("array_failure_accepted");
+        }
+        catch (COMException exc)
+        {
+            if (exc.ErrorCode != unchecked((int)0x8002000B)
+                || exc.Message != "array_check_hr_0x8002000B")
+                throw new Exception("array_failure_error_info_mixed");
+        }
+    }
+
     [STAThread]
     public static int Main(string[] args)
     {
@@ -127,6 +153,7 @@ public static class ConnectionHarness
             throw new Exception("office_dual_contract_mismatch");
 
         ManagedLifecycle(type);
+        ManagedArrayErrors();
         // Linux의 보조 실행은 Dual 메타데이터·관리형 콜백만 확인한다.
         // SAFEARRAY 마샬링과 네이티브 COM 검증은 Windows 경로에서만 판정한다.
         if (args.Length == 2 && args[1] == "--managed-only")
@@ -165,20 +192,30 @@ public static class ConnectionHarness
             var shutdown = (Notification)Slot(pointer, 11, typeof(Notification));
             custom = SafeArrayCreateVector((ushort)VarEnum.VT_VARIANT, 0, 1);
             if (custom == IntPtr.Zero) throw new Exception("native_custom_array_allocation_failed");
-            CustomValue(custom, true);
+            CustomValue(custom, true, "setup");
             Disconnected(type, instance);
             if (connect(pointer, appPointer, 1, addinPointer, ref custom) != 0
                 || !Object.ReferenceEquals(addin.Object, instance)
                 || (int)type.GetMethod("ProtocolVersion").Invoke(instance, null) != 1)
                 throw new Exception("native_connection_failed");
-            if (update(pointer, ref custom) != 0 || startup(pointer, ref custom) != 0
-                || disconnect(pointer, 1, ref custom) != 0)
-                throw new Exception("native_callbacks_failed");
+            CustomValue(custom, false, "after_connect");
+            if (update(pointer, ref custom) != 0) throw new Exception("native_update_failed");
+            CustomValue(custom, false, "after_update");
+            if (startup(pointer, ref custom) != 0) throw new Exception("native_startup_failed");
+            CustomValue(custom, false, "after_startup");
+            if (disconnect(pointer, 1, ref custom) != 0) throw new Exception("native_disconnect_failed");
+            CustomValue(custom, false, "after_disconnect");
             Disconnected(type, instance);
-            if (connect(pointer, appPointer, 1, addinPointer, ref custom) != 0
-                || shutdown(pointer, ref custom) != 0)
-                throw new Exception("native_shutdown_failed");
+            if (connect(pointer, appPointer, 1, addinPointer, ref custom) != 0)
+                throw new Exception("native_reconnect_failed");
+            CustomValue(custom, false, "after_reconnect");
+            if (shutdown(pointer, ref custom) != 0) throw new Exception("native_shutdown_failed");
+            CustomValue(custom, false, "after_shutdown");
             Disconnected(type, instance);
+
+            // 실패한 콜백의 출력 배열을 정상 결과로 검증하지 않는다. 성공 시 왕복은 위에서 확인한다.
+            ArrayResult(SafeArrayDestroy(custom), "success_array_destroy");
+            custom = IntPtr.Zero;
 
             // 실패는 HRESULT로 반환되고 부분 연결 상태나 원래 오류 문구를 남기지 않는다.
             addin.Reject = true;
@@ -191,7 +228,6 @@ public static class ConnectionHarness
             if (connect(pointer, IntPtr.Zero, 1, addinPointer, ref custom) >= 0)
                 throw new Exception("native_missing_host_accepted");
             Disconnected(type, instance);
-            CustomValue(custom, false);
         }
         finally
         {
