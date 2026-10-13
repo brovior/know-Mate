@@ -257,8 +257,10 @@ class TestAutoReader:
         captured = {}
 
         class _FakeCom:
-            def __init__(self, xlsx_block_rows=None):
-                captured_kwargs["xlsx_block_rows"] = xlsx_block_rows
+            def __init__(self, xlsx_block_rows=None, *, ppt_reader_mode=None,
+                         ppt_policy="ready", ppt_operation=None):
+                captured.update(xlsx_block_rows=xlsx_block_rows, ppt_reader_mode=ppt_reader_mode,
+                                ppt_policy=ppt_policy, ppt_operation=ppt_operation)
 
             def extract(self, path):
                 captured["path"] = path
@@ -276,6 +278,9 @@ class TestAutoReader:
         p.write_bytes(b"<## " + b"\x00" * 20)
         assert reader.extract(str(p)) == "COM_RESULT"
         assert captured["path"] == str(p)
+        assert captured["ppt_reader_mode"] == "auto"
+        assert captured["ppt_policy"] == "ready"
+        assert captured["ppt_operation"] is None
 
     def test_auto_reader_xls_without_xlrd_or_com_raises(self):
         """xlrd·win32com 둘 다 없는 환경에서 .xls는 결국 ComUnavailableError로 귀결된다."""
@@ -611,8 +616,10 @@ class TestAutoReaderOle2Fallback:
         captured = {}
 
         class _FakeCom:
-            def __init__(self, xlsx_block_rows=None):
-                captured_kwargs["xlsx_block_rows"] = xlsx_block_rows
+            def __init__(self, xlsx_block_rows=None, *, ppt_reader_mode=None,
+                         ppt_policy="ready", ppt_operation=None):
+                captured.update(xlsx_block_rows=xlsx_block_rows, ppt_reader_mode=ppt_reader_mode,
+                                ppt_policy=ppt_policy, ppt_operation=ppt_operation)
 
             def extract(self, path):
                 captured["path"] = path
@@ -624,6 +631,9 @@ class TestAutoReaderOle2Fallback:
         p.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\x00" * 16)  # OLE2 magic
         assert AutoReader().extract(str(p)) == "COM_RESULT"
         assert captured["path"] == str(p)
+        assert captured["ppt_reader_mode"] == "auto"
+        assert captured["ppt_policy"] == "ready"
+        assert captured["ppt_operation"] is None
 
     def test_drm_wrapped_xlsx_routes_to_com(self, tmp_path, monkeypatch):
         """확장자는 .xlsx인데 zip도 OLE2도 아닌 DRM 래핑이면 ComReader로 폴백한다.
@@ -638,8 +648,10 @@ class TestAutoReaderOle2Fallback:
         captured = {}
 
         class _FakeCom:
-            def __init__(self, xlsx_block_rows=None):
-                captured_kwargs["xlsx_block_rows"] = xlsx_block_rows
+            def __init__(self, xlsx_block_rows=None, *, ppt_reader_mode=None,
+                         ppt_policy="ready", ppt_operation=None):
+                captured.update(xlsx_block_rows=xlsx_block_rows, ppt_reader_mode=ppt_reader_mode,
+                                ppt_policy=ppt_policy, ppt_operation=ppt_operation)
 
             def extract(self, path):
                 captured["path"] = path
@@ -651,15 +663,22 @@ class TestAutoReaderOle2Fallback:
         p.write_bytes(b"<## " + b"\x00" * 60)  # zip도 OLE2도 아닌 임의 헤더
         assert AutoReader().extract(str(p)) == "COM_RESULT"
         assert captured["path"] == str(p)
+        assert captured["ppt_reader_mode"] == "auto"
+        assert captured["ppt_policy"] == "ready"
+        assert captured["ppt_operation"] is None
 
     def test_drm_wrapped_pptx_routes_to_com(self, tmp_path, monkeypatch):
         """pptx도 동일하게 DRM 래핑이면 ComReader로 폴백한다."""
         import knowmate.secure.com_reader as com_mod
         from knowmate.secure import AutoReader
 
+        captured = {}
+
         class _FakeCom:
-            def __init__(self, xlsx_block_rows=None):
-                captured_kwargs["xlsx_block_rows"] = xlsx_block_rows
+            def __init__(self, xlsx_block_rows=None, *, ppt_reader_mode=None,
+                         ppt_policy="ready", ppt_operation=None):
+                captured.update(xlsx_block_rows=xlsx_block_rows, ppt_reader_mode=ppt_reader_mode,
+                                ppt_policy=ppt_policy, ppt_operation=ppt_operation)
 
             def extract(self, path):
                 return "COM_RESULT"
@@ -668,7 +687,10 @@ class TestAutoReaderOle2Fallback:
 
         p = tmp_path / "drm.pptx"
         p.write_bytes(b"<## " + b"\x00" * 60)
-        assert AutoReader().extract(str(p)) == "COM_RESULT"
+        assert AutoReader(ppt_reader_mode="addin").extract(str(p)) == "COM_RESULT"
+        assert captured["ppt_reader_mode"] == "addin"
+        assert captured["ppt_policy"] == "ready"
+        assert captured["ppt_operation"] is None
 
     def test_real_xlsx_uses_plain(self, tmp_path, monkeypatch):
         """정상 OOXML(.xlsx)은 PlainReader 경로로 간다(COM 호출 안 함)."""

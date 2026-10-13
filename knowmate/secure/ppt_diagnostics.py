@@ -131,6 +131,11 @@ class PptReadDiagnostics:
         operations = " ".join(f"{name}:{calls[name]}/{seconds[name]:.2f}s" for name in sorted(calls))
         logger.info("[ppt] 읽기 구간 합계: operations=[%s] <%s>", operations, self._path)
 
+    @property
+    def error_count(self) -> int:
+        """Return all swallowed read failures so partial text cannot be committed."""
+        return sum(stats.errors for stats in self._stats.values())
+
     def _slide(self, slide: int) -> _SlideStats:
         if slide not in self._stats:
             self._stats[slide] = _SlideStats(time.monotonic())

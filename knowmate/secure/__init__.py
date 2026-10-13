@@ -1,12 +1,15 @@
 """secure 패키지 — TextExtractor 팩토리 + AutoReader."""
 import logging
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TYPE_CHECKING
 
 from knowmate.secure.base import TextExtractor
 from knowmate.secure.fake_reader import FakeReader
 from knowmate.secure.plain_reader import PlainReader
 from knowmate.secure.signature import is_zip
+
+if TYPE_CHECKING:
+    from knowmate.secure.ppt_operation import PptOperation
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +29,7 @@ __all__ = [
 class AutoReader:
     """확장자 기반으로 PlainReader 또는 ComReader를 자동 선택하는 TextExtractor 구현체."""
 
-    def __init__(self, xlsx_block_rows: int | None = None) -> None:
+    def __init__(self, xlsx_block_rows: int | None = None, *, ppt_reader_mode: str | None = None) -> None:
         """AutoReader를 초기화한다.
 
         xlsx_block_rows: COM 경로에서 Excel 범위를 한 번에 읽을 행 수
@@ -39,9 +42,23 @@ class AutoReader:
         """
         self._plain = PlainReader()
         self._xlsx_block_rows = xlsx_block_rows
+        from knowmate.config import ppt_reader_mode as resolve_ppt_mode
+        self._ppt_reader_mode = resolve_ppt_mode({} if ppt_reader_mode is None else {"ppt_reader_mode": ppt_reader_mode})
+        self._ppt_policy = "ready"
+        self._ppt_operation = None
         self._on_com_begin: Callable[[str], None] | None = None
         self._on_com_end: Callable[[], None] | None = None
         self._last_com_used = False
+
+    def set_ppt_preparation_policy(self, policy: str) -> None:
+        """Set the main-thread preparation decision before a worker starts."""
+        if policy not in {"ready", "com_only", "ppt_pending"}:
+            raise ValueError("invalid_ppt_policy")
+        self._ppt_policy = policy
+
+    def set_ppt_operation(self, operation: "PptOperation | None") -> None:
+        """Attach a scheduler-created, file-scoped frozen COM outcome guard."""
+        self._ppt_operation = operation
 
     def set_com_operation_hooks(
         self,
@@ -70,7 +87,9 @@ class AutoReader:
                 self._on_com_begin(exe)
             self._last_com_used = True
             from knowmate.secure.com_reader import ComReader
-            return ComReader(xlsx_block_rows=self._xlsx_block_rows).extract(path)
+            return ComReader(xlsx_block_rows=self._xlsx_block_rows,
+                             ppt_reader_mode=self._ppt_reader_mode, ppt_policy=self._ppt_policy,
+                             ppt_operation=self._ppt_operation).extract(path)
         finally:
             if self._on_com_end is not None and exe is not None:
                 self._on_com_end()
@@ -127,7 +146,8 @@ class AutoReader:
             )
 
 
-def get_extractor(mode: str, xlsx_block_rows: int | None = None) -> TextExtractor:
+def get_extractor(mode: str, xlsx_block_rows: int | None = None, *,
+                  ppt_reader_mode: str | None = None) -> TextExtractor:
     """mode에 따라 적합한 TextExtractor 인스턴스를 반환한다.
 
     xlsx_block_rows: COM 경로에서 Excel 범위를 한 번에 읽을 행 수
@@ -139,5 +159,5 @@ def get_extractor(mode: str, xlsx_block_rows: int | None = None) -> TextExtracto
     if mode == "plain":
         return PlainReader()
     if mode == "auto":
-        return AutoReader(xlsx_block_rows=xlsx_block_rows)
+        return AutoReader(xlsx_block_rows=xlsx_block_rows, ppt_reader_mode=ppt_reader_mode)
     raise ValueError(f"알 수 없는 extractor 모드: {mode!r}")

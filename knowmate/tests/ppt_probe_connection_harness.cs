@@ -144,8 +144,9 @@ public static class ConnectionHarness
     public static int Main(string[] args)
     {
         var assembly = Assembly.LoadFrom(args[0]);
-        var type = assembly.GetType("AegisDesk.PptProbe.Connect", true);
-        var contract = assembly.GetType("AegisDesk.PptProbe.IDTExtensibility2", true);
+        string wrapper = Array.IndexOf(args, "--production") >= 0 ? "AegisDesk.PptReader" : "AegisDesk.PptProbe";
+        var type = assembly.GetType(wrapper + ".Connect", true);
+        var contract = assembly.GetType(wrapper + ".IDTExtensibility2", true);
         var kind = (InterfaceTypeAttribute)Attribute.GetCustomAttribute(contract, typeof(InterfaceTypeAttribute));
         // 먼저 규약을 확인해 잘못된 dispinterface의 범위 밖 슬롯을 호출하지 않는다.
         if (kind == null || kind.Value != ComInterfaceType.InterfaceIsDual
@@ -156,7 +157,7 @@ public static class ConnectionHarness
         ManagedArrayErrors();
         // Linux의 보조 실행은 Dual 메타데이터·관리형 콜백만 확인한다.
         // SAFEARRAY 마샬링과 네이티브 COM 검증은 Windows 경로에서만 판정한다.
-        if (args.Length == 2 && args[1] == "--managed-only")
+        if (Array.IndexOf(args, "--managed-only") >= 0)
         {
             Console.WriteLine("PASS dual metadata/managed callbacks; native COM and Office not verified");
             return 0;

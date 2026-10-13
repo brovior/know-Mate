@@ -17,6 +17,16 @@ build_info_dir = os.environ.get("AEGIS_BUILD_INFO_DIR")
 if not build_info_dir or not os.path.isfile(os.path.join(build_info_dir, "aegisdesk_build_info.py")):
     raise SystemExit("빌드 출처 정보가 없습니다. AegisDesk.spec 대신 build.bat을 실행하세요.")
 
+# Manifest is hash-bound to this build; required payloads cannot silently disappear.
+import runpy
+from pathlib import Path
+from knowmate.secure.ppt_bundle import verify_payload, PAYLOAD_FILES
+ppt_payload_dir = Path("scripts/ppt_reader/bin")
+ppt_build_info = runpy.run_path(os.path.join(build_info_dir, "aegisdesk_build_info.py"))["BUILD_INFO"]
+verify_payload(ppt_payload_dir, ppt_build_info)
+datas += [(str(ppt_payload_dir / name), "ppt_reader")
+          for name in (*PAYLOAD_FILES, "manifest.json")]
+
 # PyQt6 전체(WebEngine 프로세스·리소스·번역 파일 포함) 수집
 for pkg in ("PyQt6",):
     d, b, h = collect_all(pkg)

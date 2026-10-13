@@ -81,6 +81,15 @@ if errorlevel 1 (
 )
 set "AEGIS_BUILD_INFO_DIR=!BUILD_META_DIR!"
 
+REM Compile required DLL/setup before bundling; no Office launch or registration.
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\ppt_reader\build.ps1 -BuildInfoDir "!BUILD_META_DIR!"
+if errorlevel 1 (
+    echo [오류] PPT 운영 payload 빌드 실패. 배포하지 마세요.
+    call :cleanup_build_meta
+    pause
+    exit /b 1
+)
+
 echo === PyInstaller 빌드 시작 ^(%BUILD_MODE%^) ===
 .venv\Scripts\python.exe -m PyInstaller !PYI_FLAGS! AegisDesk.spec
 

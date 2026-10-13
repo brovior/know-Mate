@@ -22,6 +22,7 @@ from knowmate.secure.text_util import format_table
 
 if TYPE_CHECKING:
     from knowmate.secure.office_guard import OfficeCleanupResult, OwnedOfficeProcess
+    from knowmate.secure.ppt_operation import PptOperation
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +75,11 @@ class OfficeComPoisonError(RuntimeError):
 
 def _poison_if_fatal(exc: BaseException, exe_name: str) -> None:
     """fatal transport HRESULT면 원본을 보존한 poison 예외를 발생시킨다."""
-    hresult = hresult_of(exc)
+    if exe_name == "POWERPNT.EXE":
+        from knowmate.secure.ppt_payload import fatal_hresult
+        hresult = fatal_hresult(exc)
+    else:
+        hresult = hresult_of(exc)
     if is_fatal_transport_hresult(hresult):
         raise OfficeComPoisonError(exe_name, hresult) from exc
 
@@ -217,7 +222,7 @@ def _close_quietly(timer: com_stage.StageTimer, obj: Any, method_name: str, *arg
         with timer.stage(com_stage.STAGE_CLOSE):
             getattr(obj, method_name)(*args)
     except Exception as exc:
-        logger.debug("[com] 닫기 실패: %s", exc)
+        logger.debug("[com] 닫기 실패: error_type=%s HRESULT=%s", type(exc).__name__, hresult_of(exc))
         return exc
     return None
 
@@ -733,79 +738,164 @@ def _ppt_shape_texts(
 
 
 class PowerPointComReader:
-    """ppt 파일을 COM(PowerPoint)으로 파싱하는 리더. 스레드별 싱글톤을 사용한다."""
+    """Read a PPT once, using a compatible add-in or a safe single COM fallback."""
+
+    def __init__(self, mode: str | None = None, policy: str = "ready",
+                 operation: PptOperation | None = None) -> None:
+        """Receive mode, preparation policy and file-scoped checks from the caller."""
+        from knowmate.config import ppt_reader_mode
+        self.mode = ppt_reader_mode({} if mode is None else {"ppt_reader_mode": mode})
+        self.policy = policy
+        self.operation = operation
+
+    def _check(self, stage: str = "read") -> None:
+        if self.operation is not None:
+            from knowmate.secure.ppt_operation import PptOperationError
+            try:
+                self.operation.check()
+            except PptOperationError as exc:
+                exc.stage = com_stage.snapshot()[0] or stage
+                raise
+
+    def _read_com(self, prs: Any, path: str, timer: com_stage.StageTimer) -> str:
+        """Preserve production formatting and reject previously swallowed shape failures."""
+        from knowmate.secure.ppt_addin_reader import PptPartialRead
+        slides: list[str] = []
+        count = 0
+        slowest = 0.0
+        with PptReadDiagnostics(path) as diagnostics:
+            self._check()
+            collection = diagnostics.read("slides", lambda: prs.Slides, 0)
+            for index, slide in diagnostics.items(collection, "slides", 0):
+                self._check()
+                started = time.monotonic()
+                texts = []
+                try:
+                    shapes = diagnostics.read("shapes", lambda: slide.Shapes, index)
+                    for position, shape in diagnostics.items(shapes, "shapes", index):
+                        self._check()
+                        texts.extend(_ppt_shape_texts(shape, diagnostics, index, (position,)))
+                        self._check()
+                finally:
+                    slowest = max(slowest, time.monotonic() - started)
+                    diagnostics.slide_finished(index)
+                self._check()
+                count += 1
+                if any(t.strip() for t in texts):
+                    slides.append("\n".join(t for t in texts if t.strip()))
+            if diagnostics.error_count:
+                raise PptPartialRead("partial_com_read")
+        timer.note("슬라이드", count)
+        timer.note("최장슬라이드", slowest)
+        return "\n\n".join(slides)
 
     def parse(self, path: str) -> str:
-        """ppt 파일을 열어 슬라이드 텍스트를 반환한다 (표·그룹 도형 포함).
-
-        단계(dispatch/open/read/close)별 소요시간을 계측한다(COM 처리 안정화).
-
-        슬라이드·도형별 건수와 구간 시간을 기록한다. 진행 로그 스레드는 COM을
-        호출하지 않고 현재 읽기 위치만 보고하며 read 단계 시작시각은 유지한다.
-        """
+        """Hold the machine read lock through dispatch, extraction and confirmed close."""
+        from knowmate.secure.ppt_addin_reader import PptAddinUnavailable, select_service, read_slides, REQUIRED_VERSION, PROTOCOL
+        from knowmate.secure.ppt_operation import PptOperationError, PptPreparationPending
+        from knowmate.secure.ppt_installation import MachineReadGuard
+        from knowmate.secure.office_guard import OfficeBusyError, OfficeCleanupPendingError
+        if self.policy == "ppt_pending":
+            raise PptPreparationPending("preparation_pending")
         timer = com_stage.StageTimer(path)
         prs = None
-        poison: OfficeComPoisonError | None = None
-        primary_error: Exception | None = None
+        poison = False
+        read_ok = False
+        close_ok = False
+        chosen = "com"
+        fallback = "none"
         try:
-            with timer.stage(com_stage.STAGE_DISPATCH):
-                ppt = _get_ppt_app()
-            with timer.stage(com_stage.STAGE_OPEN):
-                prs = ppt.Presentations.Open(str(Path(path).resolve()), ReadOnly=True, WithWindow=False)
-                if prs is None:
-                    raise OfficeComPoisonError("POWERPNT.EXE")
-            with timer.stage(com_stage.STAGE_READ), PptReadDiagnostics(path) as diagnostics:
-                slides: list[str] = []
-                slide_count = 0
-                slowest_slide = 0.0
-                slide_collection = diagnostics.read("slides", lambda: prs.Slides, 0)
-                for slide_index, slide in diagnostics.items(slide_collection, "slides", 0):
-                    # 슬라이드마다 com_stage.begin()을 다시 부르지는 않는다 — 그러면
-                    # 단계 시작시각이 갱신돼 워치독이 보는 "몇 초째 멈췄는지"가
-                    # 초기화되고, 한 슬라이드에서 멈춘 행오버를 놓친다.
-                    _t0 = time.monotonic()
-                    texts: list[str] = []
+            with MachineReadGuard():
+                try:
+                    self._check("dispatch")
+                    with timer.stage(com_stage.STAGE_DISPATCH):
+                        ppt = _get_ppt_app()
+                    self._check("dispatch")
+                    service = None
+                    if self.mode != "com" and self.policy != "com_only":
+                        try:
+                            service = select_service(ppt, _tls)
+                        except PptAddinUnavailable as exc:
+                            fallback = str(exc)
+                            if self.mode == "addin":
+                                raise PptPreparationPending(fallback) from None
+                    elif self.mode == "addin":
+                        raise PptPreparationPending("service_not_prepared")
+                    self._check("dispatch")
+                    with timer.stage(com_stage.STAGE_OPEN):
+                        prs = ppt.Presentations.Open(str(Path(path).resolve()), ReadOnly=True, WithWindow=False)
+                        if prs is None:
+                            raise OfficeComPoisonError("POWERPNT.EXE")
+                    self._check("open")
+                    with timer.stage(com_stage.STAGE_READ):
+                        if service is not None:
+                            chosen = "addin"
+                            try:
+                                text = read_slides(prs, path, service, self._check,
+                                                   note_count=lambda count: timer.note("슬라이드", count))
+                            except (OfficeComPoisonError, PptOperationError, PptPreparationPending,
+                                    OfficeBusyError, OfficeCleanupPendingError):
+                                raise
+                            except Exception as exc:
+                                _poison_if_fatal(exc, "POWERPNT.EXE")
+                                self._check()
+                                if self.mode == "addin":
+                                    raise
+                                fallback = "addin_read_failed"
+                                chosen = "com"
+                                # A new result buffer; the add-in's partial text is never retained.
+                                text = self._read_com(prs, path, timer)
+                        else:
+                            text = self._read_com(prs, path, timer)
+                    self._check()
+                    read_ok = True
+                except OfficeComPoisonError:
+                    poison = True
+                    _tls.ppt = None
+                    _tls.ppt_service = None
+                    raise
+                except Exception as exc:
                     try:
-                        shapes = diagnostics.read("shapes", lambda: slide.Shapes, slide_index)
-                        for shape_index, shape in diagnostics.items(shapes, "shapes", slide_index):
-                            texts.extend(_ppt_shape_texts(shape, diagnostics, slide_index, (shape_index,)))
-                    finally:
-                        slowest_slide = max(slowest_slide, time.monotonic() - _t0)
-                        diagnostics.slide_finished(slide_index)
-                    slide_count += 1
-                    texts = [t for t in texts if t.strip()]
-                    if texts:
-                        slides.append("\n".join(texts))
-                timer.note("슬라이드", slide_count)
-                timer.note("최장슬라이드", slowest_slide)
-            return "\n\n".join(slides)
-        except OfficeComPoisonError as exc:
-            poison = exc
-            _tls.ppt = None
-            raise
-        except Exception as exc:
-            primary_error = exc
-            try:
-                _poison_if_fatal(exc, "POWERPNT.EXE")
-            except OfficeComPoisonError as poison_exc:
-                poison = poison_exc
-                _tls.ppt = None
-                raise
-            raise
-        finally:
-            try:
-                close_error = None if poison is not None else _close_quietly(timer, prs, "Close")
-                if close_error is not None:
-                    try:
-                        _poison_if_fatal(close_error, "POWERPNT.EXE")
-                    except OfficeComPoisonError as close_poison:
+                        _poison_if_fatal(exc, "POWERPNT.EXE")
+                    except OfficeComPoisonError:
+                        poison = True
                         _tls.ppt = None
-                        if primary_error is not None:
-                            raise close_poison from primary_error
+                        _tls.ppt_service = None
                         raise
-            finally:
-                com_stage.clear()
-                timer.log_summary()
+                    from knowmate.secure.ppt_payload import PptPayloadError
+                    if isinstance(exc, (PptOperationError, PptPreparationPending, PptPayloadError,
+                                        OfficeBusyError, OfficeCleanupPendingError)):
+                        raise
+                    # COM descriptions can include document text. Preserve only
+                    # the numeric code for collector classification and logs.
+                    safe = PptPayloadError("ppt_read_failed")
+                    safe.hresult = hresult_of(exc)
+                    raise safe from None
+                finally:
+                    # Fatal transport failures must not initiate another blocking RPC Close.
+                    error = None if poison else _close_quietly(timer, prs, "Close")
+                    close_ok = prs is not None and not poison and error is None
+                    if self.operation is not None:
+                        self.operation.finish(close_ok, read_ok)
+                    if error is not None:
+                        try:
+                            _poison_if_fatal(error, "POWERPNT.EXE")
+                        except OfficeComPoisonError:
+                            _tls.ppt = None
+                            _tls.ppt_service = None
+                            raise
+                        raise PptOperationError("close_unconfirmed") from None
+                    if read_ok:
+                        self._check("close")
+                        if self.operation is not None:
+                            self.operation.validate_commit()
+                logger.info("[ppt] 운영 읽기: method=%s fallback=%s version=%s protocol=%d characters=%d <%s>",
+                            chosen, fallback, REQUIRED_VERSION if chosen == "addin" else "none", PROTOCOL if chosen == "addin" else 0,
+                            len(text), path)
+                return text
+        finally:
+            com_stage.clear()
+            timer.log_summary()
 
 
 
@@ -882,6 +972,8 @@ def quit_com_apps(
         finally:
             # Quit 예외에도 스레드 로컬 COM 참조를 반드시 놓는다.
             setattr(_tls, attr, None)
+            if attr == "ppt":
+                _tls.ppt_service = None
             app = None
     # PowerPoint 참조만 해제되고 Quit/강제종료되지 않는다.
     gc.collect()
@@ -938,7 +1030,8 @@ def quit_com_apps(
 class ComReader:
     """확장자를 보고 Word/Excel/PowerPoint COM 리더로 라우팅하는 TextExtractor 구현체."""
 
-    def __init__(self, xlsx_block_rows: int | None = None) -> None:
+    def __init__(self, xlsx_block_rows: int | None = None, *, ppt_reader_mode: str | None = None,
+                 ppt_policy: str = "ready", ppt_operation: PptOperation | None = None) -> None:
         """xlsx_block_rows: Excel 범위 읽기 블록 크기(config `chunking.xlsx_block_rows`).
 
         리더 3개를 인스턴스 속성으로 보유한다(이전에는 모듈 레벨 싱글톤). 리더 객체는
@@ -947,7 +1040,7 @@ class ComReader:
         """
         self._word = WordComReader()
         self._excel = ExcelComReader(block_rows=xlsx_block_rows)
-        self._ppt = PowerPointComReader()
+        self._ppt = PowerPointComReader(ppt_reader_mode, ppt_policy, ppt_operation)
 
     def extract(self, path: str) -> str:
         """확장자에 따라 적합한 COM 리더로 파일을 파싱해 텍스트를 반환한다.

@@ -814,6 +814,7 @@ class CollectorWorker(QThread):
         from knowmate.collector.com_watchdog import ComWatchdog
         from knowmate.secure import office_guard as _og
         from knowmate.secure.com_reader import OfficeComPoisonError
+        from knowmate.secure.ppt_operation import PptOperationError, PptPreparationPending
         watchdog = ComWatchdog(terminate_fn=_og.terminate_stuck_office) if com_timeout_base > 0 else None
 
         logger.info("[collector] 작업 시작 — 폴더 스캔·인덱싱 파이프라인")
@@ -927,6 +928,8 @@ class CollectorWorker(QThread):
         poisoned_exes: set[str] = set()
         cleanup_pending_logged_exes: set[str] = set()
         cleanup_pending_count = 0
+        ppt_pending_count = 0
+        ppt_timeout_count = 0
         changed_during = []  # 추출 도중 파일이 바뀌어 이번 사이클에 인덱싱하지 않은 경로들
         consumer_backoff_deferred = 0  # 소비자 재확인이 처리 직전에 걸러낸 건수(4차)
 
@@ -1058,6 +1061,9 @@ class CollectorWorker(QThread):
                 logger.warning("[collector] COM poison 복구 미확인으로 %s 연기: %s", task_exe, task.path)
                 continue
 
+            ppt_operation = None
+            set_ppt_operation = getattr(self._extractor, "set_ppt_operation", None)
+            set_commit_guard = getattr(self._indexer, "set_commit_guard", None)
             try:
                 logger.debug("[단계1] 텍스트 추출 시작: %s", task.path)
                 _extract_t0 = time.perf_counter()
@@ -1090,6 +1096,13 @@ class CollectorWorker(QThread):
                             _og.end_com_op()
                             _wd_exe = None
 
+                if is_com and task_exe == "POWERPNT.EXE" and callable(set_ppt_operation):
+                    from knowmate.secure.ppt_operation import PptOperation
+                    limit = _com_timeout_for_size(task.size, com_timeout_base, com_timeout_per_mb, com_timeout_cap)
+                    ppt_operation = PptOperation(task.path, limit if com_timeout_base > 0 else None,
+                                                 cancelled=lambda: self._cancelled,
+                                                 externally_fired=lambda: _wd_fired_stage is not None)
+                    set_ppt_operation(ppt_operation)
                 dynamic_hooks = getattr(self._extractor, "set_com_operation_hooks", None)
                 if callable(dynamic_hooks) and not is_com:
                     dynamic_hooks(_dynamic_com_begin, _dynamic_com_end)
@@ -1111,6 +1124,8 @@ class CollectorWorker(QThread):
                             _og.end_com_op()
                     if callable(dynamic_hooks) and not is_com:
                         dynamic_hooks(None, None)
+                if ppt_operation is not None:
+                    ppt_operation.validate_commit()
                 extract_sec = time.perf_counter() - _extract_t0
                 logger.debug("[단계2] 텍스트 추출 완료: %s (%d자, %.2fs)", task.path, len(text), extract_sec)
                 stat = Path(task.path).stat()
@@ -1159,14 +1174,24 @@ class CollectorWorker(QThread):
                 marker = getattr(self._indexer, "mark_maintenance_backlog", None)
                 if callable(marker) and not marker():
                     logger.warning("[lance_maintenance] 문서 backlog marker 저장 실패; 인덱싱은 계속")
-                chunk_ids = self._indexer.index_file(
+                if ppt_operation is not None:
+                    if not callable(set_commit_guard):
+                        raise RuntimeError("ppt_commit_guard_unavailable")
+                    set_commit_guard(ppt_operation.validate_commit)
+                try:
+                    chunk_ids = self._indexer.index_file(
                     path=task.path,
                     text=text,
                     mtime=stat.st_mtime,
                     scope=scope,
                     doc_uid=doc_uid,
                     revision=revision,
-                )
+                    )
+                finally:
+                    if callable(set_commit_guard):
+                        set_commit_guard(None)
+                if ppt_operation is not None:
+                    ppt_operation.validate_commit()
                 logger.debug("[단계4] 임베딩·저장 완료: %s -> %d청크", task.path, len(chunk_ids))
                 from knowmate.rag.indexer import DOC_INDEX_VERSION
                 # 다음 사이클 큐 우선순위 힌트용 — COM 경유 파일이었는지 기록
@@ -1232,6 +1257,28 @@ class CollectorWorker(QThread):
                 actual_com = getattr(self._extractor, "take_actual_com_used", None)
                 com_used = actual_com() if callable(actual_com) else is_com
                 failure_state.note_success(failures, task.path)
+            except PptPreparationPending:
+                ppt_pending_count += 1
+                deferred.append(task.path)
+                com_stage.take_last_failed_stage()
+                logger.info("[collector] PPT 준비 대기로 연기: %s", task.path)
+            except PptOperationError as exc:
+                if exc.reason == "cancelled":
+                    self._cancelled = True
+                    deferred.append(task.path)
+                else:
+                    failed.append(task.path)
+                    stage = getattr(exc, "stage", None) or com_stage.take_last_failed_stage() or "read"
+                    kind = failure_state.KIND_READ_ERROR
+                    if exc.reason == "deadline_expired":
+                        ppt_timeout_count += 1
+                        kind = failure_state.KIND_OPEN_TIMEOUT if stage in {"dispatch", "open"} else failure_state.KIND_READ_TIMEOUT
+                        logger.warning("[collector] PPT 강제 종료 없는 시간초과: stage=%s <%s>", stage, task.path)
+                    elif exc.reason == "source_changed":
+                        kind = failure_state.KIND_FILE_CHANGED
+                        changed_during.append(task.path)
+                    failure_state.note_failure(failures, task.path, kind, stage, None,
+                                               task.mtime, task.size, self._get_now())
             except EmbeddingCancelledError:
                 self._cancelled = True
                 deferred.append(task.path)
@@ -1322,6 +1369,12 @@ class CollectorWorker(QThread):
                     failures, task.path, kind, _wd_fired_stage or _failed_stage, error_code,
                     task.mtime, task.size, self._get_now(),
                 )
+
+            finally:
+                if callable(set_ppt_operation):
+                    set_ppt_operation(None)
+                if callable(set_commit_guard):
+                    set_commit_guard(None)
 
             run_hard = getattr(self._indexer, "run_hard_limit_maintenance", None)
             if callable(run_hard) and not self._cancelled:
@@ -1593,6 +1646,10 @@ class CollectorWorker(QThread):
         drm_deferred_count = producer_state.get("drm_deferred", 0)
         if drm_deferred_count:
             summary += f" / 유휴로 DRM 문서 스킵 {drm_deferred_count}건"
+        if ppt_pending_count:
+            summary += f" / PPT 준비 대기 {ppt_pending_count}건"
+        if ppt_timeout_count:
+            summary += f" / PPT 강제 종료 없는 시간초과 {ppt_timeout_count}건"
         com_timeout_count = watchdog.timeout_count if watchdog is not None else 0
         if com_timeout_count:
             summary += f" / COM 시간초과 강제해제 {com_timeout_count}건"

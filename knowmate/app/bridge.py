@@ -280,19 +280,26 @@ class Bridge(QObject):
     @pyqtSlot()
     def startReindex(self) -> None:
         """증분 재인덱싱을 시작한다."""
-        if self._worker is None:
+        gate = getattr(self._win, "_request_index_start", None)
+        if self._worker is None and gate is None:
             self.indexAlert.emit("수집기가 초기화되지 않았습니다.")
             return
-        if self._worker.isRunning():
+        if self._worker is not None and self._worker.isRunning():
             self.indexAlert.emit("인덱싱이 이미 진행 중입니다.")
             return
-        if hasattr(self._worker, "request_failure_retry"):
-            self._worker.request_failure_retry()
-        self._worker.start()
+        if gate is not None:
+            gate(retry_failures=True)
+        else:
+            if hasattr(self._worker, "request_failure_retry"):
+                self._worker.request_failure_retry()
+            self._worker.start()
 
     @pyqtSlot()
     def cancelReindex(self) -> None:
         """진행 중인 재인덱싱을 취소한다."""
+        preparation = getattr(self._win, "_ppt_preparation", None)
+        if preparation is not None:
+            preparation.cancel_start()
         if self._worker and self._worker.isRunning():
             self._worker.cancel()
 
@@ -454,17 +461,23 @@ class Bridge(QObject):
     def retryFile(self, path: str) -> str:
         """파일 1건에 대해 「지금 다시 시도」— 이번 사이클만 백오프를 무시하게
         force_retry를 세우고 재인덱싱 사이클을 시작한다. 이력은 보존된다."""
-        if self._worker is None:
+        gate = getattr(self._win, "_request_index_start", None)
+        if self._worker is None and (
+            gate is None or getattr(self._win, "_ppt_preparation", None) is None
+        ):
             self.indexAlert.emit("수집기가 초기화되지 않았습니다.")
             return "error"
-        if self._worker.isRunning():
+        if self._worker is not None and self._worker.isRunning():
             self.indexAlert.emit("인덱싱이 이미 진행 중입니다.")
             return "busy"
 
         from knowmate.collector import failure_state
         failure_file = getattr(self._worker, "_failure_file", None)
         if failure_file is None:
-            return "error"
+            if gate is None:
+                return "error"
+            from knowmate.config import get_data_dir
+            failure_file = get_data_dir() / "index_failure.json"
         records = failure_state.load_failures(failure_file)
         found = failure_state.request_retry_one(records, path)
         if found:
@@ -477,7 +490,10 @@ class Bridge(QObject):
             "[failure] 사용자 「지금 다시 시도」 요청 (기록 %s): %s",
             "있음" if found else "없음", path,
         )
-        self._worker.start()
+        if gate is not None:
+            gate()
+        else:
+            self._worker.start()
         return "ok" if found else "not_found"
 
     @pyqtSlot(str, result=str)

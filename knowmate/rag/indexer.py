@@ -101,6 +101,10 @@ class Indexer:
         """LanceDB 테이블 객체를 반환한다."""
         return self._table
 
+    def set_commit_guard(self, guard: Callable[[], None] | None) -> None:
+        """Install a file-scoped safety check immediately before publishing DB rows."""
+        self._commit_guard = guard
+
     def index_file(
         self,
         path: str,
@@ -180,6 +184,9 @@ class Indexer:
         # 파일당 add() 1회 — 배치마다 add하면 LanceDB fragment가 과도하게 쌓여
         # 검색·후속 쓰기 성능이 저하된다.
         t0 = time.perf_counter()
+        guard = getattr(self, "_commit_guard", None)
+        if guard is not None:
+            guard()
         self._table.add(all_rows)
         self._maintenance.record_mutation()
         self.table_is_empty = False

@@ -152,7 +152,23 @@ def get_config() -> dict[str, Any]:
                 _save_config(_cache)
             except OSError as exc:
                 logger.warning("COM Quit 시간제한 설정 이전 저장 실패: %s", exc)
+    collector = _cache.get("collector")
+    if isinstance(collector, dict):
+        ppt_reader_mode(collector)
     return _cache
+
+
+def ppt_reader_mode(collector: dict[str, Any]) -> str:
+    """Resolve old configs from the bundled template and reject invalid modes safely."""
+    if "ppt_reader_mode" not in collector:
+        with _bundled_config_source().open(encoding="utf-8") as handle:
+            bundled = yaml.safe_load(handle) or {}
+        collector["ppt_reader_mode"] = bundled["collector"]["ppt_reader_mode"]
+    mode = collector["ppt_reader_mode"]
+    if not isinstance(mode, str) or mode not in {"auto", "com", "addin"}:
+        logger.warning("잘못된 collector.ppt_reader_mode 설정을 com으로 복구합니다")
+        return "com"
+    return mode
 
 
 def _bundled_document_state_defaults() -> dict[str, Any]:

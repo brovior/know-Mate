@@ -351,7 +351,8 @@ def test_csharp_contract_without_office_or_registration(tmp_path, harness_name):
     commands = [
         [str(compiler), "/nologo", "/target:library", f"/out:{dll}",
          "/reference:Microsoft.CSharp.dll", "/reference:System.Core.dll",
-         "/reference:System.Web.Extensions.dll", str(root / "scripts/ppt_addin/PptReadProbe.cs")],
+         "/reference:System.Web.Extensions.dll", str(root / "scripts/ppt_addin/PptReadProbe.cs"),
+         str(root / "scripts/ppt_shared/PptExtractionCore.cs")],
         [str(compiler), "/nologo", f"/out:{harness}", str(root / "knowmate/tests" / harness_name)],
         [str(harness), str(dll)],
     ]

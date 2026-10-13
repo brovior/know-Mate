@@ -1,8 +1,6 @@
 """PowerPoint COM·파일·내부 추가 기능의 결과를 메모리에서 비교한다."""
 from __future__ import annotations
 
-import json
-import math
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -108,41 +106,12 @@ def read_baseline(prs: Any, path: Path) -> Snapshot:
 
 
 def decode_slide(reply: str, slide: int) -> tuple[list[str], dict[str, int], float]:
-    """추가 기능의 응답을 검증하고 기존 표 정렬을 적용한다."""
-    if not isinstance(reply, str) or len(reply) > MAX_REPLY_CHARS:
-        raise ProbeFailure("invalid_reply_size")
-    payload = json.loads(reply)
-    if not isinstance(payload, dict) or payload.get("schema") != 1 or payload.get("slide") != slide:
-        raise ProbeFailure("invalid_reply_schema")
-    counts = payload.get("counts")
-    keys = {"shapes", "groups", "tables", "cells", "errors"}
-    if not isinstance(counts, dict) or set(counts) != keys:
-        raise ProbeFailure("invalid_reply_counts")
-    if any(type(v) is not int or v < 0 for v in counts.values()):
-        raise ProbeFailure("invalid_reply_counts")
-    seconds = payload.get("seconds")
-    if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds < 0:
-        raise ProbeFailure("invalid_reply_time")
-    nodes = payload.get("nodes")
-    if not isinstance(nodes, list):
-        raise ProbeFailure("invalid_reply_nodes")
-    texts: list[str] = []
-    for node in nodes:
-        if not isinstance(node, dict):
-            raise ProbeFailure("invalid_reply_node")
-        if node.get("kind") == "text" and isinstance(node.get("text"), str):
-            text = node["text"].strip()
-        elif node.get("kind") == "table" and isinstance(node.get("cells"), list):
-            grid = node["cells"]
-            if any(not isinstance(row, list) or any(not isinstance(c, str) for c in row) for row in grid):
-                raise ProbeFailure("invalid_reply_cells")
-            text = format_table(grid)
-        else:
-            raise ProbeFailure("invalid_reply_node")
-        if text.strip():
-            texts.append(text)
-    log_probe_read_errors(payload, slide)
-    return texts, counts, float(seconds)
+    """Use the production pure decoder while retaining the probe failure contract."""
+    from knowmate.secure.ppt_payload import PptPayloadError, decode_slide as decode
+    try:
+        return decode(reply, slide)
+    except PptPayloadError as exc:
+        raise ProbeFailure(str(exc)) from exc
 
 
 def read_addin(prs: Any, path: Path, service: Any) -> Snapshot:

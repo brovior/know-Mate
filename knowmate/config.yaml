@@ -33,6 +33,7 @@ search:
   score_threshold: 0.3
   rerank_enabled: false
 collector:
+  ppt_reader_mode: auto  # auto | com | addin; production PPT add-in selection
   watch_folders: []        # 배포 기본값은 비움. 앱의 [폴더 관리]에서 사용자별로 지정
   # 문서 state는 dirty 상태일 때만 이 문서 수 또는 시간마다 원자 저장한다.
   # replacement 삭제 대기열도 이 checkpoint로 복구되며, DB generation metadata가

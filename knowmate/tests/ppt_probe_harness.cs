@@ -100,7 +100,7 @@ public static class Harness
     public static int Main(string[] args)
     {
         var assembly = Assembly.LoadFrom(args[0]);
-        var type = assembly.GetType("AegisDesk.PptProbe.Connect", true);
+        var type = assembly.GetType(args.Length > 1 ? args[1] : "AegisDesk.PptProbe.Connect", true);
         var read = type.GetMethod("ReadShape", BindingFlags.NonPublic | BindingFlags.Static);
         var counts = new Dictionary<string, int> {
             {"shapes", 0}, {"groups", 0}, {"tables", 0}, {"cells", 0}, {"errors", 0}
