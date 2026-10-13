@@ -169,6 +169,9 @@ PowerPoint 읽기는 `secure/ppt_diagnostics.py`에서 슬라이드·도형 위�
 시작시각은 갱신하지 않으며 텍스트·표·그룹 추출 순서는 유지한다. 로그 판독과 사내 비교는
 [PowerPoint 진단](../DIAGNOSTICS.md#powerpoint-com-슬라이드-읽기-2026-10-11)을 따른다.
 
+추가 기능의 운영 적용은 [PPT_ADDIN_INDEXING.md](PPT_ADDIN_INDEXING.md)에 설계했다.
+사내 소수 문서 비교가 통과했으며, 현재 운영 리더·설치 도구는 아직 변경하지 않았다.
+
 **Excel 셀 읽기 — 범위 단위 일괄 읽기 (`chunking.xlsx_block_rows`, 기본 1000)**
 
 COM 호출은 프로세스 간 마샬링이라 왕복 1회가 수십~수백 µs다. 셀마다 `cell.Value`를 읽으면
