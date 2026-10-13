@@ -152,6 +152,19 @@ def _check_build_info(failures: list[str]) -> None:
         failures.append("빌드 출처 정보 오류: built_at_utc")
 
 
+def _check_ppt_payload(failures: list[str]) -> None:
+    """Verify required frozen PPT hashes/source without registration or Office launch."""
+    if not bool(getattr(sys, "frozen", False)):
+        return
+    from knowmate.build_info import get_build_info
+    from knowmate.secure.ppt_bundle import verify_payload
+
+    try:
+        verify_payload(build_info=get_build_info())
+    except (OSError, ValueError) as exc:
+        failures.append(f"PPT payload 검증 실패: {type(exc).__name__}")
+
+
 def _check_log_dir_writable(failures: list[str]) -> None:
     """로그 폴더가 생성·기록 가능한지 확인한다 — 실패하면 진단 수단 자체를 잃는다."""
     from knowmate.config import get_data_dir
@@ -221,6 +234,7 @@ def run_selftest(report_path=None) -> int:
         ("지연 import 모듈", _check_lazy_imports),
         ("lancedb 버전", _check_lancedb_version),
         ("빌드 출처", _check_build_info),
+        ("PPT 운영 payload", _check_ppt_payload),
         ("로그 폴더", _check_log_dir_writable),
     )
     for label, check in checks:

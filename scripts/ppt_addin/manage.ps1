@@ -19,7 +19,8 @@ if ($Action -eq 'Build') {
     New-Item -ItemType Directory -Path (Split-Path -Parent $probeDll) -Force | Out-Null
     & $probeCompiler /nologo /target:library /platform:anycpu /optimize+ "/out:$probeDll" `
         /reference:Microsoft.CSharp.dll /reference:System.Core.dll /reference:System.Web.Extensions.dll `
-        (Join-Path $PSScriptRoot 'PptReadProbe.cs')
+        (Join-Path $PSScriptRoot 'PptReadProbe.cs') `
+        (Join-Path $PSScriptRoot '..\ppt_shared\PptExtractionCore.cs')
     if ($LASTEXITCODE -ne 0) { throw 'probe_build_failed' }
     Write-Output "Build complete: $probeDll (registration not performed)"
     return

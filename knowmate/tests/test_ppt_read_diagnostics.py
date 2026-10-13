@@ -135,8 +135,9 @@ def test_recoverable_shape_error_is_logged_without_exception_body(monkeypatch, c
     _install_presentation(monkeypatch, [SimpleNamespace(Shapes=[
         UnreadableShape(text="ignored"), _Shape(text="SECRET_GOOD_TEXT"),
     ])])
-    with caplog.at_level(logging.INFO):
-        assert com_reader.PowerPointComReader().parse("/synthetic/deck.pptx") == "SECRET_GOOD_TEXT"
+    from knowmate.secure.ppt_addin_reader import PptPartialRead
+    with caplog.at_level(logging.INFO), pytest.raises(PptPartialRead, match="partial_com_read"):
+        com_reader.PowerPointComReader().parse("/synthetic/deck.pptx")
     assert "operation=text row=0 column=0 error_type=RuntimeError" in caplog.text
     assert "errors=1" in caplog.text
     assert "SECRET_" not in caplog.text

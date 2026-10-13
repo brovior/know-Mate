@@ -162,11 +162,7 @@ class MainWindow(QMainWindow):
 
     def _tray_reindex(self) -> None:
         """트레이 메뉴에서 재인덱싱을 트리거한다(진행 중이면 무시)."""
-        worker = getattr(self._bridge, "_worker", None)
-        if worker is not None and not worker.isRunning():
-            if hasattr(worker, "request_failure_retry"):
-                worker.request_failure_retry()
-            worker.start()
+        self._request_index_start(retry_failures=True)
 
     def _quit_app(self) -> None:
         """트레이 '종료' — 실제 앱 종료 플래그를 세우고 닫는다."""
@@ -176,7 +172,7 @@ class MainWindow(QMainWindow):
     def _init_collector(self) -> None:
         """수집기 파이프라인을 초기화하고 IdleScheduler를 시작한다."""
         try:
-            from knowmate.config import get_config, get_data_dir
+            from knowmate.config import get_config, get_data_dir, ppt_reader_mode
             self._pump_startup()
             from knowmate.rag.embedding import get_embedding_client
             self._pump_startup()
@@ -186,7 +182,7 @@ class MainWindow(QMainWindow):
             self._pump_startup()
             from knowmate.secure.crypto import get_crypto_manager
             self._pump_startup()
-            from knowmate.collector.scheduler import CollectorWorker, IdleScheduler
+            from knowmate.collector.scheduler import IdleScheduler
             self._pump_startup()
 
             cfg = get_config()
@@ -227,11 +223,20 @@ class MainWindow(QMainWindow):
             self._extractor = get_extractor(
                 cfg.get("extractor", "fake"),
                 xlsx_block_rows=chunking.get("xlsx_block_rows"),
+                ppt_reader_mode=ppt_reader_mode(cfg.get("collector", {})),
             )
             self._pump_startup()
 
-            # 단일 워커를 생성해 bridge에 연결한다 (수동·유휴 인덱싱 공유)
-            self._make_worker()
+            # COM 인스턴스를 만들기 전에 Machine 설치 상태를 비동기로 확인한다.
+            # 모든 시작 요청은 같은 게이트에 모으고, 워커는 준비 판정 뒤 생성한다.
+            from knowmate.app.ppt_preparation import PptPreparationCoordinator
+            self._ppt_preparation = PptPreparationCoordinator(
+                extractor=self._extractor, extractor_mode=cfg.get("extractor", "fake"),
+                reader_mode=ppt_reader_mode(cfg.get("collector", {})),
+                data_dir=get_data_dir(), make_worker=self._make_worker, parent=self,
+            )
+            self._ppt_preparation.failed.connect(self._bridge.indexAlert.emit)
+            QTimer.singleShot(0, self._ppt_preparation.begin)
             self._pump_startup()
 
             # 유휴시간 자동 인덱싱 스케줄러 (6-7). 설정에서 끌 수 있다(collector.idle_enabled).
@@ -274,9 +279,15 @@ class MainWindow(QMainWindow):
         DRM 의심 문서 스킵 판단(collector.drm_idle_threshold_sec)은 워커가
         사이클 도중 실시간 유휴를 직접 조회하므로 여기서 유휴 값을 넘기지 않는다.
         """
-        worker = self._bridge._worker
-        if worker is not None and not worker.isRunning():
-            worker.start()
+        self._request_index_start()
+
+    def _request_index_start(self, *, retry_failures: bool = False) -> None:
+        """수동·재시도·트레이·유휴 시작을 하나의 PPT 준비 게이트에 전달한다."""
+        preparation = getattr(self, "_ppt_preparation", None)
+        if preparation is not None:
+            preparation.request_start(retry_failures=retry_failures)
+        else:
+            self._bridge.indexAlert.emit("수집기가 초기화되지 않았습니다.")
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -323,6 +334,15 @@ class MainWindow(QMainWindow):
         if self._shutdown_done:
             return
         self._shutdown_done = True
+
+        # 설치 도구는 앱과 독립적으로 실제 승격 자식 종료까지 예약을 지킨다.
+        # 앱 종료는 관찰/시작 콜백만 중단하고 설치 프로세스를 종료하지 않는다.
+        try:
+            preparation = getattr(self, "_ppt_preparation", None)
+            if preparation is not None:
+                preparation.shutdown()
+        except Exception as exc:
+            logger.warning("PPT 준비 관찰 정리 중 예외: %s", exc)
 
         # 각 단계를 독립 try로 감싸 한 곳의 실패가 이후 정리(특히 최종 판정)를
         # 건너뛰지 않게 한다.
