@@ -152,7 +152,7 @@ def read_addin(prs: Any, path: Path, service: Any) -> Snapshot:
     with PptReadDiagnostics(str(path)) as diagnostics:
         count = int(prs.Slides.Count)
         for index in range(1, count + 1):
-            reply = diagnostics.read("addin_slide", lambda: service.ExtractSlide(prs, index), index)
+            reply = diagnostics.read("addin_slide", lambda: service.ExtractSlide(str(path.resolve()), index), index)
             texts, counts, seconds = decode_slide(reply, index)
             result.slides.append(texts)
             internal += seconds
