@@ -104,7 +104,12 @@ def benchmark(app: Any, path: Path, args: argparse.Namespace, scratch: Path) -> 
         except Exception as exc:
             methods.remove("addin")
             incomplete = True
-            _emit({"method": "addin", "status": "unavailable", "error_type": type(exc).__name__})
+            reason = str(exc) if isinstance(exc, ProbeFailure) and str(exc) in {
+                "addin_not_loaded", "addin_protocol_unavailable",
+            } else None
+            _emit({"method": "addin", "status": "unavailable", "failed_stage": "addin_service",
+                   "reason": reason, "error_type": type(exc).__name__,
+                   "hresult": com_reader.hresult_of(exc), **probe_error_details(exc)})
     original = (path.stat().st_size, path.stat().st_mtime_ns)
     failures = False
     for method in methods:
@@ -184,7 +189,7 @@ def main(argv: list[str] | None = None) -> int:
             return benchmark(app, path, args, scratch)
     except Exception as exc:
         _emit({"status": "error", "error_type": type(exc).__name__,
-               "hresult": com_reader.hresult_of(exc)})
+               "hresult": com_reader.hresult_of(exc), **probe_error_details(exc)})
         return 1
     finally:
         # PowerPoint에 Quit·강제 종료·추가 Close를 요청하지 않는다.

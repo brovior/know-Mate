@@ -27,6 +27,46 @@ def test_probe_error_details_keep_codes_without_arbitrary_content():
     assert probe_error_details(RuntimeError("SECRET")) == {}
 
 
+@pytest.mark.parametrize("description,expected", [
+    ("probe_wrong_application", {"probe_error": "probe_wrong_application"}),
+    ("probe_extract_failed:application_get:binding:80131500", {
+        "probe_error": "probe_extract_failed", "probe_stage": "application_get",
+        "probe_error_kind": "binding", "probe_inner_hresult": 0x80131500,
+    }),
+    ("probe_extract_failed:application_get:SECRET:80004005", {}),
+    ("probe_extract_failed:SECRET:com:80004005", {}),
+    ("probe_extract_failed:application_get:com:80004005\nSECRET", {}),
+])
+def test_probe_error_classification_accepts_only_fixed_tokens(description, expected):
+    exc = RuntimeError("SECRET")
+    exc.excepinfo = (0, "SECRET", description, "SECRET", 0, 0x80004005)
+    assert probe_error_details(exc) == {"inner_hresult": 0x80004005, **expected}
+
+
+def test_partial_read_errors_log_only_bounded_safe_positions(caplog):
+    safe = {"stage": "cell_text", "kind": "com", "shape": "2.1", "row": 3,
+            "column": 4, "hresult": 0x80004005, "message": "SECRET_BODY"}
+    reply = _reply(read_errors=[safe] * 20, counts={"shapes": 2, "groups": 0, "tables": 1,
+                                                  "cells": 4, "errors": 20})
+    readers.decode_slide(reply, 1)
+    assert caplog.text.count("내부 읽기 오류:") == 16
+    assert "count=4" in caplog.text
+    assert "shape=2.1 stage=cell_text row=3 column=4 kind=com hresult=0x80004005" in caplog.text
+    assert "SECRET" not in caplog.text
+
+
+@pytest.mark.parametrize("changes", [
+    {"stage": "SECRET"}, {"kind": "SECRET"}, {"shape": "SECRET"},
+    {"stage": ["SECRET"]}, {"row": "SECRET"}, {"column": -1}, {"hresult": True},
+])
+def test_untrusted_partial_error_fields_are_never_logged(changes, caplog):
+    record = {"stage": "cell_text", "kind": "com", "shape": "1", "row": 0,
+              "column": 0, "hresult": 0x80004005, **changes}
+    readers.decode_slide(_reply(read_errors=[record]), 1)
+    assert "내부 읽기 오류:" not in caplog.text
+    assert "SECRET" not in caplog.text
+
+
 def _reply(nodes=None, **changes):
     payload = {"schema": 1, "slide": 1, "seconds": 0.1,
                "counts": {"shapes": 2, "groups": 0, "tables": 1, "cells": 4, "errors": 0},
@@ -97,6 +137,26 @@ def test_unavailable_addin_does_not_enable_or_install_it():
     app = SimpleNamespace(COMAddIns=SimpleNamespace(Item=lambda name: Addin()))
     with pytest.raises(readers.ProbeFailure, match="addin_not_loaded"):
         cli._service(app)
+
+
+def test_unavailable_service_keeps_safe_internal_error_details(tmp_path, monkeypatch, capsys):
+    source = tmp_path / "synthetic.ppt"
+    source.write_bytes(b"SYNTHETIC")
+    exc = RuntimeError("SECRET_BODY")
+    exc.hresult = 0x80020009
+    exc.excepinfo = (0, "SECRET_SOURCE", "probe_disconnected", "SECRET_HELP", 0, 0x80004005)
+
+    def fail(app):
+        raise exc
+
+    monkeypatch.setattr(cli, "_service", fail)
+    assert cli.benchmark(None, source, SimpleNamespace(method="addin", synthetic=True, repeat=1), tmp_path) == 2
+    output = capsys.readouterr().out
+    record = json.loads(output.splitlines()[0])
+    assert record["failed_stage"] == "addin_service"
+    assert record["probe_error"] == "probe_disconnected"
+    assert record["inner_hresult"] == 0x80004005
+    assert "SECRET" not in output
 
 
 def test_addin_reads_each_slide_once_and_keeps_plaintext_in_memory(tmp_path, caplog):

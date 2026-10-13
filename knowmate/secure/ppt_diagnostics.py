@@ -11,6 +11,14 @@ logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 _PROGRESS_INTERVAL_SEC = 10.0
 _SLOW_SHAPE_SEC = 1.0
+_PROBE_KINDS = {"com", "binding", "argument", "null_reference", "invalid_operation", "other"}
+_PROBE_STAGES = {
+    "application", "application_get", "host_identity", "document_identity", "application_compare",
+    "slide_count", "slide_get", "shapes", "shapes_get", "read_shapes", "shape_iter", "shape_read", "serialize",
+    "shape_type", "group_items", "group_iter", "has_table", "table_get", "table_rows", "table_columns",
+    "cell_get", "cell_shape", "cell_frame", "cell_range", "cell_text",
+    "has_text_frame", "text_frame", "text_range", "text_read",
+}
 
 
 def probe_error_details(exc: BaseException) -> dict[str, Any]:
@@ -26,19 +34,52 @@ def probe_error_details(exc: BaseException) -> dict[str, Any]:
     allowed = {
         "probe_wrong_thread_or_disconnected", "probe_reentrant_request",
         "probe_extract_failed", "probe_wrong_application", "probe_invalid_slide",
+        "probe_missing_presentation",
+        "probe_disconnected", "probe_wrong_thread", "probe_requires_office_sta",
     }
     if isinstance(description, str):
         if description in allowed:
             result["probe_error"] = description
         else:
             match = re.fullmatch(
-                r"probe_extract_failed:(application|slide_count|shapes|read_shapes|serialize):([0-9A-F]{8})",
+                r"probe_extract_failed:([a-z_]+):(?:([a-z_]+):)?([0-9A-F]{8})",
                 description,
             )
-            if match:
+            if match and match[1] in _PROBE_STAGES and (match[2] is None or match[2] in _PROBE_KINDS):
                 result.update(probe_error="probe_extract_failed", probe_stage=match[1],
-                              probe_inner_hresult=int(match[2], 16))
+                              probe_inner_hresult=int(match[3], 16))
+                if match[2] is not None:
+                    result["probe_error_kind"] = match[2]
     return result
+
+
+def log_probe_read_errors(payload: dict[str, Any], slide: int) -> None:
+    """추가 기능의 복구 가능 오류 중 검증된 위치·분류·코드만 제한해서 기록한다."""
+    records = payload.get("read_errors", [])
+    if not isinstance(records, list):
+        return
+    logged = 0
+    for record in records[:16]:
+        if not isinstance(record, dict):
+            continue
+        stage, kind, shape = record.get("stage"), record.get("kind"), record.get("shape")
+        row, column, code = record.get("row"), record.get("column"), record.get("hresult")
+        if not isinstance(stage, str) or stage not in _PROBE_STAGES:
+            continue
+        if not isinstance(kind, str) or kind not in _PROBE_KINDS:
+            continue
+        if not isinstance(shape, str) or len(shape) > 1024 or re.fullmatch(r"[1-9][0-9]*(?:\.[1-9][0-9]*)*", shape) is None:
+            continue
+        if any(type(value) is not int or value < 0 for value in (row, column, code)) or code > 0xFFFFFFFF:
+            continue
+        logger.warning(
+            "[ppt-probe] 내부 읽기 오류: slide=%d shape=%s stage=%s row=%d column=%d kind=%s hresult=0x%08X",
+            slide, shape, stage, row, column, kind, code,
+        )
+        logged += 1
+    total = payload.get("counts", {}).get("errors", 0)
+    if type(total) is int and total > logged:
+        logger.warning("[ppt-probe] 상세 미표시 오류: slide=%d count=%d", slide, total - logged)
 
 
 @dataclass
