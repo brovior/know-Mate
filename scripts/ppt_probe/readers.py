@@ -10,7 +10,7 @@ from typing import Any, Callable
 
 from knowmate.secure import com_reader
 from knowmate.secure.plain_reader import PlainReader
-from knowmate.secure.ppt_diagnostics import PptReadDiagnostics
+from knowmate.secure.ppt_diagnostics import PptReadDiagnostics, log_probe_read_errors
 from knowmate.secure.text_util import format_table
 
 PROG_ID = "AegisDesk.PptReadProbe"
@@ -141,6 +141,7 @@ def decode_slide(reply: str, slide: int) -> tuple[list[str], dict[str, int], flo
             raise ProbeFailure("invalid_reply_node")
         if text.strip():
             texts.append(text)
+    log_probe_read_errors(payload, slide)
     return texts, counts, float(seconds)
 
 

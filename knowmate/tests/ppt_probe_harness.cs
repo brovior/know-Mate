@@ -3,6 +3,7 @@ using System;
 using System.Collections.Generic;
 using System.Reflection;
 using System.Runtime.InteropServices;
+using System.Threading;
 
 public sealed class ProbeShape
 {
@@ -37,6 +38,35 @@ public sealed class BrokenShape
 {
     public int Type { get { throw new COMException("SECRET", unchecked((int)0x80010108)); } }
 }
+public sealed class BrokenApplication
+{
+    public object Application { get { throw new COMException("SECRET", unchecked((int)0x80004005)); } }
+}
+public sealed class ProbePresentation
+{
+    public object Application { get; set; }
+    public ProbeCount Slides { get { return new ProbeCount { Count = 1 }; } }
+}
+public sealed class BrokenTextShape
+{
+    public int Type { get { return 1; } }
+    public int HasTable { get { return 0; } }
+    public int HasTextFrame { get { return -1; } }
+    public object TextFrame { get { throw new COMException("SECRET", unchecked((int)0x80004005)); } }
+}
+public sealed class BrokenTableShape
+{
+    public int Type { get { return 19; } }
+    public int HasTable { get { return -1; } }
+    public int HasTextFrame { get { return 0; } }
+    public BrokenTable Table { get { return new BrokenTable(); } }
+}
+public sealed class BrokenTable
+{
+    public ProbeCount Rows { get { return new ProbeCount { Count = 2 }; } }
+    public ProbeCount Columns { get { return new ProbeCount { Count = 2 }; } }
+    public object Cell(int row, int column) { throw new COMException("SECRET", unchecked((int)0x80004005)); }
+}
 
 public static class Harness
 {
@@ -46,6 +76,7 @@ public static class Harness
             TextFrame = new ProbeFrame { TextRange = new ProbeRange { Text = value } } };
     }
 
+    [STAThread]
     public static int Main(string[] args)
     {
         var assembly = Assembly.LoadFrom(args[0]);
@@ -91,6 +122,47 @@ public static class Harness
         {
             if (!(exc.InnerException is COMException)) throw;
         }
+        // 실제 Office 없이 누락된 속성·COM 실패의 분류와 원문 비노출을 확인한다.
+        object host = new object();
+        type.GetField("application", BindingFlags.NonPublic | BindingFlags.Instance).SetValue(disconnected, host);
+        type.GetField("mainThread", BindingFlags.NonPublic | BindingFlags.Instance).SetValue(disconnected, Thread.CurrentThread.ManagedThreadId);
+        var extract = type.GetMethod("ExtractSlide");
+        foreach (object input in new object[] { new BrokenApplication(), new object(), null })
+        {
+            try { extract.Invoke(disconnected, new object[] { input, 1 }); throw new Exception("failure_accepted"); }
+            catch (TargetInvocationException exc)
+            {
+                string message = exc.InnerException.Message;
+                string expected = input == null ? "probe_missing_presentation" : input is BrokenApplication
+                    ? "probe_extract_failed:application_get:com:80004005" : "probe_extract_failed:application_get:binding:";
+                if (!message.StartsWith(expected) || message.Contains("SECRET"))
+                    throw new Exception("extract_error_classification_failed");
+            }
+        }
+        foreach (object app in new object[] { host, new object() })
+        {
+            try
+            {
+                extract.Invoke(disconnected, new object[] { new ProbePresentation { Application = app }, 2 });
+                throw new Exception("guard_failure_accepted");
+            }
+            catch (TargetInvocationException exc)
+            {
+                string expected = Object.ReferenceEquals(app, host) ? "probe_invalid_slide" : "probe_wrong_application";
+                if (exc.InnerException.Message != expected) throw new Exception("guard_error_was_hidden");
+            }
+        }
+        var tracked = type.GetMethod("ReadShapeTracked", BindingFlags.NonPublic | BindingFlags.Static);
+        var errors = new List<Dictionary<string, object>>();
+        counts["errors"] = 0;
+        tracked.Invoke(null, new object[] { new BrokenTableShape(), nodes, counts, errors, "2.1" });
+        if ((string)errors[0]["stage"] != "cell_get" || (int)errors[0]["row"] != 1
+            || (int)errors[0]["column"] != 1 || (string)errors[0]["shape"] != "2.1"
+            || (uint)errors[0]["hresult"] != 0x80004005) throw new Exception("cell_position_failed");
+        for (int index = 0; index < 20; index++)
+            tracked.Invoke(null, new object[] { new BrokenTextShape(), nodes, counts, errors, "3" });
+        if (counts["errors"] != 21 || errors.Count != 16 || (string)errors[1]["stage"] != "text_frame"
+            || (string)errors[1]["kind"] != "com") throw new Exception("bounded_errors_failed");
         Console.WriteLine("PASS fake C# grouping/table/order/fatal/disconnected contracts; Office not verified");
         return 0;
     }

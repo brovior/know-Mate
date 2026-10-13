@@ -172,7 +172,7 @@ powershell -NoProfile -Command "[Reflection.AssemblyName]::GetAssemblyName((Reso
 .venv\Scripts\python.exe -m pytest knowmate\tests\test_ppt_probe.py -v
 ```
 
-DLL 버전은 `0.1.1.0`이어야 한다. 다른 버전이면 재등록하지 않고 빌드 결과를 확인한다.
+DLL 버전은 `0.1.2.0`이어야 한다. 다른 버전이면 재등록하지 않고 빌드 결과를 확인한다.
 Windows .NET Framework 컴파일러가 있으면 두 C# 하네스도 실행된다. 연결 하네스는 실제
 COM callable wrapper의 Dual vtable을 통해 연결·해제·시작·종료·실패 콜백을 호출한다.
 Office를 실행하거나 등록하지 않으며 내부 순회 하네스와 별개다. Linux에서 이 항목이
@@ -199,6 +199,25 @@ PowerPoint가 앞선 충돌로 시험용 추가 기능을 비활성화했을 수
 PowerPoint의 정상 실행·연결·종료를 먼저 확인하고 위 합성 시험을 repeat 1로 실행한다.
 성공한 뒤 repeat 3으로 늘린다. 수정은 COM 연결 규약 불일치를 해소한 것이며 실제 Office/DRM
 환경의 모든 충돌이 해결됐다는 뜻은 아니다. 시험 후 같은 범위로 Remove한다.
+
+### 내부 읽기 오류 판독
+
+진단 DLL `0.1.2.0`은 재빌드·재등록해야 한다. PowerPoint와 DLL을 생성한 COM 시험용
+PowerShell을 모두 종료한 뒤 빌드한다. `CS0016` 파일 사용 중 오류가 나면 잔류 프로세스가
+DLL을 잡고 있는지 확인하며 빌드 실패 상태에서는 등록하지 않는다.
+
+실패 결과의 `probe_stage`, `probe_error_kind`, `probe_inner_hresult`로 호출 위치·오류 종류·코드를
+확인한다. `application_get`은 문서의 Application 접근, `host_identity`·`document_identity`는
+각 객체의 COM identity 취득이다. identity가 다르면 `probe_wrong_application`을 그대로
+표시하며 확인을 우회하지 않는다. 연결 해제·잘못된 스레드·STA 불일치도 별도 표식으로 표시한다.
+
+그 뒤 슬라이드·도형·그룹·표·셀·텍스트·직렬화 단계를 구분한다. 계속 처리한 읽기 오류는
+`[ppt-probe] 내부 읽기 오류`에 슬라이드·그룹 내 도형 위치·행·열과 코드만 기록한다.
+상세는 슬라이드당 최대 16건이며 나머지는 미표시 건수로 남긴다. 오류가 있는 비교는 성공으로
+판정하지 않는다. 임의 COM 오류 문구·문서 본문은 출력하지 않는다.
+
+이 정보는 반환된 예외의 진단이며 COM 호출이 멈췄거나 프로세스가 종료돼 예외가 반환되지 않으면
+실패 지점을 확정할 수 없다. 외부 진행 로그와 Office 충돌 이벤트를 함께 확인해야 한다.
 
 도구와 등록 스크립트는 PowerPoint를 Quit·강제 종료하지 않는다. 사용자 PowerPoint가 실행 중이면
 기존 소유권 가드로 읽기를 연기한다. COM 호출 자체가 멈추면 즉시 취소가 보장되지 않는다.
