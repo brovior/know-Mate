@@ -1,10 +1,24 @@
 # PowerPoint 추가 기능의 운영 인덱싱 적용 설계
 
-상태: **설계 완료·운영 구현 전** (2026-10-13). AegisDesk가 설치 상태를 확인하고 미설치·구버전이면
+상태: **개발 설계·독립 재검증 완료, 운영 구현 전** (2026-10-13). AegisDesk가 설치 상태를 확인하고 미설치·구버전이면
 배포본의 설치 도구를 자동 실행한다. 사용자는 필요할 때 Windows 권한 요청을 승인하며,
 AegisDesk는 계속 일반 권한으로 동작한다. 별도 설치 도구의 수동 실행은 점검·복구·제거용이다.
 시험 결과의 정본은 [DIAGNOSTICS.md](../DIAGNOSTICS.md#ppt-추가-기능-사내-검증-보고-2026-10-13),
 시험 절차는 [PPT_PROBE.md](../guides/PPT_PROBE.md)다.
+
+## 사용자가 처음 실행할 때
+
+1. 포터블 폴더의 `AegisDesk.exe`를 평소처럼 실행한다.
+2. 앱이 PPT 읽기 기능을 확인한다. 없거나 업데이트가 필요하면 설치 도구를 자동 실행한다.
+3. Windows 권한 요청에서 **예**를 누른다. 다른 관리자 계정의 인증이 필요한 PC는 그 승인이 필요하다.
+4. 설치 도구가 끝나고 앱이 다시 확인한 뒤, 기존 자동 인덱싱 설정에 따라 수집을 시작한다.
+   시작 요청이 대기 중이면 이어서 처리한다. 설치 성공만으로 자동 인덱싱을 새로 켜지는 않는다.
+
+명령 입력·DLL 빌드는 필요 없다. 권한 요청을 거절하면 기존 방식으로 읽는다.
+PowerPoint가 열려 있으면 설치를 미루고 기존 방식으로 읽는다. 설치 중에도 앱 화면은 사용할 수 있다.
+`addin` 검증 모드에서는 준비되지 않은 PPT만 다음 사이클로 미룬다.
+
+아래는 개발자가 구현할 계약이다. **현재 실행 파일에 이 자동 설치 동작이 구현된 것은 아니다.**
 
 ## 1. 적용 범위와 전제
 
@@ -44,7 +58,7 @@ UI 스레드를 동기 대기로 막지 않고 설치 도구의 일반 권한 `/
 | 배포 요구 버전이 정상 등록됨 | 설치 도구 승격 없이 인덱싱 시작. 실제 로드·규약은 읽기 때 확인 |
 | 미설치·구버전·자체 설치 파일/등록 누락 | 준비 조건 확인 후 설치 도구를 자동 실행, 필요한 작업만 관리자 권한 요청 |
 | PowerPoint 실행 중·비트수/상태 미확인 | 설치를 보류. 자동으로 Office를 종료하거나 비트수를 추측하지 않음 |
-| 사용자가 권한 요청 거절·관리자 승인 불가·설치 실패 | auto는 기존 COM으로 계속, addin은 준비 대기. 같은 실행 중 설치 반복 금지 |
+| 사용자가 권한 요청 거절·관리자 승인 불가·설치 실패 | setup 수정 종료·잠금 해제 확인 뒤 auto는 기존 COM, addin은 준비 대기. 종료 미확인은 PPT 준비 대기 |
 | 이미 설치됐지만 Office에서 비활성화되거나 실제 로드/규약 실패 | 자동 재설치·강제 활성화하지 않고 읽기 복구와 점검 안내 |
 | `com` 모드 | 자동 설치·업데이트를 요청하지 않고 기존 읽기 방식 사용 |
 
@@ -83,7 +97,7 @@ Office 점유로 보류한 경우는 거절로 기록하지 않으며 다음 앱
 
 설치 도구는 자체 추가 기능 키만 수정한다. 다른 추가 기능, Office의 충돌 차단 기록,
 UAC·매크로·Trust 정책을 변경하지 않는다. 시험용 등록도 일괄 삭제하지 않는다.
-이전 버전 DLL은 업데이트 성공과 잠금 해제를 확인한 뒤 정리하며, 사용 중 파일을 덮어쓰지 않는다.
+이전 버전 DLL은 최초 구현에서 자동 삭제하지 않으며, 사용 중 파일을 덮어쓰지 않는다.
 
 제거도 PowerPoint를 종료한 상태에서 같은 범위·비트수의 운영 키만 해제하고 파일을 정리한다.
 업데이트 실패는 이전 등록으로 돌아가며, 새 DLL이 시작 시 Office를 충돌시키는 경우는 사용자가
@@ -124,7 +138,7 @@ secure 모듈이 전역 설정을 직접 조회하지 않는다. 초기 구현�
 
 COM 앱과 서비스 참조는 생성한 워커에서만 사용한다. 서비스와 준비 상태는 앱 참조 수명에 묶어
 보관하고 참조 해제·재연결·poison 시 함께 무효화한다. PID가 같아도 이전 서비스 참조를 재사용하지 않는다.
-캐시에 문서 COM 객체·원문·슬라이드 JSON을 보관하지 않는다. 설치 변경 후에는 앱/Office를 재시작한다.
+캐시에 문서 COM 객체·원문·슬라이드 JSON을 보관하지 않는다. 수동 설치 변경 후에는 앱/Office를 재시작한다. 자동 준비는 첫 워커 생성 전에 끝내므로 앱 재시작 없이 진행한다.
 
 ## 4. 파일 한 건의 읽기 계약
 
@@ -196,3 +210,244 @@ dispatch/open/read/close 단계와 read 시작시각을 유지한다. 폴백이�
 코드 단계에서는 UPDATE_NOTES를 갱신하고 관련 테스트와 저장소 전체 검사를 수행한다.
 Windows/Office에서 실행하지 못한 항목과 기존 실패는 따로 보고한다. 문서만 작성한 현재 변경은
 운영 기능 완료나 설치 가능 상태로 표시하지 않는다.
+
+## 8. 개발 작업 상세
+
+### 8-1. 현재 코드와 바꿀 지점
+
+| 현재 코드 | 필요한 변경 |
+|---|---|
+| `app/main.py`가 extractor·worker·IdleScheduler를 바로 만든다 | PPT 준비 완료까지 첫 worker 연결·시작을 보류하는 비동기 coordinator 추가 |
+| `bridge.py` 수동 인덱싱·실패 재시도, main의 트레이·유휴 동작이 각자 `worker.start()` 호출 | 같은 시작 게이트를 통과. 설치 대기 중 요청은 한 번으로 합치고 재시도 의도는 보존 |
+| `secure/__init__.py`가 매 COM 호출에 ComReader를 만든다 | mode와 준비 정책을 인자로 전달. 서비스 캐시는 리더 객체가 아닌 `_tls.ppt` 수명에 연결 |
+| `PowerPointComReader`의 도형 오류가 로그 후 계속되고 일반 close 오류도 성공 반환 가능 | 오류 건수·닫기 성공을 반환 전 확인. 불완전 추출은 성공으로 반환하지 않음 |
+| `scripts/ppt_probe/readers.py`에 시험 응답 decoder가 있다 | 순수 decoder를 secure로 이동해 운영·시험이 같이 사용 |
+| 시험용 `manage.ps1`만 있고 운영 setup·DLL은 없다 | 운영 C# 외피·setup·빌드·selftest 추가. 시험 등록 도구를 앱에서 호출하지 않음 |
+
+새 파일은 `secure/ppt_payload.py`, `secure/ppt_addin_reader.py`,
+`secure/ppt_installation.py`(Windows 점검·실행·잠금),
+`app/ppt_preparation.py`(Qt 비동기 상태와 시작 게이트),
+`scripts/ppt_reader/`(운영 외피·setup·빌드)로 책임을 나눈다.
+추출 코어를 `scripts/ppt_addin/` 안의 공용 C# 소스로 분리해 시험·운영 빌드가 동시에 컴파일한다.
+`scripts/ppt_probe`의 결과 비교 기능은 운영으로 가져오지 않는다.
+
+설정 기본값은 `knowmate/config.yaml`에서 읽는 작은 기본값 함수로 기존 사용자 설정에 보충한다.
+지금 config 로더는 기존 사용자 파일 전체를 템플릿과 병합하지 않으므로 `.get(..., "auto")`를
+여러 호출부에 반복하는 것으로 기본값 주입을 대신하지 않는다. fake/plain·비Windows는 설치 점검을 생략한다.
+
+### 8-2. 시작 게이트와 준비 상태
+
+앱의 상태는 `checking → installing → rechecking → ready/com_only/ppt_pending`으로 둔다.
+`com` 모드는 자동 설치를 요청하지 않지만 Machine 준비 예약·수정·저널의 안전 확인은 생략하지 않는다.
+아래 표를 상태 전이의 정본으로 사용한다. 미확인·실패를 `ready`로 바꾸지 않는다.
+
+| 확인된 상태 | auto | addin | com |
+|---|---|---|---|
+| 요구 등록 정상 + 준비 예약/수정 잠금/저널 안전 | ready | ready | com_only |
+| 수정 미실행이 확정된 거절·읽기 전용 점검 오류·정책 실패 + Machine 안전 확인 | com_only | ppt_pending | com_only |
+| 설치 실패 후 실제 자식 종료·예약 해제·저널 복구·잠금 안전 확인 | com_only | ppt_pending | com_only |
+| disabled/conflict + Machine 안전 확인 | com_only, 자동 수정 금지 | ppt_pending, 자동 수정 금지 | com_only |
+| 설치 중·부모/자식 종료 미확인·잠금 접근 불가·예약 unresolved·미완료 저널 | ppt_pending | ppt_pending | ppt_pending |
+
+읽기 전용 `/check`의 출력 오류는 수정 실행을 뜻하지 않는다. 그러나 다른 준비 요청의 안전까지
+확인하지 못했다면 com_only로 돌아가지 않는다. `/prepare` 종료 미확인은 출력 오류와 별개 상태다.
+상태 변경은 Qt 주 스레드에서 하고, setup은 QProcess 또는 동등한 비동기 process handle로 감시한다.
+수집기 QThread 안에서 UAC나 등록을 요청하지 않는다.
+
+- 첫 자동 점검은 단일 인스턴스 선점·config 읽기 후, 첫 worker 생성 전에 한다.
+- bridge의 두 시작 경로, 트레이, 유휴 시작을 coordinator에 위임한다. 설치 대기 중
+  실패 기록 조작·작업 예약과 worker 시작은 구분하고 대기 요청을 중복 실행하지 않는다.
+- 표에서 안전이 확인된 `auto` 준비 실패만 워커에 `com_only` 정책을 전달해 서비스 조회 반복을 피한다.
+  `addin`은 COM 대상 PPT를 파일 실패·백오프가 아닌 준비 대기로 분류한다.
+  plain PPTX·Word·Excel·메일은 일반 사이클에서 계속 처리한다.
+- 앱 종료 시 coordinator는 완료 콜백·수집 시작을 취소한다. 이미 승격된 설치 프로세스를
+  강제 종료하거나 설치 도중 COM 수집을 시작하지 않는다. 다음 실행은 재점검한다.
+- 사용자별 단일 인스턴스 락은 Machine 설치 잠금을 대체하지 못한다. 다른 세션/사용자의 앱도 고려한다.
+
+거절 기록은 원래 일반 권한 사용자의 `%APPDATA%/AegisDesk/ppt_reader_preparation.json`에
+요구 버전·고정 사유만 원자적으로 저장한다. 새 버전은 한 번 재요청할 수 있다.
+파일이 깨졌으면 같은 실행에서 자동 재요청하지 않고 수동 재시도를 안내한다.
+설치 실패·정책 차단도 같은 요구 버전에 자동 반복하지 않는다. Office 점유는 다음 실행에 재점검한다.
+수동 재시도는 수집 중 실행하지 않고 다음 준비 단계에서 요청한다.
+
+### 8-3. 설치 도구의 입출력과 승격
+
+`PptReaderSetup.exe`는 일반 권한 `/check`, `/prepare`, 수동 `/remove`, 내부 승격 작업을 제공한다.
+`/check`는 Office 실행 없이 읽기 전용이고, 다음 구조의 본문 없는 JSON 한 건만 stdout으로 반환한다.
+
+```json
+{"schema":1,"operation":"check","status":"ready","reason":"registration_ok","required_version":"1.0.0.0","installed_version":"1.0.0.0","office_bitness":64,"scope":"Machine"}
+```
+
+상태는 `ready/missing/outdated/repairable/disabled/conflict/busy/unknown/failed`를 구분하고,
+Machine 예약·저널의 안전 확인 여부를 별도 필드로 반환한다.
+앱은 구조·허용값·exit code·작업 요청의 일치를 검증한다. 출력 없음·깨진 출력·시간초과는 실패다.
+설치 요청의 종료 코드는 `0=작업 완료`, `10=Office/설치 점유`, `11=권한 거절`,
+`12=환경/정책 미확인`, `13=수정 실패`로 고정하고 schema 버전에 포함한다.
+`0`만으로 ready가 되지 않으며 원래 사용자 권한의 `/check`를 다시 수행한다.
+
+`/prepare` 일반 프로세스는 필요한 경우 `ShellExecuteEx(runas)`로 같은 도구의 작업 모드만
+승격하고 `SEE_MASK_NOCLOSEPROCESS`로 얻은 실제 자식 handle을 기다린다.
+실행 요청 성공만으로 완료를 판정하지 않는다. handle을 받지 못하면 종료 미확인으로 PPT 수집을 보류한다.
+UAC 취소와 실행 실패는 구분한다.
+중간 파일·사용자 AppData에 관리자 결과를 써서 전달하지 않고 자식 exit code 후 재점검으로 판정한다.
+다른 관리자 계정으로 승인해도 HKLM과 OS의 ProgramFiles만 수정하고 그 관리자의 HKCU/AppData는 쓰지 않는다.
+등록할 Office 정보·경로를 사용자 프로세스가 준 값만 믿지 않고 승격 작업이 다시 확인한다.
+
+UAC 대기·설치의 관찰 제한 시간이 지나면 Qt coordinator만 대기를 분리하고 `ppt_pending`으로 둔다.
+helper·승격 자식을 kill/terminate하지 않는다. 다른 문서·메일은 계속 가능하다.
+`/check`는 짧은 읽기 전용 QProcess로 실행할 수 있지만 `/prepare`는 QProcess 소유 수명에 묶지 않는다.
+일반 helper를 Windows CreateProcess의 독립 process로 실행하고 앱은 별도 handle로 관찰한다.
+앱 종료 시 그 handle만 닫으며 helper/자식을 kill-on-close job에 넣지 않는다.
+일반 helper는 UAC 요청 전부터 자식의 실제 종료·재점검까지 계속 살아서 준비 예약을 보유한다.
+부모 helper의 종료·관찰 timeout·QProcess finished를 승격 자식 종료와 동일시하지 않는다.
+
+설치 대상은 도구가 정한 고정 디렉터리와 자체 키뿐이다. 임의 source/destination/registry path를
+승격 옵션으로 받지 않는다. helper 옆의 배포 manifest와 payload를 확인한 뒤 복사한 파일도 재검증한다.
+manifest의 해시는 파일 일치 확인이며 배포자의 신뢰를 보장하는 서명으로 설명하지 않는다.
+설치된 파일·저널은 일반 사용자가 바꿀 수 없는 ACL을 적용하고 링크/재분석 지점 경유를 거부한다.
+사내 서명·허용 정책은 Windows 배포 시험의 별도 확인 항목이다.
+
+### 8-4. Machine 잠금·점검·복구
+
+**준비 예약**은 UAC 요청 전부터 자식의 실제 종료 확인까지, **수정/읽기 mutex**는 실제
+수정 또는 PPT COM 호출 구간에만 유지한다. mutex가 없다는 사실로 과거 준비 요청이 끝났다고 판단하지 않는다.
+
+구현 후보는 모든 세션에서 열람 가능한 `%ProgramData%/AegisDesk/PptReaderRequests/`의
+요청별 작은 durable 예약 파일과 global named mutex다. 요청은 UUID·요구 버전·원래 사용자 SID·
+helper PID/생성시각·자식 PID/생성시각(확인 전 null)·고정 상태를 기록한다. 문서/본문은 기록하지 않는다.
+이 예약은 동기화/보류 판단만 하며 관리자 작업을 승인하는 근거로 사용하지 않는다.
+
+일반 helper는 mutex 아래 다른 미완료 예약/저널을 확인하고 자기 예약을 원자적으로 저장한 뒤
+mutex를 놓고 UAC를 요청한다. 승격 자식은 실제 작업 전 같은 UUID의 예약과 프로세스 identity를
+확인하고 PID/생성시각을 기록하며, 수정 mutex를 획득한다. helper는 실제 자식 handle의 종료 후
+Machine 상태를 재점검해 안전한 완료 상태를 기록한다. handle을 얻지 못하거나 helper가 죽으면
+예약을 지우지 않고 unresolved로 판정한다. 거절도 수정 미실행이 확정된 뒤 완료로 기록한다.
+
+예약 디렉터리는 Users 읽기/열거·새 요청 생성, Creator Owner 자기 요청 갱신,
+Administrators/System 관리 권한으로 제한한다. 일반 사용자가 타인의 예약을 삭제/완료 처리하지 못한다.
+일반권한 최초 생성·ACL 설정이 해당 Windows/회사 정책에서 가능한지 **미검증**이다.
+필요 권한을 확보하지 못하면 자동 prepare를 시작하지 않는다. 수정 미실행과 Machine 안전이
+확인되면 auto는 기존 COM, 안전 확인이 불가능하면 PPT 준비 대기로 처리한다.
+사용자에게 별도 관리자 초기화를 정상 선행 절차로 요구하지 않는다. **앱 실행과 UAC 승인 외의
+수동 작업 없이 첫 설치가 가능한 Windows prototype gate를 통과해야 자동 설치를 배포한다.**
+이 후보가 gate를 통과하지 못하면 다른 자동 동기화 메커니즘을 설계·검증해야 하며,
+수동 초기화에 성공한 결과를 자동 설치 완료로 보고하지 않는다.
+
+새 앱과 다른 사용자/세션의 `/check`는 전체 예약을 읽고 helper/자식 PID와 생성시각을 확인한다.
+PID 재사용·identity/프로세스 조회 불가·기록 파손은 unresolved다. helper 부재만으로 예약을 제거하지 않는다.
+재부팅·오래된 예약도 시간 경과로 자동 만료하지 않는다. 실제 프로세스 종료와 Machine 저널/등록 안전을
+확인한 재점검 또는 관리자 수동 복구만 완료 처리한다. 어느 세션의 UAC/자식 실행 가능성도
+확인할 수 없으면 PPT를 보류한다. 앱이 직접 타인의 예약/관리자 저널을 수정하지 않는다.
+
+새 global named mutex 한 개로 설치 수정과 PPT COM 진입을 직렬화한다.
+일반 워커는 PPT dispatch 전 획득해서 read/close 완료까지 보유하고 setup은 전체 수정 구간에서 보유한다.
+워커는 mutex 획득 뒤 미완료 예약/저널을 재확인하며 하나라도 있으면 COM 진입을 보류한다.
+자식은 자기 요청 외의 미완료 예약이 있으면 수정하지 않는다.
+잠금 이름·접근권은 일반 사용자 동기화와 다른 관리자 UAC 모두 가능한 Windows 하네스로 검증한다.
+생성·접근 거부는 설치/읽기 점유로 보류하며 잠금 없음으로 추정하지 않는다.
+포기된 mutex를 얻으면 설치 저널·등록 상태를 확인한 뒤에만 읽기/수정을 허용한다.
+
+setup은 락 획득 전후 PowerPoint 프로세스를 모든 확인 가능한 세션에서 점검한다.
+조회 접근 거부·비트수 미확인은 설치 보류다. 사용자 PowerPoint가 검사 직후 실행하는 경합은
+앱의 락만으로 막을 수 없으므로 수정 직전 다시 점검하고 버전별 새 파일을 사용한다.
+Windows 시험에서 실행 경합의 안전성을 확인하지 못하면 자동 업데이트 배포를 보류한다.
+
+읽기 전용 점검은 Office App Paths/설치 정보에서 실제 POWERPNT.EXE 후보를 찾고 PE 비트수로 확정한다.
+후보가 충돌·누락되면 추측하지 않는다. Machine 등록은 OS가 제공하는 해당 ProgramFiles 경로를
+사용하며 Office 32비트라도 Python 비트수에 의존하지 않는다.
+HKCU와 HKLM의 운영 CLSID·ProgID·Addins를 Office와 같은 레지스트리 뷰에서 읽는다.
+HKCU shadow/다른 경로·버전·미소유 키는 `conflict`, 기존 Addins의 LoadBehavior가 비활성이면
+`disabled`다. 자동 repair로 `3`을 덮어쓰지 않는다. Office Resiliency를 지우거나 강제 활성화하지 않는다.
+시험용 키는 설치·점검 충돌 대상으로 무단 수정하지 않으며 운영과 별개로 남긴다.
+
+수정 전에 보호된 Machine 저널에 자체 키의 존재 여부·값 종류·값·현재 버전을 보존한다.
+DLL 복사 검증 → CLR·CLSID·ProgID 등록 → Addins 노출 → 재점검 → 저널 완료 순서다.
+실패·다음 실행의 미완료 저널은 락 아래 이전 상태로 복구하고 복구 실패면 준비 완료로 취급하지 않는다.
+새 키만 삭제하고 기존 키는 값 종류까지 복원한다. 다른 키는 건드리지 않는다.
+이전 DLL은 최초 구현에서 자동 삭제하지 않는다. 검증된 제거/정리 작업만 자체 버전 폴더를 정리한다.
+동일 버전 경로의 파일 해시가 다르면 덮어쓰지 않고 재빌드 버전 갱신 또는 수동 복구를 요구한다.
+제거는 설치 기록의 scope/bitness/고정 경로를 확인하고 Machine의 운영 키만 처리한다.
+HKCU 충돌이나 시험용 등록을 함께 제거하지 않는다. 설치 기록 불명확 시 삭제를 중단한다.
+
+### 8-5. 운영 읽기 성공 조건
+
+운영 서비스는 `ProtocolVersion()=2`, `ReaderVersion()=1.0.0.0`, JSON schema 1을 최초에 확인한다.
+첫 릴리스는 요구 운영 버전과 정확히 일치할 때만 선택한다. 향후 호환 범위를 넓히는 것은 별도 변경이다.
+경로는 원본을 연 Python의 절대 경로와 host Presentations의 FullName을 비교한다.
+UNC·대소문자·중복·상대경로는 기존 하네스 계약을 유지하고 경로 alias는 추측해서 동일시하지 않는다.
+
+응답 검증은 시험 decoder의 슬라이드당 32Mi 문자 상한을 유지하며 bool을 숫자로 받지 않는다.
+counts·nodes·셀 문자열·finite 시간·schema·요청 slide·오류 위치를 검사하고
+`counts.errors>0`이면 운영 성공 결과를 반환하지 않는다. 파일 전체 원문은 기존 문자열 계약에 따라
+메모리에 조합하되 COM 객체/JSON/응답 문자열을 서비스 캐시에 누적하지 않는다.
+
+외부 HRESULT, pywin32 EXCEPINFO scode, 허용된 추가기능 오류 코드·내부 HRESULT를 순수 함수로
+분류한다. RPC 치명 코드가 하나라도 있으면 fatal을 우선한다. 임의 COM description을 로그로 찍지 않는다.
+기존 `_poison_if_fatal`은 PPT 경로에서 이 분류를 사용하고 실패 코드 테스트를 먼저 추가한다.
+
+폴백은 같은 열린 문서에서 1회이며 결과 버퍼·addin 오류를 분리한다.
+현재 ComWatchdog는 실제 종료 `killed>0`일 때만 fired/stage를 남기고 PowerPoint는
+`terminable=False`라 종료되지 않는다. 따라서 PPT timeout 판정은 fired나 강제종료 여부에 의존하지 않는다.
+
+scheduler는 파일의 실제 COM 진입에서 기존 `_com_timeout_for_size`로 제한 시간을 산정해
+`time.monotonic()+timeout`의 파일별 deadline을 한 번 생성하고 secure에 읽기 전용 확인 callback을 주입한다.
+`com_timeout_base_sec<=0`이면 기존 timeout 비활성화를 존중해 deadline을 None으로 둔다.
+슬라이드 전환·addin 폴백·close로 deadline을 재생성하거나 제한 시간을 늘리지 않는다.
+
+callback은 deadline 도달·취소·외부 fired·원본 size/mtime 변경을 read 시작, 각 슬라이드 호출 전후,
+일반 오류의 폴백 결정 전, close 후 최종 반환 전에 확인한다.
+닫기 완료·추출 반환 시점의 monotonic end와 성공/expired 판정을 파일별 불변 결과로 확정하고
+워치독을 정리한다. 결과는 파일 세대 토큰·COM 시작/종료시각·deadline·expired·close 성공을
+담는 frozen 기록으로 scheduler 컨텍스트에 보관한다. 별도 종료 훅으로 secure에서 확정하며
+기존 `extract(path)->str` 반환 계약은 유지한다. 결과 누락·세대 불일치·close 미확인은 성공이 아니다. scheduler는 추출 반환 직후 이 확정 결과를 확인하며 COM deadline을 다음
+임베딩 구간으로 연장하지 않는다. COM 호출이 늦게 정상 반환하거나 일반 오류를 반환해도
+COM 종료 시 deadline을 넘었으면 폴백·성공 커밋을 금지한다.
+임베딩 후 DB 커밋 직전에는 확정된 COM 성공/expired 판정과 현재 취소·원본 변경만 확인한다.
+그때 `time.monotonic()>옛 COM deadline`으로 정상 임베딩을 거부하지 않는다.
+시간초과 뒤에도 기존 안전한 close 처리만 수행하며 Office 강제 종료를 새로 도입하지 않는다.
+secure가 scheduler를 import하지 않는다. callback은 파일 단위 수명이며 다음 파일에 넘기지 않는다.
+이 설계는 늦게 돌아온 결과의 사용을 막지만 영원히 멈춘 PPT COM 호출을 해제하지 못한다.
+
+PPT deadline 초과는 별도의 '강제 종료 없이 시간초과' 건수·단계로 기록한다.
+기존 Word/Excel 실제 강제해제 `timeout_count`와 섞지 않는다.
+`killed=0`·fired 없음에서 늦은 정상값과 일반 오류, close 중 deadline 초과,
+정상 COM 뒤 COM 제한보다 긴 임베딩을 마치고도 정상 커밋, 확정 expired 결과의 미커밋,
+커밋 직전 취소/원본 변경, timeout disabled, 다음 파일 deadline 독립성을 fake clock으로 검증한다.
+기존 COM 경로도 diagnostics 오류 건수를 공개 accessor로 합산해 부분 읽기를 거부한다.
+기존 일반 close 오류는 PPT 전용 `close_unconfirmed` 예외로 실패 처리하며 추출 return은 close 성공 뒤 한다.
+이 보완은 `com` 모드에도 적용한다. Word·Excel의 close 정책은 이번 범위에서 바꾸지 않는다.
+
+### 8-6. 구현 단위와 검증 전달
+
+| 순서 | 변경 단위 | 완료 조건 |
+|---|---|---|
+| 1 | C# 공용 코어·운영 외피·순수 payload/오류 분류 | 시험 reader 회귀, 운영 버전·경로·부분읽기·본문 비노출 하네스 통과 |
+| 2 | PowerPointComReader 모드·캐시·폴백·close 성공조건 | config 주입, fatal 포장·취소·독립 deadline(killed=0/disabled/COM 종료 확정/긴 임베딩 후 정상 커밋)·mtime 변경·부분결과 미커밋 fake 검증 |
+| 3 | setup check/prepare/remove·준비 예약·Machine 락·저널 | Windows 최초 예약 ACL·UAC 대기중 앱종료/재시작·다른 사용자·helper 중단/핸들없음·중간 복구·점유 시험 |
+| 4 | Qt coordinator·모든 시작 경로·준비 대기 분류 | 상태 전이표·check 출력오류와 prepare 종료미확인 분리·모든 시작게이트·timeout에 helper 비종료·다른 세션 경합 검증 |
+| 5 | 빌드/배포·selftest·베타 안내 | 운영 DLL/setup/manifest 누락·버전/해시 불일치면 빌드 실패, 일반권한 포터블 시험 |
+
+빌드는 `scripts/build_impl.bat`에서 build_guard 후 운영 C# payload를 컴파일하고
+`AegisDesk.spec`가 해당 산출물을 포함한다. `app/selftest.py`는 등록·승격·Office 실행 없이
+필수 payload·어셈블리·manifest와 앱 build commit/source_fingerprint 일치를 확인한다.
+개발 source 실행의 payload 누락은 auto=com, addin=준비 대기다. 배포 빌드 누락은 허용하지 않는다.
+
+각 코드 변경은 UPDATE_NOTES와 해당 테스트를 포함하고 전체 fake 회귀를 수행한다.
+문서만 수정한 현재 단계는 Windows 설치·UAC·다른 사용자 세션·32비트 Office·사내 정책을 검증하지 않았다.
+세 문서의 시험 DLL 결과를 운영 DLL/장시간/자동설치 성공으로 승격하지 않는다.
+검증 agent는 **시작 게이트의 누락, lock/설치 자식 수명, disabled/conflict 자동수정,
+rollback 권한, 부분 추출 성공, fatal HRESULT 은폐, 빌드 출처 누락**을 우선 확인한다.
+
+Windows API 근거: [ShellExecuteEx process handle](https://learn.microsoft.com/ko-kr/windows/win32/api/shellapi/ns-shellapi-shellexecuteinfow),
+[UAC 권한 승인과 자격증명](https://learn.microsoft.com/ko-kr/windows/security/application-security/application-control/user-account-control/how-it-works).
+
+## 9. 개발 설계 검증 상태
+
+설계 에이전트 작성 후 별도 검증 에이전트가 실제 코드와 대조했다. PPT의 강제 종료 없는
+시간초과 판정, 설치 실패/종료 미확인 상태의 우선순위, UAC 대기와 앱 재실행 사이 준비 예약
+수명의 세 지적을 수정했고 독립 재검증에서 새 중대·높음·보통 지적은 없었다. 구현 착수 가능하다.
+
+이 결과는 문서·코드 계약과 링크·코드 블록·diff 검증이며 Windows 설치나 실제 Office를
+실행한 검증이 아니다. §8-4의 일반 권한 최초 예약 생성·ACL·다른 관리자/세션·중단 복구
+prototype gate가 통과되기 전에는 자동 설치를 배포하지 않는다.
