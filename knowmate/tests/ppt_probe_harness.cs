@@ -1,6 +1,7 @@
 // Office 없이 실제 추가 기능의 내부 순회를 검증하는 합성 객체.
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -38,14 +39,33 @@ public sealed class BrokenShape
 {
     public int Type { get { throw new COMException("SECRET", unchecked((int)0x80010108)); } }
 }
-public sealed class BrokenApplication
+public sealed class BrokenHost
 {
-    public object Application { get { throw new COMException("SECRET", unchecked((int)0x80004005)); } }
+    public object Presentations { get { throw new COMException("SECRET", unchecked((int)0x80004005)); } }
 }
 public sealed class ProbePresentation
 {
-    public object Application { get; set; }
-    public ProbeCount Slides { get { return new ProbeCount { Count = 1 }; } }
+    public string FullName { get; set; }
+    public ProbeSlides Slides { get { return new ProbeSlides(); } }
+}
+public sealed class ProbeSlides
+{
+    public int Count { get { return 1; } }
+    public ProbeSlide this[int index] { get { return new ProbeSlide(); } }
+}
+public sealed class ProbeSlide
+{
+    public List<ProbeShape> Shapes { get { return new List<ProbeShape> { Harness.Text("SECRET_HOST") }; } }
+}
+public sealed class ProbeDocuments
+{
+    public List<ProbePresentation> Items = new List<ProbePresentation>();
+    public int Count { get { return Items.Count; } }
+    public ProbePresentation this[int index] { get { return Items[index - 1]; } }
+}
+public sealed class ProbeHost
+{
+    public ProbeDocuments Presentations = new ProbeDocuments();
 }
 public sealed class BrokenTextShape
 {
@@ -122,36 +142,47 @@ public static class Harness
         {
             if (!(exc.InnerException is COMException)) throw;
         }
-        // 실제 Office 없이 누락된 속성·COM 실패의 분류와 원문 비노출을 확인한다.
-        object host = new object();
-        type.GetField("application", BindingFlags.NonPublic | BindingFlags.Instance).SetValue(disconnected, host);
+        // 콜백 호스트의 문서만 읽고 외부 COM 객체를 전달받지 않는 계약을 검증한다.
+        var hostField = type.GetField("application", BindingFlags.NonPublic | BindingFlags.Instance);
+        string path = Path.Combine(Path.GetTempPath(), "probe-host-only.ppt");
         type.GetField("mainThread", BindingFlags.NonPublic | BindingFlags.Instance).SetValue(disconnected, Thread.CurrentThread.ManagedThreadId);
         var extract = type.GetMethod("ExtractSlide");
-        foreach (object input in new object[] { new BrokenApplication(), new object(), null })
+        if (extract.GetParameters()[0].ParameterType != typeof(string)) throw new Exception("path_contract_required");
+        foreach (object host in new object[] { new BrokenHost(), new object() })
         {
-            try { extract.Invoke(disconnected, new object[] { input, 1 }); throw new Exception("failure_accepted"); }
+            hostField.SetValue(disconnected, host);
+            try { extract.Invoke(disconnected, new object[] { path, 1 }); throw new Exception("failure_accepted"); }
             catch (TargetInvocationException exc)
             {
                 string message = exc.InnerException.Message;
-                string expected = input == null ? "probe_missing_presentation" : input is BrokenApplication
-                    ? "probe_extract_failed:application_get:com:80004005" : "probe_extract_failed:application_get:binding:";
+                string expected = host is BrokenHost ? "probe_extract_failed:host_presentations:com:80004005"
+                    : "probe_extract_failed:host_presentations:binding:";
                 if (!message.StartsWith(expected) || message.Contains("SECRET"))
                     throw new Exception("extract_error_classification_failed");
             }
         }
-        foreach (object app in new object[] { host, new object() })
-        {
-            try
-            {
-                extract.Invoke(disconnected, new object[] { new ProbePresentation { Application = app }, 2 });
-                throw new Exception("guard_failure_accepted");
-            }
-            catch (TargetInvocationException exc)
-            {
-                string expected = Object.ReferenceEquals(app, host) ? "probe_invalid_slide" : "probe_wrong_application";
-                if (exc.InnerException.Message != expected) throw new Exception("guard_error_was_hidden");
-            }
-        }
+        var goodHost = new ProbeHost();
+        hostField.SetValue(disconnected, goodHost);
+        // 다른 인스턴스에만 열린 문서는 이 호스트의 읽기 대상이 아니다.
+        var foreignDocument = new ProbePresentation { FullName = path };
+        ExpectGuard(extract, disconnected, path, 1, "probe_document_not_open_in_host");
+        goodHost.Presentations.Items.Add(new ProbePresentation { FullName = "unsaved.ppt" });
+        goodHost.Presentations.Items.Add(new ProbePresentation { FullName = path });
+        string reply = (string)extract.Invoke(disconnected, new object[] { path, 1 });
+        if (!reply.Contains("SECRET_HOST") || !reply.Contains("\"errors\":0"))
+            throw new Exception("host_read_failed");
+        string normalizedReply = (string)extract.Invoke(disconnected, new object[] {
+            Path.Combine(Path.GetTempPath(), "probe-subfolder", "..", "probe-host-only.ppt"), 1 });
+        if (!normalizedReply.Contains("SECRET_HOST")) throw new Exception("normalized_path_failed");
+        ExpectGuard(extract, disconnected, path, 2, "probe_invalid_slide");
+        ExpectGuard(extract, disconnected, null, 1, "probe_invalid_path");
+        ExpectGuard(extract, disconnected, "relative.ppt", 1, "probe_invalid_path");
+        ExpectGuard(extract, disconnected, "C:relative.ppt", 1, "probe_invalid_path");
+        goodHost.Presentations.Items.Add(foreignDocument);
+        ExpectGuard(extract, disconnected, path, 1, "probe_ambiguous_host_document");
+        goodHost.Presentations.Items.Clear();
+        goodHost.Presentations.Items.Add(null);
+        ExpectGuard(extract, disconnected, path, 1, "probe_missing_host_document");
         var tracked = type.GetMethod("ReadShapeTracked", BindingFlags.NonPublic | BindingFlags.Static);
         var errors = new List<Dictionary<string, object>>();
         counts["errors"] = 0;
@@ -163,7 +194,20 @@ public static class Harness
             tracked.Invoke(null, new object[] { new BrokenTextShape(), nodes, counts, errors, "3" });
         if (counts["errors"] != 21 || errors.Count != 16 || (string)errors[1]["stage"] != "text_frame"
             || (string)errors[1]["kind"] != "com") throw new Exception("bounded_errors_failed");
-        Console.WriteLine("PASS fake C# grouping/table/order/fatal/disconnected contracts; Office not verified");
+        Console.WriteLine("PASS fake C# host-document/guards/grouping/table/order/fatal/disconnected contracts; Office not verified");
         return 0;
+    }
+
+    private static void ExpectGuard(MethodInfo extract, object instance, string path, int slide, string expected)
+    {
+        try
+        {
+            extract.Invoke(instance, new object[] { path, slide });
+            throw new Exception("guard_failure_accepted");
+        }
+        catch (TargetInvocationException exc)
+        {
+            if (exc.InnerException.Message != expected) throw new Exception("guard_error_was_hidden");
+        }
     }
 }

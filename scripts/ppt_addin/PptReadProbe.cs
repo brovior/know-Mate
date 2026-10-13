@@ -2,12 +2,13 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.IO;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Web.Script.Serialization;
 
-[assembly: AssemblyVersion("0.1.2.0")]
+[assembly: AssemblyVersion("0.1.3.0")]
 [assembly: ComVisible(false)]
 
 namespace AegisDesk.PptProbe
@@ -33,12 +34,12 @@ namespace AegisDesk.PptProbe
     }
 
     /// <summary>외부 비교 스크립트에 노출하는 최소 추출 계약.</summary>
-    [ComVisible(true), Guid("94D61957-6341-43E3-AD86-D968157BB181")]
+    [ComVisible(true), Guid("819985A8-742C-4AF1-90AF-BF7B135968D5")]
     [InterfaceType(ComInterfaceType.InterfaceIsDual)]
     public interface IPptReadProbe
     {
         [DispId(1)] int ProtocolVersion();
-        [DispId(2)] string ExtractSlide([MarshalAs(UnmanagedType.IDispatch)] object presentation, int slide);
+        [DispId(2)] string ExtractSlide([MarshalAs(UnmanagedType.BStr)] string presentationPath, int slide);
     }
 
     /// <summary>PowerPoint 주 STA에서 슬라이드를 읽는 시험 추가 기능.</summary>
@@ -91,41 +92,60 @@ namespace AegisDesk.PptProbe
         }
 
         /// <summary>시험 스크립트와 맞춰야 하는 응답 버전을 반환한다.</summary>
-        public int ProtocolVersion() { RequireHostThread(); return 1; }
+        public int ProtocolVersion() { RequireHostThread(); return 2; }
 
-        private bool SameApplication(object other, ref string stage)
+        private static bool IsAbsolutePath(string path)
         {
-            stage = "host_identity";
-            IntPtr left = Marshal.GetIUnknownForObject(application);
-            IntPtr right = IntPtr.Zero;
+            if (String.IsNullOrWhiteSpace(path) || !Path.IsPathRooted(path)) return false;
+            string root = Path.GetPathRoot(path);
+            // Windows 드라이브·루트 상대 경로는 현재 디렉터리에 의존하므로 거부한다.
+            return !(root.Length == 2 && root[1] == ':')
+                && !(Path.DirectorySeparatorChar == '\\' && root == "\\");
+        }
+
+        private object FindHostPresentation(string path, ref string stage)
+        {
+            stage = "path_validate";
+            if (!IsAbsolutePath(path)) throw new COMException("probe_invalid_path");
+            string expected;
             try
             {
-                stage = "document_identity";
-                right = Marshal.GetIUnknownForObject(other);
-                stage = "application_compare";
-                return left == right;
+                expected = Path.GetFullPath(path);
             }
-            finally
+            catch (ArgumentException) { throw new COMException("probe_invalid_path"); }
+            catch (NotSupportedException) { throw new COMException("probe_invalid_path"); }
+            stage = "host_presentations";
+            dynamic documents = ((dynamic)application).Presentations;
+            stage = "host_document_count";
+            int count = (int)documents.Count;
+            object found = null;
+            for (int index = 1; index <= count; index++)
             {
-                if (right != IntPtr.Zero) Marshal.Release(right);
-                Marshal.Release(left);
+                stage = "host_document_get";
+                dynamic candidate = documents[index];
+                if (candidate == null) throw new COMException("probe_missing_host_document");
+                stage = "host_document_path";
+                string fullName = (string)candidate.FullName;
+                // 저장 전 문서의 상대 이름을 요청한 파일로 오인하지 않는다.
+                if (!IsAbsolutePath(fullName)) continue;
+                if (!String.Equals(Path.GetFullPath(fullName), expected, StringComparison.OrdinalIgnoreCase)) continue;
+                if (found != null) throw new COMException("probe_ambiguous_host_document");
+                found = (object)candidate;
             }
+            if (found == null) throw new COMException("probe_document_not_open_in_host");
+            return found;
         }
 
         /// <summary>이미 열린 같은 Office의 슬라이드를 읽어 JSON을 메모리로 반환한다.</summary>
-        public string ExtractSlide(object presentation, int slide)
+        public string ExtractSlide(string presentationPath, int slide)
         {
             RequireHostThread();
             if (reading) throw new COMException("probe_reentrant_request");
             reading = true;
-            string stage = "application_get";
+            string stage = "path_validate";
             try
             {
-                if (presentation == null) throw new COMException("probe_missing_presentation");
-                dynamic prs = presentation;
-                object documentApplication = (object)prs.Application;
-                if (!SameApplication(documentApplication, ref stage))
-                    throw new COMException("probe_wrong_application");
+                dynamic prs = FindHostPresentation(presentationPath, ref stage);
                 stage = "slide_count";
                 if (slide < 1 || slide > (int)prs.Slides.Count)
                     throw new COMException("probe_invalid_slide");
@@ -162,8 +182,9 @@ namespace AegisDesk.PptProbe
             {
                 if (IsFatal(exc)) throw;
                 // 의도적인 거부 사유를 공통 오류로 덮지 않는다.
-                if (exc is COMException && (exc.Message == "probe_wrong_application"
-                    || exc.Message == "probe_invalid_slide" || exc.Message == "probe_missing_presentation")) throw;
+                if (exc is COMException && (exc.Message == "probe_invalid_path"
+                    || exc.Message == "probe_invalid_slide" || exc.Message == "probe_missing_host_document"
+                    || exc.Message == "probe_ambiguous_host_document" || exc.Message == "probe_document_not_open_in_host")) throw;
                 // COM 예외에 셀 내용·경로·JSON을 포함하지 않는다.
                 // 고정 단계와 숫자 코드만 반환하고 예외 본문은 외부에 노출하지 않는다.
                 string code = unchecked((uint)Marshal.GetHRForException(exc)).ToString("X8");

@@ -18,6 +18,7 @@ _PROBE_STAGES = {
     "shape_type", "group_items", "group_iter", "has_table", "table_get", "table_rows", "table_columns",
     "cell_get", "cell_shape", "cell_frame", "cell_range", "cell_text",
     "has_text_frame", "text_frame", "text_range", "text_read",
+    "path_validate", "host_presentations", "host_document_count", "host_document_get", "host_document_path",
 }
 
 
@@ -36,6 +37,8 @@ def probe_error_details(exc: BaseException) -> dict[str, Any]:
         "probe_extract_failed", "probe_wrong_application", "probe_invalid_slide",
         "probe_missing_presentation",
         "probe_disconnected", "probe_wrong_thread", "probe_requires_office_sta",
+        "probe_invalid_path", "probe_missing_host_document", "probe_ambiguous_host_document",
+        "probe_document_not_open_in_host",
     }
     if isinstance(description, str):
         if description in allowed:

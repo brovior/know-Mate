@@ -99,7 +99,7 @@ public static class ConnectionHarness
         object[] args = { new ProbeHost(), 1, addin, null };
         connect.Invoke(instance, args);
         if (!Object.ReferenceEquals(addin.Object, instance)
-            || (int)type.GetMethod("ProtocolVersion").Invoke(instance, null) != 1)
+            || (int)type.GetMethod("ProtocolVersion").Invoke(instance, null) != 2)
             throw new Exception("managed_connection_failed");
         type.GetMethod("OnDisconnection").Invoke(instance, new object[] { 1, null });
         Disconnected(type, instance);
@@ -196,7 +196,7 @@ public static class ConnectionHarness
             Disconnected(type, instance);
             if (connect(pointer, appPointer, 1, addinPointer, ref custom) != 0
                 || !Object.ReferenceEquals(addin.Object, instance)
-                || (int)type.GetMethod("ProtocolVersion").Invoke(instance, null) != 1)
+                || (int)type.GetMethod("ProtocolVersion").Invoke(instance, null) != 2)
                 throw new Exception("native_connection_failed");
             CustomValue(custom, false, "after_connect");
             if (update(pointer, ref custom) != 0) throw new Exception("native_update_failed");

@@ -159,10 +159,11 @@ def test_unavailable_service_keeps_safe_internal_error_details(tmp_path, monkeyp
     assert "SECRET" not in output
 
 
-def test_addin_reads_each_slide_once_and_keeps_plaintext_in_memory(tmp_path, caplog):
+def test_addin_reads_each_slide_by_absolute_path_and_keeps_plaintext_in_memory(tmp_path, caplog):
     calls = []
 
-    def extract(prs, number):
+    def extract(path, number):
+        assert isinstance(path, str) and path == str((tmp_path / "deck.ppt").resolve())
         calls.append(number)
         return _reply(slide=number)
 
@@ -173,6 +174,26 @@ def test_addin_reads_each_slide_once_and_keeps_plaintext_in_memory(tmp_path, cap
     assert result.counts["cells"] == 8
     assert "SECRET" not in caplog.text
     assert list(tmp_path.iterdir()) == []
+
+
+def test_legacy_addin_protocol_is_rejected_before_reading():
+    service = SimpleNamespace(ProtocolVersion=lambda: 1,
+                              ExtractSlide=lambda *args: pytest.fail("legacy service must not read"))
+    addin = SimpleNamespace(Connect=True, Object=service)
+    app = SimpleNamespace(COMAddIns=SimpleNamespace(Item=lambda name: addin))
+    with pytest.raises(readers.ProbeFailure, match="addin_protocol_mismatch"):
+        cli._service(app)
+    service.ProtocolVersion = lambda: 2
+    assert cli._service(app) is service
+
+
+@pytest.mark.parametrize("marker", [
+    "probe_document_not_open_in_host", "probe_ambiguous_host_document", "probe_invalid_path",
+])
+def test_host_document_guard_messages_are_safe_and_preserved(marker):
+    exc = RuntimeError("SECRET")
+    exc.excepinfo = (0, "SECRET_SOURCE", marker, "SECRET_HELP", 0, 0x80004005)
+    assert probe_error_details(exc) == {"inner_hresult": 0x80004005, "probe_error": marker}
 
 
 def test_opened_closes_document_on_read_failure_without_quit(tmp_path):

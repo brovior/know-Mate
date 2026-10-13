@@ -67,8 +67,8 @@ PowerPoint를 사용자가 모두 정상 종료한 뒤 합성 변환 비교:
 
 `scripts/ppt_addin/PptReadProbe.cs`는 VSTO 런타임을 추가하지 않는 최소 C# COM 시제품이다.
 Office 주 STA에서 순회하도록 `StandardOleMarshalObject`를 사용하고 호출 스레드도 확인한다.
-PowerPoint가 로드한 앱과 입력 프레젠테이션의 COM identity가 같아야 읽는다. 파일 저장·열기·Quit을
-추가 기능에서 수행하지 않는다. Python은 `COMAddIns.Item(...).Object`로 이미 로드된 객체만 호출한다.
+외부 프레젠테이션 COM 객체를 전달받지 않고, 연결 콜백으로 받은 PowerPoint의 열린 문서 목록에서
+요청한 절대 경로가 정확히 하나인 문서만 읽는다. 추가 기능에서 파일 저장·열기·Quit을 수행하지 않는다. Python은 `COMAddIns.Item(...).Object`로 이미 로드된 객체만 호출한다.
 
 빌드는 설치와 분리돼 있다. .NET Framework 4.x와 C# 컴파일러를 사용하며 Office PIA·NuGet·인터넷이
 필요하지 않다. 대상 PC에는 .NET Framework 4.x가 있어야 한다. 사내 규정상 등록이 허용되지 않으면
@@ -172,7 +172,7 @@ powershell -NoProfile -Command "[Reflection.AssemblyName]::GetAssemblyName((Reso
 .venv\Scripts\python.exe -m pytest knowmate\tests\test_ppt_probe.py -v
 ```
 
-DLL 버전은 `0.1.2.0`이어야 한다. 다른 버전이면 재등록하지 않고 빌드 결과를 확인한다.
+DLL 버전은 `0.1.3.0`이어야 한다. 다른 버전이면 재등록하지 않고 빌드 결과를 확인한다.
 Windows .NET Framework 컴파일러가 있으면 두 C# 하네스도 실행된다. 연결 하네스는 실제
 COM callable wrapper의 Dual vtable을 통해 연결·해제·시작·종료·실패 콜백을 호출한다.
 Office를 실행하거나 등록하지 않으며 내부 순회 하네스와 별개다. Linux에서 이 항목이
@@ -202,14 +202,19 @@ PowerPoint의 정상 실행·연결·종료를 먼저 확인하고 위 합성 �
 
 ### 내부 읽기 오류 판독
 
-진단 DLL `0.1.2.0`은 재빌드·재등록해야 한다. PowerPoint와 DLL을 생성한 COM 시험용
+진단 DLL `0.1.3.0`은 재빌드·재등록해야 한다. PowerPoint와 DLL을 생성한 COM 시험용
 PowerShell을 모두 종료한 뒤 빌드한다. `CS0016` 파일 사용 중 오류가 나면 잔류 프로세스가
 DLL을 잡고 있는지 확인하며 빌드 실패 상태에서는 등록하지 않는다.
 
 실패 결과의 `probe_stage`, `probe_error_kind`, `probe_inner_hresult`로 호출 위치·오류 종류·코드를
-확인한다. `application_get`은 문서의 Application 접근, `host_identity`·`document_identity`는
-각 객체의 COM identity 취득이다. identity가 다르면 `probe_wrong_application`을 그대로
-표시하며 확인을 우회하지 않는다. 연결 해제·잘못된 스레드·STA 불일치도 별도 표식으로 표시한다.
+확인한다. `host_presentations`·`host_document_count`·`host_document_get`·`host_document_path`는
+연결된 PowerPoint의 열린 문서 목록·건수·항목·경로 확인이다. 대상이 없으면
+`probe_document_not_open_in_host`, 중복이면 `probe_ambiguous_host_document`로 거부한다.
+연결 해제·잘못된 스레드·STA 불일치도 별도 표식으로 표시한다. 경로와 본문은 오류 문구에 넣지 않는다.
+
+DLL과 Python 도구는 호출 규약 2를 사용하며 이전 규약은 `addin_protocol_mismatch`로 거부한다.
+추출 결과 JSON 스키마는 1을 유지한다. 경로의 대소문자와 `.`·`..`은 정규화하지만 심볼릭 링크·
+드라이브 별칭·짧은 경로의 동등성을 추측하지 않으며 대상이 확인되지 않으면 읽지 않는다.
 
 그 뒤 슬라이드·도형·그룹·표·셀·텍스트·직렬화 단계를 구분한다. 계속 처리한 읽기 오류는
 `[ppt-probe] 내부 읽기 오류`에 슬라이드·그룹 내 도형 위치·행·열과 코드만 기록한다.

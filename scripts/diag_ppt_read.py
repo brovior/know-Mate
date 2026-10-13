@@ -84,8 +84,10 @@ def _service(app: Any) -> Any:
     if not addin.Connect:
         raise ProbeFailure("addin_not_loaded")
     service = addin.Object
-    if service is None or service.ProtocolVersion() != 1:
+    if service is None:
         raise ProbeFailure("addin_protocol_unavailable")
+    if service.ProtocolVersion() != 2:
+        raise ProbeFailure("addin_protocol_mismatch")
     return service
 
 
@@ -105,7 +107,7 @@ def benchmark(app: Any, path: Path, args: argparse.Namespace, scratch: Path) -> 
             methods.remove("addin")
             incomplete = True
             reason = str(exc) if isinstance(exc, ProbeFailure) and str(exc) in {
-                "addin_not_loaded", "addin_protocol_unavailable",
+                "addin_not_loaded", "addin_protocol_unavailable", "addin_protocol_mismatch",
             } else None
             _emit({"method": "addin", "status": "unavailable", "failed_stage": "addin_service",
                    "reason": reason, "error_type": type(exc).__name__,
