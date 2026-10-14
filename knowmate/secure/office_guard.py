@@ -31,7 +31,9 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field, replace
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Literal
+
+from knowmate.secure.com_fault import fatal_hresult, outer_hresult
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +50,7 @@ _OFFICE_EXES = set(_EXT_TO_PROCESS.values())
 
 # 프로세스 목록 캐시 (한 사이클에서 수천 건 가드 확인 시 매번 열거하지 않도록 짧은 TTL)
 _CACHE_TTL_SEC = 2.0
-_cache: dict[str, object] = {"ts": 0.0, "procs": None}  # procs: list[(name, pid)] | None
+_cache: dict[str, object] = {"ts": 0.0, "procs": None, "epoch": 0}  # procs: list[(name, pid)] | None
 
 # 우리 자동화(COM Dispatch)가 띄운 Office 프로세스 PID와 실행 파일명.
 # 워치독(별도 스레드)이 행오버 시 이 목록을 읽어 강제 종료해야 하므로 모듈
@@ -69,12 +71,79 @@ class OwnedOfficeProcess:
 
 
 _owned_pids: dict[int, OwnedOfficeProcess] = {}
+_guard_epoch = 0
 _ownership_generation = 0
 _shutdown_generation = 0
 _cleanup_retry_at: dict[str, float] = {}
 _cleanup_inflight: dict[str, int] = {}
 _unverified_cleanup: dict[str, set[int]] = {}
 _application_closing = threading.Event()
+
+
+@dataclass(frozen=True)
+class ProcessSnapshot:
+    """Immutable OS list tied to the Python ownership state it observed."""
+
+    epoch: int
+    procs: tuple[tuple[str, int], ...] | None
+    enumerated_at: float
+    source: Literal["cache", "live"]
+
+
+@dataclass(frozen=True)
+class OfficeGuardDecision:
+    """Fixed fields for a coherent Office admission query."""
+
+    status: Literal["available", "busy", "deferred"]
+    exe: str | None
+    reason: str
+    epoch: int
+    source: str = "none"
+    cache_age_sec: float | None = None
+    listed_pids: tuple[int, ...] = ()
+    external_pids: tuple[int, ...] = ()
+    identity_unknown_pids: tuple[int, ...] = ()
+    retries: int = 0
+
+
+def _state_changed_unlocked() -> None:
+    """Invalidate observations in the same transaction as an ownership mutation."""
+    global _guard_epoch
+    _guard_epoch += 1
+    _cache.update(procs=None, ts=0.0, epoch=_guard_epoch)
+
+
+def guard_epoch() -> int:
+    """Return the current diagnostic mutation sequence."""
+    with _owned_lock:
+        return _guard_epoch
+
+
+def _gate_reason_unlocked(exe: str) -> str | None:
+    if exe in {"WINWORD.EXE", "EXCEL.EXE"} and _application_closing.is_set():
+        return "application_closing"
+    if _unverified_cleanup.get(exe):
+        return "unverified_cleanup"
+    if _cleanup_inflight.get(exe):
+        return "cleanup_inflight"
+    if any(record.cleanup_pending for record in _owned_pids.values() if record.exe == exe):
+        return "cleanup_pending"
+    return None
+
+
+def _assert_registered_app_admitted_unlocked(exe: str, pid: int, record: OwnedOfficeProcess) -> None:
+    current = _owned_pids.get(pid)
+    reason = _gate_reason_unlocked(exe)
+    if reason or current is None or current.cleanup_pending:
+        raise OfficeCleanupPendingError(exe, reason or "registered_app_unavailable")
+    if current.exe != exe or not _record_matches_unlocked(current, record):
+        raise OfficeCleanupPendingError(exe, "registered_app_changed")
+
+
+def assert_registered_app_admitted(exe: str, pid: int, record: OwnedOfficeProcess) -> None:
+    """Require the exact active proof and all admission gates to remain valid."""
+    with _owned_lock:
+        _assert_registered_app_admitted_unlocked(exe.upper(), pid, record)
 
 
 def begin_application_shutdown() -> None:
@@ -114,7 +183,8 @@ class OfficeCleanupResult:
 class OfficeCleanupPendingError(RuntimeError):
     """An owned Office process is still shutting down, so COM must be deferred."""
 
-    def __init__(self, exe: str, detail: str) -> None:
+    def __init__(self, exe: str, detail: str, *, decision: OfficeGuardDecision | None = None) -> None:
+        self.decision = decision
         self.exe = exe.upper()
         super().__init__(detail)
 
@@ -127,6 +197,10 @@ _op: dict = {"exe": None, "baseline": frozenset()}
 
 class OfficeBusyError(RuntimeError):
     """대상 Office 앱이 사용자에 의해 실행 중이라 COM 점유를 피해 건너뛸 때 발생한다."""
+
+    def __init__(self, detail: str, *, decision: OfficeGuardDecision | None = None) -> None:
+        self.decision = decision
+        super().__init__(detail)
 
 
 class OfficeOwnershipProbeError(RuntimeError):
@@ -149,6 +223,8 @@ class OfficeOwnershipCleanupError(OfficeOwnershipProbeError):
         self.restore_error = restore_error
         self.document = document
         self.registered: tuple[int, OwnedOfficeProcess] | None = None
+        self.probe_phase: str | None = getattr(probe_error, "probe_phase", None)
+        self.close_phase = "blank_close"
         super().__init__("Office 소유권 확인용 창 정리 실패", document)
 
 
@@ -230,20 +306,34 @@ def _enumerate_processes():
             kernel32.CloseHandle(snapshot)
         return out
     except Exception as exc:  # ctypes/권한 등 예외 시 "판단 불가"
-        logger.debug("프로세스 열거 실패(무시): %s", exc)
+        logger.debug("프로세스 열거 실패(무시): error_type=%s", type(exc).__name__)
         return None
 
 
+def _cached_process_snapshot() -> ProcessSnapshot | None:
+    """Enumerate once outside the lock; discard stale publication."""
+    with _owned_lock:
+        epoch = _guard_epoch
+        started = time.monotonic()
+        if (_cache["procs"] is not None and _cache.get("epoch") == epoch
+                and started - float(_cache["ts"]) < _CACHE_TTL_SEC):
+            return ProcessSnapshot(epoch, tuple(_cache["procs"]), float(_cache["ts"]), "cache")
+    processes = _enumerate_processes()
+    immutable = tuple(processes) if processes is not None else None
+    with _owned_lock:
+        if epoch != _guard_epoch:
+            return None
+        result = ProcessSnapshot(epoch, immutable, started, "live")
+        if immutable is not None and time.monotonic() - started < _CACHE_TTL_SEC:
+            if _cache["procs"] is None or started >= float(_cache["ts"]):
+                _cache.update(procs=immutable, ts=started, epoch=epoch)
+        return result
+
+
 def _cached_processes():
-    """TTL 캐시를 적용해 (name, pid) 목록을 반환한다(가드의 빈번한 호출용)."""
-    now = time.monotonic()
-    procs = _cache["procs"]
-    if procs is not None and (now - float(_cache["ts"])) < _CACHE_TTL_SEC:
-        return procs
-    procs = _enumerate_processes()
-    _cache["procs"] = procs
-    _cache["ts"] = now
-    return procs
+    """Compatibility list query; admission uses the coherent decision instead."""
+    snapshot = _cached_process_snapshot()
+    return snapshot.procs if snapshot is not None else None
 
 
 def _pids_for(exe: str, procs) -> set:
@@ -263,38 +353,47 @@ def office_pids_live(exe: str) -> set:
 
 
 def prepare_powerpoint_dispatch() -> tuple[set[int], dict[int, OwnedOfficeProcess]]:
-    """최신 OS 목록으로 외부 PPT를 차단하고 재접속할 소유 기록을 캡처한다."""
+    """Fresh PPT preflight with bounded state/identity rechecks before Dispatch."""
     if sys.platform != "win32":
         return set(), {}
-    procs = _enumerate_processes()
-    if procs is None:
-        logger.warning("[com] PowerPoint 연결 연기: reason=process_enumeration_unavailable")
-        raise OfficeCleanupPendingError("POWERPNT.EXE", "PowerPoint 실행 상태 확인 대기 중")
-    baseline = _pids_for("POWERPNT.EXE", procs)
-    records = _owned_for_exe("POWERPNT.EXE")
-    reusable = {}
-    for pid in baseline:
-        record = records.get(pid)
-        if record is None or record.terminable or record.creation_identity is None:
-            logger.info("[com] PowerPoint 연결 차단: PID=%d reason=external_process", pid)
-            raise OfficeBusyError("사용자 PowerPoint가 실행 중입니다")
-        identity = _process_creation_identity(pid)
-        if identity is None:
-            raise OfficeCleanupPendingError("POWERPNT.EXE", "PowerPoint 생성 시각 확인 대기 중")
-        if identity != record.creation_identity:
-            raise OfficeBusyError("사용자 PowerPoint가 실행 중입니다")
-        reusable[pid] = record
-    with _owned_lock:
-        if (
-            _cleanup_inflight.get("POWERPNT.EXE") or _unverified_cleanup.get("POWERPNT.EXE")
-            or any(rec.cleanup_pending for rec in _owned_pids.values() if rec.exe == "POWERPNT.EXE")
-            or any(
-                pid not in _owned_pids or not _record_matches_unlocked(_owned_pids[pid], rec)
-                for pid, rec in reusable.items()
-            )
-        ):
-            raise OfficeCleanupPendingError("POWERPNT.EXE", "PowerPoint 소유 기록 변경 또는 정리 대기 중")
-    return baseline, reusable
+    for attempt in range(2):
+        with _owned_lock:
+            epoch = _guard_epoch
+            records = {pid: record for pid, record in _owned_pids.items() if record.exe == "POWERPNT.EXE"}
+            reason = _gate_reason_unlocked("POWERPNT.EXE")
+        if reason:
+            raise OfficeCleanupPendingError("POWERPNT.EXE", reason)
+        processes = _enumerate_processes()
+        if processes is None:
+            raise OfficeCleanupPendingError("POWERPNT.EXE", "process_enumeration_unavailable")
+        baseline = _pids_for("POWERPNT.EXE", processes)
+        reusable = {}
+        external = False
+        unknown = False
+        for pid in baseline:
+            record = records.get(pid)
+            if record is None or record.terminable or record.creation_identity is None:
+                external = True
+                continue
+            identity = _process_creation_identity(pid)
+            if identity is None:
+                unknown = True
+            elif identity != record.creation_identity:
+                external = True
+            else:
+                reusable[pid] = record
+        with _owned_lock:
+            reason = _gate_reason_unlocked("POWERPNT.EXE")
+            if reason:
+                raise OfficeCleanupPendingError("POWERPNT.EXE", reason)
+            if epoch != _guard_epoch:
+                continue
+            if external:
+                raise OfficeBusyError("사용자 PowerPoint가 실행 중입니다")
+            if unknown:
+                raise OfficeCleanupPendingError("POWERPNT.EXE", "identity_unavailable")
+            return baseline, reusable
+    raise OfficeCleanupPendingError("POWERPNT.EXE", "guard_state_changed")
 
 
 def register_owned_pids(pids: set[int]) -> None:
@@ -304,8 +403,15 @@ def register_owned_pids(pids: set[int]) -> None:
     # 이전 공개 API 호환용. 생성 identity가 없으므로 이 경로의 PID는 절대
     # 강제 종료 대상이 되지 않는다. 새 생성 경로는 register_owned_app만 쓴다.
     with _owned_lock:
+        changed = False
         for pid in pids:
-            _owned_pids[pid] = OwnedOfficeProcess("", None)
+            record = OwnedOfficeProcess("", None)
+            current = _owned_pids.get(pid)
+            if current is None or not _record_matches_unlocked(current, record):
+                _owned_pids[pid] = record
+                changed = True
+        if changed:
+            _state_changed_unlocked()
     logger.debug("우리 소유 Office PID 등록: %s", sorted(pids))
 
 
@@ -392,12 +498,16 @@ def _app_hwnd(app: Any, exe: str = "") -> int | None:
     for attr in ("Hwnd", "HWND"):
         try:
             hwnd = getattr(app, attr)
-        except AttributeError:
+        except AttributeError as exc:
+            if fatal_hresult(exc, app_exe=exe.upper()) is not None:
+                wrapped = OfficeOwnershipProbeError("Office HWND 소유권 확인 실패")
+                wrapped.probe_phase = "window_verify"
+                raise wrapped from exc
             logger.info("Office HWND 조회: exe=%s property=%s reason=unsupported", exe, attr)
             continue
         except Exception as exc:
-            code = getattr(exc, "hresult", None)
-            if isinstance(code, int) and (code & 0xFFFFFFFF) in {0x80020003, 0x80020006}:
+            code = outer_hresult(exc)
+            if fatal_hresult(exc, app_exe=exe.upper()) is None and code in {0x80020003, 0x80020006}:
                 logger.info(
                     "Office HWND 조회: exe=%s property=%s reason=unsupported HRESULT=%s",
                     exe, attr, code & 0xFFFFFFFF,
@@ -407,7 +517,9 @@ def _app_hwnd(app: Any, exe: str = "") -> int | None:
                 "Office HWND 조회 실패: exe=%s property=%s error_type=%s HRESULT=%s",
                 exe, attr, type(exc).__name__, (code & 0xFFFFFFFF) if isinstance(code, int) else None,
             )
-            raise OfficeOwnershipProbeError("Office HWND 소유권 확인 실패") from exc
+            wrapped = OfficeOwnershipProbeError("Office HWND 소유권 확인 실패")
+            wrapped.probe_phase = "window_verify"
+            raise wrapped from exc
         if isinstance(hwnd, int) and hwnd != 0:
             return hwnd
         logger.info(
@@ -421,7 +533,7 @@ def _app_hwnd(app: Any, exe: str = "") -> int | None:
 @contextmanager
 def _ppt_ownership_window(app: Any) -> Iterator[Callable[[], int | None]]:
     """HWND 미지원 PowerPoint는 COM으로 지정한 고유 창 제목으로 확인한다."""
-    from knowmate.secure.com_reader import hresult_of, is_fatal_transport_hresult
+    from knowmate.secure.com_fault import outer_hresult as hresult_of
 
     document = None
     original_caption = None
@@ -429,6 +541,7 @@ def _ppt_ownership_window(app: Any) -> Iterator[Callable[[], int | None]]:
     original_security = None
     security_changed = False
     probe_error: Exception | None = None
+    probe_phase = None
     marker = "AegisDesk-ownership-" + uuid.uuid4().hex
     phase = "configure"
     logger.info("[com] PowerPoint 소유 확인 대체 경로 시작: method=caption_marker stage=%s", phase)
@@ -457,7 +570,9 @@ def _ppt_ownership_window(app: Any) -> Iterator[Callable[[], int | None]]:
         yield read_hwnd
     except OfficeOwnershipProbeError as exc:
         probe_error = exc
+        probe_phase = phase
         exc.document = document
+        exc.probe_phase = phase
         original = exc.__cause__ or exc
         logger.warning(
             "[com] PowerPoint 소유 확인 오류: stage=%s error_type=%s HRESULT=%s",
@@ -466,22 +581,22 @@ def _ppt_ownership_window(app: Any) -> Iterator[Callable[[], int | None]]:
         raise
     except Exception as exc:
         probe_error = exc
+        probe_phase = phase
         logger.warning(
             "[com] PowerPoint 소유 확인 오류: stage=%s error_type=%s HRESULT=%s",
             phase, type(exc).__name__, hresult_of(exc),
         )
-        raise OfficeOwnershipProbeError("PowerPoint 확인용 창 소유권 확인 실패", document) from exc
+        wrapped = OfficeOwnershipProbeError("PowerPoint 확인용 창 소유권 확인 실패", document)
+        wrapped.probe_phase = phase
+        raise wrapped from exc
     finally:
-        error = probe_error
-        fatal_probe = False
-        while error is not None and not fatal_probe:
-            fatal_probe = is_fatal_transport_hresult(hresult_of(error))
-            error = error.__cause__
+        fatal_probe = probe_error is not None and fatal_hresult(probe_error, app_exe="POWERPNT.EXE") is not None
         # 끊어진 RPC에는 제목 복원/Close를 다시 요청하지 않는다.
         if fatal_probe:
             logger.warning("[com] PowerPoint 확인용 창 정리 연기: reason=rpc_disconnected")
         else:
             cleanup_error = None
+            cleanup_phase = None
             restore_error = None
             try:
                 if caption_changed:
@@ -498,13 +613,10 @@ def _ppt_ownership_window(app: Any) -> Iterator[Callable[[], int | None]]:
                     phase, type(exc).__name__, hresult_of(exc),
                 )
                 cleanup_error = exc
+                cleanup_phase = phase
             # 일반 제목 복원/닫기 실패에도 사용자 앱의 보안 설정은 복원한다.
             # 정리 자체에서 fatal RPC가 발생했다면 COM 호출을 더 하지 않는다.
-            error = cleanup_error
-            fatal_cleanup = False
-            while error is not None and not fatal_cleanup:
-                fatal_cleanup = is_fatal_transport_hresult(hresult_of(error))
-                error = error.__cause__
+            fatal_cleanup = cleanup_error is not None and fatal_hresult(cleanup_error, app_exe="POWERPNT.EXE") is not None
             if security_changed and not fatal_cleanup:
                 try:
                     phase = "security_restore"
@@ -517,12 +629,14 @@ def _ppt_ownership_window(app: Any) -> Iterator[Callable[[], int | None]]:
                     )
                     if cleanup_error is None:
                         cleanup_error = exc
+                        cleanup_phase = phase
                     else:
                         restore_error = exc
             if cleanup_error is not None:
-                raise OfficeOwnershipCleanupError(
-                    probe_error, cleanup_error, document, restore_error,
-                ) from cleanup_error
+                wrapped = OfficeOwnershipCleanupError(probe_error, cleanup_error, document, restore_error)
+                wrapped.probe_phase = probe_phase
+                wrapped.close_phase = cleanup_phase
+                raise wrapped from cleanup_error
             if document is not None or caption_changed:
                 logger.info("[com] PowerPoint 확인용 창 정리 완료")
 
@@ -568,8 +682,6 @@ def _hwnd_for_caption_marker(marker: str) -> int | None:
 @contextmanager
 def _ownership_window(exe: str, app: Any) -> Iterator[Callable[[], int | None]]:
     """앱 HWND가 없으면 Word/PPT의 확인용 창으로 COM 소유권을 확인한다."""
-    from knowmate.secure.com_reader import hresult_of, is_fatal_transport_hresult
-
     hwnd = _app_hwnd(app, exe)
     if hwnd is None and exe.upper() == "POWERPNT.EXE":
         with _ppt_ownership_window(app) as read_hwnd:
@@ -580,30 +692,34 @@ def _ownership_window(exe: str, app: Any) -> Iterator[Callable[[], int | None]]:
         return
     document = None
     probe_error: Exception | None = None
+    phase = "configure"
     try:
         app.AutomationSecurity = 3
+        phase = "blank_create"
         document = app.Documents.Add()
+        phase = "window_verify"
         yield lambda: document.Windows.Item(1).Hwnd
     except OfficeOwnershipProbeError as exc:
         probe_error = exc
         exc.document = document
+        exc.probe_phase = phase
         raise
     except Exception as exc:
         probe_error = exc
-        raise OfficeOwnershipProbeError("Word 빈 문서 창 소유권 확인 실패", document) from exc
+        wrapped = OfficeOwnershipProbeError("Word 빈 문서 창 소유권 확인 실패", document)
+        wrapped.probe_phase = phase
+        raise wrapped from exc
     finally:
-        error = probe_error
-        fatal_probe = False
-        while error is not None and not fatal_probe:
-            fatal_probe = is_fatal_transport_hresult(hresult_of(error))
-            error = error.__cause__
+        fatal_probe = probe_error is not None and fatal_hresult(probe_error, app_exe=exe.upper()) is not None
         # 이미 끊어진 RPC에 Close를 다시 요청하면 소유 등록 전 워커가 멈출 수 있다.
         # 닫지 않은 문서는 probe 예외로 전달해 생성 워커의 TLS에 보존한다.
         if document is not None and not fatal_probe:
             try:
                 document.Close(False)
             except Exception as exc:
-                raise OfficeOwnershipCleanupError(probe_error, exc, document) from exc
+                wrapped = OfficeOwnershipCleanupError(probe_error, exc, document)
+                wrapped.probe_phase = phase
+                raise wrapped from exc
 
 
 def _register_owned_window(
@@ -611,6 +727,9 @@ def _register_owned_window(
     expected_owned: dict[int, OwnedOfficeProcess] | None = None,
 ) -> tuple[int, OwnedOfficeProcess] | None:
     """창의 PID·EXE·생성 identity를 검증하고 등록한 프로세스 기록을 반환한다."""
+    with _owned_lock:
+        captured_epoch = _guard_epoch
+        captured_records = dict(_owned_pids)
     current_procs = _enumerate_processes()
     if current_procs is None:
         logger.warning("Office 소유 등록 실패: exe=%s reason=process_enumeration_unavailable", exe)
@@ -644,7 +763,9 @@ def _register_owned_window(
     except OfficeOwnershipProbeError:
         raise
     except Exception as exc:
-        raise OfficeOwnershipProbeError("Office HWND 소유권 재확인 실패") from exc
+        wrapped = OfficeOwnershipProbeError("Office HWND 소유권 재확인 실패")
+        wrapped.probe_phase = "window_verify"
+        raise wrapped from exc
     confirmed_pid = _pid_from_hwnd(confirmed_hwnd)
     confirmed_procs = _enumerate_processes()
     confirmed_identity = (
@@ -662,68 +783,60 @@ def _register_owned_window(
     global _ownership_generation, _shutdown_generation
     with _owned_lock:
         current_record = _owned_pids.get(pid)
-        if up == "POWERPNT.EXE" and (
-            _cleanup_inflight.get(up) or _unverified_cleanup.get(up)
-            or any(rec.cleanup_pending for rec in _owned_pids.values() if rec.exe == up)
-            or (previous is not None and (
-                current_record is None or not _record_matches_unlocked(current_record, previous)
-            ))
-            or (previous is None and current_record is not None)
-        ):
-            logger.warning("Office 소유 등록 실패: exe=%s PID=%s reason=ownership_changed_or_pending", up, pid)
+        captured_record = captured_records.get(pid)
+        if ((captured_record is None) != (current_record is None) or
+                (captured_record is not None and not _record_matches_unlocked(current_record, captured_record))):
+            return None
+        late_gate = _gate_reason_unlocked(up)
+        if up == "POWERPNT.EXE":
+            if captured_epoch != _guard_epoch or late_gate:
+                return None
+            if previous is not None and (current_record is None or not _record_matches_unlocked(current_record, previous)):
+                return None
+            if previous is None and current_record is not None:
+                return None
+        elif captured_epoch != _guard_epoch and not late_gate:
             return None
         if reconnect:
-            logger.info("[com] PowerPoint 기존 소유 재연결 확인: PID=%d generation=%d", pid, previous.generation)
             return pid, previous
         _ownership_generation += 1
-        # PowerPoint MultiUse Dispatch는 동시 사용자 실행과 완전한 소유 증명이
-        # 불가능하다. 세션 추적은 해 가드의 자기 감지만 피하되, 어떤 강제 종료
-        # 경로에도 넣지 않는다.
-        record = OwnedOfficeProcess(
-            up, creation_identity, up != "POWERPNT.EXE", _ownership_generation,
-        )
-        if up in {"WINWORD.EXE", "EXCEL.EXE"} and _application_closing.is_set():
+        record = OwnedOfficeProcess(up, creation_identity, up != "POWERPNT.EXE", _ownership_generation)
+        if up in {"WINWORD.EXE", "EXCEL.EXE"} and late_gate:
             _shutdown_generation += 1
             record = replace(record, cleanup_pending=True, cleanup_generation=_shutdown_generation)
         _owned_pids[pid] = record
+        _state_changed_unlocked()
     logger.debug("우리 소유 Office PID 등록: %s=%d", up, pid)
     return pid, record
 
 
-def register_owned_app(
+def _register_owned_app_record(
     exe: str, baseline: set[int], app: Any,
     expected_owned: dict[int, OwnedOfficeProcess] | None = None,
-) -> bool:
-    """앱에 연결된 창의 PID·EXE·생성 identity를 검증해 소유 등록한다."""
+) -> tuple[int, OwnedOfficeProcess] | None:
+    """Return the exact HWND/identity proof registered for this app."""
     if sys.platform != "win32":
-        return True
+        return None
     if exe.upper() == "POWERPNT.EXE":
-        # 소유 확인용 설정 변경/빈 창 생성 전에 baseline 프로세스가 여전히
-        # 같은 검증 소유인지 확인한다. 사용자 앱에는 probe 자체를 요청하지 않는다.
+        with _owned_lock:
+            captured_epoch = _guard_epoch
+            records = {pid: record for pid, record in _owned_pids.items() if record.exe == exe.upper()}
         procs = _enumerate_processes()
         if procs is None:
-            logger.warning("Office 소유 등록 실패: exe=%s reason=process_enumeration_unavailable", exe)
-            return False
-        expected_owned = expected_owned if expected_owned is not None else _owned_for_exe(exe)
+            return None
+        expected_owned = expected_owned if expected_owned is not None else records
+        valid = True
         for pid in baseline & _pids_for(exe, procs):
             record = expected_owned.get(pid)
-            if (
-                record is None or record.terminable or record.cleanup_pending
-                or record.creation_identity is None
-                or _process_creation_identity(pid) != record.creation_identity
-            ):
-                logger.warning("Office 소유 등록 거부: exe=%s PID=%d reason=external_baseline", exe, pid)
-                return False
+            if (record is None or record.terminable or record.cleanup_pending
+                    or record.creation_identity is None or _process_creation_identity(pid) != record.creation_identity):
+                valid = False
         with _owned_lock:
-            if (
-                _cleanup_inflight.get(exe.upper()) or _unverified_cleanup.get(exe.upper())
-                or any(rec.cleanup_pending for rec in _owned_pids.values() if rec.exe == exe.upper())
-                or any(
-                    pid not in _owned_pids or not _record_matches_unlocked(_owned_pids[pid], rec)
-                    for pid, rec in expected_owned.items()
-                )
-            ):
-                return False
+            if captured_epoch != _guard_epoch or _gate_reason_unlocked(exe.upper()) or not valid:
+                return None
+            if any(pid not in _owned_pids or not _record_matches_unlocked(_owned_pids[pid], rec)
+                   for pid, rec in expected_owned.items()):
+                return None
     registered = None
     try:
         with _ownership_window(exe, app) as read_hwnd:
@@ -736,11 +849,23 @@ def register_owned_app(
         raise
     if registered is not None:
         pid, record = registered
+        if exe.upper() == "POWERPNT.EXE" and (expected_owned or {}).get(pid) is record:
+            logger.info("[com] PowerPoint 기존 소유 재연결 확인: PID=%d generation=%d", pid, record.generation)
         logger.info(
             "Office 소유 등록 완료: exe=%s PID=%d generation=%d terminable=%s",
             record.exe, pid, record.generation, record.terminable,
         )
-    return registered is not None
+    return registered
+
+
+def register_owned_app(
+    exe: str, baseline: set[int], app: Any,
+    expected_owned: dict[int, OwnedOfficeProcess] | None = None,
+) -> bool:
+    """Compatibility facade for the exact ownership registration core."""
+    if sys.platform != "win32":
+        return True
+    return _register_owned_app_record(exe, baseline, app, expected_owned) is not None
 
 
 def _mark_owned_cleanup_pending(pid: int, record: OwnedOfficeProcess) -> OwnedOfficeProcess | None:
@@ -755,6 +880,7 @@ def _mark_owned_cleanup_pending(pid: int, record: OwnedOfficeProcess) -> OwnedOf
         _shutdown_generation += 1
         pending = replace(record, cleanup_pending=True, cleanup_generation=_shutdown_generation)
         _owned_pids[pid] = pending
+        _state_changed_unlocked()
         return pending
 
 
@@ -765,6 +891,7 @@ def begin_unverified_cleanup(exe: str) -> int:
         _shutdown_generation += 1
         token = _shutdown_generation
         _unverified_cleanup.setdefault(exe.upper(), set()).add(token)
+        _state_changed_unlocked()
         return token
 
 
@@ -772,8 +899,9 @@ def finish_unverified_cleanup(exe: str, token: int) -> None:
     """일치하는 미검증 정리 요청만 해제한다."""
     with _owned_lock:
         tokens = _unverified_cleanup.get(exe.upper())
-        if tokens is not None:
-            tokens.discard(token)
+        if tokens is not None and token in tokens:
+            tokens.remove(token)
+            _state_changed_unlocked()
             if not tokens:
                 _unverified_cleanup.pop(exe.upper(), None)
 
@@ -808,6 +936,7 @@ def clear_owned_pids() -> set[int]:
         _cleanup_retry_at.clear()
         _unverified_cleanup.clear()
         _application_closing.clear()
+        _state_changed_unlocked()
     return prev
 
 
@@ -824,13 +953,17 @@ def begin_owned_cleanup(exe: str | None = None) -> dict[int, OwnedOfficeProcess]
         _shutdown_generation += 1
         cleanup_generation = _shutdown_generation
         snapshot: dict[int, OwnedOfficeProcess] = {}
+        changed = False
         for pid, record in tuple(_owned_pids.items()):
             if record.exe in {"WINWORD.EXE", "EXCEL.EXE"} and (exe is None or record.exe == exe.upper()):
                 pending = record if record.cleanup_pending else replace(
                     record, cleanup_pending=True, cleanup_generation=cleanup_generation,
                 )
                 _owned_pids[pid] = pending
+                changed = changed or pending is not record
                 snapshot[pid] = pending
+        if changed:
+            _state_changed_unlocked()
         return snapshot
 
 
@@ -855,6 +988,7 @@ def _remove_owned_if_matches(pid: int, record: OwnedOfficeProcess) -> bool:
         if current is None or not _record_matches_unlocked(current, record):
             return False
         _owned_pids.pop(pid, None)
+        _state_changed_unlocked()
         return True
 
 
@@ -942,6 +1076,7 @@ def begin_shutdown_cleanup(exe: str) -> None:
     with _owned_lock:
         up = exe.upper()
         _cleanup_inflight[up] = _cleanup_inflight.get(up, 0) + 1
+        _state_changed_unlocked()
 
 
 def finish_shutdown_cleanup(exe: str) -> None:
@@ -953,41 +1088,79 @@ def finish_shutdown_cleanup(exe: str) -> None:
             _cleanup_inflight.pop(up, None)
         else:
             _cleanup_inflight[up] = count - 1
+        if count:
+            _state_changed_unlocked()
 
 
-def _log_cleanup_result(exe: str, result: OfficeCleanupResult, phase: str) -> None:
+def _log_cleanup_result(exe: str, result: OfficeCleanupResult, phase: str, *, attempt_id: int | None = None) -> None:
     """Log cleanup status without including document content or paths."""
+    from knowmate.secure.com_stage import get_attempt_context
+    context = get_attempt_context()
+    if attempt_id is None and context is not None:
+        attempt_id = context.attempt_id
     logger.info(
-        "[com] Office 정리 결과: exe=%s phase=%s actual_exit=%s remaining=%s identity_unknown=%s failed=%s",
-        exe, phase, sorted(result.confirmed_exited), sorted(result.remaining),
+        "[com] Office 정리 결과: attempt_id=%s exe=%s phase=%s epoch=%d actual_exit=%s remaining=%s identity_unknown=%s failed=%s",
+        attempt_id, exe, phase, guard_epoch(), sorted(result.confirmed_exited), sorted(result.remaining),
         sorted(result.identity_unknown), sorted(result.failed),
     )
 
 
-def is_office_busy_for_ext(ext: str) -> bool:
-    """확장자를 서비스하는 Office 앱이 **사용자에 의해** 실행 중이면 True.
-
-    우리 자동화가 띄운 소유 PID는 제외한다 — 자기 감지로 인한 스킵 방지.
-    비Windows·열거 실패·대상 외 확장자·(우리 소유 외) 미실행이면 False.
-    """
-    proc = process_for_ext(ext)
-    if proc is None:
-        return False
-    procs = _cached_processes()
-    if procs is None:  # 판단 불가 → 기존 동작 유지(차단하지 않음)
-        return False
-    running = _pids_for(proc, procs)
-    if sys.platform != "win32":
-        return bool(running - _owned_snapshot())
+def inspect_office_for_ext(ext: str) -> OfficeGuardDecision:
+    """Return available, busy or deferred after a final state recheck."""
+    exe = process_for_ext(ext)
+    if exe is None:
+        with _owned_lock:
+            return OfficeGuardDecision("available", None, "unsupported_extension", _guard_epoch)
+    for attempt in range(2):
+        if attempt:
+            logger.debug("[com] Office guard 재조회: exe=%s reason=state_changed retry=%d", exe, attempt)
+        with _owned_lock:
+            reason = _gate_reason_unlocked(exe)
+            if reason:
+                return OfficeGuardDecision("deferred", exe, reason, _guard_epoch, retries=attempt)
+        snapshot = _cached_process_snapshot()
+        if snapshot is None:
+            logger.debug("[com] process snapshot 폐기: exe=%s reason=state_changed", exe)
+            continue
+        running = _pids_for(exe, snapshot.procs)
+        with _owned_lock:
+            if snapshot.epoch != _guard_epoch:
+                continue
+            records = {pid: record for pid, record in _owned_pids.items() if pid in running}
+        unknown = set()
+        if sys.platform != "win32":
+            proven = set(records)
+        else:
+            proven = set()
+            for pid, record in records.items():
+                if record.exe != exe or record.creation_identity is None:
+                    continue
+                identity = _process_creation_identity(pid)
+                if identity is None:
+                    unknown.add(pid)
+                elif identity == record.creation_identity:
+                    proven.add(pid)
+        external = running - proven
+        with _owned_lock:
+            reason = _gate_reason_unlocked(exe)
+            if reason:
+                return OfficeGuardDecision("deferred", exe, reason, _guard_epoch, retries=attempt)
+            if snapshot.epoch != _guard_epoch:
+                continue
+            status = "busy" if external else "available"
+            reason = "external_process" if external else (
+                "enumeration_unavailable" if snapshot.procs is None else "no_external_process")
+            return OfficeGuardDecision(status, exe, reason, _guard_epoch, snapshot.source,
+                                       max(0.0, time.monotonic() - snapshot.enumerated_at),
+                                       tuple(sorted(running)), tuple(sorted(external)),
+                                       tuple(sorted(unknown)), attempt)
     with _owned_lock:
-        records = {pid: record for pid, record in _owned_pids.items() if pid in running}
-    proven_owned = {
-        pid for pid, record in records.items()
-        if record.exe == proc and record.creation_identity is not None
-        and _process_creation_identity(pid) == record.creation_identity
-    }
-    external = running - proven_owned
-    return bool(external)
+        return OfficeGuardDecision("deferred", exe, "guard_state_changed", _guard_epoch, retries=1)
+
+
+def is_office_busy_for_ext(ext: str) -> bool:
+    """Compatibility busy query; deferred must never authorize admission."""
+    return inspect_office_for_ext(ext).status == "busy"
 
 
 def begin_com_op(exe: str) -> None:
@@ -1057,6 +1230,7 @@ def terminate_stuck_office(exe: str) -> int:
     if not targets:
         return 0
     result = cleanup_owned_processes(targets)
+    _log_cleanup_result(up, result, "read timeout")
     if result.confirmed_exited:
         logger.warning(
             "COM 행오버 추정 — %s 프로세스 실제 종료 확인 %d개: %s",
@@ -1078,10 +1252,16 @@ def recover_poisoned_office(exe: str, timeout_sec: float = 2.0) -> bool:
     if any(not record.terminable for record in registered.values()):
         logger.warning("COM poison 복구 보류 — %s MultiUse 세션은 종료하지 않음", up)
         return False
+    before_epoch = guard_epoch()
     snapshot = begin_owned_cleanup(up)
     if not snapshot:
         return False
     result = cleanup_owned_processes(snapshot, timeout_sec=timeout_sec)
+    from knowmate.secure.com_stage import get_attempt_context
+    context = get_attempt_context()
+    logger.info("[com] COM poison 복구 상태: attempt_id=%s exe=%s epoch_before=%d epoch_after=%d cleanup_generations=%s",
+                context.attempt_id if context is not None else None, up, before_epoch, guard_epoch(),
+                sorted({record.cleanup_generation for record in snapshot.values()}))
     _log_cleanup_result(up, result, "poison recovery")
     if result.successful:
         logger.warning("COM poison 즉시 복구 완료: %s actual_exit=%s", up, sorted(result.confirmed_exited))
@@ -1236,7 +1416,7 @@ def _cleanup_owned_processes_impl(
             for exe in {owned[pid].exe for pid in forced_exited}:
                 clear_resiliency_markers(exe)
         except Exception as exc:
-            logger.warning("Office Resiliency 표식 정리 실패: %s", exc)
+            logger.warning("Office Resiliency 표식 정리 실패: error_type=%s HRESULT=%s", type(exc).__name__, outer_hresult(exc))
     return result
 
 

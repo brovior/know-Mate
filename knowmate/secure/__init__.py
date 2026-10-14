@@ -134,15 +134,19 @@ class AutoReader:
     def _guard_office_busy(ext: str, path: str) -> None:
         """종료 대기를 먼저 확인한 뒤 사용자 Office 점유를 구분한다."""
         from knowmate.secure.office_guard import (
-            OfficeBusyError, ensure_office_available,
-            is_office_busy_for_ext, process_for_ext,
+            OfficeBusyError, OfficeCleanupPendingError, ensure_office_available,
+            inspect_office_for_ext, process_for_ext,
         )
         proc = process_for_ext(ext)
         if proc is not None:
             ensure_office_available(proc)
-        if is_office_busy_for_ext(ext):
+        decision = inspect_office_for_ext(ext)
+        if decision.status == "deferred":
+            raise OfficeCleanupPendingError(proc, decision.reason, decision=decision)
+        if decision.status == "busy":
             raise OfficeBusyError(
-                f"{proc} 실행 중 — {ext} COM 파싱을 이번 사이클에서 건너뜁니다: {path}"
+                f"{proc} 실행 중 — {ext} COM 파싱을 이번 사이클에서 건너뜁니다: {path}",
+                decision=decision,
             )
 
 

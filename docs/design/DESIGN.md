@@ -131,24 +131,13 @@ def get_reader(path):
 
 **COM 앱 재사용**
 
-```python
-class WordComReader:
-    _instance = None
-    def get_app(self):
-        if self._instance is None:
-            self._instance = _dispatch_and_own(win32com, "Word.Application", "WINWORD.EXE")
-        return self._instance
-    def parse(self, path):
-        word = self.get_app()
-        try:
-            doc = word.Documents.Open(path)
-            text = doc.Content.Text
-            doc.Close()
-            return text
-        except Exception:
-            self._instance = None   # 예외 시 재생성
-            raise
-```
+Word·Excel은 생성 워커의 앱 참조와 정확한 `(PID, 생성 identity, 소유 generation,
+정리 generation)` 증명을 함께 보관한다. 소유 등록 core가 실제 HWND 검증 결과를 getter로
+전달하며, 설정 완료 후 게시와 다음 재사용 모두 `_owned_lock` 아래 동일 활성 기록과
+정리 gate를 확인한다. 설정 사이 또는 게시 이후 정리가 끝난 앱은 재사용하지 않고 연기한다.
+거부된 검증 앱은 재사용 슬롯과 별도의 정리 전용 참조에 보관하며 새 미검증 토큰을 만들지 않는다.
+참조 해제는 생성 워커와 잠금 밖에서 수행하며 registry·gate를 정리 성공으로 바꾸지 않는다.
+PowerPoint는 기존 MultiUse 연결·재접속 정책을 유지하고 Quit·강제 종료하지 않는다.
 Word는 Application.Hwnd가 없어 매크로를 차단한 뒤 저장하지 않는 빈 문서를 만들고 Window.Hwnd로 소유권을 검증한 후 즉시 닫는다. 앱 HWND의 미지원 COM 속성은 다른 표기를 확인한다. PowerPoint가 앱 HWND를 제공하지 않으면 매크로를 차단하고 창이 있는 빈 프레젠테이션을 만든 뒤, 같은 COM 앱의 Caption에 임시 UUID 식별자를 설정한다. Windows에서 그 식별자가 있는 최상위 창이 정확히 하나일 때만 HWND를 얻고, 앱 Caption과 HWND·PID·EXE·생성 identity를 재확인한다. 원래 Caption을 복원하고 확인용 프레젠테이션만 저장 없이 닫은 뒤 원래 AutomationSecurity를 복원하며, 이 과정에서 빈 창이 잠깐 보일 수 있다. 제목 복원·닫기·보안 설정 복원 실패는 등록 재시도를 중단하고 정리 대기로 전환한다. 일반 제목 복원이나 닫기 오류가 나도 보안 설정 복원은 시도하고, 두 정리 오류와 원본 cause를 함께 보존한다. RPC 단절 이후에는 복원·닫기를 재호출하지 않는다. PowerPoint의 Quit·강제 종료 금지는 유지한다. 생성 직후 등록은 같은 앱과 baseline으로 최대 3회 재시도한다. baseline 차집합만으로 소유권을 추정하지 않는다. 소유 확인 중 원인 예외에 RPC 연결 단절이 있으면 확인용 문서 Close를 재호출하지 않고 앱·문서 참조와 미검증 정리 대기를 보존해 poison을 즉시 전달한다. 일반 조회 오류는 문서 닫기를 시도하며, 확인용 빈 문서 닫기가 실패하면 등록 재시도를 중단하고 조회·닫기 오류를 함께 보존한다. 이미 검증된 해당 PID만 정리 대기로 전환하며, 정리를 확인하기 전 새 Word를 생성하지 않는다. COM 생성 후 소유 등록 재시도 소진, 조회 오류, 예상 밖 예외 및 등록 전 이중 오류는 PID 소유를 추정하지 않고 EXE별 미검증 정리 토큰으로 차단한다. 미검증 토큰이 있으면 종료 결과도 정리 미완료로 보고한다. 앱과 확인용 빈 문서가 있으면 생성 워커의 TLS에 보관하며 종료 경로에서는 COM 재조회나 미검증 PID 강제 종료를 하지 않는다. 워커 종료 전 COM 참조를 해제해도 미확인 EXE 토큰은 유지하고, 프로세스 열거가 성공하고 해당 Office가 하나도 없을 때 해제한다. 소유권을 끝내 확인하지 못한 경우에는 해당 Office가 사라질 때까지 정리 대기를 유지한다.
 
 PowerPoint 연결 직전에는 2초 캐시를 쓰지 않고 최신 OS 프로세스 목록·생성 identity와 소유 기록을 확인한다. 외부 프로세스가 있으면 Dispatch와 확인용 창 생성을 차단하고, 목록이나 소유 identity 확인이 불가능하면 COM을 만들지 않고 연기한다. 기존 소유 PowerPoint에 재접속할 때는 baseline에 포함된 PID라도 실행파일명·생성 identity·generation이 기존 기록과 같고 정리 대기·in-flight·미검증 토큰이 없으면 허용한다. 등록은 COM에 연결된 HWND를 두 번 확인한 뒤 락 아래 기존 기록과 gate를 재검증하며, 재접속은 기존 generation을 유지한다. PID 재사용이나 동시 소유 기록 변경은 거부한다. 연결 전 검사와 Dispatch 사이 사용자 실행 경합을 완전히 배제할 수 없으므로, 확인용 AutomationSecurity는 정상 완료·등록 거부·일반 오류 때 원래 값으로 복원한다. 실제 문서 추출용 매크로 차단 설정은 소유 검증 성공 후 적용한다. RPC 단절 뒤에는 설정 복원·문서 닫기를 추가 요청하지 않고 앱·문서와 정리 대기를 보존한다.
@@ -209,14 +198,23 @@ COM 호출은 프로세스 간 마샬링이라 왕복 1회가 수십~수백 µs�
 
 **Office 점유 가드 (`secure/office_guard.py`)**
 
-COM 자동화는 대상 Office 프로세스가 이미 떠 있으면 그 인스턴스에 붙는다(사용자당 1 인스턴스). 백그라운드
-인덱싱이 사용자가 열어둔 창을 점유해 응답없음을 유발하는 것을 막기 위해, `AutoReader`는 COM 라우팅
-(`.doc/.xls/.ppt` + OLE2 오라벨 docx) **직전** `is_office_busy_for_ext(ext)`로 사용자 앱 점유를
-확인한다. 실행 중이면 `OfficeBusyError`를 던져 그 확장자만 **이번 사이클에서 연기**하고, 소비자
+백그라운드 COM 인덱싱이 사용자가 열어둔 창을 점유해 응답없음을 유발하는 것을 막기 위해,
+`AutoReader`는 COM 라우팅
+(`.doc/.xls/.ppt` + OLE2 오라벨 docx) **직전** `inspect_office_for_ext(ext)`로
+사용자 점유와 정리 대기를 구분한다. `busy`는 `OfficeBusyError`, `deferred`는
+`OfficeCleanupPendingError`로 전달한다. Boolean 조회 facade는 COM 진입 허가에 쓰지 않는다. 실행 중이면 `OfficeBusyError`를 던져 그 확장자만 **이번 사이클에서 연기**하고, 소비자
 루프(`scheduler`)는 이를 실패가 아닌 연기로 처리(state 미갱신 → 다음 유휴 사이클 자동 재시도). 감지는
-Toolhelp32 **프로세스 열거만** 수행하며 COM 객체를 생성·연결하지 않는다(사용자 창 무간섭). 비Windows·
-열거 실패 시 차단하지 않아(기존 동작 유지) 사외 테스트에 영향 없다. 정상 OOXML(docx 등)은 라이브러리
+Toolhelp32 **프로세스 열거만** 수행하며 COM 객체를 생성·연결하지 않는다(사용자 창 무간섭).
+비Windows는 기존 fake 동작을 유지하고, 열거 실패는 정리 차단 상태가 없을 때만 진입을 허용한다. 정상 OOXML(docx 등)은 라이브러리
 파싱이라 가드 대상이 아니다.
+
+프로세스 캐시 TTL은 2초다. 소유 등록·pending·제거·미검증 토큰·정리 in-flight 변경과
+캐시 무효화를 하나의 `_owned_lock` transaction으로 묶고 단조 증가 epoch를 유지한다.
+OS 열거와 identity 조회는 잠금 밖에서 한다. 열거 시작 이후 상태가 바뀌면 캐시 게시를
+버리고, 이미 받은 목록도 최종 판단 직전에 epoch·gate를 다시 확인한다. 최대 두 번 조회 뒤
+계속 변경되면 연기한다. 열거 실패는 gate가 없을 때만 기존 fail-open을 유지한다.
+PPT의 fresh preflight·등록도 같은 상태 재검사를 적용하며 cache로 대신하지 않는다.
+
 
 **우리 자신 vs 사용자 구분 (자기 감지 스킵 방지)**: 인덱싱이 DRM/구형 문서를 읽으려고 COM으로 직접
 띄운 Office도 같은 실행 파일(WINWORD.EXE 등)이라, 단순히 "프로세스가 있나?"로 판정하면 *우리가 띄운
@@ -495,6 +493,25 @@ hard_exit 주입) 사외 단위 테스트가 가능하다.
 폴더 삭제 후 재인덱싱"이 항상 유효한 완전 복구 경로다 — 실제 장애 사례가 쌓이면 자동 감지·격리를
 근거 있게 설계한다. 위 dirty-shutdown 표식은 "언제 그 복구가 필요할지"에 대한 최소한의 신호일
 뿐, 자동 격리·재구축은 여전히 하지 않는다.
+
+## COM 오류 증거와 복구 진단
+
+`secure/com_fault.py`는 부호 있는/없는 32비트 정수 HRESULT, 표준 6항목 excepinfo의
+마지막 code와 최대 8개 cause만 판독한다. bool·문자열·실수·범위 초과 값은 코드로 보지 않는다.
+Word·Excel·PPT에 같은 fatal RPC allowlist를 적용하며 PPT 고정 프로토콜 표식은 PPT에서만 허용한다.
+
+읽기·열기 등 최초 실패와 Close·제목/보안 복원 실패는 단계·수치 코드·원본을 각각
+파일 처리 동안만 메모리에 둔다. poison 원인은 실제 fatal 오류이고 실패 이력의 분류·code는
+최초 오류를 사용한다. 예를 들어 read=0x80004005 뒤 Close=0x800706BA면 read 분류와
+0x80004005를 저장하고 복구는 0x800706BA로 수행한다. 실제 워치독 timeout이 발생했으면
+기존 timeout 분류 우선순위가 유지된다. failure schema·backoff·일반 busy 정책은 바꾸지 않는다.
+RPC 단절 뒤 추가 Close·설정 복원은 요청하지 않는다.
+
+파일 추출의 attempt ID는 static COM과 동적 fallback에서 공유하고 동기 복구 이후 file finally에
+비운다. 로그는 primary/cleanup stage·type·outer/inner code, poison code, guard epoch/cache
+source/age/PID 및 직전 복구 attempt를 연결한다. 원문 예외·본문·시트명·Caption을 로그나
+failure state에 저장하지 않는다. daemon에는 구성 시 캡처한 정수 attempt ID만 전달한다.
+실제 Windows·Office·DRM의 RPC·종료·COM Release 검증은 아직 미실행이다.
 
 ## COM 행오버 워치독 (`collector/com_watchdog.py` + `secure/office_guard.py`)
 

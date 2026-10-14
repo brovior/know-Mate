@@ -55,7 +55,7 @@ def ppt_probe(monkeypatch):
     monkeypatch.setattr(guard, "_cleanup_retry_at", {})
     monkeypatch.setattr(com_reader._tls, "ownership_cleanup", {}, raising=False)
     monkeypatch.setattr(guard, "_enumerate_processes", lambda: [("POWERPNT.EXE", 20)])
-    monkeypatch.setattr(guard, "_cached_processes", lambda: [("POWERPNT.EXE", 20)])
+    monkeypatch.setattr(guard, "_cached_process_snapshot", lambda: guard.ProcessSnapshot(guard._guard_epoch, [("POWERPNT.EXE", 20)], 0.0, "live"))
     monkeypatch.setattr(guard, "_pid_from_hwnd", lambda hwnd: 20 if hwnd == 123 else None)
     monkeypatch.setattr(guard, "_process_creation_identity", lambda pid: 2020)
 
@@ -483,7 +483,11 @@ def test_ppt_close_and_security_restore_errors_preserve_causes_and_gate(monkeypa
     assert events.count(("add", -1)) == 1
     assert app.Caption == "PowerPoint"
     if fatal_restore:
-        assert raised.value.__cause__ is fatal
+        assert raised.value.__cause__ is restore_error
+        evidence = raised.value.evidence
+        assert evidence.poison_fault.original is restore_error
+        assert evidence.poison_fault.phase == "security_restore"
+        assert [fault.original for fault in evidence.cleanup] == [close_error, restore_error]
         assert restore_error.__cause__ is fatal  # 앞선 close 오류로 fatal cause를 덮어쓰지 않는다.
     else:
         assert raised.value.__cause__.close_error is close_error
