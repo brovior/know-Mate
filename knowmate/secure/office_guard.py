@@ -74,6 +74,24 @@ _shutdown_generation = 0
 _cleanup_retry_at: dict[str, float] = {}
 _cleanup_inflight: dict[str, int] = {}
 _unverified_cleanup: dict[str, set[int]] = {}
+_application_closing = threading.Event()
+
+
+def begin_application_shutdown() -> None:
+    """Block new Word/Excel automation without waiting on the ownership lock."""
+    _application_closing.set()
+
+
+def ensure_application_open(exe: str) -> None:
+    """Reject Word/Excel reads and activations once application exit begins."""
+    if exe.upper() in {"WINWORD.EXE", "EXCEL.EXE"} and _application_closing.is_set():
+        raise OfficeCleanupPendingError(exe, "application_closing")
+
+
+def shutdown_cleanup_inflight() -> bool:
+    """Report active Word/Excel cleanup callbacks under the ownership lock."""
+    with _owned_lock:
+        return any(_cleanup_inflight.get(exe, 0) for exe in ("WINWORD.EXE", "EXCEL.EXE"))
 
 
 @dataclass(frozen=True)
@@ -641,7 +659,7 @@ def _register_owned_window(
     ):
         logger.warning("Office 소유 등록 실패: exe=%s PID=%s reason=confirmation_changed", up, pid)
         return None
-    global _ownership_generation
+    global _ownership_generation, _shutdown_generation
     with _owned_lock:
         current_record = _owned_pids.get(pid)
         if up == "POWERPNT.EXE" and (
@@ -664,6 +682,9 @@ def _register_owned_window(
         record = OwnedOfficeProcess(
             up, creation_identity, up != "POWERPNT.EXE", _ownership_generation,
         )
+        if up in {"WINWORD.EXE", "EXCEL.EXE"} and _application_closing.is_set():
+            _shutdown_generation += 1
+            record = replace(record, cleanup_pending=True, cleanup_generation=_shutdown_generation)
         _owned_pids[pid] = record
     logger.debug("우리 소유 Office PID 등록: %s=%d", up, pid)
     return pid, record
@@ -729,6 +750,8 @@ def _mark_owned_cleanup_pending(pid: int, record: OwnedOfficeProcess) -> OwnedOf
         current = _owned_pids.get(pid)
         if current is None or not _record_matches_unlocked(current, record):
             return None
+        if current.cleanup_pending:
+            return current
         _shutdown_generation += 1
         pending = replace(record, cleanup_pending=True, cleanup_generation=_shutdown_generation)
         _owned_pids[pid] = pending
@@ -784,6 +807,7 @@ def clear_owned_pids() -> set[int]:
         _owned_pids.clear()
         _cleanup_retry_at.clear()
         _unverified_cleanup.clear()
+        _application_closing.clear()
     return prev
 
 
@@ -802,9 +826,8 @@ def begin_owned_cleanup(exe: str | None = None) -> dict[int, OwnedOfficeProcess]
         snapshot: dict[int, OwnedOfficeProcess] = {}
         for pid, record in tuple(_owned_pids.items()):
             if record.exe in {"WINWORD.EXE", "EXCEL.EXE"} and (exe is None or record.exe == exe.upper()):
-                pending = OwnedOfficeProcess(
-                    record.exe, record.creation_identity, record.terminable,
-                    record.generation, True, cleanup_generation,
+                pending = record if record.cleanup_pending else replace(
+                    record, cleanup_pending=True, cleanup_generation=cleanup_generation,
                 )
                 _owned_pids[pid] = pending
                 snapshot[pid] = pending
@@ -875,6 +898,7 @@ def prune_released_nonterminable_processes() -> None:
 def ensure_office_available(exe: str, retry_cooldown_sec: float = 30.0) -> None:
     """Retry pending cleanup at most once per cooldown, then gate COM if unresolved."""
     up = exe.upper()
+    ensure_application_open(up)
     with _owned_lock:
         tokens = set(_unverified_cleanup.get(up, ()))
     if tokens:
@@ -1143,20 +1167,23 @@ def wait_for_owned_exit(
     return unresolved, time.monotonic() - t0
 
 
-def cleanup_owned_processes(owned: dict[int, OwnedOfficeProcess], timeout_sec: float = 2.0) -> OfficeCleanupResult:
+def cleanup_owned_processes(
+    owned: dict[int, OwnedOfficeProcess], timeout_sec: float = 2.0,
+    *, deadline: float | None = None,
+) -> OfficeCleanupResult:
     """Run verified process cleanup behind EXE gates until all OS work finishes."""
     exes = {record.exe for record in owned.values() if record.exe in {"WINWORD.EXE", "EXCEL.EXE"}}
     for exe in exes:
         begin_shutdown_cleanup(exe)
     try:
-        return _cleanup_owned_processes_impl(owned, timeout_sec)
+        return _cleanup_owned_processes_impl(owned, timeout_sec, deadline)
     finally:
         for exe in exes:
             finish_shutdown_cleanup(exe)
 
 
 def _cleanup_owned_processes_impl(
-    owned: dict[int, OwnedOfficeProcess], timeout_sec: float,
+    owned: dict[int, OwnedOfficeProcess], timeout_sec: float, deadline: float | None = None,
 ) -> OfficeCleanupResult:
     """Terminate identity-matched owned Office processes and confirm actual exit."""
     if not owned:
@@ -1173,6 +1200,9 @@ def _cleanup_owned_processes_impl(
     failed: set[int] = set()
     forced_exited: set[int] = set()
     for pid, record in owned.items():
+        if deadline is not None and time.monotonic() >= deadline:
+            remaining.add(pid)
+            continue
         if not _record_matches(pid, record):
             failed.add(pid)
             continue
@@ -1183,7 +1213,8 @@ def _cleanup_owned_processes_impl(
         if not record.terminable:
             remaining.add(pid)
             continue
-        state = _terminate_and_confirm(pid, record, timeout_sec)
+        wait_sec = timeout_sec if deadline is None else min(timeout_sec, max(0.0, deadline - time.monotonic()))
+        state = _terminate_and_confirm(pid, record, wait_sec)
         if state in {"exited", "terminated", "identity_changed"}:
             if _remove_owned_if_matches(pid, record):
                 exited.add(pid)

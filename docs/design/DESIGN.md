@@ -162,7 +162,22 @@ COM 합계 30건 주기 정리와 사이클 종료의 최종 정리도 유지한
 보존하며 메일 처리는 계속한다. 수집 취소는 해당 워커의 임베딩 요청에만 적용하며 HTTP 연결은
 스레드별로 재사용한다. 임베딩·Office·DB 정리가 진행 중이면 앱 종료 유예를 최대 60초로
 늘리고, 일반 작업은 8초 대기한다. 종료 시간 초과에는 실제 작업 단계를 기록한다.
-하드 종료 경로에 블로킹 정리를 추가하지 않으며 PowerPoint Quit·강제 종료 금지를 유지한다.
+앱 종료 요청 즉시 새 Word·Excel 생성·읽기를 차단한다. 이미 생성 중이던 COM 앱은 HWND·EXE·
+생성 identity로 소유권을 검증할 수 있으면 정리 대기로 등록하고 읽지 않는다. 정상 유예 뒤에는
+유휴·워커 없음·정상 완료도 포함해 별도 daemon에서 소유 Word·Excel만 OS 핸들로 종료·확인한다.
+같은 핸들에서 생성 identity를 확인해 PID 재사용을 보호하고, 기존 워치독과 겹치는 정리는 동일한
+정리 generation을 유지한다. 정리·워커 복귀·뒤늦은 소유 등록 확인은 합산 13초를 넘겨 기다리지
+않으며 PID별 종료 대기도 같은 마감시각을 사용한다. 기존 정리 콜백이나 새 daemon이 아직
+실행 중이면 정상 quit을 허용하지 않는다. 잠금·로그·Resiliency 정리가 멈춰도 제어 스레드는
+마감 뒤 강제 종료로 진행한다. 정상 유예 최대 60초와 terminate 확인 3초를 합친 대기 상한은
+76초이며, 이는 Python 제어 스레드가 실행될 수 있다는 전제다.
+
+Office 종료 뒤 워커가 finally를 마치면 정상 종료하고, 계속 멈춰 있으면 QThread.terminate 후
+os._exit로 종료한다. terminate 이후에는 로깅·레지스트리·파일 I/O·정리를 호출하지 않는다.
+앱 종료 로그는 정리 대상 수와 실제 종료·강제 종료·잔류·identity 미확인·실패·미검증 소유권·
+in-flight·시간 초과를 구분한다. 대상 0은 모든 OS Office의 부재를 의미하지 않는다. 소유권을
+확인하지 못한 Dispatch 행오버는 사용자 프로세스를 보호하기 위해 추측 종료하지 않아 잔류할 수
+있다. PowerPoint Quit·강제 종료 금지는 유지한다.
 
 PowerPoint 읽기는 `secure/ppt_diagnostics.py`에서 슬라이드·도형 위치, 개수, 구간별 시간을
 계측한다. 진행 로그 스레드는 수치 정보만 조회하고 COM 객체를 받지 않는다. 워치독의 read
@@ -440,9 +455,11 @@ DRM 문서는 스킵된다(COM Open 실패/로그인 모달 대기로 사이클�
 트레이 [종료] 시 워커가 COM Open 등에 블로킹돼 있으면(로그가 특정 파일에서 멈추는 행오버) 취소
 플래그(`_cancelled`)를 못 봐 정상 종료가 안 되고, 프로세스가 잔존해 QWebEngine 자식 프로세스 등과
 함께 자원을 계속 물어 PC가 버벅인다(트레이 아이콘은 `hide()`로 사라져 종료된 것처럼 보임).
-`lifecycle.stop_worker`가 **정상 종료(wait 8s) → 실패 시 `terminate()`(스레드 강제 종료, wait 3s)
-→ 그래도 잔존 시 `os._exit(0)`(프로세스 하드 종료)**로 단계적으로 강제해, [종료]가 반드시 프로세스를
-끝내도록 보장한다. `_shutdown`은 스케줄러 정지·트레이 숨김·워커 정리를 각각 독립 try로 감싸(한
+`lifecycle.stop_worker`는 **정상 종료 유예(일반 8초, 정리 중 최대 60초) → 앱 소유 Word·Excel
+OS 정리와 워커 복귀 확인(합산 최대 13초) → 계속 멈춘 워커 `terminate()`(확인 최대 3초) →
+`os._exit(0)`** 순서로 종료한다. 워커가 멈췄더라도 정리 daemon·기존 정리 콜백이 실행 중이거나
+종료 상태를 확인할 수 없으면 정상 quit 대신 하드 종료한다. 유휴·워커 없음도 OS 정리 단계를
+거치며, 안전하게 종료할 수 없는 사용자 Office·PowerPoint·소유 미확인 PID는 보호한다. `_shutdown`은 스케줄러 정지·트레이 숨김·워커 정리를 각각 독립 try로 감싸(한
 곳의 실패가 이후 정리를 건너뛰지 않게) 처리한다. 로직은 PyQt6 비의존으로 분리해(worker 덕타이핑,
 hard_exit 주입) 사외 단위 테스트가 가능하다.
 
@@ -454,8 +471,8 @@ hard_exit 주입) 사외 단위 테스트가 가능하다.
 사건 자체가 없어 `app.exec()`가 영영 반환되지 않았다(트레이 아이콘만 사라지고 프로세스 잔존이
 항상 재현되던 원인). `main()`에서 `app.setQuitOnLastWindowClosed(False)`로 암묵 종료를 끄고,
 `_shutdown()` 마지막에 `lifecycle.finalize_shutdown(worker, quit_fn, hard_exit)`를 항상 호출한다:
-`worker.isRunning()`이 False로 확인되면 `QApplication.quit()`, 실행 중이거나 조회 자체가
-예외(판정 불가)면 보수적으로 `hard_exit` — 둘 중 정확히 하나만 실행된다. `_shutdown()`은
+`worker.isRunning()`이 False이고 정리 완료가 확인되면 `QApplication.quit()`, 실행 중·정리
+미완료·강제 중단·조회 예외(판정 불가)는 보수적으로 `hard_exit` — 둘 중 정확히 하나만 실행된다. `_shutdown()`은
 `_shutdown_done` 플래그로 프로세스 수명 기준 1회만 실행되도록 멱등화했다(근접한 이중 종료 요청
 방어). `finalize_shutdown`도 `stop_worker`와 동형으로 PyQt6 비의존 분리 — `quit_fn`/`hard_exit`
 주입으로 사외 단위 테스트 가능(`knowmate/tests/test_phase3.py::TestFinalizeShutdown`).
