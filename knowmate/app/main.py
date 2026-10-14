@@ -334,6 +334,8 @@ class MainWindow(QMainWindow):
         if self._shutdown_done:
             return
         self._shutdown_done = True
+        from knowmate.secure.office_guard import begin_application_shutdown
+        begin_application_shutdown()
 
         # 설치 도구는 앱과 독립적으로 실제 승격 자식 종료까지 예약을 지킨다.
         # 앱 종료는 관찰/시작 콜백만 중단하고 설치 프로세스를 종료하지 않는다.
@@ -362,26 +364,28 @@ class MainWindow(QMainWindow):
 
         # 워커 종료 에스컬레이션(정상→강제→하드)은 lifecycle.stop_worker로 분리
         # (PyQt6 비의존이라 단위 테스트 가능). 스케줄러·트레이 정리는 위에서 이미 시도함.
-        # 반환값(terminate() 사용 여부)은 finalize_shutdown의 force_hard_exit로 그대로
-        # 넘긴다(설계 리뷰 15차 B-1) — 예외로 이탈하면 "판정 불가"와 동일하게 False로
-        # 취급해 finalize_shutdown의 isRunning() 재조회에 맡긴다.
-        terminated = False
+        # A live cleanup helper, a forced worker stop or an exception requires
+        # hard exit. Start conservatively so an exception cannot permit quit.
+        force_hard_exit = True
         try:
             from knowmate.app.lifecycle import stop_worker
-            terminated = stop_worker(getattr(self._bridge, "_worker", None))
-        except Exception as exc:
-            logger.warning("워커 정리 중 예외: %s", exc)
+            from knowmate.secure.office_exit import cleanup_before_worker_termination
+            force_hard_exit = stop_worker(
+                getattr(self._bridge, "_worker", None),
+                office_cleanup=cleanup_before_worker_termination,
+            )
+        except Exception:
+            # The cleanup helper may hold a logging lock. Unknown completion
+            # must go directly to the final hard-exit decision without logging.
+            pass
 
-        # 최종 판정 — 항상 도달한다. stop_worker()가 정상 반환했다면 워커는 이미 멈췄지만,
-        # stop_worker() 자체가 예외로 이탈했을 경우를 대비해 워커 실행 여부를 다시 조회한다.
-        # 비실행 확인 시 quit(), 실행 중이거나 조회 자체가 실패(판정 불가)하거나 terminate()로
-        # 강제 중단됐으면(락 보유 가능성) 보수적으로 hard_exit — quit과 hard_exit는 정확히
-        # 하나만 실행된다.
+        # A normal worker stop alone is insufficient if OS cleanup is unfinished.
+        # finalize_shutdown performs no logging or cleanup when hard exit is required.
         from knowmate.app.lifecycle import finalize_shutdown
         finalize_shutdown(
             getattr(self._bridge, "_worker", None),
             quit_fn=QApplication.instance().quit,
-            force_hard_exit=terminated,
+            force_hard_exit=force_hard_exit,
         )
 
 

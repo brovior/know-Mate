@@ -26,7 +26,7 @@ hard_exit가 프로세스 수명 동안 "정확히 하나만" 실행된다는 �
 """
 import logging
 import os
-from typing import Callable, NoReturn
+from typing import Any, Callable, NoReturn
 
 logger = logging.getLogger(__name__)
 
@@ -130,13 +130,44 @@ def _default_hard_exit(code: int = 0) -> NoReturn:
     os._exit(code)
 
 
-def stop_worker(worker, hard_exit: HardExit = _default_hard_exit) -> bool:
+def stop_worker(
+    worker: Any, hard_exit: HardExit = _default_hard_exit,
+    office_cleanup: Callable[[object], bool] | None = None,
+) -> bool:
+    """Stop the worker after bounded Office cleanup; report any unsafe exit."""
+    cleanup_started = False
+
+    def cleanup_once(target: object) -> bool:
+        nonlocal cleanup_started
+        cleanup_started = True
+        return office_cleanup(target)
+
+    try:
+        return _stop_worker_impl(worker, hard_exit, cleanup_once if office_cleanup is not None else None)
+    except Exception:
+        # A Qt status/cancel/wait failure must not bypass owned Office cleanup.
+        # The callback is bounded and logs on its daemon, never on this thread.
+        if office_cleanup is not None and not cleanup_started:
+            try:
+                cleanup_once(worker)
+            except Exception:
+                pass
+        return True
+
+
+def _stop_worker_impl(
+    worker, hard_exit: HardExit = _default_hard_exit,
+    office_cleanup: Callable[[object], bool] | None = None,
+) -> bool:
     """워커를 정상 종료 → 실패 시 강제 종료 → 그래도 실패 시 프로세스 하드 종료.
 
     worker: cancel()/isRunning()/wait(ms)->bool/terminate() 를 갖는 객체(또는 None).
     hard_exit: 최종 프로세스 종료 콜백(기본 os._exit 래퍼, 테스트 주입용).
 
-    반환값: `terminate()`가 이번 호출에서 사용됐는지(bool). 호출부(`finalize_shutdown`)가
+    office_cleanup: 정상 유예 뒤(유휴/워커 없음 포함) 실행할 제한 시간 있는 OS 정리 콜백.
+        True는 워커/정리 스레드가 완료되지 않아 하드 종료해야 함을 뜻한다.
+
+    반환값: `terminate()` 사용 또는 정리 미완료로 하드 종료해야 하는지(bool). 호출부(`finalize_shutdown`)가
     이 값을 `force_hard_exit`로 넘겨야 한다(설계 리뷰 15차 B-1) — `QThread.terminate()`는
     스레드를 임의 지점에서 강제 중단하므로, 그 결과 `isRunning()`이 False가 되더라도
     "정상 종료"로 취급할 수 없다. 강제 중단된 스레드가 로깅 핸들러 락·LanceDB 파일 락 등을
@@ -152,7 +183,7 @@ def stop_worker(worker, hard_exit: HardExit = _default_hard_exit) -> bool:
     시작·정상종료 시점에 담당한다.
     """
     if worker is None or not worker.isRunning():
-        return False
+        return office_cleanup(worker) if office_cleanup is not None else False
 
     worker.cancel()
     # 현재 처리 중인 파일 완료 후 정상 종료 대기
@@ -165,7 +196,7 @@ def stop_worker(worker, hard_exit: HardExit = _default_hard_exit) -> bool:
         maintenance_in_progress = False
     wait_ms = _WAIT_MAINTENANCE_MS if maintenance_in_progress else _WAIT_GRACEFUL_MS
     if worker.wait(wait_ms):
-        return False
+        return office_cleanup(worker) if office_cleanup is not None else False
 
     # 첫 8초 대기 중 임베딩·Office·DB 정리가 시작되면 남은 유예를 준다.
     if not maintenance_in_progress:
@@ -175,23 +206,39 @@ def stop_worker(worker, hard_exit: HardExit = _default_hard_exit) -> bool:
         except Exception:
             maintenance_in_progress = False
         if maintenance_in_progress and worker.wait(_WAIT_MAINTENANCE_MS - _WAIT_GRACEFUL_MS):
-            return False
+            return office_cleanup(worker) if office_cleanup is not None else False
 
+    # Cleanup first: terminating QThread can strand the ownership/logger lock.
+    # The bounded callback also gives the COM worker time to finish after Office
+    # exits. If its helper remains alive, never enter normal interpreter shutdown.
+    unsafe_cleanup = office_cleanup(worker) if office_cleanup is not None else False
+    if office_cleanup is not None:
+        try:
+            if not worker.isRunning():
+                return unsafe_cleanup
+        except Exception:
+            hard_exit(0)
+            return True
+    if office_cleanup is None:
+        try:
+            stage = getattr(worker, "work_stage", "unknown")
+        except Exception:
+            stage = "unknown"
+        logger.warning("워커가 제때 종료되지 않음 — stage=%s; 스레드 강제 종료", stage)
+    # No logging/registry/file calls after this point, even if Qt raises.
     try:
-        stage = getattr(worker, "work_stage", "unknown")
+        worker.terminate()
+        stopped = worker.wait(_WAIT_AFTER_TERMINATE_MS)
     except Exception:
-        stage = "unknown"
-    logger.warning("워커가 제때 종료되지 않음 — stage=%s; 스레드 강제 종료", stage)
-    worker.terminate()
-    if worker.wait(_WAIT_AFTER_TERMINATE_MS):
+        hard_exit(0)
+        return True
+    if stopped:
         # terminate()가 스레드를 멈추는 데는 성공했지만, 임의 지점에서 강제 중단된 것이라
         # 락을 보유한 채 죽었을 가능성이 있어 "정상 종료"로 취급하지 않는다(리뷰15 B-1) —
         # 호출부가 이 반환값을 finalize_shutdown(force_hard_exit=True)로 넘겨야 한다.
-        logger.error("워커 스레드가 강제 종료됨(terminate) — 락 보유 가능성으로 하드 종료 강제")
         return True
 
     # 강제 종료 후에도 잔존 → 프로세스 하드 종료(사용자가 의도한 종료이므로 0)
-    logger.error("워커 스레드가 강제 종료 후에도 잔존 — 프로세스 하드 종료(os._exit)")
     hard_exit(0)
     return True
 
@@ -204,7 +251,7 @@ def finalize_shutdown(worker, quit_fn, hard_exit: HardExit = _default_hard_exit,
     멈춘 상태이지만, stop_worker() 자체가 예외를 던졌거나 isRunning() 조회 자체가 실패하면
     "판정 불가" 상태이므로 quit()만으로는 QThread가 잔존할 수 있어 보수적으로 hard_exit한다.
 
-    force_hard_exit: `stop_worker()`가 `terminate()`를 사용했으면(반환값 True) 호출부가
+    force_hard_exit: `stop_worker()`가 강제 중단 또는 정리 미완료를 보고하면(반환값 True) 호출부가
     이 값을 그대로 넘겨야 한다(설계 리뷰 15차 B-1). `terminate()`는 스레드를 임의 지점에서
     강제 중단하므로 이후 `isRunning()`이 False가 되어도 "정상 종료"가 아니다 — 락을 쥔 채
     죽었을 수 있어 `quit()`으로 넘어가면 인터프리터 종료가 블록되거나, `app.exec()`가
@@ -225,7 +272,6 @@ def finalize_shutdown(worker, quit_fn, hard_exit: HardExit = _default_hard_exit,
         즉시 실행되어야 한다(리뷰11 B-1).
     """
     if force_hard_exit:
-        logger.error("워커가 terminate()로 강제 중단됨 — 락 보유 가능성으로 정상 quit 대신 하드 종료")
         hard_exit(0)
         return
 

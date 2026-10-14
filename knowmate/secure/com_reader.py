@@ -313,7 +313,7 @@ def _dispatch_and_own(win32com, prog_id: str, exe_name: str):
         OfficeOwnershipProbeError, OfficeOwnershipCleanupError,
         OfficeCleanupPendingError, office_pids_live, register_owned_app,
         ensure_office_available, unverified_cleanup_pending,
-        prepare_powerpoint_dispatch,
+        prepare_powerpoint_dispatch, ensure_application_open,
     )
     from knowmate.secure.office_resiliency import clear_resiliency_markers
 
@@ -330,6 +330,7 @@ def _dispatch_and_own(win32com, prog_id: str, exe_name: str):
         win32com.Dispatch if exe_name == "POWERPNT.EXE"
         else getattr(win32com, "DispatchEx", win32com.Dispatch)
     )
+    ensure_application_open(exe_name)
     try:
         app = dispatch(prog_id)
     except Exception as exc:
@@ -386,6 +387,11 @@ def _dispatch_and_own(win32com, prog_id: str, exe_name: str):
         _retain_unverified_app(exe_name, app)
         logger.warning("[com] 소유 등록 재시도 소진; 미검증 앱 정리 대기: exe=%s", exe_name)
         raise OfficeCleanupPendingError(exe_name, f"{exe_name} 소유권 확인 실패로 정리 대기 중")
+    # A Dispatch that began before exit must still register its proven PID.
+    # Preserve the COM reference for the worker finally block, but do not read.
+    if exe_name in {"WINWORD.EXE", "EXCEL.EXE"}:
+        setattr(_tls, "word" if exe_name == "WINWORD.EXE" else "excel", app)
+        ensure_application_open(exe_name)
     return app
 
 
