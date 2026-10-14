@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from PyQt6.QtCore import QObject, pyqtSlot, pyqtSignal
@@ -359,16 +360,20 @@ class Bridge(QObject):
                         from datetime import datetime
                         dt = datetime.fromisoformat(str(raw_ts))
                         last_indexed = dt.astimezone().strftime("%Y-%m-%d %H:%M")
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "문서 건수 조회 실패: error_type=%s", type(exc).__name__
+            )
 
         try:
             if self._worker and hasattr(self._worker, "_email_indexer") and self._worker._email_indexer:
                 etbl = self._worker._email_indexer.table.search().select(["mail_uid", "is_deleted"]).to_arrow()
                 edf = etbl.to_pandas()
                 mail_count = int(edf[~edf["is_deleted"]]["mail_uid"].nunique())
-        except Exception:
-            pass
+        except Exception as exc:
+            logging.getLogger(__name__).warning(
+                "메일 건수 조회 실패: error_type=%s", type(exc).__name__
+            )
 
         self._local_count, self._shared_count, self._mail_count = local_count, shared_count, mail_count
         return local_count, shared_count, mail_count, last_indexed
@@ -689,6 +694,10 @@ class Bridge(QObject):
         worker.progress.connect(self._on_worker_progress)
         worker.finished.connect(self._on_worker_finished)
         worker.indexing_needed.connect(self.indexAlert)
+        # The web UI may have queried before asynchronous PPT preparation
+        # created this worker. Seed the count cache now, even if the first
+        # indexing cycle has no changes and therefore skips count queries.
+        self.statusUpdated.emit(self.getIndexStatus())
 
     # ------------------------------------------------------------------
     # 내부 헬퍼
