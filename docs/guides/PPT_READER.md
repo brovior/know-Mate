@@ -43,6 +43,31 @@ PowerPoint에서 운영 추가 기능을 강제 활성화하거나 Office 충돌
 
 ## 제거와 중단 복구
 
+### 공백이 있는 설치 경로에서 활성화 실패
+
+이전 설치 도구는 `CodeBase`의 공백을 `%20`으로 기록했습니다. DLL 직접 로드는 성공하지만
+COM 생성이 `0x80070002`로 실패하는 환경에서, 공백을 그대로 기록하면 생성에 성공하고
+기존 값으로 복구하면 다시 실패하는 비교 시험으로 원인을 확인했습니다. 수정된 도구는
+RegAsm과 같은 공백 표기를 사용하며 설치 점검도 같은 기준으로 검사합니다.
+
+위 빌드 명령으로 수정된 도구를 만든 뒤 PowerPoint와 AegisDesk를 정상 종료합니다.
+일반 권한 PowerShell에서 아래 명령을 실행하고 필요한 UAC를 승인합니다. 자기 소유 운영
+등록만 제거하며 시험용 추가 기능과 Office 충돌 차단 기록은 변경하지 않습니다.
+
+```powershell
+& .\scripts\ppt_reader\bin\PptReaderSetup.exe /remove
+if ($LASTEXITCODE -ne 0) { throw 'ppt_reader_remove_failed' }
+& .\scripts\ppt_reader\bin\PptReaderSetup.exe /prepare /prototype
+if ($LASTEXITCODE -ne 0) { throw 'ppt_reader_install_failed' }
+& .\scripts\ppt_reader\bin\PptReaderSetup.exe /check
+```
+
+`ready` 뒤에는 새 PowerPoint에서 운영 추가 기능의 체크 유지와 실제 읽기를 확인합니다.
+인덱싱 성공 로그의 `method=addin`이 운영 DLL 사용을 뜻합니다. `ready`만으로 Office 읽기
+성공이나 자동 설치 출하 검증이 완료된 것으로 간주하지 않습니다.
+
+### 일반 제거와 중단 복구
+
 PowerPoint와 AegisDesk를 정상 종료한 뒤 일반 권한 PowerShell에서 제거 도구를 실행한다.
 필요한 Machine 수정만 UAC로 승격한다. 소유·비트수·고정 경로가 확인된 운영 등록만 해제하며,
 비활성 운영 등록도 제거할 수 있다. 이전 버전 DLL 파일은 자동 삭제하지 않는다.

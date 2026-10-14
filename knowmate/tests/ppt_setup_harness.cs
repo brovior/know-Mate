@@ -17,6 +17,16 @@ internal static class SetupHarness
     {
         string id = "33e979c6-c5c4-40af-845a-64c80517d1ae";
         Require(!Contract.AutoInstallValidated, "gate_not_closed");
+        // These are Windows paths even when the pure harness runs under Mono.
+        string suffix = "/AegisDesk/PptReader/1.0.0.0/AegisDesk.PptReader.dll";
+        foreach (string directory in new[] { "Program Files", "Program Files (x86)", "프로그램 파일", "literal%20folder" })
+        {
+            string file = @"C:\" + directory + suffix.Replace('/', '\\');
+            string codebase = Mutation.RegistrationCodeBase(file);
+            Require(codebase == "file:///C:/" + directory + suffix, "codebase_unescaped_" + directory);
+        }
+        Require(Mutation.RegistrationCodeBase(@"C:\Program Files" + suffix.Replace('/', '\\')) !=
+            new Uri(@"C:\Program Files" + suffix.Replace('/', '\\')).AbsoluteUri, "escaped_codebase_regression");
         Require(Reservation.Valid(Record(), id), "complete_valid");
         var old = Record(); old["required_version"] = "0.9.0.0";
         Require(Reservation.Valid(old, id), "old_complete_valid");

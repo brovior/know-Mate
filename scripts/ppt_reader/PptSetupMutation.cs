@@ -11,6 +11,14 @@ namespace AegisDesk.PptSetup
 {
     internal static class Mutation
     {
+        /// <summary>Return the unescaped file URL expected by .NET COM registration.</summary>
+        public static string RegistrationCodeBase(string path)
+        {
+            // RegAsm uses GetCodeBase(false). AbsoluteUri encodes spaces as %20,
+            // which can make native COM activation fail with 0x80070002.
+            return new Uri(path).GetComponents(UriComponents.AbsoluteUri, UriFormat.Unescaped);
+        }
+
         public static void Protect(string directory)
         {
             Machine.NoLinks(directory);
@@ -57,12 +65,12 @@ namespace AegisDesk.PptSetup
                 return server != null && versionKey != null && prog != null &&
                     String.Equals(prog.GetValue("") as string, Contract.ClassId, StringComparison.OrdinalIgnoreCase) &&
                     Object.Equals(server.GetValue(""), "mscoree.dll") && Object.Equals(server.GetValue("Class"), Contract.ReaderClass) &&
-                    Object.Equals(server.GetValue("CodeBase"), new Uri(path).AbsoluteUri) &&
+                    Object.Equals(server.GetValue("CodeBase"), RegistrationCodeBase(path)) &&
                     Object.Equals(server.GetValue("Assembly"), assembly) && Object.Equals(server.GetValue("RuntimeVersion"), "v4.0.30319") &&
                     Object.Equals(server.GetValue("ThreadingModel"), "Both") &&
                     Object.Equals(versionKey.GetValue("Assembly"), assembly) && Object.Equals(versionKey.GetValue("Class"), Contract.ReaderClass) &&
                     Object.Equals(versionKey.GetValue("RuntimeVersion"), "v4.0.30319") &&
-                    Object.Equals(versionKey.GetValue("CodeBase"), new Uri(path).AbsoluteUri);
+                    Object.Equals(versionKey.GetValue("CodeBase"), RegistrationCodeBase(path));
             }
         }
         private static FileSecurity FileAcl()
@@ -195,7 +203,7 @@ namespace AegisDesk.PptSetup
                         Set(root, Contract.Keys[0], "", "Aegis Desk PPT Reader");
                         Set(root, server, "", "mscoree.dll"); Set(root, server, "ThreadingModel", "Both");
                         foreach (string key in new[] { server, server + "\\" + Contract.Version })
-                        { Set(root, key, "Class", Contract.ReaderClass); Set(root, key, "Assembly", assembly); Set(root, key, "RuntimeVersion", "v4.0.30319"); Set(root, key, "CodeBase", new Uri(path).AbsoluteUri); }
+                        { Set(root, key, "Class", Contract.ReaderClass); Set(root, key, "Assembly", assembly); Set(root, key, "RuntimeVersion", "v4.0.30319"); Set(root, key, "CodeBase", RegistrationCodeBase(path)); }
                         Set(root, Contract.Keys[0] + @"\ProgId", "", Contract.ProgId);
                         Set(root, Contract.Keys[1], "", "Aegis Desk PPT Reader");
                         Set(root, Contract.Keys[1] + @"\CLSID", "", Contract.ClassId);
