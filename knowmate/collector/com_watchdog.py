@@ -21,6 +21,10 @@
 """
 import logging
 import threading
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from knowmate.secure.com_stage import AttemptContext
 
 logger = logging.getLogger(__name__)
 
@@ -77,16 +81,36 @@ class ComWatchdog:
 
     def arm(self, exe: str, timeout_sec: float) -> None:
         """exe 대상으로 timeout_sec 후 발화하도록 무장한다(이전 무장은 대체)."""
+        from knowmate.secure.com_stage import get_attempt_context
+        context = get_attempt_context()
         with self._lock:
             self._gen += 1
             gen = self._gen
             self._active = True
-            timer = self._timer_factory(timeout_sec, lambda: self._fire(exe, gen))
+            timer = self._timer_factory(timeout_sec, lambda: self._fire_with_context(exe, gen, context))
             self._timer = timer
         timer.start()
 
+    def _fire_with_context(self, exe: str, gen: int, context: "AttemptContext | None") -> int:
+        """Carry only captured scalar IDs into daemon cleanup and restore its TLS."""
+        from knowmate.secure.com_stage import clear_attempt_context, get_attempt_context, set_attempt_context
+        previous = get_attempt_context()
+        try:
+            if context is None:
+                clear_attempt_context()
+            else:
+                set_attempt_context(context.cycle_id, context.attempt_id, context.app_exe)
+            return self._fire(exe, gen)
+        finally:
+            if previous is None:
+                clear_attempt_context()
+            else:
+                set_attempt_context(previous.cycle_id, previous.attempt_id, previous.app_exe)
+
     def _fire(self, exe: str, gen: int) -> int:
         """타이머 발화 콜백 — 현재 세대·활성 상태일 때만 종료를 수행한다."""
+        from knowmate.secure.com_stage import get_attempt_context
+        context = get_attempt_context()
         with self._lock:
             if not self._active or gen != self._gen:
                 return 0  # 이미 해제됐거나 다른(과거) 세대 → 무시
@@ -101,8 +125,9 @@ class ComWatchdog:
                 self._fired_gen = gen
                 self._fired_stage = stage_name
                 logger.warning(
-                    "COM 추출 타임아웃 — %s 강제 해제(%d개 종료) [단계: %s]",
-                    exe, killed, stage_desc,
+                    "COM 추출 타임아웃 — %s 강제 해제(%d개 종료) [단계: %s] cycle_id=%s attempt_id=%s",
+                    exe, killed, stage_desc, context.cycle_id if context else None,
+                    context.attempt_id if context else None,
                 )
             # 종료 후에는 비활성화(같은 파일에 중복 발화 방지)
             self._active = False

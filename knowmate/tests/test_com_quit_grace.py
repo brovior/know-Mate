@@ -307,7 +307,7 @@ def test_pending_guard_precedes_user_busy_detection(monkeypatch):
     _register()
     office_guard.begin_owned_cleanup("EXCEL.EXE")
     calls = []
-    monkeypatch.setattr(office_guard, "is_office_busy_for_ext", lambda ext: calls.append(ext) or True)
+    monkeypatch.setattr(office_guard, "inspect_office_for_ext", lambda ext: calls.append(ext) or office_guard.OfficeGuardDecision("busy", office_guard.process_for_ext(ext), "external_process", office_guard._guard_epoch))
     with pytest.raises(office_guard.OfficeCleanupPendingError):
         AutoReader._guard_office_busy(".xls", "sample.xls")
     assert calls == []

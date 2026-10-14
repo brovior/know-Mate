@@ -9,7 +9,8 @@ _ThreadLocalComApps를 통해 스레드별로 독립적인 COM 앱 인스턴스�
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import sys
 import threading
 import time
 from pathlib import Path
@@ -17,6 +18,10 @@ from types import ModuleType
 from typing import Any, TYPE_CHECKING
 
 from knowmate.secure import com_stage
+from knowmate.secure.com_fault import (
+    ComFailureEvidence, ComFault, make_fault, outer_hresult, fatal_hresult,
+    FATAL_HRESULTS,
+)
 from knowmate.secure.ppt_diagnostics import PptReadDiagnostics
 from knowmate.secure.text_util import format_table
 
@@ -36,52 +41,45 @@ class ComUnavailableError(RuntimeError):
 # Office가 이미 죽었거나 RPC 연결이 끊겼음을 뜻하는 HRESULT만 여기에 둔다.
 # 파일별 암호/손상 오류나 busy/retry 오류를 여기에 넣으면 정상 인스턴스까지
 # 불필요하게 죽여 사용자 작업과 재사용성을 해칠 수 있다.
-_FATAL_TRANSPORT_HRESULTS = frozenset({
-    0x800706BA,  # RPC_S_SERVER_UNAVAILABLE
-    0x800706BE,  # RPC_S_CALL_FAILED
-    0x800706BF,  # RPC_S_CALL_FAILED_DNE
-    0x80010006,  # RPC_E_CONNECTION_TERMINATED
-    0x80010007,  # RPC_E_SERVER_DIED
-    0x80010012,  # RPC_E_SERVER_DIED_DNE
-    0x80010108,  # RPC_E_DISCONNECTED
-    0x800401FD,  # CO_E_OBJNOTCONNECTED
-})
+_FATAL_TRANSPORT_HRESULTS = FATAL_HRESULTS
 
 
 def hresult_of(exc: BaseException) -> int | None:
-    """예외의 HRESULT를 unsigned 32-bit 정수로 반환한다(없으면 None)."""
-    value = getattr(exc, "hresult", None)
-    if not isinstance(value, int):
-        args = getattr(exc, "args", ())
-        value = args[0] if args and isinstance(args[0], int) else None
-    return (value & 0xFFFFFFFF) if isinstance(value, int) else None
+    """Return only the outer numeric HRESULT for classification compatibility."""
+    return outer_hresult(exc)
 
 
 def is_fatal_transport_hresult(hresult: int | None) -> bool:
-    """HRESULT가 재사용 불가 Office RPC 전송 단절인지 판정한다."""
-    return isinstance(hresult, int) and (hresult & 0xFFFFFFFF) in _FATAL_TRANSPORT_HRESULTS
+    """Whether a strictly typed 32-bit code is a fatal Office transport failure."""
+    return type(hresult) is int and -0x80000000 <= hresult <= 0xFFFFFFFF and (hresult & 0xFFFFFFFF) in FATAL_HRESULTS
 
 
 class OfficeComPoisonError(RuntimeError):
-    """Office RPC 연결이 끊겨 해당 COM 인스턴스를 즉시 폐기해야 할 때 발생한다."""
+    """A fatal transport failure with separate primary and cleanup evidence."""
 
-    def __init__(self, exe_name: str, hresult: int | None = None) -> None:
+    def __init__(self, exe_name: str, hresult: int | None = None, *, evidence: ComFailureEvidence | None = None) -> None:
         self.exe_name = exe_name.upper()
         self.app_exe = self.exe_name
-        self.hresult = (hresult & 0xFFFFFFFF) if isinstance(hresult, int) else None
+        self.hresult = (hresult & 0xFFFFFFFF) if type(hresult) is int else None
+        self.evidence = evidence
         detail = f" (HRESULT=0x{self.hresult:08X})" if self.hresult is not None else ""
         super().__init__(f"{self.exe_name} COM RPC 연결이 끊어졌습니다{detail}")
 
 
-def _poison_if_fatal(exc: BaseException, exe_name: str) -> None:
-    """fatal transport HRESULT면 원본을 보존한 poison 예외를 발생시킨다."""
-    if exe_name == "POWERPNT.EXE":
-        from knowmate.secure.ppt_payload import fatal_hresult
-        hresult = fatal_hresult(exc)
-    else:
-        hresult = hresult_of(exc)
-    if is_fatal_transport_hresult(hresult):
-        raise OfficeComPoisonError(exe_name, hresult) from exc
+def _poison_if_fatal(
+    exc: BaseException, exe_name: str, *, stage: str | None = None,
+    primary: ComFault | None = None, cleanup: tuple[ComFault, ...] = (), phase: str | None = None,
+) -> None:
+    """Promote structured fatal codes without replacing existing evidence."""
+    if isinstance(exc, OfficeComPoisonError):
+        raise exc
+    code = fatal_hresult(exc, app_exe=exe_name)
+    if code is not None:
+        fault = make_fault(exc, stage or com_stage.current_stage_name(), app_exe=exe_name, phase=phase)
+        evidence = ComFailureEvidence(primary if primary is not None else (None if cleanup else fault),
+                                      cleanup, fault, code)
+        raise OfficeComPoisonError(exe_name, code, evidence=evidence) from exc
+
 
 
 def _require_win32com():
@@ -128,12 +126,14 @@ def _retain_unverified_app(exe: str, app: Any, document: Any = None) -> None:
     """소유를 확인 못한 COM 참조와 EXE 차단을 생성 워커에 보존한다."""
     from knowmate.secure.office_guard import begin_unverified_cleanup
 
+    previous = _clear_reusable_word_excel_app("word" if exe == "WINWORD.EXE" else "excel") if exe in {"WINWORD.EXE", "EXCEL.EXE"} else None
     candidates = getattr(_tls, "ownership_cleanup", None)
     if candidates is None:
         candidates = _tls.ownership_cleanup = {}
     if exe not in candidates:
         begin_unverified_cleanup(exe)
     candidates[exe] = _PendingOwnershipCleanup(app, document)
+    del previous
 
 
 def release_unverified_com_refs() -> None:
@@ -146,6 +146,113 @@ def release_unverified_com_refs() -> None:
             "[com] 미검증 COM 참조 해제: exe=%s quit_requested=False reason=unverified_ownership cleanup_gate_action=unchanged",
             exe,
         )
+
+
+@dataclass(frozen=True)
+class DispatchedOfficeApp:
+    """A COM reference and the exact proof obtained for that dispatch."""
+
+    app: Any = field(repr=False, compare=False)
+    proved: tuple[int, OwnedOfficeProcess] | None = None
+
+
+@dataclass
+class VerifiedPendingReference:
+    """Worker-only cleanup reference, never a reusable app or unverified token."""
+
+    app: Any = field(repr=False, compare=False)
+    pid: int
+    record: OwnedOfficeProcess
+    document: Any = field(default=None, repr=False, compare=False)
+
+
+def _clear_reusable_word_excel_app(slot: str) -> tuple[Any, Any]:
+    """Clear app/proof atomically, returning a keepalive released outside the lock."""
+    from knowmate.secure.office_guard import _owned_lock
+    with _owned_lock:
+        previous = (getattr(_tls, slot, None), getattr(_tls, slot + "_proof", None))
+        setattr(_tls, slot, None)
+        setattr(_tls, slot + "_proof", None)
+    return previous
+
+
+def _retain_verified_pending_app(exe: str, app: Any, pid: int, record: OwnedOfficeProcess, document: Any = None) -> None:
+    """Retain an already proven reference without creating an unverified gate."""
+    if exe in {"WINWORD.EXE", "EXCEL.EXE"}:
+        previous = _clear_reusable_word_excel_app("word" if exe == "WINWORD.EXE" else "excel")
+    else:
+        previous = None
+    candidates = getattr(_tls, "verified_cleanup", None)
+    if candidates is None:
+        candidates = _tls.verified_cleanup = {}
+    candidates[exe] = VerifiedPendingReference(app, pid, record, document)
+    del previous
+
+
+def release_verified_pending_com_refs(exe: str | None = None) -> None:
+    """Release worker references only; registry records and gates remain unchanged."""
+    candidates = getattr(_tls, "verified_cleanup", {})
+    exes = tuple(candidates) if exe is None else ((exe,) if exe in candidates else ())
+    for name in exes:
+        candidates.pop(name, None)
+        logger.info("[com] 정리 전용 COM 참조 해제: exe=%s ownership=verified_pending quit_requested=False cleanup_gate_action=unchanged", name)
+
+
+def _reject_reusable_app(exe: str, app: Any, proof: Any) -> None:
+    from knowmate.secure.office_guard import _mark_owned_cleanup_pending
+    if proof is None:
+        _retain_unverified_app(exe, app)
+    else:
+        pid, record = proof
+        pending = _mark_owned_cleanup_pending(pid, record)
+        _retain_verified_pending_app(exe, app, pid, pending if pending is not None else record)
+
+
+def _publish_word_excel_app(slot: str, dispatched: DispatchedOfficeApp) -> None:
+    """Publish only while the exact registered proof is still active."""
+    from knowmate.secure.office_guard import _owned_lock, _assert_registered_app_admitted_unlocked, OfficeCleanupPendingError
+    exe = "WINWORD.EXE" if slot == "word" else "EXCEL.EXE"
+    previous = None
+    try:
+        with _owned_lock:
+            previous = (getattr(_tls, slot, None), getattr(_tls, slot + "_proof", None))
+            if sys.platform == "win32":
+                if dispatched.proved is None:
+                    raise OfficeCleanupPendingError(exe, "registered_app_proof_missing")
+                _assert_registered_app_admitted_unlocked(exe, *dispatched.proved)
+            setattr(_tls, slot, dispatched.app)
+            setattr(_tls, slot + "_proof", dispatched.proved)
+    except OfficeCleanupPendingError:
+        cleared = _clear_reusable_word_excel_app(slot)
+        _reject_reusable_app(exe, dispatched.app, dispatched.proved)
+        del cleared
+        raise
+    finally:
+        del previous
+
+
+def _consume_word_excel_app(slot: str) -> Any:
+    """Validate the app/proof pair at every reuse, including cleanup ABA."""
+    from knowmate.secure.office_guard import _owned_lock, _assert_registered_app_admitted_unlocked, OfficeCleanupPendingError
+    exe = "WINWORD.EXE" if slot == "word" else "EXCEL.EXE"
+    app = proof = None
+    try:
+        with _owned_lock:
+            app = getattr(_tls, slot, None)
+            proof = getattr(_tls, slot + "_proof", None)
+            if app is None:
+                setattr(_tls, slot + "_proof", None)
+                return None
+            if sys.platform == "win32":
+                if proof is None:
+                    raise OfficeCleanupPendingError(exe, "registered_app_proof_missing")
+                _assert_registered_app_admitted_unlocked(exe, *proof)
+            return app
+    except OfficeCleanupPendingError:
+        previous = _clear_reusable_word_excel_app(slot)
+        _reject_reusable_app(exe, app, proof)
+        del previous
+        raise
 
 
 # COM 상수 (모달 다이얼로그 억제용)
@@ -235,6 +342,8 @@ class _OfficeQuitWatchdog:
         owned: dict[int, OwnedOfficeProcess], timeout_sec: float,
     ) -> None:
         self._guard = office_guard
+        context = com_stage.get_attempt_context()
+        self._attempt_id = context.attempt_id if context is not None else None
         self._exe = exe
         self._owned = dict(owned)
         self._timeout = timeout_sec
@@ -271,7 +380,7 @@ class _OfficeQuitWatchdog:
         try:
             logger.warning("[com] Office Quit 시간 초과 발화: exe=%s PID=%s", self._exe, sorted(self._owned))
             result = self._guard.cleanup_owned_processes(self._owned)
-            self._guard._log_cleanup_result(self._exe, result, "Quit timeout")
+            self._guard._log_cleanup_result(self._exe, result, "Quit timeout", attempt_id=self._attempt_id)
         except Exception as exc:
             logger.error("[com] Quit timeout cleanup 예외: exe=%s error_type=%s", self._exe, type(exc).__name__)
         finally:
@@ -294,7 +403,7 @@ class _OfficeQuitWatchdog:
         return fired, completed, result
 
 
-def _dispatch_and_own(win32com, prog_id: str, exe_name: str):
+def _dispatch_owned_app(win32com, prog_id: str, exe_name: str) -> DispatchedOfficeApp:
     """앱별 방식으로 COM을 생성하고 검증된 프로세스 PID만 소유 등록한다.
 
     Word·Excel은 DispatchEx로 기존 ROT 객체 재접속을 피하고, MultiUse인
@@ -312,7 +421,8 @@ def _dispatch_and_own(win32com, prog_id: str, exe_name: str):
     from knowmate.secure.office_guard import (
         OfficeOwnershipProbeError, OfficeOwnershipCleanupError,
         OfficeCleanupPendingError, office_pids_live, register_owned_app,
-        ensure_office_available, unverified_cleanup_pending,
+        ensure_office_available, unverified_cleanup_pending, _register_owned_app_record,
+        assert_registered_app_admitted, _mark_owned_cleanup_pending,
         prepare_powerpoint_dispatch, ensure_application_open,
     )
     from knowmate.secure.office_resiliency import clear_resiliency_markers
@@ -341,36 +451,47 @@ def _dispatch_and_own(win32com, prog_id: str, exe_name: str):
     # 이 자동화 요청 자체를 연기한다. 비Windows fake 객체는 office_guard의
     # platform fallback으로 허용돼 기존 단위 테스트를 유지한다.
     owned = False
+    proved = None
     for attempt in range(3):
         try:
-            if expected_owned is not None:
+            if sys.platform == "win32":
+                proved = _register_owned_app_record(exe_name, before, app, expected_owned)
+                owned = proved is not None
+            elif expected_owned is not None:
                 owned = register_owned_app(exe_name, before, app, expected_owned)
             else:
                 owned = register_owned_app(exe_name, before, app)
         except OfficeOwnershipCleanupError as exc:
             if exc.registered is None:
                 _retain_unverified_app(exe_name, app, exc.document)
+            else:
+                pid, record = exc.registered
+                pending = _mark_owned_cleanup_pending(pid, record)
+                _retain_verified_pending_app(exe_name, app, pid, pending if pending is not None else record, exc.document)
             logger.warning(
                 "[com] 소유 확인용 문서 정리 실패; 등록 재시도 중단: exe=%s probe_error=%s close_error=%s",
                 exe_name, type(exc.probe_error).__name__, type(exc.close_error).__name__,
             )
-            for error in (exc.probe_error, exc.close_error, exc.restore_error):
-                while error is not None:
-                    if exe_name == "POWERPNT.EXE" and is_fatal_transport_hresult(hresult_of(error)):
+            faults = tuple(make_fault(error.__cause__ if isinstance(error, OfficeOwnershipProbeError) and isinstance(error.__cause__, BaseException) else error,
+                                     "dispatch", app_exe=exe_name, phase=phase)
+                           for error, phase in ((exc.probe_error, getattr(exc, "probe_phase", "probe")),
+                                                (exc.close_error, getattr(exc, "close_phase", "blank_close")),
+                                                (exc.restore_error, "security_restore")) if error is not None)
+            primary = faults[0] if exc.probe_error is not None else None
+            for fault in faults:
+                if fatal_hresult(fault.original, app_exe=exe_name) is not None:
+                    if exe_name == "POWERPNT.EXE":
                         _retain_unverified_app(exe_name, app, exc.document)
-                    _poison_if_fatal(error, exe_name)
-                    error = error.__cause__
+                    _poison_if_fatal(fault.original, exe_name, stage=fault.stage, phase=fault.phase,
+                                     primary=primary, cleanup=tuple(f for f in faults if f is not primary))
             raise OfficeCleanupPendingError(
                 exe_name, f"{exe_name} 소유 확인용 문서 종료 확인 대기 중",
             ) from exc
         except OfficeOwnershipProbeError as exc:
             original = exc.__cause__ if isinstance(exc.__cause__, BaseException) else exc
-            error = exc
-            while error is not None:
-                if is_fatal_transport_hresult(hresult_of(error)):
-                    _retain_unverified_app(exe_name, app, exc.document)
-                _poison_if_fatal(error, exe_name)
-                error = error.__cause__
+            if fatal_hresult(exc, app_exe=exe_name) is not None:
+                _retain_unverified_app(exe_name, app, exc.document)
+            _poison_if_fatal(original, exe_name, stage="dispatch", phase=getattr(exc, "probe_phase", "probe"))
             logger.warning(
                 "[com] 소유권 확인 오류: exe=%s attempt=%d error_type=%s HRESULT=%s",
                 exe_name, attempt + 1, type(original).__name__, hresult_of(original),
@@ -387,12 +508,20 @@ def _dispatch_and_own(win32com, prog_id: str, exe_name: str):
         _retain_unverified_app(exe_name, app)
         logger.warning("[com] 소유 등록 재시도 소진; 미검증 앱 정리 대기: exe=%s", exe_name)
         raise OfficeCleanupPendingError(exe_name, f"{exe_name} 소유권 확인 실패로 정리 대기 중")
-    # A Dispatch that began before exit must still register its proven PID.
-    # Preserve the COM reference for the worker finally block, but do not read.
-    if exe_name in {"WINWORD.EXE", "EXCEL.EXE"}:
-        setattr(_tls, "word" if exe_name == "WINWORD.EXE" else "excel", app)
-        ensure_application_open(exe_name)
-    return app
+    if proved is not None:
+        try:
+            assert_registered_app_admitted(exe_name, *proved)
+        except OfficeCleanupPendingError:
+            pid, record = proved
+            pending = _mark_owned_cleanup_pending(pid, record)
+            _retain_verified_pending_app(exe_name, app, pid, pending if pending is not None else record)
+            raise
+    return DispatchedOfficeApp(app, proved)
+
+
+def _dispatch_and_own(win32com, prog_id: str, exe_name: str) -> Any:
+    """Compatibility facade returning the raw app from the detailed core."""
+    return _dispatch_owned_app(win32com, prog_id, exe_name).app
 
 
 def _configure_app(app: Any, exe_name: str, assignments: tuple[tuple[Any, str, Any], ...]) -> None:
@@ -412,51 +541,44 @@ def _configure_word_options(app: Any) -> None:
         _poison_if_fatal(exc, "WINWORD.EXE")
 
 
-def _get_word_app():
-    """현재 스레드의 Word.Application COM 인스턴스를 반환한다."""
+def _get_word_excel_app(slot: str, exe: str, prog_id: str) -> Any:
     from knowmate.secure.office_guard import ensure_office_available
-    ensure_office_available("WINWORD.EXE")
-    if not getattr(_tls, "word", None):
-        _ensure_com_initialized()
-        win32com = _require_win32com()
-        app = _dispatch_and_own(win32com, "Word.Application", "WINWORD.EXE")
-        # 모달 다이얼로그/매크로 경고/변환 확인창 억제
-        _configure_app(app, "WINWORD.EXE", (
-            (app, "Visible", False), (app, "DisplayAlerts", _WD_ALERTS_NONE),
-            (app, "AutomationSecurity", _MSO_SEC_FORCE_DISABLE),
-        ))
+    release_verified_pending_com_refs(exe)
+    ensure_office_available(exe)
+    app = _consume_word_excel_app(slot)
+    if app is not None:
+        return app
+    _ensure_com_initialized()
+    dispatched = _dispatch_owned_app(_require_win32com(), prog_id, exe)
+    app = dispatched.app
+    assignments = ((app, "Visible", False), (app, "DisplayAlerts", _WD_ALERTS_NONE if slot == "word" else _XL_ALERTS_OFF),
+                   (app, "AutomationSecurity", _MSO_SEC_FORCE_DISABLE))
+    if slot == "excel":
+        assignments += ((app, "AskToUpdateLinks", False),)
+    _configure_app(app, exe, assignments)
+    if slot == "word":
         _configure_word_options(app)
-        _tls.word = app
-    return _tls.word
+    _publish_word_excel_app(slot, dispatched)
+    return app
 
 
-def _get_excel_app():
-    """현재 스레드의 Excel.Application COM 인스턴스를 반환한다."""
-    from knowmate.secure.office_guard import ensure_office_available
-    ensure_office_available("EXCEL.EXE")
-    if not getattr(_tls, "excel", None):
+def _get_word_app() -> Any:
+    """Return a Word app whose reusable proof remains active."""
+    return _get_word_excel_app("word", "WINWORD.EXE", "Word.Application")
+
+
+def _get_excel_app() -> Any:
+    """Return an Excel app whose reusable proof remains active."""
+    return _get_word_excel_app("excel", "EXCEL.EXE", "Excel.Application")
+
+
+def _get_ppt_app() -> Any:
+    """Return the PowerPoint app without requesting Quit or process termination."""
+    if getattr(_tls, "ppt", None) is None:
         _ensure_com_initialized()
-        win32com = _require_win32com()
-        app = _dispatch_and_own(win32com, "Excel.Application", "EXCEL.EXE")
-        _configure_app(app, "EXCEL.EXE", (
-            (app, "Visible", False), (app, "DisplayAlerts", _XL_ALERTS_OFF),
-            (app, "AutomationSecurity", _MSO_SEC_FORCE_DISABLE),
-            (app, "AskToUpdateLinks", False),
-        ))
-        _tls.excel = app
-    return _tls.excel
-
-
-def _get_ppt_app():
-    """현재 스레드의 PowerPoint.Application COM 인스턴스를 반환한다."""
-    if not getattr(_tls, "ppt", None):
-        _ensure_com_initialized()
-        win32com = _require_win32com()
-        app = _dispatch_and_own(win32com, "PowerPoint.Application", "POWERPNT.EXE")
-        _configure_app(app, "POWERPNT.EXE", (
-            (app, "DisplayAlerts", 1),  # ppAlertsNone 계열 (버전별 차이)
-            (app, "AutomationSecurity", _MSO_SEC_FORCE_DISABLE),
-        ))
+        dispatched = _dispatch_owned_app(_require_win32com(), "PowerPoint.Application", "POWERPNT.EXE")
+        app = dispatched.app
+        _configure_app(app, "POWERPNT.EXE", ((app, "DisplayAlerts", 1), (app, "AutomationSecurity", _MSO_SEC_FORCE_DISABLE)))
         _tls.ppt = app
     return _tls.ppt
 
@@ -475,7 +597,7 @@ class WordComReader:
         timer = com_stage.StageTimer(path)
         doc = None
         poison: OfficeComPoisonError | None = None
-        primary_error: Exception | None = None
+        primary_error: ComFault | None = None
         try:
             with timer.stage(com_stage.STAGE_DISPATCH):
                 word = _get_word_app()
@@ -509,30 +631,34 @@ class WordComReader:
             return text
         except OfficeComPoisonError as exc:
             poison = exc
-            _tls.word = None
+            if exc.evidence is None:
+                fault = make_fault(exc, timer.failed_stage or "open", app_exe="WINWORD.EXE")
+                exc.evidence = ComFailureEvidence(fault, (), fault, exc.hresult)
+            _clear_reusable_word_excel_app("word")
             raise
         except Exception as exc:
-            primary_error = exc
+            primary_error = make_fault(exc, timer.failed_stage or "read", app_exe="WINWORD.EXE")
             try:
-                _poison_if_fatal(exc, "WINWORD.EXE")
+                _poison_if_fatal(exc, "WINWORD.EXE", stage=primary_error.stage, primary=primary_error)
             except OfficeComPoisonError as poison_exc:
                 poison = poison_exc
-                _tls.word = None
+                _clear_reusable_word_excel_app("word")
                 raise
             raise
         finally:
             # RPC 단절 뒤 Close도 다시 RPC에 매달릴 수 있어 scheduler의 즉시 복구로
             # 넘긴다. 일반 문서 오류는 기존처럼 Close를 유지한다.
             try:
+                if poison is not None:
+                    logger.debug("[com] 문서 닫기 생략: exe=WINWORD.EXE reason=rpc_disconnected")
                 close_error = None if poison is not None else _close_quietly(timer, doc, "Close", False)
                 if close_error is not None:
                     try:
-                        _poison_if_fatal(close_error, "WINWORD.EXE")
+                        close_fault = make_fault(close_error, "close", app_exe="WINWORD.EXE")
+                        _poison_if_fatal(close_error, "WINWORD.EXE", stage="close", primary=primary_error, cleanup=(close_fault,))
                     except OfficeComPoisonError as close_poison:
-                        _tls.word = None
-                        if primary_error is not None:
-                            raise close_poison from primary_error
-                        raise
+                        _clear_reusable_word_excel_app("word")
+                        raise close_poison from close_error
             finally:
                 com_stage.clear()
                 timer.log_summary()
@@ -598,7 +724,7 @@ class ExcelComReader:
         timer = com_stage.StageTimer(path)
         wb = None
         poison: OfficeComPoisonError | None = None
-        primary_error: Exception | None = None
+        primary_error: ComFault | None = None
         try:
             with timer.stage(com_stage.STAGE_DISPATCH):
                 excel = _get_excel_app()
@@ -638,28 +764,32 @@ class ExcelComReader:
             return "\n".join(lines)
         except OfficeComPoisonError as exc:
             poison = exc
-            _tls.excel = None
+            if exc.evidence is None:
+                fault = make_fault(exc, timer.failed_stage or "open", app_exe="EXCEL.EXE")
+                exc.evidence = ComFailureEvidence(fault, (), fault, exc.hresult)
+            _clear_reusable_word_excel_app("excel")
             raise
         except Exception as exc:
-            primary_error = exc
+            primary_error = make_fault(exc, timer.failed_stage or "read", app_exe="EXCEL.EXE")
             try:
-                _poison_if_fatal(exc, "EXCEL.EXE")
+                _poison_if_fatal(exc, "EXCEL.EXE", stage=primary_error.stage, primary=primary_error)
             except OfficeComPoisonError as poison_exc:
                 poison = poison_exc
-                _tls.excel = None
+                _clear_reusable_word_excel_app("excel")
                 raise
             raise
         finally:
             try:
+                if poison is not None:
+                    logger.debug("[com] 문서 닫기 생략: exe=EXCEL.EXE reason=rpc_disconnected")
                 close_error = None if poison is not None else _close_quietly(timer, wb, "Close", False)
                 if close_error is not None:
                     try:
-                        _poison_if_fatal(close_error, "EXCEL.EXE")
+                        close_fault = make_fault(close_error, "close", app_exe="EXCEL.EXE")
+                        _poison_if_fatal(close_error, "EXCEL.EXE", stage="close", primary=primary_error, cleanup=(close_fault,))
                     except OfficeComPoisonError as close_poison:
-                        _tls.excel = None
-                        if primary_error is not None:
-                            raise close_poison from primary_error
-                        raise
+                        _clear_reusable_word_excel_app("excel")
+                        raise close_poison from close_error
             finally:
                 com_stage.clear()
                 timer.log_summary()
@@ -806,6 +936,7 @@ class PowerPointComReader:
         timer = com_stage.StageTimer(path)
         prs = None
         poison = False
+        primary_error: ComFault | None = None
         read_ok = False
         close_ok = False
         chosen = "com"
@@ -855,14 +986,18 @@ class PowerPointComReader:
                             text = self._read_com(prs, path, timer)
                     self._check()
                     read_ok = True
-                except OfficeComPoisonError:
+                except OfficeComPoisonError as exc:
                     poison = True
+                    if exc.evidence is None:
+                        fault = make_fault(exc, timer.failed_stage or "open", app_exe="POWERPNT.EXE")
+                        exc.evidence = ComFailureEvidence(fault, (), fault, exc.hresult)
                     _tls.ppt = None
                     _tls.ppt_service = None
                     raise
                 except Exception as exc:
+                    primary_error = make_fault(exc, timer.failed_stage or "read", app_exe="POWERPNT.EXE")
                     try:
-                        _poison_if_fatal(exc, "POWERPNT.EXE")
+                        _poison_if_fatal(exc, "POWERPNT.EXE", stage=primary_error.stage, primary=primary_error)
                     except OfficeComPoisonError:
                         poison = True
                         _tls.ppt = None
@@ -876,6 +1011,7 @@ class PowerPointComReader:
                     # the numeric code for collector classification and logs.
                     safe = PptPayloadError("ppt_read_failed")
                     safe.hresult = hresult_of(exc)
+                    safe.evidence = ComFailureEvidence(primary_error, (), primary_error, None)
                     raise safe from None
                 finally:
                     # Fatal transport failures must not initiate another blocking RPC Close.
@@ -885,12 +1021,16 @@ class PowerPointComReader:
                         self.operation.finish(close_ok, read_ok)
                     if error is not None:
                         try:
-                            _poison_if_fatal(error, "POWERPNT.EXE")
+                            close_fault = make_fault(error, "close", app_exe="POWERPNT.EXE")
+                            _poison_if_fatal(error, "POWERPNT.EXE", stage="close", primary=primary_error, cleanup=(close_fault,))
                         except OfficeComPoisonError:
                             _tls.ppt = None
                             _tls.ppt_service = None
                             raise
-                        raise PptOperationError("close_unconfirmed") from None
+                        safe = PptOperationError("close_unconfirmed")
+                        close_fault = make_fault(error, "close", app_exe="POWERPNT.EXE")
+                        safe.evidence = ComFailureEvidence(primary_error, (close_fault,), close_fault, None)
+                        raise safe from None
                     if read_ok:
                         self._check("close")
                         if self.operation is not None:
@@ -931,6 +1071,7 @@ def quit_com_apps(
     quit_timeout_sec = com_quit_call_timeout_seconds(
         {} if quit_timeout_sec is None else {"com_quit_call_timeout_sec": quit_timeout_sec}
     )
+    release_verified_pending_com_refs()
     office_guard.prune_unverified_cleanup()
     owned = office_guard.begin_owned_cleanup()
     results: list[OfficeCleanupResult] = []
@@ -939,6 +1080,8 @@ def quit_com_apps(
     for attr, exe in (("word", "WINWORD.EXE"), ("excel", "EXCEL.EXE"), ("ppt", "POWERPNT.EXE")):
         app = getattr(_tls, attr, None)
         if app is None:
+            if attr in {"word", "excel"}:
+                _clear_reusable_word_excel_app(attr)
             continue
         watchdog = None
         try:
@@ -977,7 +1120,11 @@ def quit_com_apps(
                 )
         finally:
             # Quit 예외에도 스레드 로컬 COM 참조를 반드시 놓는다.
-            setattr(_tls, attr, None)
+            if attr in {"word", "excel"}:
+                previous = _clear_reusable_word_excel_app(attr)
+                del previous
+            else:
+                setattr(_tls, attr, None)
             if attr == "ppt":
                 _tls.ppt_service = None
             app = None

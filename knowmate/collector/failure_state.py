@@ -363,13 +363,8 @@ def _hresult_of(exc: BaseException) -> int | None:
     pywintypes.com_error는 `.hresult` 속성 또는 `args[0]`에 HRESULT를 담는다(버전에
     따라 다름) — 둘 다 확인한다.
     """
-    hresult = getattr(exc, "hresult", None)
-    if isinstance(hresult, int):
-        return hresult & 0xFFFFFFFF
-    args = getattr(exc, "args", None)
-    if args and isinstance(args[0], int):
-        return args[0] & 0xFFFFFFFF
-    return None
+    from knowmate.secure.com_fault import outer_hresult
+    return outer_hresult(exc)
 
 
 def _format_error_code(hresult: int | None) -> str | None:

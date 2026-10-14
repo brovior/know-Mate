@@ -286,9 +286,12 @@ def test_dispatch_started_before_closing_registers_owner_without_reading(monkeyp
         with pytest.raises(guard.OfficeCleanupPendingError, match="application_closing"):
             com_reader._dispatch_and_own(fake, "Excel.Application", "EXCEL.EXE")
         assert guard.take_owned_processes()[111].cleanup_pending
-        assert com_reader._tls.excel is app
+        assert getattr(com_reader._tls, "excel", None) is None
+        assert com_reader._tls.verified_cleanup["EXCEL.EXE"].app is app
+        assert not guard.unverified_cleanup_pending()
     finally:
-        com_reader._tls.excel = None
+        com_reader.release_verified_pending_com_refs()
+        com_reader._clear_reusable_word_excel_app("excel")
 
 
 def test_unresolved_first_pid_is_not_hidden_by_later_success(monkeypatch, caplog):

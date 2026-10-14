@@ -3,35 +3,25 @@ from __future__ import annotations
 import json
 import math
 import re
-from knowmate.secure.ppt_diagnostics import log_probe_read_errors, probe_error_details, _PROBE_KINDS, _PROBE_STAGES
+from knowmate.secure.ppt_diagnostics import log_probe_read_errors, _PROBE_KINDS, _PROBE_STAGES
 from knowmate.secure.text_util import format_table
+from knowmate.secure.com_fault import FATAL_HRESULTS as FATAL_HRESULTS
+from knowmate.secure import com_fault
 
 MAX_REPLY_CHARS = 32 * 1024 * 1024
-FATAL_HRESULTS = frozenset({0x800706BA, 0x800706BE, 0x800706BF, 0x80010006,
-                           0x80010007, 0x80010012, 0x80010108, 0x800401FD})
 
 class PptPayloadError(RuntimeError):
     """A fixed, content-free reply validation error."""
 
 
-def exception_hresult_codes(exc: BaseException) -> tuple[int, ...]:
+def exception_hresult_codes(exc: BaseException, *, app_exe: str | None = "POWERPNT.EXE") -> tuple[int, ...]:
     """Collect outer and safely decoded inner COM codes, including wrapped RPC."""
-    codes = []
-    outer = getattr(exc, "hresult", None)
-    if type(outer) is not int:
-        outer = exc.args[0] if exc.args and type(exc.args[0]) is int else None
-    if type(outer) is int:
-        codes.append(outer & 0xFFFFFFFF)
-    details = probe_error_details(exc)
-    for key in ("inner_hresult", "probe_inner_hresult"):
-        if type(details.get(key)) is int:
-            codes.append(details[key] & 0xFFFFFFFF)
-    return tuple(dict.fromkeys(codes))
+    return com_fault.exception_hresult_codes(exc, app_exe=app_exe)
 
 
-def fatal_hresult(exc: BaseException) -> int | None:
+def fatal_hresult(exc: BaseException, *, app_exe: str | None = "POWERPNT.EXE") -> int | None:
     """Return a fatal transport code even when DISP_E_EXCEPTION wraps it."""
-    return next((code for code in exception_hresult_codes(exc) if code in FATAL_HRESULTS), None)
+    return com_fault.fatal_hresult(exc, app_exe=app_exe)
 
 
 def decode_slide(reply: str, slide: int, *, strict: bool = False) -> tuple[list[str], dict[str, int], float]:

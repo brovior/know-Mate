@@ -252,7 +252,7 @@ class TestAutoReader:
         import knowmate.secure.com_reader as com_mod
         import knowmate.secure.office_guard as og
 
-        monkeypatch.setattr(og, "is_office_busy_for_ext", lambda ext: False)
+        monkeypatch.setattr(og, "inspect_office_for_ext", lambda ext: og.OfficeGuardDecision("available", og.process_for_ext(ext), "no_external_process", og._guard_epoch))
 
         captured = {}
 
@@ -348,20 +348,20 @@ class TestOfficeGuard:
     def test_busy_false_when_not_running(self, monkeypatch):
         """대상 프로세스가 안 떠 있으면 False."""
         import knowmate.secure.office_guard as og
-        monkeypatch.setattr(og, "_cached_processes", lambda: [("EXPLORER.EXE", 100)])
+        monkeypatch.setattr(og, "_cached_process_snapshot", lambda: og.ProcessSnapshot(og._guard_epoch, [("EXPLORER.EXE", 100)], 0.0, "live"))
         assert og.is_office_busy_for_ext(".doc") is False
 
     def test_busy_true_when_running(self, monkeypatch):
         """대상 프로세스가 (우리 소유가 아닌 채) 떠 있으면 True."""
         import knowmate.secure.office_guard as og
-        monkeypatch.setattr(og, "_cached_processes", lambda: [("WINWORD.EXE", 200)])
+        monkeypatch.setattr(og, "_cached_process_snapshot", lambda: og.ProcessSnapshot(og._guard_epoch, [("WINWORD.EXE", 200)], 0.0, "live"))
         assert og.is_office_busy_for_ext(".doc") is True
         assert og.is_office_busy_for_ext(".docx") is True
 
     def test_busy_false_when_running_process_is_ours(self, monkeypatch):
         """우리가 띄운(소유) 프로세스뿐이면 점유로 보지 않는다(자기 감지 방지)."""
         import knowmate.secure.office_guard as og
-        monkeypatch.setattr(og, "_cached_processes", lambda: [("WINWORD.EXE", 200)])
+        monkeypatch.setattr(og, "_cached_process_snapshot", lambda: og.ProcessSnapshot(og._guard_epoch, [("WINWORD.EXE", 200)], 0.0, "live"))
         monkeypatch.setattr(og.sys, "platform", "win32")
         monkeypatch.setattr(og, "_process_creation_identity", lambda pid: 2000)
         og._owned_pids[200] = og.OwnedOfficeProcess("WINWORD.EXE", 2000)
@@ -371,7 +371,7 @@ class TestOfficeGuard:
         """PID 번호만 등록한 기존 API는 Windows 소유권 증명을 대체하지 않는다."""
         import knowmate.secure.office_guard as og
         monkeypatch.setattr(og.sys, "platform", "win32")
-        monkeypatch.setattr(og, "_cached_processes", lambda: [("WINWORD.EXE", 200)])
+        monkeypatch.setattr(og, "_cached_process_snapshot", lambda: og.ProcessSnapshot(og._guard_epoch, [("WINWORD.EXE", 200)], 0.0, "live"))
         og.register_owned_pids({200})
         assert og.is_office_busy_for_ext(".doc") is True
 
@@ -379,8 +379,8 @@ class TestOfficeGuard:
         """우리 소유 인스턴스가 있어도 사용자(외부) 인스턴스가 별도로 있으면 True."""
         import knowmate.secure.office_guard as og
         monkeypatch.setattr(
-            og, "_cached_processes",
-            lambda: [("WINWORD.EXE", 200), ("WINWORD.EXE", 201)],
+            og, "_cached_process_snapshot",
+            lambda: og.ProcessSnapshot(og._guard_epoch, (("WINWORD.EXE", 200), ("WINWORD.EXE", 201)), 0.0, "live"),
         )
         monkeypatch.setattr(og.sys, "platform", "win32")
         monkeypatch.setattr(og, "_process_creation_identity", lambda pid: pid * 10)
@@ -390,13 +390,13 @@ class TestOfficeGuard:
     def test_busy_false_for_non_office_ext_even_if_running(self, monkeypatch):
         """대상 외 확장자는 프로세스가 떠 있어도 차단하지 않는다."""
         import knowmate.secure.office_guard as og
-        monkeypatch.setattr(og, "_cached_processes", lambda: [("WINWORD.EXE", 200)])
+        monkeypatch.setattr(og, "_cached_process_snapshot", lambda: og.ProcessSnapshot(og._guard_epoch, [("WINWORD.EXE", 200)], 0.0, "live"))
         assert og.is_office_busy_for_ext(".pdf") is False
 
     def test_busy_false_when_enumeration_unavailable(self, monkeypatch):
         """프로세스 열거 불가(None, 비Windows 등)면 차단하지 않는다(기존 동작 유지)."""
         import knowmate.secure.office_guard as og
-        monkeypatch.setattr(og, "_cached_processes", lambda: None)
+        monkeypatch.setattr(og, "_cached_process_snapshot", lambda: og.ProcessSnapshot(og._guard_epoch, None, 0.0, "live"))
         assert og.is_office_busy_for_ext(".doc") is False
 
     def test_clear_owned_pids_returns_and_empties(self):
@@ -480,7 +480,7 @@ class TestOfficeGuard:
         import knowmate.secure.office_guard as og
         from knowmate.secure import AutoReader
         from knowmate.secure.office_guard import OfficeBusyError
-        monkeypatch.setattr(og, "is_office_busy_for_ext", lambda ext: True)
+        monkeypatch.setattr(og, "inspect_office_for_ext", lambda ext: og.OfficeGuardDecision("busy", og.process_for_ext(ext), "external_process", og._guard_epoch))
         with pytest.raises(OfficeBusyError):
             AutoReader().extract("C:/dummy/report.doc")
 

@@ -24,6 +24,24 @@ PowerPoint 내부 추가 기능은 VDI와 사내 PC의 소수 문서에서 내�
 사례의 원본 로그는 없어 실제 원인이 Quit hang, 강제종료 실패, identity 조회 실패 중 무엇인지는
 확정하지 않았다. 새 로그는 PID·EXE·시간·정리 결과만 남기며 문서 내용은 기록하지 않는다.
 
+### COM poison 복구 일관성 (2026-10-15)
+
+실제 종료·소유 기록 제거 후 2초 목록이 남는 문제, 진행 중인 열거/guard가 옛 결과를 사용하는
+경합, Word·Excel 설정 완료/재사용과 정리가 겹치는 경합을 제품 코드에서 보완했다.
+최초 오류 뒤 Close RPC 오류가 생겼을 때 단계와 code를 섞던 경로도 분리했다.
+공통 판독기는 내부 구조화 HRESULT와 bounded cause를 처리한다. 사용자 Office와
+미검증 PID를 추정 종료하지 않으며 PPT Quit·kill 금지를 유지한다.
+
+실제 제품 helper·getter·parse를 사용하는 fake 회귀는 event로 열거/identity 시점을 고정하고
+실제 registry mutator로 cleanup ABA를 만든다. 정확한 generation·앱/proof pair,
+잠금 밖 참조 해제, 최초 분류·이중 오류 증거·민감 문구 불로그 및 PPT fresh preflight를 확인한다.
+설계 모델 통과와 구분하여 제품 회귀 결과는 PR의 검증 기록을 따른다.
+
+사내에서는 동일 EXE의 RPC 단절 → actual exit → 다음 파일의 attempt/guard epoch·PID를
+연결해 확인한다. 사용자 Word·Excel 동시 실행, 조회 권한 실패, PID 재사용, HWND 대체 창,
+PPT 재접속·중단 Close도 확인해야 한다. 실제 Windows·Office·DRM·COM Release는 미실행이다.
+잠금 검사 이후 새로운 OS 종료·사용자 실행을 원자화하지 않으며 즉시 GC를 보장하지 않는다.
+
 ## 1. 앱 크래시와 메모리 진단
 
 ### 확인된 코드 흐름

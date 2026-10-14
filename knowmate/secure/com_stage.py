@@ -21,6 +21,7 @@ import해도 CLAUDE.md 원칙3(보안·Office 의존 코드는 secure/ 안에 �
 import logging
 import threading
 import time
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,31 @@ _current: dict = {"stage": None, "path": None, "started_at": None}
 # 만들어져 호출부(스케줄러)가 직접 참조할 수 없다. 여기 게시해 두고
 # take_last_failed_stage()로 읽고 비운다(다음 파일로 값이 새는 것 방지).
 _last_failed_stage: str | None = None
+_attempt_tls = threading.local()
+
+
+@dataclass(frozen=True)
+class AttemptContext:
+    """Scalar correlation IDs captured on the creating worker thread."""
+
+    cycle_id: int
+    attempt_id: int
+    app_exe: str | None = None
+
+
+def set_attempt_context(cycle_id: int, attempt_id: int, app_exe: str | None = None) -> None:
+    """Set file-attempt correlation until scheduler recovery and finally finish."""
+    _attempt_tls.context = AttemptContext(cycle_id, attempt_id, app_exe)
+
+
+def get_attempt_context() -> AttemptContext | None:
+    """Return only this worker's immutable scalar correlation context."""
+    return getattr(_attempt_tls, "context", None)
+
+
+def clear_attempt_context() -> None:
+    """Drop file-attempt correlation after all file handlers have completed."""
+    _attempt_tls.context = None
 
 
 def begin(stage: str, path: str) -> None:
@@ -120,6 +146,7 @@ class StageTimer:
 
     def __init__(self, path: str) -> None:
         self._path = path
+        self._attempt_context = get_attempt_context()
         self._durations: dict[str, float] = {}
         self._notes: dict[str, str] = {}
         self.failed_stage: str | None = None
@@ -177,7 +204,10 @@ class StageTimer:
         """
         if self.total_seconds() >= SLOW_COM_PARSE_LOG_SEC:
             level = max(level, logging.INFO)
-        logger.log(level, "[com] 단계별 소요: %s <%s>", self.summary(), self._path)
+        context = self._attempt_context
+        logger.log(level, "[com] 단계별 소요: %s cycle_id=%s attempt_id=%s <%s>",
+                   self.summary(), context.cycle_id if context else None,
+                   context.attempt_id if context else None, self._path)
 
 
 class _StageContext:

@@ -208,7 +208,7 @@ def test_word_without_application_hwnd_uses_unsaved_window(monkeypatch, baseline
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr(office_guard, "_owned_pids", {})
     monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: [("WINWORD.EXE", 20)])
-    monkeypatch.setattr(office_guard, "_cached_processes", lambda: [("WINWORD.EXE", 20)])
+    monkeypatch.setattr(office_guard, "_cached_process_snapshot", lambda: office_guard.ProcessSnapshot(office_guard._guard_epoch, [("WINWORD.EXE", 20)], 0.0, "live"))
     monkeypatch.setattr(office_guard, "_pid_from_hwnd", lambda hwnd: 20 if hwnd == 123 else None)
     monkeypatch.setattr(office_guard, "_process_creation_identity", lambda pid: 2020)
     closed = []
@@ -341,7 +341,8 @@ def test_fatal_close_overrides_general_read_error_for_recovery(monkeypatch):
     with pytest.raises(com_reader.OfficeComPoisonError) as raised:
         com_reader.ExcelComReader().parse("C:/private/x.xls")
     assert raised.value.hresult == 0x800706BA
-    assert isinstance(raised.value.__cause__, RuntimeError)
+    assert isinstance(raised.value.__cause__, _FatalCloseError)
+    assert isinstance(raised.value.evidence.primary.original, RuntimeError)
     assert com_reader._tls.excel is None
 
 
@@ -746,7 +747,7 @@ def test_unregistered_word_close_failure_preserves_gate_without_new_com_calls(mo
     monkeypatch.setattr(office_guard, "_cleanup_retry_at", {})
     monkeypatch.setattr(office_guard, "office_pids_live", lambda exe: baseline)
     monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: list(live))
-    monkeypatch.setattr(office_guard, "_cached_processes", lambda: list(live))
+    monkeypatch.setattr(office_guard, "_cached_process_snapshot", lambda: office_guard.ProcessSnapshot(office_guard._guard_epoch, list(live), 0.0, "live"))
     monkeypatch.setattr(office_guard, "_pid_from_hwnd", lambda hwnd: 20)
     monkeypatch.setattr(office_guard, "_process_creation_identity", lambda pid: 2020)
     monkeypatch.setattr("knowmate.secure.office_resiliency.clear_resiliency_markers", lambda exe: None)
@@ -873,7 +874,7 @@ def test_all_registration_failures_retain_app_and_gate(monkeypatch, exe, prog_id
     def register(exe, baseline, candidate, expected_owned=None):
         attempts.append(candidate)
         if failure == "false":
-            return False
+            return None
         if failure == "unexpected":
             raise ValueError("unexpected probe failure")
         original = _Fatal() if failure == "fatal" else RuntimeError("probe rejected")
@@ -885,9 +886,9 @@ def test_all_registration_failures_retain_app_and_gate(monkeypatch, exe, prog_id
     monkeypatch.setattr(office_guard, "_cleanup_inflight", {})
     monkeypatch.setattr(office_guard, "_cleanup_retry_at", {})
     monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: [(exe, 20)])
-    monkeypatch.setattr(office_guard, "_cached_processes", lambda: [(exe, 20)])
+    monkeypatch.setattr(office_guard, "_cached_process_snapshot", lambda: office_guard.ProcessSnapshot(office_guard._guard_epoch, [(exe, 20)], 0.0, "live"))
     monkeypatch.setattr(office_guard, "office_pids_live", lambda exe: set())
-    monkeypatch.setattr(office_guard, "register_owned_app", register)
+    monkeypatch.setattr(office_guard, "_register_owned_app_record", register)
     monkeypatch.setattr(office_guard, "prepare_powerpoint_dispatch", lambda: (set(), {}))
     monkeypatch.setattr(com_reader.time, "sleep", lambda seconds: None)
     monkeypatch.setattr("knowmate.secure.office_resiliency.clear_resiliency_markers", lambda exe: None)
@@ -939,7 +940,7 @@ def test_ppt_hwnd_not_ready_exhaustion_is_pending_not_external_busy(monkeypatch)
     monkeypatch.setattr(office_guard, "office_pids_live", lambda exe: set())
     monkeypatch.setattr(office_guard, "prepare_powerpoint_dispatch", lambda: (set(), {}))
     monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: list(live))
-    monkeypatch.setattr(office_guard, "_cached_processes", lambda: list(live))
+    monkeypatch.setattr(office_guard, "_cached_process_snapshot", lambda: office_guard.ProcessSnapshot(office_guard._guard_epoch, list(live), 0.0, "live"))
     monkeypatch.setattr(office_guard, "_pid_from_hwnd", lambda hwnd: 20 if hwnd else None)
     monkeypatch.setattr(office_guard, "_process_creation_identity", lambda pid: 2020)
     monkeypatch.setattr(com_reader.time, "sleep", lambda seconds: None)
