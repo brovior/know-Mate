@@ -71,7 +71,7 @@ const context = {
   document: {getElementById: element, querySelector: () => null},
   bridge: {getVersion: () => Promise.resolve("test"), saveSettings: payload => {saved = JSON.parse(payload); return Promise.resolve('{"ok":true}');}},
   Option: function(label, value) {this.text = label; this.value = value; this.dataset = {};},
-  showToast: () => {}, closeSettings: () => {},
+  showToast: () => {}, closeSettings: () => {}, policyWriteBlocked: () => false,
 };
 vm.createContext(context);
 vm.runInContext(SOURCE, context);

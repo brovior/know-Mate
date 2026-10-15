@@ -15,6 +15,7 @@ sys.path.insert(0, str(REPO_ROOT))
 def create_manifest(payload_dir: Path, build_info_dir: Path) -> dict[str, object]:
     """Bind precompiled payload hashes to the app's generated build identity."""
     from knowmate.secure.ppt_bundle import PAYLOAD_FILES, validate_manifest
+    from knowmate.secure.ppt_policy import REQUIRED_VERSION, AUTO_INSTALL_MODES
 
     build_info = runpy.run_path(str(build_info_dir / "aegisdesk_build_info.py"))["BUILD_INFO"]
     # Guard metadata must describe the source currently being compiled, including
@@ -22,14 +23,25 @@ def create_manifest(payload_dir: Path, build_info_dir: Path) -> dict[str, object
     current = runpy.run_path(str(REPO_ROOT / "scripts" / "build_guard.py"))["_build_info"]()
     if any(current[key] != build_info.get(key) for key in ("commit", "source_fingerprint", "dirty")):
         raise ValueError("ppt_build_source_changed")
+    mode = build_info.get("ppt_auto_install_mode")
+    if mode not in AUTO_INSTALL_MODES:
+        raise ValueError("ppt_auto_install_mode")
+    expected_policy = ('namespace AegisDesk.PptSetup { internal static class BuildPolicy { '
+                       f'public const string AutoInstallMode = "{mode}";' + ' } }\n'
+                       'namespace AegisDesk.PptReader { internal static class ShutdownBuildPolicy { '
+                       f'public const bool Enabled = {str(mode == "candidate").lower()};' + ' } }\n')
+    if (build_info_dir / "PptBuildPolicy.cs").read_text(encoding="utf-8") != expected_policy:
+        raise ValueError("ppt_build_policy_changed")
     manifest: dict[str, object] = {
-        "schema": 1, "reader_version": "1.0.0.0", "protocol": 2, "payload_schema": 1,
+        "schema": 1, "reader_version": REQUIRED_VERSION, "protocol": 3, "payload_schema": 1,
         "prog_id": "AegisDesk.PptReader", "reader_class": "AegisDesk.PptReader.Connect",
         "reader_clsid": "287A80D2-804A-46D3-A0E9-CA31C6FC3D09",
-        "reader_iid": "65152412-DFD3-47EC-8346-3F2675ED0C15",
-        "auto_install_validated": False,
+        "reader_iid": "9A20F4A6-6364-4BA7-930B-3E8857BEAF60",
+        "auto_install_mode": mode, "auto_install_enabled": mode != "disabled",
+        "auto_install_validated": mode == "released",
+        "auto_shutdown_enabled": mode == "candidate",
         "build": {key: build_info[key] for key in ("commit", "source_fingerprint", "dirty")},
-        "assembly_versions": {name: "1.0.0.0" for name in PAYLOAD_FILES},
+        "assembly_versions": {name: REQUIRED_VERSION for name in PAYLOAD_FILES},
         "files": {name: hashlib.sha256((payload_dir / name).read_bytes()).hexdigest()
                   for name in PAYLOAD_FILES},
     }

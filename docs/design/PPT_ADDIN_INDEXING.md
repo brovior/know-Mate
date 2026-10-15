@@ -1,13 +1,14 @@
 # PowerPoint 추가 기능의 운영 인덱싱 적용 설계
 
-상태: **운영 구현·fake/managed 검사 완료, Windows 자동 설치 출하 보류** (2026-10-13). 현재 구현은 AegisDesk 시작 시 설치 상태를 점검하며, Machine 안전을 확인하면 미설치 auto는
-기존 COM으로 읽는다. 설치 상태가 불확실하면 PPT만 준비 대기로 미룬다. **자동 설치 실행은
-Windows prototype 검증 전까지 비활성이다.** 아래 자동 권한 승인 흐름은 검증 후 활성화할
-목표 동작이며, 현재 사용자에게 설치 성공이나 UAC 자동 표시를 보장하지 않는다.
+상태: **자동 설치·정상종료 후보 구현, Windows 승인 시험 전** (2026-10-15). 기본 `disabled` 빌드는
+설치 상태만 점검하고, Machine 안전을 확인하면 미설치 auto는 기존 COM으로 읽는다.
+개발 시 명시한 `candidate`/`released` 빌드는 앱 시작부터 UAC·설치·원래 사용자 재점검을
+실행한다. 설치 모드는 빌드 출처에 내장하며 사용자 설정·환경변수·manifest 편집으로 켜지지 않는다.
+`released`라는 이름도 Windows 검증 성공을 뜻하지 않으며, 최종 산출물의 승인 시험 전 배포하지 않는다.
 시험 결과의 정본은 [DIAGNOSTICS.md](../DIAGNOSTICS.md#ppt-추가-기능-사내-검증-보고-2026-10-13),
 시험 절차는 [PPT_PROBE.md](../guides/PPT_PROBE.md)다.
 
-## Windows 검증 후 활성화할 첫 실행 흐름
+## 자동 설치 빌드의 첫 실행 흐름
 
 1. 포터블 폴더의 `AegisDesk.exe`를 평소처럼 실행한다.
 2. 앱이 PPT 읽기 기능을 확인한다. 없거나 업데이트가 필요하면 설치 도구를 자동 실행한다.
@@ -19,14 +20,16 @@ Windows prototype 검증 전까지 비활성이다.** 아래 자동 권한 승�
 PowerPoint가 열려 있으면 설치를 미루고 기존 방식으로 읽는다. 설치 중에도 앱 화면은 사용할 수 있다.
 `addin` 검증 모드에서는 준비되지 않은 PPT만 다음 사이클로 미룬다.
 
-아래 계약에 따라 운영 리더·준비 점검·설치 도구 후보를 구현했다. **자동 설치는 Windows prototype gate 미통과로 비활성이고, 기존 배포 실행 파일에 새 구현이 반영된 것은 아니다.**
+기존 배포 파일에는 이번 변경이 자동 반영되지 않는다. 일반 배포의 기본은 `disabled`로 유지하며,
+후보·최종 파일의 검증과 빌드 명령은 [운영 검증 절차](../guides/PPT_READER.md)에 따른다.
 
 ## 1. 적용 범위와 전제
 
 - `.ppt`와 현재 COM으로 라우팅되는 DRM/OLE2 `.pptx`에 적용한다. 일반 ZIP `.pptx`는 PlainReader를 사용한다.
 - CollectorWorker의 기존 QThread, Office 점유·소유 확인, 파일 단위 실패 격리와 DB 커밋 계약을 유지한다.
 - 추가 기능은 PowerPoint의 연결 콜백으로 받은 호스트에 이미 열린 문서만 읽는다.
-  파일 저장·변환·새로 열기·닫기·Quit, 클립보드 사용을 하지 않는다.
+  추출은 파일 저장·변환·새로 열기·닫기·Quit, 클립보드 사용을 하지 않는다.
+  정상종료는 별도 lifecycle 계약으로만 요청한다([자동종료](#9-powerpoint-자동종료-후보)).
 - 추출 코어는 시험 DLL 0.1.3.0에서 검증한 코드와 공유한다. 시험용과 운영용의 설치 식별자는 분리한다.
 - 사내 보고는 소수 문서의 정확성·시간 비교다. 대량 인덱싱·사용자 Office 실행 경합·장시간 메모리 안정성은 미검증이다.
 
@@ -35,8 +38,8 @@ PowerPoint가 열려 있으면 설치를 미루고 기존 방식으로 읽는다
 | 항목 | 결정 |
 |---|---|
 | 운영 추가 기능 | 표시 이름 `Aegis Desk PPT Reader`, ProgID `AegisDesk.PptReader` |
-| DLL | `AegisDesk.PptReader.dll`, 최초 운영 버전 `1.0.0.0` |
-| COM 계약 | 경로·슬라이드 번호 전달 규약 2, 추출 결과 JSON 스키마 1 |
+| DLL | `AegisDesk.PptReader.dll`, 현재 요구 버전 `1.0.2.0` |
+| COM 계약 | 경로·슬라이드 번호 전달 규약 3, 추출 결과 JSON 스키마 1 |
 | 식별자 | 시험용과 다른 운영 CLSID·추출 인터페이스 IID를 구현 시 고정. Office 연결 IID는 기존 규약 유지 |
 | 설치 위치 | `%ProgramFiles%/AegisDesk/PptReader/<version>/`의 보호된 고정 경로 |
 | 설치 범위 | HKLM Machine. Office 비트수에 해당하는 Registry32 또는 Registry64 |
@@ -63,12 +66,15 @@ UI 스레드를 동기 대기로 막지 않고 설치 도구의 일반 권한 `/
 | 이미 설치됐지만 Office에서 비활성화되거나 실제 로드/규약 실패 | 자동 재설치·강제 활성화하지 않고 읽기 복구와 점검 안내 |
 | `com` 모드 | 자동 설치·업데이트를 요청하지 않고 기존 읽기 방식 사용 |
 
-사용자가 권한을 거절한 대상 버전은 준비 상태에 기록하고 다음 실행에서도 같은 권한 창을
-반복 띄우지 않는다. 새 배포 버전이나 사용자의 수동 설치 재시도 때만 다시 요청한다.
-Office 점유로 보류한 경우는 거절로 기록하지 않으며 다음 앱 시작 때 다시 점검한다.
+사용자가 UAC를 명시적으로 거절한 대상 버전만 준비 상태에 기록하고 다음 실행에서도 같은 권한 창을
+반복 띄우지 않는다. 새 reader 버전이나 명시적 수동 설치 재시도 때만 다시 요청한다.
+Office·mutex 경합과 다른 설치 실패는 거절로 기록하지 않으며 다음 앱 시작 때 다시 점검한다.
+기존 launch_failed/check_failed/mutation_failed 억제 기록은 정상화하고 실제 permission_declined는 유지한다.
+미완료 예약·저널·종료 미확인은 재시도 사유와 별도로 PPT를 계속 보류한다.
 준비 기록에는 버전·상태·고정된 사유만 저장하고 문서 정보는 넣지 않는다.
 
-설치 중에는 수집 시작을 보류해 앱이 새 PowerPoint를 만들지 않게 한다. 설치 도구의 종료 후
+설치 관찰 중에는 최초 수집 워커의 시작 전체를 보류해 앱이 새 PowerPoint를 만들지 않게 한다.
+관찰이 끝나 `ppt_pending`으로 워커를 생성하면 PPT만 미루고 다른 문서·메일을 수집한다. 설치 도구의 종료 후
 일반 권한으로 다시 점검하고 성공한 경우에만 새 추가 기능 준비 상태로 전환한다.
 앱을 관리자 권한으로 재시작하지 않으며 설치 도구에 문서 COM 객체를 전달하지 않는다.
 설치 성공 후 생성되는 워커가 서비스를 처음 조회하므로 이전 서비스 캐시를 이어받지 않는다.
@@ -214,23 +220,13 @@ Windows/Office에서 실행하지 못한 항목과 기존 실패는 따로 보�
 
 ## 8. 개발 작업 상세
 
-### 8-1. 현재 코드와 바꿀 지점
+### 8-1. 현재 연결
 
-| 현재 코드 | 필요한 변경 |
-|---|---|
-| `app/main.py`가 extractor·worker·IdleScheduler를 바로 만든다 | PPT 준비 완료까지 첫 worker 연결·시작을 보류하는 비동기 coordinator 추가 |
-| `bridge.py` 수동 인덱싱·실패 재시도, main의 트레이·유휴 동작이 각자 `worker.start()` 호출 | 같은 시작 게이트를 통과. 설치 대기 중 요청은 한 번으로 합치고 재시도 의도는 보존 |
-| `secure/__init__.py`가 매 COM 호출에 ComReader를 만든다 | mode와 준비 정책을 인자로 전달. 서비스 캐시는 리더 객체가 아닌 `_tls.ppt` 수명에 연결 |
-| `PowerPointComReader`의 도형 오류가 로그 후 계속되고 일반 close 오류도 성공 반환 가능 | 오류 건수·닫기 성공을 반환 전 확인. 불완전 추출은 성공으로 반환하지 않음 |
-| `scripts/ppt_probe/readers.py`에 시험 응답 decoder가 있다 | 순수 decoder를 secure로 이동해 운영·시험이 같이 사용 |
-| 시험용 `manage.ps1`만 있고 운영 setup·DLL은 없다 | 운영 C# 외피·setup·빌드·selftest 추가. 시험 등록 도구를 앱에서 호출하지 않음 |
-
-새 파일은 `secure/ppt_payload.py`, `secure/ppt_addin_reader.py`,
-`secure/ppt_installation.py`(Windows 점검·실행·잠금),
-`app/ppt_preparation.py`(Qt 비동기 상태와 시작 게이트),
-`scripts/ppt_reader/`(운영 외피·setup·빌드)로 책임을 나눈다.
-추출 코어를 `scripts/ppt_shared/PptExtractionCore.cs` 공용 C# 소스로 분리해 시험·운영 빌드가 동시에 컴파일한다.
-`scripts/ppt_probe`의 결과 비교 기능은 운영으로 가져오지 않는다.
+`main`의 최초 워커 생성과 bridge·트레이·유휴 시작 요청은 `ppt_preparation`의 동일 게이트를 통과한다.
+`secure/ppt_installation.py`는 설치 점검·실행·Machine 잠금을, `ppt_policy.py`는 내장 모드와 요구 버전을 담당한다.
+모드·준비 정책은 extractor와 COM 리더로 주입하며 서비스 캐시는 `_tls.ppt` 수명에 연결한다.
+`ppt_payload`의 순수 decoder와 `scripts/ppt_shared/PptExtractionCore.cs`를 운영·시험 경로가 공유한다.
+운영은 추출 오류와 Close 실패를 성공으로 반환하지 않으며 시험 등록 도구를 앱에서 호출하지 않는다.
 
 설정 기본값은 `knowmate/config.yaml`에서 읽는 작은 기본값 함수로 기존 사용자 설정에 보충한다.
 지금 config 로더는 기존 사용자 파일 전체를 템플릿과 병합하지 않으므로 `.get(..., "auto")`를
@@ -268,8 +264,9 @@ Windows/Office에서 실행하지 못한 항목과 기존 실패는 따로 보�
 거절 기록은 원래 일반 권한 사용자의 `%APPDATA%/AegisDesk/ppt_reader_preparation.json`에
 요구 버전·고정 사유만 원자적으로 저장한다. 새 버전은 한 번 재요청할 수 있다.
 파일이 깨졌으면 같은 실행에서 자동 재요청하지 않고 수동 재시도를 안내한다.
-설치 실패·정책 차단도 같은 요구 버전에 자동 반복하지 않는다. Office 점유는 다음 실행에 재점검한다.
-수동 재시도는 수집 중 실행하지 않고 다음 준비 단계에서 요청한다.
+설치 시도는 앱 실행당 최대 한 번이다. Office·mutex 점유와 11 이외 실패는 다음 실행에서 재점검하며
+영구 억제하지 않는다. 설치 실패가 남긴 예약·저널은 안전 확인 또는 명시 복구 전까지 보류한다.
+수집 재시도 버튼은 UAC 거절 기록을 지우지 않는다. 명시 수동 재시도는 수집을 종료한 뒤 검증 절차에 따른다.
 
 ### 8-3. 설치 도구의 입출력과 승격
 
@@ -277,7 +274,7 @@ Windows/Office에서 실행하지 못한 항목과 기존 실패는 따로 보�
 `/check`는 Office 실행 없이 읽기 전용이고, 다음 구조의 본문 없는 JSON 한 건만 stdout으로 반환한다.
 
 ```json
-{"schema":1,"operation":"check","status":"ready","reason":"registration_ok","required_version":"1.0.0.0","installed_version":"1.0.0.0","office_bitness":64,"scope":"Machine"}
+{"schema":1,"operation":"check","status":"ready","reason":"registration_ok","required_version":"1.0.1.0","installed_version":"1.0.1.0","office_bitness":64,"scope":"Machine","machine_safe":true,"auto_install_mode":"candidate","auto_install_validated":false}
 ```
 
 상태는 `ready/missing/outdated/repairable/disabled/conflict/busy/unknown/failed`를 구분하고,
@@ -286,6 +283,9 @@ Machine 예약·저널의 안전 확인 여부를 별도 필드로 반환한다.
 설치 요청의 종료 코드는 `0=작업 완료`, `10=Office/설치 점유`, `11=권한 거절`,
 `12=환경/정책 미확인`, `13=수정 실패`로 고정하고 schema 버전에 포함한다.
 `0`만으로 ready가 되지 않으며 원래 사용자 권한의 `/check`를 다시 수행한다.
+`auto_install_mode`는 앱·도구·manifest와 일치해야 한다. candidate도 자동 실행되지만
+`auto_install_validated`는 released 모드에서만 true이며 외부 승인 시험의 통과 증거가 아니다.
+명시 거절 11을 확인한 뒤 부모 재잠금이 실패하면 거절 증거를 유지하고 Machine 안전은 별도로 미확인 처리한다.
 
 `/prepare` 일반 프로세스는 필요한 경우 `ShellExecuteEx(runas)`로 같은 도구의 작업 모드만
 승격하고 `SEE_MASK_NOCLOSEPROCESS`로 얻은 실제 자식 handle을 기다린다.
@@ -327,6 +327,8 @@ Machine 상태를 재점검해 안전한 완료 상태를 기록한다. handle�
 
 예약 디렉터리는 Users 읽기/열거·새 요청 생성, Creator Owner 자기 요청 갱신,
 Administrators/System 관리 권한으로 제한한다. 일반 사용자가 타인의 예약을 삭제/완료 처리하지 못한다.
+신규 디렉터리는 원자적 생성 결과와 함께 초기 ACL을 적용한다. 기존 디렉터리는 소유·보호 ACL을
+검사해 재사용하며, 비어 있다는 이유로 소유권·ACL을 변경하지 않는다. 같은 원칙을 설치 디렉터리에도 적용한다.
 일반권한 최초 생성·ACL 설정이 해당 Windows/회사 정책에서 가능한지 **미검증**이다.
 필요 권한을 확보하지 못하면 자동 prepare를 시작하지 않는다. 수정 미실행과 Machine 안전이
 확인되면 auto는 기존 COM, 안전 확인이 불가능하면 PPT 준비 대기로 처리한다.
@@ -373,7 +375,7 @@ HKCU 충돌이나 시험용 등록을 함께 제거하지 않는다. 설치 기�
 
 ### 8-5. 운영 읽기 성공 조건
 
-운영 서비스는 `ProtocolVersion()=2`, `ReaderVersion()=1.0.0.0`, JSON schema 1을 최초에 확인한다.
+운영 서비스는 `ProtocolVersion()=3`, `ReaderVersion()=1.0.2.0`, JSON schema 1을 최초에 확인한다.
 첫 릴리스는 요구 운영 버전과 정확히 일치할 때만 선택한다. 향후 호환 범위를 넓히는 것은 별도 변경이다.
 경로는 원본을 연 Python의 절대 경로와 host Presentations의 FullName을 비교한다.
 UNC·대소문자·중복·상대경로는 기존 하네스 계약을 유지하고 경로 alias는 추측해서 동일시하지 않는다.
@@ -466,11 +468,11 @@ prototype gate가 통과되기 전에는 자동 설치를 배포하지 않는다
 영원히 멈춘 경우를 해제하는 기능으로 표시하지 않는다.
 
 Windows 최초 자동 설치와 요청 디렉터리 ACL·UAC·다른 사용자/세션·Office 경합은 이 환경에서
-검증할 수 없어 `AUTO_INSTALL_VALIDATED=False`와 manifest의 `auto_install_validated=false`를
-유지한다. 읽기 전용 점검이 Machine 안전을 확인하면 auto는 기존 COM을 사용할 수 있다.
+검증하지 않았다. 기본 빌드는 disabled이며, candidate/released는 개발 빌드에서만 선택한다.
+읽기 전용 점검이 Machine 안전을 확인하면 auto는 기존 COM을 사용할 수 있다.
 설치·예약·저널이 불확실하면 모든 모드에서 PPT를 준비 대기로 처리한다.
-실제 Windows prototype를 통과하기 전 gate를 설정값으로 우회하거나 자동 설치 완료로
-보고하지 않는다. 업데이트/제거 후보도 실제 Windows 검증 전 운영 배포하지 않는다.
+최종 released 산출물을 고정한 뒤 Windows 승인 시험 전체를 그 파일로 수행하고 같은 해시의 파일만 배포한다.
+candidate 시험 결과를 다른 released 파일의 승인으로 사용하지 않는다. 재빌드·payload 교체 시 다시 검증한다.
 
 
 ### 코드 리뷰와 검사 결과 (2026-10-13)
@@ -492,3 +494,33 @@ Windows 최초 자동 설치와 요청 디렉터리 ACL·UAC·다른 사용자/�
 
 현재의 운영 등록·읽기 검증 명령과 자동 설치 출하 전 확인 항목은
 [운영 PPT Reader 개발 검증](../guides/PPT_READER.md)에 있다.
+
+
+## 9. PowerPoint 자동종료 후보
+
+자동종료는 `candidate` 빌드에서만 시험한다. 기본·소스·`released`에서는 자동종료를
+활성화하지 않는다. 설치의 released 모드와 정상종료 승인 여부는 별개다.
+실제 Windows·Office의 직접 실행 연결 및 취소 이벤트 검증 전에는 정상종료 기능을 배포하지 않는다.
+
+읽기용 소유 등록은 종료 권한이 아니다. 신뢰한 Office 실행파일을 `/EMBEDDING`으로 직접
+실행한 프로세스의 handle·PID·생성 identity와 COM 호스트 증명이 모두 일치할 때만 종료를
+요청한다. 기존 Dispatch-only, 실행 인계, identity 불명, 다른 호스트는 추측해서 종료하지 않는다.
+실행 결과 불명의 기록은 COM을 담지 않는 프로세스 전체 상태로 유지해 새 워커의 중복 실행도 막는다.
+
+문서 처리 완료·사이클 종료·기존 주기 재기동에서 호스트 세대마다 최대 한 번 요청한다.
+동일 호스트의 호환 추가 기능이 주 STA에서 문서·보호된 보기·슬라이드 쇼가 모두 비어 있는지
+확인하고, 종료 중 문서 닫기 취소 이벤트로 사용자 문서를 보호한다. 처음부터 PowerPoint
+경고를 표시하며, 사용자 문서 Close/Save/Saved 변경이나 알림 억제로 종료하지 않는다.
+
+Quit 반환·연결 단절은 실제 종료 증거가 아니다. COM 참조를 놓은 뒤 동일 프로세스의 실제
+종료를 관찰한다. 미확인은 보류하고, 사용자가 문서를 열었으면 종료 권한을 폐기해 외부 점유로
+취급한다. PPT `terminable=False` 및 read/quit watchdog·poison·앱 종료의 강제종료 금지는 유지한다.
+poison 이후에는 Count·Quit을 포함한 새 RPC를 요청하지 않는다.
+
+설치 읽기 잠금 안에서 생성·호환 서비스 확인·정상종료 요청을 수행한다. COM 객체는 생성
+QThread의 MTA에서만 사용하며 UI·타이머·OS 종료 helper로 넘기지 않는다. 동기 RPC가 멈췄다고
+타임아웃만으로 취소됐다고 간주하지 않는다. 앱의 제한된 종료는 PowerPoint 강제종료를 허용하지 않는다.
+
+기존 dual 인터페이스는 유지하고 새 기본 인터페이스로 lifecycle을 노출한다. 요구 버전은
+reader/setup 모두 1.0.2.0, protocol 3이며 추출 JSON schema 1·청크·인덱스 형식은 바꾸지 않는다.
+사전 검증과 사용자 문서 보호 시험은 [운영 검증 절차](../guides/PPT_READER.md#powerpoint-자동종료-후보-검증)를 따른다.

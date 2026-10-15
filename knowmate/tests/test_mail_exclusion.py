@@ -159,6 +159,9 @@ def test_retriever_filters_excluded_mail_before_decryption(tmp_path):
         def where(self, _where):
             return self
 
+        def select(self, _columns):
+            return self
+
         def limit(self, _limit):
             return self
 
@@ -171,6 +174,10 @@ def test_retriever_filters_excluded_mail_before_decryption(tmp_path):
             })
 
     class Table:
+        schema = pa.schema([(name, pa.string()) for name in (
+            "chunk_id", "source_file", "text",
+        )])
+
         def search(self, *_args):
             return Query()
 

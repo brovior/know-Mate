@@ -258,10 +258,40 @@ class PlainReader:
 
     def _read_pdf(self, path: str) -> str:
         """PyMuPDF(fitz)로 pdf 파일을 읽어 페이지별 텍스트를 반환한다."""
+        import sys
         import fitz  # type: ignore
 
+        # Compare bytes visible to this process with the standalone Python probe.
+        # This diagnostic must not prevent the original parser attempt.
+        header = b""
+        read_error = None
+        try:
+            with open(path, "rb", buffering=0) as source:
+                header = source.read(8)
+        except OSError as exc:
+            read_error = exc
+        logger.info(
+            "PDF 열기 진단: path=%s frozen=%s executable=%s pymupdf_version=%s "
+            "header_read=%s header_bytes=%d header_hex=%s error_type=%s errno=%s winerror=%s",
+            path, bool(getattr(sys, "frozen", False)), sys.executable,
+            getattr(fitz, "VersionBind", "unknown"),
+            "failed" if read_error is not None else "ok", len(header),
+            header.hex().upper() if read_error is None else "-",
+            type(read_error).__name__ if read_error is not None else "-",
+            getattr(read_error, "errno", None), getattr(read_error, "winerror", None),
+        )
+
         pages: list[str] = []
-        with fitz.open(path) as doc:
+        try:
+            doc = fitz.open(path)
+        except Exception as exc:
+            logger.warning(
+                "PDF 열기 실패 진단: path=%s error_type=%s cause_type=%s",
+                path, type(exc).__name__,
+                type(exc.__cause__).__name__ if exc.__cause__ is not None else "-",
+            )
+            raise
+        with doc:
             for page in doc:
                 text = page.get_text()
                 if text.strip():

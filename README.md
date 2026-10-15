@@ -77,19 +77,24 @@ python knowmate\app\main.py    # 또는 run.bat
 # (pyinstaller는 requirements.txt에 고정 버전으로 포함돼 있다)
 build.bat          # 클린 빌드 — 배포용 (기본값)
 build.bat fast     # 캐시 재사용 — 개발 중 반복 확인용, 배포 금지
+build.bat clean candidate  # PPT 자동 설치 사내 검증용
+build.bat clean released   # 최종 산출물 승인 시험용
 
-# → dist\AegisDesk\ 생성 (AegisDesk.exe + _internal 폴더).
+# → dist\disabled\AegisDesk\ 생성 (candidate/released는 각 모드 폴더).
 # 빌드 시작 시 PyInstaller 고정 버전과 Git 커밋을 확인하고, 앱 버전에도
 # 짧은 커밋 해시를 포함한다. 빌드 직후 AegisDesk.exe --selftest가 번들 누락과
-# 빌드 출처를 검사한다(실패하면 배포 중단 + dist\selftest.log에 상세).
+# 빌드 출처를 검사한다(실패하면 배포 중단 + dist\<mode>\selftest.log에 상세).
 # WebEngine 실제 렌더링은 배포 전 한 번 직접 실행해 확인할 것.
 # 이 폴더를 통째로 zip으로 압축해 테스터에게 배포 (exe 단독 배포 불가).
 # 배포 가이드: docs/guides/BETA_GUIDE.md
 ```
 
+PPT [자동 설치](docs/updates/2026-10-15-ppt-auto-install.md)와
+[자동종료 후보](docs/updates/2026-10-15-ppt-auto-shutdown.md)의 변경·검증 범위를 수정노트에 정리했습니다.
+
 빌드 기본값이 '클린'인 이유: 배포용 결과물이라 PyInstaller 증분 캐시가 stale해져
 깨진 exe가 테스터에게 나가는 비용이 빌드 시간보다 크다. 반복 확인이 필요할 때만
-`fast`로 명시한다. `dist\`는 두 모드 모두 항상 지운다 — PyInstaller는 덮어쓸 뿐
+`fast`로 명시한다. `dist\<mode>\`는 선택한 설치 모드의 결과만 항상 지운다 — PyInstaller는 덮어쓸 뿐
 이전 빌드에만 있던 파일을 지우지 않아, 남기면 불필요한 DLL·구 UI 파일이 배포
 결과에 섞일 수 있다. 삭제에 실패하면 빌드를 즉시 중단한다. 현재 브랜치·커밋·dirty
 여부는 빌드 시작 시 출력되고 exe 내부에도 포함돼 앱 화면과 시작 로그에서 확인할 수 있다.

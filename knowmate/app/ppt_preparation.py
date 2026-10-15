@@ -6,6 +6,7 @@ import json
 import logging
 import os
 from pathlib import Path
+import re
 import sys
 import threading
 import time
@@ -20,7 +21,8 @@ from knowmate.secure.ppt_installation import (
 )
 
 logger = logging.getLogger(__name__)
-_SUPPRESS_REASONS = {"permission_declined", "mutation_failed", "launch_failed", "check_failed"}
+_LEGACY_REASONS = {"mutation_failed", "launch_failed", "check_failed"}
+_SUPPRESS_REASONS = {"permission_declined", *_LEGACY_REASONS}
 
 
 def preparation_policy(mode: str, result: SetupResult) -> str:
@@ -67,8 +69,10 @@ class PptPreparationCoordinator(QObject):
         self._retry_failures = False
         self._attempted = False
         self._after_install = False
+        self._check_generation = 0
         self._process: Any = None
         self._install_exit: int | None = None
+        self._install_unconfirmed = False
         self._deadline = 0.0
         self._timer = QTimer(self)
         self._timer.setInterval(250)
@@ -79,6 +83,11 @@ class PptPreparationCoordinator(QObject):
         if self._closed or self._begun:
             return
         self._begun = True
+        from knowmate.secure.ppt_policy import auto_install_mode
+        mode = auto_install_mode()
+        logger.info("PPT 자동 설치 정책: mode=%s validated=%s", mode, mode == "released")
+        if mode == "candidate":
+            logger.warning("PPT 미검증 자동 설치 후보 빌드 — 사내 승인 시험 필요")
         if self._extractor_mode != "auto" or self._platform != "win32":
             self._finish("com_only" if self._reader_mode == "com" else "ready")
         else:
@@ -110,6 +119,8 @@ class PptPreparationCoordinator(QObject):
         # This is a read-only setup check, never a collector. A daemon thread
         # avoids destroying a running QThread when the app exits. Completion is
         # delivered by Qt's queued signal; helper /check has its own timeout.
+        self._check_generation += 1
+        generation = self._check_generation
         reference, checker = weakref.ref(self), self._checker
 
         def run_check() -> None:
@@ -121,26 +132,30 @@ class PptPreparationCoordinator(QObject):
             owner = reference()
             if owner is not None and not owner._closed:
                 try:
-                    owner._check_completed.emit(value)
+                    owner._check_completed.emit((generation, value))
                 except RuntimeError:
                     # The Qt parent may already have destroyed this QObject.
                     return
 
         threading.Thread(target=run_check, name="ppt-setup-check", daemon=True).start()
 
-    def _checked(self, result: SetupResult) -> None:
-        if self._closed:
+    def _checked(self, completion: tuple[int, SetupResult]) -> None:
+        generation, result = completion
+        if generation != self._check_generation:
             return
+        if self._closed or self._worker is not None or self.state == "installing":
+            return
+        logger.info("PPT 준비 점검: phase=%s status=%s reason=%s machine_safe=%s version=%s",
+                    "post_check" if self._after_install else "check", result.status,
+                    result.reason, result.machine_safe, REQUIRED_VERSION)
         if self._after_install:
             # An exited helper is not evidence of repaired registrations or locks.
-            if self._install_exit in (11, 12, 13):
-                reason = {11: "permission_declined", 12: "check_failed", 13: "mutation_failed"}[self._install_exit]
-                self._save_suppression(reason)
-            self._finish(preparation_policy(self._reader_mode, result))
+            self._finish("ppt_pending" if self._install_unconfirmed else
+                         preparation_policy(self._reader_mode, result))
             return
         installable = result.status in {"missing", "outdated", "repairable"}
         if (self._reader_mode != "com" and result.machine_safe and installable
-                and result.auto_install_validated and not self._attempted
+                and result.auto_install_enabled and result.office_bitness in (32, 64) and not self._attempted
                 and not self._suppressed()):
             self._attempted = True
             self.state = "installing"
@@ -149,8 +164,8 @@ class PptPreparationCoordinator(QObject):
                 self._process.start()
             except Exception as exc:
                 logger.warning("PPT 준비 도구 실행 실패: %s", type(exc).__name__)
-                self._save_suppression("launch_failed")
                 self._close_observation()
+                self._install_unconfirmed = True
                 # Failure may have happened after creation; recheck safety first.
                 self._after_install = True
                 self.state = "rechecking"
@@ -173,6 +188,11 @@ class PptPreparationCoordinator(QObject):
         if exit_code is not None:
             self._timer.stop()
             self._install_exit = exit_code
+            outcome = {0: "completed", 10: "deferred", 11: "permission_declined",
+                       12: "check_failed", 13: "mutation_failed"}.get(exit_code, "unknown")
+            logger.info("PPT 설치 도구 종료: code=%s result=%s version=%s", exit_code, outcome, REQUIRED_VERSION)
+            if exit_code == 11:
+                self._save_suppression("permission_declined")
             self._close_observation()
             self._after_install = True
             self.state = "rechecking"
@@ -229,9 +249,17 @@ class PptPreparationCoordinator(QObject):
             record = json.loads(self._record.read_text(encoding="utf-8"))
             if (not isinstance(record, dict) or set(record) != {"version", "reason"}
                     or not isinstance(record["version"], str)
+                    or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+", record["version"])
                     or record["reason"] not in _SUPPRESS_REASONS):
                 raise ValueError("record_contract")
-            return record["version"] == REQUIRED_VERSION
+            if record["reason"] in _LEGACY_REASONS:
+                self._record.unlink()
+                logger.info("PPT 기존 설치 실패 기록 정상화: reason=%s", record["reason"])
+                return False
+            suppressed = record["version"] == REQUIRED_VERSION
+            if suppressed:
+                logger.info("PPT 자동 권한 요청 생략: reason=permission_declined version=%s", REQUIRED_VERSION)
+            return suppressed
         except FileNotFoundError:
             return False
         except (OSError, ValueError, TypeError):

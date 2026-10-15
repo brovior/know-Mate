@@ -44,34 +44,56 @@ PPT 재접속·중단 Close도 확인해야 한다. 실제 Windows·Office·DRM�
 
 ## 1. 앱 크래시와 메모리 진단
 
-### 확인된 코드 흐름
+### 현재 사용법과 검증 대기
 
-`collector.memory_diagnostics_enabled` 기본값은 `false`다. 활성 시
-`collector/scheduler.py`의 `CollectorWorker.run()`은 매 사이클 `MemoryDiagnostics`를 만들고,
-`collector/memory_diagnostics.py`에서 다음을 수행한다.
+기본값 `collector.memory_diagnostics_enabled: false`는 유지한다. 일반 사용량 로그가 필요하면
+`true`와 `memory_diagnostics_mode: basic`을 사용한다. 기존 true 설정도 mode를 추가하지 않으면
+basic으로 동작한다. 설정을 바꾼 뒤 앱을 재시작한다. 계약은
+[설계 문서의 메모리 진단](design/DESIGN.md)을 따른다.
 
-1. 추적이 없으면 `tracemalloc.start(10)` 실행, 사이클 기준 스냅샷 생성. 각각의 전후를 기록한다.
-2. 단계별 메모리 기록, 메일 완료·GC 완료·DB 최적화 전후 스냅샷 비교. 비교 시작/완료와 완료
-   상태도 남긴다. 메일 목록 조회 전후와 첫 묶음·약 50건 진행 뒤·마지막 남은 묶음에서 임베딩 및
-   DB 저장 전후를 표본화하며, 이 표본은 추가 스냅샷을 만들지 않는다.
-3. 사이클 종료에 COM 정리, `gc.collect()`, 마지막 스냅샷 비교, 자체 추적의 `tracemalloc.stop()`
-   전후를 기록한다. 스냅샷 참조를 해제한 뒤 `cycle_diagnostics_released`를 남긴다.
+| 모드 | 기록·동작 | 부하 해석 |
+|---|---|---|
+| OFF | 조회·진단 로그·추적·진단 GC 없음 | 평소 기본값 |
+| basic | Windows Private Bytes·delta와 이미 로드된 Arrow 풀 수치 | tracemalloc API·스냅샷·강제 GC 없음. 외부 tracing 자체의 부하는 남음 |
+| detailed | 기존 프로세스 전체 depth 10 추적·스냅샷 비교·종료 GC | 명시 선택한 짧은 재현에만 사용. 외부 추적의 depth·peak·수명 보존 |
 
-추적은 프로세스 전체에 적용된다. 외부에서 이미 시작한 추적은 진단 코드가 종료하지 않는다.
-상위 5개 차이만 로그에 남겨도 스냅샷 비교는 전체 추적 기록을 대상으로 한다.
-호출 기록 깊이가 클수록 CPU·메모리 비용이 늘어난다.
-([Python 문서](https://docs.python.org/3.11/library/tracemalloc.html))
+basic은 Python 값을 `n/a`, `python_scope=not_measured`로 기록한다. 미로드 PyArrow를 수치 조회
+때문에 import하지 않으며 Windows가 아니거나 조회 실패하면 해당 수치는 `n/a`다. Private 조회가
+실패한 표본과 다음 유효 표본의 delta도 `n/a`다. Arrow peak는 사이클 peak가 아닌 풀 수명 고수위다.
+Private에서 Python·Arrow를 빼서 네이티브 사용량을 확정하지 않는다.
 
-`python_current_mib`는 추적 시작 이전부터 살아 있던 할당을 포함하지 않는다. 자체 추적은
-사이클마다 다시 시작하므로 이 값을 전체 Python 사용량으로 해석하면 안 된다. `python_scope`와
-`trace_started_at_ns`로 측정 범위를 표시하고, `tracemalloc_mib`로 추적기 내부 사용량을 별도로
-기록한다. 외부 추적의 시작 시각은 알 수 없으므로 `n/a`다. Arrow 값도 기본 풀만 측정하므로
-Private에서 두 값을 뺀 결과를 네이티브 메모리라고 확정할 수 없다.
-`private_delta_mib`는 직전 메모리 표본과의 차이이며 작업 하나의 순수 할당량이 아니다.
+기존 단계·메일 첫/약 50건/마지막 묶음·optimize 전후 표본 빈도는 유지한다. COM 정리 뒤 basic은
+`cycle_resources_released`를 남기며 GC·추적 시작/종료·스냅샷 로그는 생성하지 않는다.
+이 표본은 작업 참조 정리 뒤 사용량이지 전체 메모리 반환 보장이 아니다. detailed는 실제 GC 전후와
+자체 trace 시작/종료·스냅샷 경계를 유지한다. 자체 추적 current는 추적 이후 살아 있는 할당만 포함하며
+`python_scope`·`trace_started_at_ns`·`tracemalloc_mib`로 범위와 추적기 사용량을 표시한다.
 
-수집 완료 시그널은 `_run_cycle()` 끝에서 전송되며 COM·GC·추적 종료보다 먼저다.
-UI의 DB 건수 조회와 진단 정리가 겹칠 여지는 있지만, 이것만으로 충돌이 증명되지는 않는다.
-다음 자동 수집은 `isRunning()`으로 막으므로 완료 알림이 곧 새 수집의 동시 실행을 뜻하지 않는다.
+진단의 Python 예외는 종류만 보고하고 수집 결과를 바꾸지 않는다. 오류 보고 자체가 실패해도 COM
+정리·진단 참조 해제·idle 전환을 계속하며 optimize 전후 콜백 실패로 성공/쿨다운을 바꾸지 않는다.
+수집 완료 시그널은 `_run_cycle()` 끝에서 전송되어 COM·진단 종료보다 먼저다. 다음 자동 수집은
+`isRunning()`으로 중복 실행을 막는다. 강제 QThread 중단·네이티브 크래시는 finally를 보장하지 않는다.
+
+**운영 권장 전 검증 대기**: 같은 입력·임시 인덱스 조건의 OFF/basic을 각각 최소 3회 비교하고,
+외부 tracing이 없는 상태에서 basic median 경과시간 증가 5% 이내를 확인한다. 실제 Windows EXE에서
+30분 이상 반복, 취소·다음 사이클·앱 종료와 저장 결과 동일성도 확인한다. 사외 fake 성능 비교는
+Windows Private·Office·사내 API 검증을 대신하지 않는다. 현장 시험 전 기본 OFF를 유지한다.
+
+### 로컬 합성 비교 (2026-10-15)
+
+Linux에서 합성 32×1024 임베딩 응답을 실제 JSON 해석·벡터 검증 함수로 처리했다.
+워밍업 뒤 각 모드를 별도 프로세스에서 3회씩 순서를 바꿔 실행한 경과시간 중앙값이다.
+일반 로그는 이미 로드된 Arrow 풀과 단계·50회 단위 표본을 실제 파일에 기록했다.
+
+| 같은 작업의 반복 수 | OFF | basic | detailed |
+|---|---:|---:|---:|
+| 1,800회 | 12.955초 | 12.865초 | 미실행 |
+| 30회 | 0.210초 | 0.227초 | 5.603초 |
+
+긴 OFF/basic 비교는 목표인 중앙값 증가 5% 이내를 충족했다. 작은 시간 차이를 성능 향상으로
+해석하지 않으며 짧은 사이클의 표본·파일 로그 비용은 남는다. 각 비교 안에서 입력 hash·처리
+벡터 수·checksum은 같았다. 초기 1,500회 detailed 측정은 시간이 과도해 중단하고 별도 짧은 동일
+작업 비교로 나눴다. 긴 상세 진단이나 실제 Windows 부하가 검증됐다는 의미는 아니다.
+Private Bytes·Office·사내 API·실제 메모리 누수와 크래시 감소 효과는 미측정이다.
 
 ### 가설과 한계
 
@@ -89,12 +111,12 @@ Python 3.12/3.13·Linux다. 이 프로젝트의 Windows·Python 3.11에 동일 �
 
 1. 사내 앱 버전·빌드 커밋·실제 Python/의존성 버전, 진단 설정, 발생 시각·작업·종료 요청
    여부, 직전 로그와 Windows 응용 프로그램 오류의 오류 모듈·예외 코드를 확보한다.
-2. 진단 설정을 켠 빌드에서 COM 정리·GC·스냅샷 비교·추적 종료의 시작/완료를 PID·사이클
-   ID별로 비교한다. 추가 자료가 필요하면 `faulthandler` 또는 Windows 크래시 덤프도 검토한다.
+2. 먼저 OFF/basic의 같은 작업 로그를 PID·사이클 ID별로 비교한다. 상세 자료가 꼭 필요할 때만
+   detailed의 COM 정리·GC·스냅샷 비교·추적 종료 경계를 짧게 확인한다. 추가 자료가 필요하면 `faulthandler` 또는 Windows 크래시 덤프도 검토한다.
 3. 동일 조건에서 진단 활성/비활성을 비교하고, 관련성이 확인되면 추적을 한 번 시작해 유지하는
    방식, 스냅샷, 강제 GC를 분리해서 비교한다. 간헐적 증상이므로 한 번 성공으로 판정하지 않는다.
 
-현재 로그는 `after_gc_collect` 뒤의 스냅샷 비교와 추적 종료를 구분한다. 전후 표본은 Python
+detailed 로그는 `after_gc_collect` 뒤의 스냅샷 비교와 추적 종료를 구분한다. 전후 표본은 Python
 예외로 작업이 종료된 경우에도 남으므로, 완료 표본만으로 작업 성공을 판정하지 않는다.
 `sys.excepthook`은 있으며 `faulthandler`는 없다. 테스트는 진단 비활성의 무계측, 외부 추적 보존,
 표본 범위·배치 결과·정리 순서 등을 확인하며 Windows 네이티브 경합 재현 검증은 아니다.
@@ -179,7 +201,7 @@ tracing·trace_depth는 느린 호출 기록 시점의 메모리 추적 상태�
 
 로컬 합성 응답 32청크의 해석·검증은 메모리 추적 없이 약 0.03초, tracemalloc 깊이 10에서
 약 0.27초로 사내 지연을 재현하지 못했다. 새 구간 로그와 실제
-`collector.memory_diagnostics_enabled` 설정으로 다음 확인 대상을 정한다. 본문·벡터·키는 기록하지 않는다.
+`collector.memory_diagnostics_enabled`와 `memory_diagnostics_mode` 설정으로 다음 확인 대상을 정한다. 본문·벡터·키는 기록하지 않는다.
 
 ### PPT 추가 기능 사내 검증 보고 (2026-10-13)
 
@@ -378,7 +400,7 @@ fragment 수 기반 DB 정리, Office RPC 단절 복구다.
 
 - [PERF_ANALYSIS.md](archive/PERF_ANALYSIS.md): 2026-09-06 분석 초안. 일부 근거가 반박됐으며 현행 지시가 아님.
 - [PERF_ANALYSIS_REVIEW.md](archive/PERF_ANALYSIS_REVIEW.md): 교차검증·결함 발견 이력. 발견 후 수정된 항목 포함.
-- [ISSUE_B_query_async.md](design/ISSUE_B_query_async.md): 미구현 비동기화 상세 설계. 현행 구현의 안전성을 증명하는 자료가 아님.
+- [ISSUE_B_query_async.md](design/ISSUE_B_query_async.md): 질문 비동기 실행·읽기/대화/종료 보호 계약. 실제 사내 Windows·Office 장시간 검증은 남아 있음.
 
 과거 3,000개 파일 부하와 ‘상태에 색인 추가’의 정확한 기록은 이번 문서·Git 이력 검색에서
 찾지 못했다. SQLite 보류 기록만으로 같은 논의였다고 단정하지 않는다.

@@ -222,8 +222,9 @@ def test_closing_blocks_dispatch_but_late_verified_registration_remains_pending(
     assert registered is not None
     assert registered[1].cleanup_pending
     assert 111 in guard.begin_owned_cleanup()
-    # PowerPoint policy is deliberately unaffected by the application-closing flag.
-    guard.ensure_application_open("POWERPNT.EXE")
+    # PowerPoint also refuses new dispatch, while retaining its no-force-kill policy.
+    with pytest.raises(guard.OfficeCleanupPendingError, match="application_closing"):
+        guard.ensure_application_open("POWERPNT.EXE")
 
 
 def test_late_verified_registration_is_swept_after_initial_empty_snapshot(monkeypatch):

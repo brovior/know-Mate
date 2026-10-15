@@ -14,22 +14,27 @@ namespace AegisDesk.PptSetup
         public string required_version = Contract.Version, installed_version;
         public int? office_bitness;
         public string scope = "Machine";
-        public bool machine_safe, auto_install_validated = false;
+        public bool machine_safe, auto_install_validated = Contract.AutoInstallValidated;
+        public string auto_install_mode = Contract.AutoInstallMode;
         public Result(string op) { operation = op; }
         public void Emit() { Console.WriteLine(Contract.Json.Serialize(this)); }
     }
 
     internal static class Contract
     {
-        public const string Version = "1.0.0.0";
+        public const string Version = "1.0.2.0";
         public const string ProgId = "AegisDesk.PptReader";
         public const string ClassId = "{287A80D2-804A-46D3-A0E9-CA31C6FC3D09}";
+        public const string ReaderIid = "9A20F4A6-6364-4BA7-930B-3E8857BEAF60";
         public const string ReaderClass = "AegisDesk.PptReader.Connect";
         public const string Dll = "AegisDesk.PptReader.dll";
         public const string MutexName = @"Global\AegisDesk.PptReader.Machine.v1";
         // Shipping automatic preparation requires the actual Windows prototype.
         // This cannot be enabled via the caller's manifest or user config.
-        public const bool AutoInstallValidated = false;
+        public const string AutoInstallMode = BuildPolicy.AutoInstallMode;
+        public const bool AutoShutdownEnabled = AutoInstallMode == "candidate";
+        public const bool AutoInstallValidated = AutoInstallMode == "released";
+        public const bool AutoInstallEnabled = AutoInstallMode == "candidate" || AutoInstallMode == "released";
         public static readonly JavaScriptSerializer Json = new JavaScriptSerializer { MaxJsonLength = 1048576 };
         public static readonly string[] Keys = {
             @"Software\Classes\CLSID\" + ClassId,
@@ -49,7 +54,12 @@ namespace AegisDesk.PptSetup
             {
                 Dictionary<string, object> data = Read(Path.Combine(PayloadDirectory, "manifest.json"));
                 if (Convert.ToInt32(data["schema"]) != 1 || (string)data["reader_version"] != Version ||
-                    Convert.ToInt32(data["protocol"]) != 2 || Convert.ToInt32(data["payload_schema"]) != 1 ||
+                    (string)data["auto_install_mode"] != AutoInstallMode ||
+                    !(data["auto_install_enabled"] is bool) || (bool)data["auto_install_enabled"] != AutoInstallEnabled ||
+                    !(data["auto_install_validated"] is bool) || (bool)data["auto_install_validated"] != AutoInstallValidated ||
+                    !(data["auto_shutdown_enabled"] is bool) || (bool)data["auto_shutdown_enabled"] != AutoShutdownEnabled ||
+                    !String.Equals((string)data["reader_iid"], ReaderIid, StringComparison.OrdinalIgnoreCase) ||
+                    Convert.ToInt32(data["protocol"]) != 3 || Convert.ToInt32(data["payload_schema"]) != 1 ||
                     (string)data["reader_class"] != ReaderClass || (string)data["prog_id"] != ProgId ||
                     !String.Equals((string)data["reader_clsid"], ClassId.Trim('{', '}'), StringComparison.OrdinalIgnoreCase)) return false;
                 Dictionary<string, object> files = (Dictionary<string, object>)data["files"];
@@ -73,15 +83,13 @@ namespace AegisDesk.PptSetup
         {
             string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
             Machine.NoLinks(Path.GetDirectoryName(path));
-            try
-            {
-                using (FileStream stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-                using (StreamWriter writer = new StreamWriter(stream))
-                { writer.Write(Json.Serialize(value)); writer.Flush(); stream.Flush(true); }
-                if (security != null) File.SetAccessControl(temp, security);
-                if (File.Exists(path)) File.Replace(temp, path, null); else File.Move(temp, path);
-            }
-            finally { if (File.Exists(temp)) File.Delete(temp); }
+            using (FileStream stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            using (StreamWriter writer = new StreamWriter(stream))
+            { writer.Write(Json.Serialize(value)); writer.Flush(); stream.Flush(true); }
+            if (security != null) File.SetAccessControl(temp, security);
+            if (File.Exists(path)) File.Replace(temp, path, null); else File.Move(temp, path);
+            // An interrupted write is unresolved evidence. Do not erase the
+            // temporary file automatically; /check must keep mutation blocked.
         }
     }
 }

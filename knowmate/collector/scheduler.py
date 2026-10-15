@@ -326,28 +326,27 @@ class CollectorWorker(QThread):
         from knowmate.rag.embedding_cancel import EmbeddingCancellation, EmbeddingCancelledError, embedding_cancellation_scope
         self._embedding_cancel = EmbeddingCancellation()
         start = time.time()
-        memory_diagnostics = MemoryDiagnostics(
-            enabled=self._config.get("collector", {}).get("memory_diagnostics_enabled", False)
-            is True
-        )
-        self._memory_diagnostics = memory_diagnostics
-        memory_diagnostics.start()
-        memory_diagnostics.log("cycle_start")
-
-        # QThread에서 COM 사용 시 초기화 필수.
-        # MTA로 초기화해야 메시지 펌프 없이 Office STA 서버를 호출할 수 있다.
-        # (STA로 초기화하면 펌프 부재로 Documents.Open 등이 무한 대기)
+        self._memory_diagnostics = None
         _com_initialized = False
         try:
-            import pythoncom  # type: ignore
-            pythoncom.CoInitializeEx(pythoncom.COINIT_MULTITHREADED)
-            _com_initialized = True
-        except ImportError:
-            pass
-        except Exception as exc:
-            logger.warning("COM 초기화 경고: %s", exc)
+            try:
+                from knowmate.config import memory_diagnostics_settings
+                enabled, mode = memory_diagnostics_settings(self._config.get("collector", {}))
+                self._memory_diagnostics = MemoryDiagnostics(enabled=enabled, mode=mode)
+                self._memory_call("start")
+                self._memory_call("log", "cycle_start")
+            except Exception as exc:
+                self._memory_failure("initialize", exc)
 
-        try:
+            # QThread에서는 메시지 펌프 없이 Office를 호출할 수 있도록 MTA를 사용한다.
+            try:
+                import pythoncom  # type: ignore
+                pythoncom.CoInitializeEx(pythoncom.COINIT_MULTITHREADED)
+                _com_initialized = True
+            except ImportError:
+                pass
+            except Exception as exc:
+                logger.warning("COM 초기화 경고: %s", exc)
             with embedding_cancellation_scope(self._embedding_cancel):
                 self._run_cycle()
         except EmbeddingCancelledError:
@@ -356,7 +355,7 @@ class CollectorWorker(QThread):
             logger.exception("수집기 예외 발생: %s", exc)
             self.error.emit(str(exc))
         finally:
-            memory_diagnostics.log("before_com_cleanup")
+            self._memory_call("log", "before_com_cleanup")
             try:
                 if _com_initialized:
                     # COM 앱 Quit은 반드시 생성 스레드(여기)에서 수행해야 한다(STA)
@@ -375,15 +374,35 @@ class CollectorWorker(QThread):
                         import pythoncom  # type: ignore
                         pythoncom.CoUninitialize()
             finally:
-                memory_diagnostics.log("after_com_cleanup")
-                # COM 정리까지 끝난 뒤 GC 후 최종 표본을 남겨,
-                # 사이클 작업과 COM 자원 해제를 모두 반영한다.
-                memory_diagnostics.collect_and_log()
-                memory_diagnostics.stop()
-                self._memory_diagnostics = None
-                self._work_phase = "idle"
+                try:
+                    self._memory_call("log", "after_com_cleanup")
+                    self._memory_call("collect_and_log")
+                finally:
+                    try:
+                        self._memory_call("stop")
+                    finally:
+                        self._memory_diagnostics = None
+                        self._work_phase = "idle"
             elapsed = time.time() - start
             logger.info("수집기 사이클 완료: %.1f초", elapsed)
+
+    def _memory_call(self, operation: str, *args, **kwargs) -> None:
+        """Keep optional diagnostic callbacks from changing collection results."""
+        diagnostics = self._memory_diagnostics
+        if diagnostics is None:
+            return
+        try:
+            getattr(diagnostics, operation)(*args, **kwargs)
+        except Exception as exc:
+            self._memory_failure(operation, exc)
+
+    @staticmethod
+    def _memory_failure(operation: str, exc: Exception) -> None:
+        """Report a diagnostic failure without allowing a second logging failure out."""
+        try:
+            logger.warning("[memory] diagnostic_failed operation=%s error_type=%s", operation, type(exc).__name__)
+        except Exception:
+            pass  # Diagnostic reporting itself is best-effort.
 
     def cancel(self):
         """취소를 요청하고 활성 임베딩 응답 대기를 중단한다."""
@@ -1519,7 +1538,7 @@ class CollectorWorker(QThread):
 
         memory_diagnostics = self._memory_diagnostics
         if memory_diagnostics is not None:
-            memory_diagnostics.log("after_document_indexing")
+            self._memory_call("log", "after_document_indexing")
 
         # watch_folders에서 제거된 폴더의 청크를 정리한다 (dry_run·대량삭제차단 준수).
         # 판정 순서는 차단 → 백오프 → 성공 스킵 → 실행 순으로 고정(purge_meta.decide) —
@@ -1616,7 +1635,7 @@ class CollectorWorker(QThread):
             )
 
         if memory_diagnostics is not None:
-            memory_diagnostics.log("after_documents")
+            self._memory_call("log", "after_documents")
 
         # 메일 제외 정리는 신규 메일 인덱싱 설정과 무관하게 수행한다. mail.enabled가
         # 꺼져 있어도 기존 메일은 검색되므로 제외·보류 삭제 복구가 멈추면 안 된다.
@@ -1721,7 +1740,7 @@ class CollectorWorker(QThread):
                 logger.warning("[lance_maintenance] 메일 상태 미저장으로 steady optimize 연기")
 
         if memory_diagnostics is not None:
-            memory_diagnostics.log("after_mail")
+            self._memory_call("log", "after_mail")
 
         summary = (
             f"인덱싱 완료 - 처리 {done}건 / 실패 {len(failed)}건 / "

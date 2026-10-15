@@ -1,11 +1,16 @@
-"""지식검색 에이전트 — Phase 2 RAG 파이프라인 연결 (실패 시 mock fallback)."""
+"""질문 스레드 전용 읽기 파이프라인을 사용하는 지식검색 에이전트."""
 import logging
-import os
 import time
+from contextlib import nullcontext
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
-from knowmate.agents.base import Block, TextBlock, SourcesBlock, SourceItem
+from knowmate.agents.base import Block, SourceItem, SourcesBlock, TextBlock
+from knowmate.rag.embedding_cancel import (
+    EmbeddingCancelledError,
+    embedding_cancellation_scope,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -13,15 +18,13 @@ logger = logging.getLogger(__name__)
 MAIL_SOURCE_TYPES = {"knox", "outlook", "eml"}
 
 
-def _mock_blocks(query: str, error: str = "") -> list[Block]:
+def _mock_blocks(query: str) -> list[Block]:
     """RAG 파이프라인 미초기화 시 반환할 안내 블록."""
     body = (
         f'"{query}"에 대한 검색을 시도했으나 RAG 파이프라인이 초기화되지 않았습니다.\n\n'
         "인덱싱 후 재시도해 주세요. 사이드바의 [인덱싱 시작] 버튼을 눌러 문서를 인덱싱하면 "
         "실제 문서를 기반으로 답변을 받을 수 있습니다."
     )
-    if error:
-        body += f"\n\n[디버그] 오류 내용:\n{error}"
     text: TextBlock = {"type": "text", "content": body}
     return [text]
 
@@ -75,105 +78,119 @@ def _dedupe_sources(chunks: list[dict[str, Any]]) -> list[SourceItem]:
     return items
 
 
-def _build_pipeline() -> dict[str, Any]:
-    """RAG 파이프라인 컴포넌트를 생성해 dict로 반환한다."""
+def _build_pipeline(config: dict | None = None, data_dir: Path | None = None) -> dict[str, Any]:
+    """기존 인덱스만 여는 요청 전용 검색 파이프라인을 생성한다."""
     from knowmate.config import get_config, get_data_dir
-    from knowmate.rag.embedding import get_embedding_client
-    from knowmate.rag.indexer import Indexer
-    from knowmate.rag.retriever import Retriever
     from knowmate.llm.client import get_llm_client
-    from knowmate.secure import get_extractor
+    from knowmate.rag.embedding import get_embedding_client
+    from knowmate.rag.query_reader import QueryIndexUnavailable, QueryReader
+    from knowmate.rag.retriever import Retriever
     from knowmate.secure.crypto import get_crypto_manager
 
-    cfg = get_config()
-    chunking = cfg.get("chunking", {})
-    maintenance = cfg.get("lancedb_maintenance", {})
-    search = cfg.get("search", {})
-
-    db_path = str(get_data_dir() / "index")
-    os.makedirs(db_path, exist_ok=True)
-
-    # crypto는 Indexer와 Retriever가 공유한다
-    crypto = get_crypto_manager(cfg)
-
-    embed_client = get_embedding_client(cfg)
-    indexer = Indexer(
-        db_path=db_path,
-        embed_client=embed_client,
-        chunk_size=chunking.get("chunk_size", 400),
-        overlap=chunking.get("overlap", 80),
-        batch_size=cfg.get("embedding", {}).get("batch_size", 32),
-        crypto=crypto,
-        maintenance_config=maintenance,
+    cfg = deepcopy(config if config is not None else get_config())
+    root = Path(data_dir) if data_dir is not None else get_data_dir()
+    mode = cfg.get("embedding", {}).get(
+        "mode", "fake" if cfg.get("extractor", "fake") == "fake" else "api",
     )
-
-    # 메일 인덱서 (mail.enabled 무관하게 항상 초기화 — 기존 emails 테이블 검색 지원)
-    from knowmate.rag.email_indexer import EmailIndexer
-    email_indexer = EmailIndexer(
-        db_path=db_path,
-        embed_client=embed_client,
-        chunk_size=chunking.get("chunk_size", 400),
-        overlap=chunking.get("overlap", 80),
-        batch_size=cfg.get("embedding", {}).get("batch_size", 32),
-        crypto=crypto,
-        maintenance_config=maintenance,
-    )
-
-    retriever = Retriever(
-        indexer=indexer,
-        embed_client=embed_client,
-        top_k=search.get("top_k_max", 10),
-        score_threshold=search.get("score_threshold", 0.4),
-        crypto=crypto,
-        rerank_enabled=search.get("rerank_enabled", False),
-        email_indexer=email_indexer,
-    )
-    llm = get_llm_client(cfg)
-    extractor = get_extractor(
-        cfg.get("extractor", "fake"),
-        xlsx_block_rows=chunking.get("xlsx_block_rows"),
-    )
-
-    return {
-        "indexer": indexer,
-        "email_indexer": email_indexer,
-        "retriever": retriever,
-        "llm": llm,
-        "extractor": extractor,
-    }
+    if mode not in {"api", "fake"}:
+        raise QueryIndexUnavailable("embedding_mode_not_supported")
+    reader = QueryReader(root / "index")
+    if reader.table is None and reader.email_indexer is None:
+        reader.close()
+        raise QueryIndexUnavailable("index_empty")
+    embed_client = None
+    try:
+        crypto = get_crypto_manager(cfg, data_dir=root, create_if_missing=False)
+        embed_client = get_embedding_client(cfg)
+        search = cfg.get("search", {})
+        retriever = Retriever(
+            indexer=reader,
+            embed_client=embed_client,
+            top_k=search.get("top_k_max", 10),
+            score_threshold=search.get("score_threshold", 0.4),
+            crypto=crypto,
+            rerank_enabled=search.get("rerank_enabled", False),
+            email_indexer=reader.email_indexer,
+            config=cfg,
+        )
+        return {"reader": reader, "embed_client": embed_client,
+                "retriever": retriever, "llm": get_llm_client(cfg)}
+    except BaseException:
+        reader.close()
+        if embed_client is not None:
+            embed_client.close()
+        raise
 
 
 class KnowledgeAgent:
-    def __init__(self) -> None:
+    def __init__(self, config: dict | None = None, data_dir: Path | None = None) -> None:
         """KnowledgeAgent를 초기화한다. 파이프라인은 첫 요청 시 지연 초기화한다."""
         self._pipeline: dict[str, Any] | None = None
+        self._config = deepcopy(config) if config is not None else None
+        self._data_dir = Path(data_dir) if data_dir is not None else None
 
     def _get_pipeline(self) -> dict[str, Any]:
         """파이프라인을 반환한다. 아직 초기화되지 않았으면 빌드한다."""
         if self._pipeline is None:
-            self._pipeline = _build_pipeline()
+            self._pipeline = _build_pipeline(self._config, self._data_dir)
         return self._pipeline
 
-    def handle(self, query: str, context: dict) -> list[Block]:
-        """RAG 검색 결과를 블록으로 반환한다. 파이프라인 초기화 실패 시 mock 반환."""
-        try:
-            pipeline = self._get_pipeline()
-        except Exception as exc:
-            import traceback
-            detail = traceback.format_exc()
-            logger.warning("RAG 파이프라인 초기화 실패: %s\n%s", exc, detail)
-            return _mock_blocks(query, error=detail)
+    def close(self) -> None:
+        """이 요청이 생성한 리소스를 소유 스레드에서 해제한다."""
+        pipeline, self._pipeline = self._pipeline, None
+        if pipeline is not None:
+            for key in ("retriever", "embed_client", "reader"):
+                resource = pipeline.pop(key, None)
+                if resource is not None:
+                    try:
+                        resource.close()
+                    except Exception as exc:  # noqa: BLE001 - isolate search/resource failures without exposing payloads
+                        logger.warning("질문 리소스 해제 실패: error_type=%s", type(exc).__name__)
+            pipeline.clear()
+        self._config = None
+        self._data_dir = None
 
+    def handle(self, query: str, context: dict) -> list[Block]:
+        """선택 범위와 취소 상태를 확인하고 요청 전용 RAG를 실행한다."""
+        cancellation = context.get("embedding_cancellation")
+        with embedding_cancellation_scope(cancellation) if cancellation is not None else nullcontext():
+            return self._handle(query, context)
+
+    def _handle(self, query: str, context: dict) -> list[Block]:
+        cancellation = context.get("embedding_cancellation")
+        check = context.get("cancel_check") or (cancellation.check if cancellation is not None else lambda: None)
+        check()
         scopes = context.get("scopes") or []
         if not scopes:
             return [{"type": "text", "content": "검색 범위를 하나 이상 선택해주세요. (내 PC 문서 또는 공유 폴더)"}]
-
+        from knowmate.rag.query_reader import QueryIndexUnavailable
+        try:
+            pipeline = self._get_pipeline()
+        except EmbeddingCancelledError:
+            raise
+        except QueryIndexUnavailable as exc:
+            check()
+            if exc.reason == "embedding_mode_not_supported":
+                return [{"type": "text", "content": "질문 검색은 API 또는 fake 임베딩 모드를 지원합니다. 임베딩 설정을 확인해 주세요."}]
+            return _mock_blocks(query)
+        except Exception as exc:  # noqa: BLE001 - isolate search/resource failures without exposing payloads
+            check()
+            logger.warning("RAG 파이프라인 초기화 실패: error_type=%s", type(exc).__name__)
+            return _mock_blocks(query)
+        check()
+        from knowmate.rag.retriever import Retriever
+        if isinstance(pipeline["retriever"], Retriever):
+            pipeline["retriever"].set_cancel_check(check)
         retrieve_t0 = time.perf_counter()
         try:
             chunks = pipeline["retriever"].search(query, scopes=scopes)
-        except Exception as exc:
-            logger.warning("검색 실패: %s", exc)
-            chunks = []
+        except EmbeddingCancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - isolate search/resource failures without exposing payloads
+            check()
+            logger.warning("검색 실패: error_type=%s", type(exc).__name__)
+            return [{"type": "text", "content": "문서 검색에 실패했습니다. 잠시 후 다시 시도해 주세요."}]
+        check()
         retrieve_sec = time.perf_counter() - retrieve_t0
 
         def _chunk_context(c: dict) -> str:
@@ -193,7 +210,16 @@ class KnowledgeAgent:
             return text
 
         llm_t0 = time.perf_counter()
-        answer_text = pipeline["llm"].answer(query, [_chunk_context(c) for c in chunks])
+        check()
+        try:
+            answer_text = pipeline["llm"].answer(query, [_chunk_context(c) for c in chunks])
+        except EmbeddingCancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - isolate search/resource failures without exposing payloads
+            check()
+            logger.warning("답변 생성 실패: error_type=%s", type(exc).__name__)
+            return [{"type": "text", "content": "답변 생성에 실패했습니다. 잠시 후 다시 시도해 주세요."}]
+        check()
         llm_sec = time.perf_counter() - llm_t0
 
         # 질의 한 건당 한 줄. 검색(임베딩+벡터검색)과 LLM 생성 중 어디가 체감

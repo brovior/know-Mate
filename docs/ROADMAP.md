@@ -64,12 +64,14 @@ Phase 1~4 완료(RAG 지식검색), 5a 완료(Knox `.mysingle` + 표준 `.eml` �
 | 항목 | 상태·다음 행동 | 시작 조건 |
 |---|---|---|
 | COM poison 복구 뒤 점유 오판·오류 혼합 | 2초 캐시 epoch·정확한 앱 증명·최초/닫기 오류 분리 및 fake 회귀 구현 | [진단 §COM poison](DIAGNOSTICS.md#com-poison-복구-일관성-2026-10-15)의 실제 Windows·Office·DRM 검증 대기 |
+| 메모리 진단 부하 분리 | OFF 유지·basic 수치 로그·명시적 detailed 추적과 진단 예외 격리 구현, 로컬 합성 비교 완료 | [진단 §1](DIAGNOSTICS.md#1-앱-크래시와-메모리-진단)의 실제 Windows OFF/basic 성능 비교·장시간/취소 시험 대기. 크래시 해결은 미확정 |
 | 앱 크래시 | 사내 로그·Windows 오류 기록 확보 | 기존 기록이 부족하면 진단 보강을 먼저 설계 |
 | 메일 처리 중 종료 후 Office 잔류 | 문서 완료 시 Office 정리·임베딩 취소·단계별 종료 로그 구현, fake·localhost 회귀 통과 | [진단 §4](DIAGNOSTICS.md#4-office-종료-정리-확인)의 사내 종료·PID 확인 대기 |
 | 상태 JSON·유휴 스캔 | 단계별 실측 대기 | JSON 처리와 실제 파일 접근 비용을 구분한 뒤 개선 선택 |
 | 검색·임베딩·COM 성능 | 실측 대기 | 진단 문서의 검증 자료 확보 |
-| PowerPoint 추가 기능 운영 적용 | 운영 리더·준비 점검·설치 도구 후보 구현 및 fake/managed 검사 완료, 자동 설치 출하 보류 | [운영 설계](design/PPT_ADDIN_INDEXING.md)·[검증 절차](guides/PPT_READER.md)에 따라 운영 DLL 내용 일치·최초 예약 ACL/UAC·32/64비트 Office·중단 복구·다른 사용자/세션 경합과 사내 연속 인덱싱을 검증한 뒤 자동 설치 가드 해제 여부 결정 |
-| 질문 비동기화 | 미착수 | [상세 설계](design/ISSUE_B_query_async.md)에 따른 별도 변경·검증 |
+| PowerPoint 추가 기능 운영 적용 | 자동 설치 후보·일시 보류 재시도·거절 기록·내장 빌드 정책·최초 예약 권한 구현, 기본 disabled 유지 | [운영 설계](design/PPT_ADDIN_INDEXING.md)·[검증 절차](guides/PPT_READER.md)에 따라 최종 released 파일의 최초 ACL/UAC·32/64비트 Office·중단 복구·사용자/세션 경합·내용 일치·연속 인덱싱을 실제 검증한 뒤 동일 파일 배포 |
+| PowerPoint 인덱싱 후 자동종료 #116 | 직접 실행 증명·호스트 정상종료·사용자 문서 보호 후보 구현, candidate만 시험 | [자동종료 검증](guides/PPT_READER.md#powerpoint-자동종료-후보-검증)의 실제 Windows·Office 시험 후 별도 배포 활성화 |
+| 질문 비동기화 | 요청별 QThread·기존 인덱스 읽기·대화 ACK/오래된 응답 차단·종료 보호 구현 | [상세 설계](design/ISSUE_B_query_async.md)의 사내 Windows·Office·DPAPI·실제 UI/장시간 질문 검증 대기 |
 | 실패 원인 판별 6b | 보류 | 오류 코드 실측, 워치독 밖 probe I/O의 행오버 위험 해소 |
 | 공용 인덱스 5b | 예정 | 로컬 캐시 복사 배포 설계·검증 |
 | DRM 저장 정책 | 사내 확인 대기 | 코드 변경이 아닌 정책 확인. [DESIGN.md](design/DESIGN.md) 참고 |

@@ -119,6 +119,8 @@ def _check_build_info(failures: list[str]) -> None:
     from knowmate.build_info import get_build_info
 
     info = get_build_info()
+    if info.get("ppt_auto_install_mode") not in {"disabled", "candidate", "released"}:
+        failures.append("빌드 출처 정보 오류: PPT 자동 설치 정책")
     commit = info.get("commit")
     short_commit = info.get("short_commit")
     valid_commit = bool(

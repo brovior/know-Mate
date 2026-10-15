@@ -33,7 +33,7 @@ def office(tmp_path, monkeypatch):
     path.write_bytes(b"not a document body")
     prs = SimpleNamespace(Slides=Collection([SimpleNamespace(Shapes=Collection([shape("baseline")]))]), Close=Mock())
     app = SimpleNamespace(Presentations=SimpleNamespace(Open=Mock(return_value=prs)))
-    service = SimpleNamespace(ProtocolVersion=lambda: 2, ReaderVersion=lambda: "1.0.0.0", ExtractSlide=Mock(return_value=reply()))
+    service = SimpleNamespace(ProtocolVersion=lambda: 3, ReaderVersion=lambda: "1.0.2.0", ExtractSlide=Mock(return_value=reply()))
     app.COMAddIns = SimpleNamespace(Item=Mock(return_value=SimpleNamespace(Connect=True, Object=service)))
     monkeypatch.setattr(com_reader, "_get_ppt_app", lambda: app)
     monkeypatch.setattr(com_reader._tls, "ppt_service", None, raising=False)
@@ -351,3 +351,36 @@ def test_office_control_errors_defer_without_fallback_or_sanitizing(office, monk
     else:
         assert service.ExtractSlide.call_count == 1
         prs.Close.assert_called_once()
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_candidate_setup_check_precedes_machine_lock_and_rechecks_installation(office, monkeypatch, changed):
+    from contextlib import contextmanager
+    from knowmate.secure import ppt_policy, ppt_installation, ppt_launch
+    path, prs, app, service = office
+    monkeypatch.setattr(com_reader._tls, "ppt", None)
+    monkeypatch.setattr(ppt_policy, "auto_shutdown_enabled", lambda: True)
+    inside = []
+    @contextmanager
+    def lock():
+        inside.append(True)
+        try:
+            yield
+        finally:
+            inside.pop()
+    def checker():
+        assert not inside, "helper check would contend with the held machine mutex"
+        return SimpleNamespace(status="ready", office_bitness=64)
+    stamps = iter([("installed",), ("changed",) if changed else ("installed",)])
+    monkeypatch.setattr(ppt_installation, "MachineReadGuard", lock)
+    monkeypatch.setattr(ppt_installation, "check_installation", checker)
+    monkeypatch.setattr(ppt_installation, "_validate_helper", lambda path: True)
+    monkeypatch.setattr(ppt_launch, "installation_stamp", lambda: next(stamps))
+    ready = []
+    def app_getter():
+        assert inside
+        ready.append(com_reader._tls.ppt_launch_ready)
+        return app
+    monkeypatch.setattr(com_reader, "_get_ppt_app", app_getter)
+    assert com_reader.PowerPointComReader("auto").parse(str(path)) == "candidate"
+    assert (ready[0] is None) is changed

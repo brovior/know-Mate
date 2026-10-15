@@ -21,6 +21,14 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+def _shutdown_warning(message: str, error: Exception) -> None:
+    """Keep diagnostic failures from bypassing mandatory shutdown stages."""
+    try:
+        logging.getLogger(__name__).warning("%s: error_type=%s", message, type(error).__name__)
+    except Exception:  # noqa: BLE001, S110 - shutdown must proceed even if logging is broken
+        pass
+
+
 def resource_path(rel: str) -> Path:
     """소스 실행/PyInstaller 번들(frozen) 모두에서 동작하는 리소스 경로를 반환한다.
 
@@ -74,8 +82,6 @@ class MainWindow(QMainWindow):
         self._pump_startup()
         from PyQt6.QtWebEngineWidgets import QWebEngineView
         self._pump_startup()
-        from knowmate.agents.registry import AgentRegistry
-        self._pump_startup()
         from knowmate.app.bridge import Bridge
         self._pump_startup()
 
@@ -88,8 +94,10 @@ class MainWindow(QMainWindow):
         self._grip.raise_()
 
         self._channel  = QWebChannel(self._view.page())
-        self._registry = AgentRegistry()
-        self._bridge   = Bridge(agent_registry=self._registry, main_window=self, parent=self)
+        from knowmate.config import get_config, get_data_dir
+        self._cfg = get_config()
+        self._bridge = Bridge(main_window=self, parent=self, query_config=self._cfg,
+                              query_data_dir=get_data_dir())
         self._channel.registerObject("bridge", self._bridge)
         self._view.page().setWebChannel(self._channel)
         self._pump_startup()
@@ -334,8 +342,21 @@ class MainWindow(QMainWindow):
         if self._shutdown_done:
             return
         self._shutdown_done = True
-        from knowmate.secure.office_guard import begin_application_shutdown
-        begin_application_shutdown()
+        query_close_failed = False
+        try:
+            begin_query_shutdown = getattr(self._bridge, "begin_query_shutdown", None)
+            if begin_query_shutdown is not None:
+                begin_query_shutdown()
+        except Exception:
+            # Query cleanup must never skip the existing Office/collector path.
+            query_close_failed = True
+        office_shutdown_failed = False
+        try:
+            from knowmate.secure.office_guard import begin_application_shutdown
+            begin_application_shutdown()
+        except Exception as exc:
+            office_shutdown_failed = True
+            _shutdown_warning("Office 종료 진입 실패", exc)
 
         # 설치 도구는 앱과 독립적으로 실제 승격 자식 종료까지 예약을 지킨다.
         # 앱 종료는 관찰/시작 콜백만 중단하고 설치 프로세스를 종료하지 않는다.
@@ -344,7 +365,7 @@ class MainWindow(QMainWindow):
             if preparation is not None:
                 preparation.shutdown()
         except Exception as exc:
-            logger.warning("PPT 준비 관찰 정리 중 예외: %s", exc)
+            _shutdown_warning("PPT 준비 관찰 정리 중 예외", exc)
 
         # 각 단계를 독립 try로 감싸 한 곳의 실패가 이후 정리(특히 최종 판정)를
         # 건너뛰지 않게 한다.
@@ -353,14 +374,14 @@ class MainWindow(QMainWindow):
             if scheduler is not None:
                 scheduler.stop()
         except Exception as exc:
-            logger.warning("스케줄러 정리 중 예외: %s", exc)
+            _shutdown_warning("스케줄러 정리 중 예외", exc)
 
         # 프로세스가 끝까지 못 죽더라도 트레이 아이콘은 먼저 치운다.
         try:
             if self._tray is not None:
                 self._tray.hide()
         except Exception as exc:
-            logger.warning("트레이 정리 중 예외: %s", exc)
+            _shutdown_warning("트레이 정리 중 예외", exc)
 
         # 워커 종료 에스컬레이션(정상→강제→하드)은 lifecycle.stop_worker로 분리
         # (PyQt6 비의존이라 단위 테스트 가능). 스케줄러·트레이 정리는 위에서 이미 시도함.
@@ -373,19 +394,33 @@ class MainWindow(QMainWindow):
             force_hard_exit = stop_worker(
                 getattr(self._bridge, "_worker", None),
                 office_cleanup=cleanup_before_worker_termination,
-            )
+            ) or office_shutdown_failed
         except Exception:
             # The cleanup helper may hold a logging lock. Unknown completion
             # must go directly to the final hard-exit decision without logging.
             pass
 
-        # A normal worker stop alone is insufficient if OS cleanup is unfinished.
-        # finalize_shutdown performs no logging or cleanup when hard exit is required.
         from knowmate.app.lifecycle import finalize_shutdown
+        if force_hard_exit:
+            # Collector termination can strand locks. Do no further query work.
+            finalize_shutdown(
+                getattr(self._bridge, "_worker", None),
+                quit_fn=QApplication.instance().quit,
+                force_hard_exit=True,
+            )
+            return
+
+        query_unsafe = True
+        try:
+            wait_query_shutdown = getattr(self._bridge, "wait_query_shutdown", None)
+            query_joined = wait_query_shutdown(8000) if wait_query_shutdown is not None else True
+            query_unsafe = query_close_failed or not query_joined
+        except Exception:
+            pass
         finalize_shutdown(
             getattr(self._bridge, "_worker", None),
             quit_fn=QApplication.instance().quit,
-            force_hard_exit=force_hard_exit,
+            force_hard_exit=query_unsafe,
         )
 
 

@@ -11,6 +11,8 @@ REM Aegis Desk 포터블 빌드 스크립트 — 사내 PC에서 실행
 REM
 REM 사용법:
 REM   build.bat          클린 빌드 (배포용 — 기본값)
+REM   build.bat clean candidate   자동 설치 후보 (일반 배포와 별도 폴더)
+REM   build.bat clean released    최종 승인 시험용 산출물
 REM   build.bat fast     캐시 재사용 빌드 (개발 중 반복 확인용, 배포 금지)
 REM
 REM   기본을 '클린'으로 둔 이유: 이건 배포용 빌드다. PyInstaller 증분 캐시는
@@ -25,13 +27,25 @@ REM      실제 사내 서버 IP로 채웠는가? (10.x.x.x 그대로면 테스�
 REM   2. .venv 에 requirements.txt 전체가 설치되어 있는가?
 REM      (pyinstaller도 requirements.txt에 고정 버전으로 포함돼 있다)
 REM
-REM 결과물: dist\AegisDesk\  (이 폴더를 zip으로 압축해 테스터에게 배포)
+REM 결과물: !BUILD_DIST_DIR!\AegisDesk\  (이 폴더를 zip으로 압축해 테스터에게 배포)
 
 cd /d "%~dp0.."
 
 set "BUILD_MODE=clean"
+if not "%~1"=="" if /i not "%~1"=="clean" if /i not "%~1"=="fast" (
+    echo [ERROR] Usage: build.bat [clean^|fast] [disabled^|candidate^|released]
+    exit /b 1
+)
 if /i "%~1"=="fast" set "BUILD_MODE=fast"
-set "BUILD_META_DIR=%CD%\.aegisdesk_build"
+set "PPT_INSTALL_MODE=disabled"
+if not "%~2"=="" set "PPT_INSTALL_MODE=%~2"
+if not "!PPT_INSTALL_MODE!"=="disabled" if not "!PPT_INSTALL_MODE!"=="candidate" if not "!PPT_INSTALL_MODE!"=="released" (
+    echo [ERROR] Usage: build.bat [clean^|fast] [disabled^|candidate^|released]
+    exit /b 1
+)
+set "BUILD_META_DIR=%CD%\.aegisdesk_build\!PPT_INSTALL_MODE!"
+set "BUILD_DIST_DIR=dist\!PPT_INSTALL_MODE!"
+set "BUILD_WORK_DIR=build\!PPT_INSTALL_MODE!"
 
 if not exist ".venv\Scripts\python.exe" (
     echo [오류] .venv 가 없습니다. 먼저 가상환경을 만들고 requirements.txt 를 설치하세요.
@@ -39,12 +53,13 @@ if not exist ".venv\Scripts\python.exe" (
     exit /b 1
 )
 
-REM dist\ 는 모드와 무관하게 항상 지운다 — PyInstaller 는 --noconfirm 으로 덮어쓸 뿐
+REM Only the selected mode directory is removed; candidates preserve general output.
+REM dist\ 는 선택 모드의 결과물만 지운다 — PyInstaller 는 --noconfirm 으로 덮어쓸 뿐
 REM 이전 빌드에만 있던 파일을 지우지는 않는다. 남겨두면 더 이상 필요 없는 DLL·구 UI
 REM 파일이 그대로 배포 zip 에 섞여 나간다.
 echo === 이전 배포 결과물 정리 (dist) ===
-if exist "dist" rmdir /s /q "dist"
-if exist "dist" (
+if exist "!BUILD_DIST_DIR!" rmdir /s /q "!BUILD_DIST_DIR!"
+if exist "!BUILD_DIST_DIR!" (
     echo [오류] dist 폴더를 완전히 삭제하지 못했습니다. 실행 중인 AegisDesk를 종료하고 다시 시도하세요.
     pause
     exit /b 1
@@ -52,8 +67,8 @@ if exist "dist" (
 
 if /i "%BUILD_MODE%"=="clean" (
     echo === 클린 빌드: 빌드 캐시 삭제 ===
-    if exist "build" rmdir /s /q "build"
-    if exist "build" (
+    if exist "!BUILD_WORK_DIR!" rmdir /s /q "!BUILD_WORK_DIR!"
+    if exist "!BUILD_WORK_DIR!" (
         echo [오류] build 폴더를 완전히 삭제하지 못했습니다. 파일 점유를 확인하세요.
         pause
         exit /b 1
@@ -72,7 +87,7 @@ if exist "!BUILD_META_DIR!" (
 )
 
 echo === 빌드 환경 및 소스 버전 확인 ===
-.venv\Scripts\python.exe scripts\build_guard.py --output-dir "!BUILD_META_DIR!"
+.venv\Scripts\python.exe scripts\build_guard.py --output-dir "!BUILD_META_DIR!" --ppt-auto-install-mode "!PPT_INSTALL_MODE!"
 if errorlevel 1 (
     echo [오류] 빌드 환경 확인 실패. 위 내용을 확인하세요.
     call :cleanup_build_meta
@@ -91,7 +106,7 @@ if errorlevel 1 (
 )
 
 echo === PyInstaller 빌드 시작 ^(%BUILD_MODE%^) ===
-.venv\Scripts\python.exe -m PyInstaller !PYI_FLAGS! AegisDesk.spec
+.venv\Scripts\python.exe -m PyInstaller !PYI_FLAGS! --distpath "!BUILD_DIST_DIR!" --workpath "!BUILD_WORK_DIR!" AegisDesk.spec
 
 if errorlevel 1 (
     echo [오류] 빌드 실패. 위 로그를 확인하세요.
@@ -104,13 +119,13 @@ REM 빌드 직후 자체 점검 — 번들 리소스·WebEngine 프로세스 실
 REM 모듈·lancedb 버전·빌드 출처·로그 폴더를 확인한다. --windowed 빌드라 콘솔
 REM 출력이 붙지 않으므로 종료 코드로 판정하고 상세 내용은 파일로 받는다.
 echo === 빌드 자체 점검 ^(--selftest^) ===
-"dist\AegisDesk\AegisDesk.exe" --selftest --selftest-report "dist\selftest.log" 2> "dist\selftest.stderr.log"
+"!BUILD_DIST_DIR!\AegisDesk\AegisDesk.exe" --selftest --selftest-report "!BUILD_DIST_DIR!\selftest.log" 2> "!BUILD_DIST_DIR!\selftest.stderr.log"
 set "SELFTEST_EXIT=!ERRORLEVEL!"
-if not exist "dist\selftest.log" (
+if not exist "!BUILD_DIST_DIR!\selftest.log" (
     echo [오류] 자체 점검 보고서가 생성되지 않았습니다.
     set "SELFTEST_EXIT=1"
 ) else (
-    for %%F in ("dist\selftest.log") do if %%~zF EQU 0 (
+    for %%F in ("!BUILD_DIST_DIR!\selftest.log") do if %%~zF EQU 0 (
         echo [오류] 자체 점검 보고서가 비어 있습니다.
         set "SELFTEST_EXIT=1"
     )
@@ -118,20 +133,20 @@ if not exist "dist\selftest.log" (
 if not "!SELFTEST_EXIT!"=="0" (
     echo [오류] 자체 점검 실패 — 번들에 빠진 것이 있습니다. 배포하지 마세요.
     echo.
-    if exist "dist\selftest.log" type "dist\selftest.log"
-    if exist "dist\selftest.stderr.log" type "dist\selftest.stderr.log"
+    if exist "!BUILD_DIST_DIR!\selftest.log" type "!BUILD_DIST_DIR!\selftest.log"
+    if exist "!BUILD_DIST_DIR!\selftest.stderr.log" type "!BUILD_DIST_DIR!\selftest.stderr.log"
     echo.
-    echo         상세: dist\selftest.log
+    echo         상세: !BUILD_DIST_DIR!\selftest.log
     call :cleanup_build_meta
     pause
     exit /b 1
 )
-if exist "dist\selftest.log" type "dist\selftest.log"
+if exist "!BUILD_DIST_DIR!\selftest.log" type "!BUILD_DIST_DIR!\selftest.log"
 
 echo.
 echo === 빌드 완료 ^(%BUILD_MODE%^) ===
-echo 결과물: dist\AegisDesk\AegisDesk.exe
-echo 이 폴더(dist\AegisDesk\)를 통째로 zip으로 압축해 테스터에게 배포하세요.
+echo 결과물: !BUILD_DIST_DIR!\AegisDesk\AegisDesk.exe
+echo 이 폴더(!BUILD_DIST_DIR!\AegisDesk\)를 통째로 zip으로 압축해 테스터에게 배포하세요.
 echo.
 if /i "%BUILD_MODE%"=="fast" (
     echo [주의] 캐시 재사용 빌드입니다. 배포 전에는 반드시 'build.bat' 으로
@@ -140,7 +155,7 @@ if /i "%BUILD_MODE%"=="fast" (
 )
 echo [필수] 자체 점검은 '번들에 파일이 있는지'만 확인합니다. WebEngine이 실제로
 echo        화면을 그리는지는 창을 띄워야만 알 수 있으므로, 배포 전 사내 PC에서
-echo        dist\AegisDesk\AegisDesk.exe 를 직접 실행해 흰 화면 없이 뜨는지
+echo        !BUILD_DIST_DIR!\AegisDesk\AegisDesk.exe 를 직접 실행해 흰 화면 없이 뜨는지
 echo        한 번 확인하세요.
 pause
 call :cleanup_build_meta

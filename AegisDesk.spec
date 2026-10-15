@@ -21,7 +21,7 @@ if not build_info_dir or not os.path.isfile(os.path.join(build_info_dir, "aegisd
 import runpy
 from pathlib import Path
 from knowmate.secure.ppt_bundle import verify_payload, PAYLOAD_FILES
-ppt_payload_dir = Path("scripts/ppt_reader/bin")
+ppt_payload_dir = Path(build_info_dir) / "ppt_reader"
 ppt_build_info = runpy.run_path(os.path.join(build_info_dir, "aegisdesk_build_info.py"))["BUILD_INFO"]
 verify_payload(ppt_payload_dir, ppt_build_info)
 datas += [(str(ppt_payload_dir / name), "ppt_reader")

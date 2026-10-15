@@ -143,7 +143,7 @@ class TestIndividualChecks:
         failures = []
         selftest._check_build_info(failures)
 
-        assert len(failures) == 4
+        assert len(failures) == 5
         assert all("빌드 출처 정보 오류" in failure for failure in failures)
 
     def test_frozen_build_with_commit_provenance_passes(self, monkeypatch):
@@ -154,6 +154,7 @@ class TestIndividualChecks:
         monkeypatch.setattr(build_info, "get_build_info", lambda: {
             "commit": "a" * 40, "short_commit": "a" * 7, "dirty": False,
             "built_at_utc": "2026-09-14T00:00:00+00:00",
+            "ppt_auto_install_mode": "disabled",
         })
         failures = []
         selftest._check_build_info(failures)
@@ -168,6 +169,7 @@ class TestIndividualChecks:
         monkeypatch.setattr(build_info, "get_build_info", lambda: {
             "commit": "a" * 40, "short_commit": "b" * 7, "dirty": False,
             "built_at_utc": "2026-09-14T00:00:00+00:00",
+            "ppt_auto_install_mode": "disabled",
         })
         failures = []
         selftest._check_build_info(failures)
@@ -185,6 +187,7 @@ class TestIndividualChecks:
             "dirty": True,
             "source_fingerprint": "bad",
             "built_at_utc": "2026-09-14T00:00:00+00:00",
+            "ppt_auto_install_mode": "disabled",
         })
         failures = []
         selftest._check_build_info(failures)

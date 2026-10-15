@@ -351,8 +351,9 @@ def test_memory_diagnostics_cover_collector_cycle_phases(tmp_path: Path, monkeyp
     events: list[str] = []
 
     class _FakeMemoryDiagnostics:
-        def __init__(self, enabled: bool) -> None:
+        def __init__(self, enabled: bool, *, mode: str) -> None:
             assert enabled is True
+            assert mode == "basic"
 
         def start(self) -> None:
             events.append("start")
@@ -361,7 +362,7 @@ def test_memory_diagnostics_cover_collector_cycle_phases(tmp_path: Path, monkeyp
             events.append(phase)
 
         def collect_and_log(self) -> None:
-            events.append("after_gc_collect")
+            events.append("cycle_resources_released")
 
         def stop(self) -> None:
             events.append("stop")
@@ -386,7 +387,7 @@ def test_memory_diagnostics_cover_collector_cycle_phases(tmp_path: Path, monkeyp
     assert events == ["start", "cycle_start", *cycle_phases,
         "before_com_cleanup",
         "after_com_cleanup",
-        "after_gc_collect",
+        "cycle_resources_released",
         "stop",
     ]
 
@@ -2610,7 +2611,27 @@ class TestSingleInstance:
         yield
         QLocalServer.removeServer(server_name)
 
-    def test_first_instance_acquires(self):
+    @pytest.fixture
+    def _local_socket_transport(self, tmp_path):
+        """Unix socket을 금지한 환경에서만 실제 IPC 통합 검증을 생략한다."""
+        import errno
+        import socket
+        import sys
+
+        if sys.platform == "win32":
+            return  # Windows QLocalServer는 named pipe를 사용한다.
+        probe_path = tmp_path / "ipc-probe"
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.bind(str(probe_path))
+        except OSError as exc:
+            if exc.errno not in {errno.EPERM, errno.EACCES, errno.EAFNOSUPPORT}:
+                raise
+            pytest.skip(f"실제 Unix IPC 사용 불가: errno={exc.errno}")
+        finally:
+            probe_path.unlink(missing_ok=True)
+
+    def test_first_instance_acquires(self, _local_socket_transport):
         """서버가 없으면 listen으로 선점한 primary server를 반환한다."""
         from knowmate.app.single_instance import acquire_or_notify_existing
         result = acquire_or_notify_existing()
@@ -2621,7 +2642,7 @@ class TestSingleInstance:
             if result.server is not None:
                 result.server.close()
 
-    def test_server_emits_show_requested_on_message(self):
+    def test_server_emits_show_requested_on_message(self, _local_socket_transport):
         """서버는 'show' 메시지를 받으면 show_requested를 발동한다.
 
         원자 선점은 별도 테스트에서 덮고, 여기서는 소켓을 직접 유지해 수신 큐 처리만
@@ -2659,7 +2680,7 @@ class TestSingleInstance:
             sock.disconnectFromServer()
             server.close()
 
-    def test_server_close_allows_new_acquisition(self):
+    def test_server_close_allows_new_acquisition(self, _local_socket_transport):
         """서버를 닫으면 이후 다시 첫 인스턴스로 획득할 수 있다."""
         from knowmate.app.single_instance import (
             acquire_or_notify_existing,
@@ -2699,6 +2720,45 @@ class TestSingleInstance:
         assert not result.acquired
         assert not result.secondary_notified
         assert not lock.stale_remove_called
+
+    @pytest.mark.parametrize("listens,notified,acquired,removals", [
+        ([True], False, True, 0),
+        ([False, True], False, True, 1),
+        ([False], True, False, 0),
+        ([False, False], False, False, 1),
+    ])
+    def test_authority_holder_handles_listen_outcomes_without_real_ipc(
+        self, monkeypatch, listens, notified, acquired, removals,
+    ):
+        """IPC 제한과 무관하게 선점·기존 알림·stale 복구·실패 시 정리를 검증한다."""
+        from knowmate.app import single_instance
+
+        lock = MagicMock()
+        lock.tryLock.return_value = True
+        server = MagicMock()
+        server.listen.side_effect = listens
+        remove_server = MagicMock()
+
+        def make_server(parent, *, authority_lock):
+            assert authority_lock is lock
+            return server
+
+        monkeypatch.setattr(single_instance, "_new_authority_lock", lambda: lock)
+        monkeypatch.setattr(single_instance, "SingleInstanceServer", make_server)
+        monkeypatch.setattr(single_instance, "_notify_existing", lambda: notified)
+        monkeypatch.setattr(single_instance.QLocalServer, "removeServer", remove_server)
+
+        result = single_instance.acquire_or_notify_existing()
+
+        assert result.acquired is acquired
+        assert result.secondary_notified is notified
+        assert result.server is (server if acquired else None)
+        lock.tryLock.assert_called_once_with(0)
+        assert server.listen.call_count == len(listens)
+        assert remove_server.call_count == removals
+        if removals:
+            remove_server.assert_called_once_with(single_instance._SERVER_NAME)
+        assert server.close.call_count == int(not acquired)
 
 
 # ============================================================
@@ -3231,3 +3291,83 @@ class TestMailFailureMigration:
         assert set(failure_state.load_failures(failure_file)) == {document, mail}
         assert not legacy_file.exists()
         assert legacy_file.with_name("mail_index_failure.migrated.json").exists()
+
+
+@pytest.mark.parametrize("mode", ["off", "basic", "detailed"])
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancel"])
+@pytest.mark.parametrize("broken_operation", [None, "initialize", "start", "log", "collect_and_log", "stop"])
+def test_memory_diagnostic_errors_preserve_cycle_cleanup_and_restart(tmp_path, monkeypatch, mode, outcome, broken_operation):
+    """Normal/error/cancel runs still clean COM, release diagnostics and become idle."""
+    import sys
+    from types import SimpleNamespace
+    from knowmate.collector import scheduler
+    from knowmate.secure import com_reader
+    from knowmate.rag.embedding_cancel import EmbeddingCancelledError
+
+    events = []
+
+    class Diagnostic:
+        def __init__(self, enabled, *, mode):
+            self.enabled = enabled
+            self.mode = mode
+            self._action("initialize")
+
+        def _action(self, operation):
+            events.append(operation)
+            if operation == broken_operation:
+                raise ValueError("secret diagnostic failure")
+
+        def start(self):
+            self._action("start")
+
+        def log(self, phase):
+            self._action("log")
+            events.append(phase)
+
+        def collect_and_log(self):
+            self._action("collect_and_log")
+
+        def stop(self):
+            self._action("stop")
+
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    worker, _, _ = _make_worker(tmp_path, str(folder))
+    worker._config["collector"].update(memory_diagnostics_enabled=mode != "off", memory_diagnostics_mode=mode)
+    errors = []
+    worker.error.connect(errors.append)
+    monkeypatch.setattr(scheduler, "MemoryDiagnostics", Diagnostic)
+    monkeypatch.setitem(sys.modules, "pythoncom", SimpleNamespace(
+        COINIT_MULTITHREADED=0,
+        CoInitializeEx=lambda _: events.append("com_initialize"),
+        CoUninitialize=lambda: events.append("com_uninitialize"),
+    ))
+    monkeypatch.setattr(worker, "_cleanup_com_apps", lambda _: events.append("com_cleanup"))
+    monkeypatch.setattr(com_reader, "release_unverified_com_refs", lambda: events.append("unverified_refs"))
+    monkeypatch.setattr(com_reader, "release_verified_pending_com_refs", lambda: events.append("verified_refs"))
+
+    def cycle():
+        events.append("cycle_work")
+        worker._work_phase = "indexing"
+        if outcome == "failure":
+            raise RuntimeError("cycle failure")
+        if outcome == "cancel":
+            worker.cancel()
+            raise EmbeddingCancelledError("cancelled")
+
+    monkeypatch.setattr(worker, "_run_cycle", cycle)
+    # Reporting a diagnostic exception may fail as well; this must remain optional.
+    monkeypatch.setattr(scheduler.logger, "warning", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("handler failed")))
+    for _ in range(2):
+        events.clear()
+        worker.run()
+        assert events.count("cycle_work") == 1
+        ordered = ["com_initialize", "cycle_work", "com_cleanup", "unverified_refs", "verified_refs", "com_uninitialize"]
+        positions = [events.index(event) for event in ordered]
+        assert positions == sorted(positions)
+        if broken_operation != "initialize":
+            assert events.index("collect_and_log") > events.index("com_uninitialize")
+            assert events.index("stop") > events.index("collect_and_log")
+        assert worker._memory_diagnostics is None
+        assert worker._work_phase == "idle"
+    assert len(errors) == (2 if outcome == "failure" else 0)

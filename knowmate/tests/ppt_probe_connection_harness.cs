@@ -91,6 +91,8 @@ public static class ConnectionHarness
         }
     }
 
+    private static int Protocol(Type type) { return type.Namespace == "AegisDesk.PptReader" ? 3 : 2; }
+
     private static void ManagedLifecycle(Type type)
     {
         object instance = Activator.CreateInstance(type);
@@ -99,7 +101,7 @@ public static class ConnectionHarness
         object[] args = { new ProbeHost(), 1, addin, null };
         connect.Invoke(instance, args);
         if (!Object.ReferenceEquals(addin.Object, instance)
-            || (int)type.GetMethod("ProtocolVersion").Invoke(instance, null) != 2)
+            || (int)type.GetMethod("ProtocolVersion").Invoke(instance, null) != Protocol(type))
             throw new Exception("managed_connection_failed");
         type.GetMethod("OnDisconnection").Invoke(instance, new object[] { 1, null });
         Disconnected(type, instance);
@@ -197,7 +199,7 @@ public static class ConnectionHarness
             Disconnected(type, instance);
             if (connect(pointer, appPointer, 1, addinPointer, ref custom) != 0
                 || !Object.ReferenceEquals(addin.Object, instance)
-                || (int)type.GetMethod("ProtocolVersion").Invoke(instance, null) != 2)
+                || (int)type.GetMethod("ProtocolVersion").Invoke(instance, null) != Protocol(type))
                 throw new Exception("native_connection_failed");
             CustomValue(custom, false, "after_connect");
             if (update(pointer, ref custom) != 0) throw new Exception("native_update_failed");

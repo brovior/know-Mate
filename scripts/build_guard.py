@@ -83,8 +83,10 @@ def _build_info() -> dict[str, object]:
     }
 
 
-def prepare(output_dir: Path) -> None:
+def prepare(output_dir: Path, ppt_auto_install_mode: str = "disabled") -> None:
     """도구 버전을 검증하고 PyInstaller가 포함할 모듈을 생성한다."""
+    if ppt_auto_install_mode not in {"disabled", "candidate", "released"}:
+        raise ValueError("ppt_auto_install_mode")
     root_module = REPO_ROOT / "aegisdesk_build_info.py"
     if root_module.exists():
         raise RuntimeError(
@@ -101,6 +103,7 @@ def prepare(output_dir: Path) -> None:
         )
 
     info = _build_info()
+    info["ppt_auto_install_mode"] = ppt_auto_install_mode
     output_dir.mkdir(parents=True, exist_ok=True)
     module_path = output_dir / "aegisdesk_build_info.py"
     module_path.write_text(
@@ -109,6 +112,16 @@ def prepare(output_dir: Path) -> None:
         encoding="utf-8",
     )
 
+    policy = output_dir / "PptBuildPolicy.cs"
+    policy.write_text(
+        'namespace AegisDesk.PptSetup { internal static class BuildPolicy { '
+        f'public const string AutoInstallMode = "{ppt_auto_install_mode}";'
+        ' } }\n'
+        'namespace AegisDesk.PptReader { internal static class ShutdownBuildPolicy { '
+        f'public const bool Enabled = {str(ppt_auto_install_mode == "candidate").lower()};'
+        ' } }\n', encoding="utf-8",
+    )
+    print(f"[확인] PPT 자동 설치: {ppt_auto_install_mode}")
     print(f"[확인] PyInstaller {actual}")
     print(
         f"[확인] 빌드 소스: branch={info['branch']} commit={info['short_commit']} "
@@ -128,9 +141,10 @@ def main() -> int:
     """명령행 인자를 처리하고 검증 실패를 종료 코드로 전달한다."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument("--ppt-auto-install-mode", choices=("disabled", "candidate", "released"), default="disabled")
     args = parser.parse_args()
     try:
-        prepare(args.output_dir)
+        prepare(args.output_dir, args.ppt_auto_install_mode)
     except Exception as exc:
         print(f"[오류] 빌드 환경 검증 실패: {exc}")
         return 1

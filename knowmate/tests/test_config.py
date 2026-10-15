@@ -141,3 +141,60 @@ def test_existing_config_backfills_com_quit_timeout(tmp_path, monkeypatch):
     assert cfg["collector"]["idle_enabled"] is True
     assert cfg["collector"]["com_quit_call_timeout_sec"] == 10
     assert yaml.safe_load(config_path.read_text(encoding="utf-8"))["collector"]["com_quit_call_timeout_sec"] == 10
+
+
+@pytest.mark.parametrize("enabled", [None, False, "true", "false", 0, 1])
+def test_memory_diagnostics_requires_exact_boolean_true(monkeypatch, enabled):
+    """False/invalid opt-ins stay off without even reading the mode default."""
+    import knowmate.config as config_module
+
+    monkeypatch.setattr(config_module, "_bundled_config_source", lambda: pytest.fail("OFF read YAML"))
+    assert config_module.memory_diagnostics_settings({"memory_diagnostics_enabled": enabled, "memory_diagnostics_mode": "detailed"}) == (False, "basic")
+
+
+@pytest.mark.parametrize("mode", ["basic", "detailed"])
+def test_explicit_memory_mode_is_used_without_mutating_config(mode):
+    """Only the exact explicit detailed string enables tracing."""
+    import knowmate.config as config_module
+
+    collector = {"memory_diagnostics_enabled": True, "memory_diagnostics_mode": mode}
+    before = collector.copy()
+    assert config_module.memory_diagnostics_settings(collector) == (True, mode)
+    assert collector == before
+
+
+@pytest.mark.parametrize("invalid", [None, True, 1, "DETAILED", " detailed ", [], {}])
+def test_invalid_memory_mode_falls_back_to_basic_warns_once(monkeypatch, caplog, invalid):
+    """Invalid values cannot accidentally preserve the expensive old behavior."""
+    import knowmate.config as config_module
+
+    monkeypatch.setattr(config_module, "_memory_mode_warned", False)
+    collector = {"memory_diagnostics_enabled": True, "memory_diagnostics_mode": invalid}
+    for _ in range(2):
+        assert config_module.memory_diagnostics_settings(collector) == (True, "basic")
+    assert len([r for r in caplog.records if "memory_diagnostics_mode" in r.message]) == 1
+    assert collector["memory_diagnostics_mode"] is invalid
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+def test_old_appdata_memory_enabled_uses_template_basic_without_persisting_mode(tmp_path, monkeypatch, frozen):
+    """Source/frozen templates resolve old configs but never rewrite the mode."""
+    import sys
+    import knowmate.config as config_module
+
+    template = tmp_path / "bundle" / "knowmate" / "config.yaml"
+    template.parent.mkdir(parents=True)
+    template.write_bytes(config_module._BUNDLED_CONFIG_PATH.read_bytes())
+    if frozen:
+        monkeypatch.setattr(sys, "_MEIPASS", str(template.parent.parent), raising=False)
+    else:
+        monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+        monkeypatch.setattr(config_module, "_BUNDLED_CONFIG_PATH", template)
+    config_path = tmp_path / "user.yaml"
+    config_path.write_text("collector:\n  memory_diagnostics_enabled: true\n", encoding="utf-8")
+    monkeypatch.setattr(config_module, "_cache", None)
+    monkeypatch.setattr(config_module, "_get_config_path", lambda: config_path)
+    collector = config_module.get_config()["collector"]
+    assert config_module.memory_diagnostics_settings(collector) == (True, "basic")
+    assert "memory_diagnostics_mode" not in collector
+    assert "memory_diagnostics_mode" not in yaml.safe_load(config_path.read_text(encoding="utf-8"))["collector"]

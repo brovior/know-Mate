@@ -323,7 +323,7 @@ class LanceTableMaintenance:
         self.in_progress = True
         try:
             if memory_log:
-                memory_log(f"before_optimize_{self.table_name}")
+                self._log_memory_sample(memory_log, f"before_optimize_{self.table_name}")
             if cancelled and cancelled():
                 return False
             self._table.optimize()
@@ -355,7 +355,7 @@ class LanceTableMaintenance:
             self._failure_deadline = self._now()
             self._persist_state(f"optimize {trigger}")
             if memory_log:
-                memory_log(f"after_optimize_{self.table_name}")
+                self._log_memory_sample(memory_log, f"after_optimize_{self.table_name}")
             logger.info(
                 "[lance_maintenance] table=%s trigger=%s before_small=%d after_small=%s",
                 self.table_name, trigger, before_small,
@@ -372,6 +372,17 @@ class LanceTableMaintenance:
             return False
         finally:
             self.in_progress = False
+
+    @staticmethod
+    def _log_memory_sample(memory_log: Callable[[str], None], phase: str) -> None:
+        """Keep diagnostic callback failures out of optimize success/cooldown state."""
+        try:
+            memory_log(phase)
+        except Exception as exc:
+            try:
+                logger.warning("[memory] diagnostic_failed operation=optimize_sample error_type=%s", type(exc).__name__)
+            except Exception:
+                pass  # Diagnostic reporting itself is best-effort.
 
     def note_external_optimize_success(self) -> None:
         """Update the same sidecar when the public Indexer.optimize API is used."""

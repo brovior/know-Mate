@@ -125,3 +125,35 @@ def test_prepare_rejects_shadowing_root_module(monkeypatch, tmp_path):
 
     with pytest.raises(RuntimeError, match="생성 정보를 가릴 수 있습니다"):
         build_guard.prepare(tmp_path / "generated")
+
+
+@pytest.mark.parametrize("mode", ["disabled", "candidate", "released"])
+def test_prepare_generates_matching_python_and_csharp_policy(monkeypatch, tmp_path, mode):
+    monkeypatch.setattr(build_guard, "_pinned_pyinstaller_version", lambda _: "6.21.0")
+    monkeypatch.setattr(build_guard.importlib.metadata, "version", lambda _: "6.21.0")
+    monkeypatch.setattr(build_guard, "_build_info", lambda: {
+        "commit": "a" * 40, "short_commit": "a" * 7, "dirty": False,
+        "source_fingerprint": "", "origin_main": "a" * 40, "branch": "main"})
+    build_guard.prepare(tmp_path, mode)
+    info = runpy.run_path(str(tmp_path / "aegisdesk_build_info.py"))["BUILD_INFO"]
+    assert info["ppt_auto_install_mode"] == mode
+    policy = (tmp_path / "PptBuildPolicy.cs").read_text()
+    assert f'AutoInstallMode = "{mode}";' in policy
+    script = (REPO_ROOT / "scripts/ppt_reader/build.ps1").read_text()
+    assert "$policySource @setupSources" in script
+    assert "$out = Join-Path $BuildInfoDir 'ppt_reader'" in script
+
+
+def test_candidate_build_output_isolated_from_other_profiles():
+    script = (REPO_ROOT / "scripts/build_impl.bat").read_text()
+    assert 'set "BUILD_DIST_DIR=dist\\!PPT_INSTALL_MODE!"' in script
+    assert 'set "BUILD_WORK_DIR=build\\!PPT_INSTALL_MODE!"' in script
+    assert 'if exist "dist" rmdir' not in script
+    assert 'if exist "build" rmdir' not in script
+    assert '--distpath "!BUILD_DIST_DIR!" --workpath "!BUILD_WORK_DIR!"' in script
+
+
+def test_invalid_policy_rejected_before_metadata_write(tmp_path):
+    with pytest.raises(ValueError, match="ppt_auto_install_mode"):
+        build_guard.prepare(tmp_path, "unexpected")
+    assert not list(tmp_path.iterdir())

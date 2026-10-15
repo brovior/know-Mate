@@ -29,7 +29,7 @@ def test_logs_private_python_and_arrow_in_one_info_line(monkeypatch, caplog):
         lambda: (10 * 1024 * 1024, 20 * 1024 * 1024),
     )
     diagnostics = module.MemoryDiagnostics(
-        True,
+        True, mode="detailed",
         private_bytes_reader=lambda: 50 * 1024 * 1024,
         arrow_pool_getter=_FakeArrowPool,
         pid=1234,
@@ -45,7 +45,7 @@ def test_logs_private_python_and_arrow_in_one_info_line(monkeypatch, caplog):
         "[memory] pid=1234 cycle_id=test-cycle phase=after_mail private_mib=50.0 python_current_mib=10.0 "
         "python_peak_mib=20.0 arrow_current_mib=30.0 arrow_peak_mib=40.0 "
         "arrow_backend=mimalloc private_delta_mib=0.0 python_scope=external_start_unknown "
-        "trace_started_at_ns=n/a tracemalloc_mib=3.0"
+        "trace_started_at_ns=n/a tracemalloc_mib=3.0 mode=detailed"
     ]
 
 
@@ -127,7 +127,7 @@ def test_collect_and_log_runs_gc_before_final_sample(monkeypatch):
 
     events: list[str] = []
     monkeypatch.setattr(module.gc, "collect", lambda: events.append("gc"))
-    diagnostics = module.MemoryDiagnostics(True)
+    diagnostics = module.MemoryDiagnostics(True, mode="detailed")
     monkeypatch.setattr(diagnostics, "log", lambda phase: events.append(phase))
 
     diagnostics.collect_and_log()
@@ -150,7 +150,7 @@ def test_owned_trace_records_scope_overhead_and_release_order(monkeypatch, caplo
     monkeypatch.setattr(module.tracemalloc, "get_tracemalloc_memory", lambda: 1024 * 1024)
     monkeypatch.setattr(module.time, "time_ns", lambda: 42)
     readings = iter([100, 101, 105, 106, 150, 151, 147, 147])
-    diagnostics = module.MemoryDiagnostics(True, private_bytes_reader=lambda: next(readings) * 1024 * 1024, arrow_pool_getter=_FakeArrowPool)
+    diagnostics = module.MemoryDiagnostics(True, mode="detailed", private_bytes_reader=lambda: next(readings) * 1024 * 1024, arrow_pool_getter=_FakeArrowPool)
 
     with caplog.at_level(logging.INFO, logger=module.__name__):
         diagnostics.start()
@@ -174,7 +174,7 @@ def test_external_trace_is_preserved_and_start_time_is_unknown(monkeypatch, capl
     monkeypatch.setattr(module.tracemalloc, "stop", lambda: (_ for _ in ()).throw(AssertionError("stopped external tracer")))
     monkeypatch.setattr(module.tracemalloc, "reset_peak", lambda: (_ for _ in ()).throw(AssertionError("reset external peak")))
     monkeypatch.setattr(module.tracemalloc, "take_snapshot", object)
-    diagnostics = module.MemoryDiagnostics(True, private_bytes_reader=lambda: None, arrow_pool_getter=_FakeArrowPool)
+    diagnostics = module.MemoryDiagnostics(True, mode="detailed", private_bytes_reader=lambda: None, arrow_pool_getter=_FakeArrowPool)
     with caplog.at_level(logging.INFO, logger=module.__name__):
         diagnostics.start()
         diagnostics.stop()
@@ -187,10 +187,172 @@ def test_snapshot_failure_has_end_marker_and_does_not_escape(monkeypatch, caplog
 
     monkeypatch.setattr(module.tracemalloc, "is_tracing", lambda: True)
     monkeypatch.setattr(module.tracemalloc, "take_snapshot", lambda: (_ for _ in ()).throw(RuntimeError("snapshot failed")))
-    diagnostics = module.MemoryDiagnostics(True, private_bytes_reader=lambda: None, arrow_pool_getter=_FakeArrowPool)
+    diagnostics = module.MemoryDiagnostics(True, mode="detailed", private_bytes_reader=lambda: None, arrow_pool_getter=_FakeArrowPool)
     with caplog.at_level(logging.INFO, logger=module.__name__):
         diagnostics.log("after_mail")
     markers = [record.message for record in caplog.records if "snapshot_diff phase=after_mail action=" in record.message]
     assert len(markers) == 2
     assert markers[0].endswith("action=start")
     assert markers[1].endswith("action=end status=failed")
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_off_and_basic_never_call_tracer_or_gc_in_any_phase(monkeypatch, caplog, enabled):
+    """Even an active external tracer must remain completely uninspected in basic."""
+    from knowmate.collector import memory_diagnostics as module
+
+    calls = []
+
+    def forbidden(name):
+        def fail(*_args, **_kwargs):
+            calls.append(name)
+            raise AssertionError(name)
+        return fail
+
+    for name in ("is_tracing", "start", "stop", "reset_peak", "get_traced_memory",
+                 "get_tracemalloc_memory", "get_traceback_limit", "take_snapshot"):
+        monkeypatch.setattr(module.tracemalloc, name, forbidden(name))
+    monkeypatch.setattr(module.gc, "collect", forbidden("gc"))
+    measurements = []
+    diagnostic = module.MemoryDiagnostics(
+        enabled,
+        private_bytes_reader=lambda: measurements.append("private"),
+        arrow_pool_getter=lambda: measurements.append("arrow"),
+    )
+    with caplog.at_level(logging.INFO, logger=module.__name__):
+        diagnostic.start()
+        for phase in ("cycle_start", "before_mail_discovery", "after_mail_discovery", "mail_sample",
+                      "before_mail_embed", "after_mail_embed", "before_mail_commit", "after_mail_commit",
+                      "after_document_indexing", "after_documents", "before_optimize_chunks",
+                      "after_optimize_chunks", "after_mail", "before_com_cleanup", "after_com_cleanup"):
+            diagnostic.log(phase, counters={"attempted": 50})
+        diagnostic.collect_and_log()
+        diagnostic.stop()
+    assert calls == []
+    if enabled:
+        assert measurements
+        assert all("python_scope=not_measured" in r.message for r in caplog.records)
+        assert any("phase=cycle_resources_released " in r.message for r in caplog.records)
+        assert not any(token in r.message for r in caplog.records for token in ("gc_collect", "tracemalloc_start", "tracemalloc_stop", "snapshot"))
+    else:
+        assert measurements == []
+        assert not caplog.records
+
+
+def test_basic_missing_arrow_does_not_import_it(monkeypatch, caplog):
+    """A diagnostic-only process does not load PyArrow just to measure it."""
+    import builtins
+    import sys
+    from knowmate.collector import memory_diagnostics as module
+
+    monkeypatch.delitem(sys.modules, "pyarrow", raising=False)
+    original_import = builtins.__import__
+    calls = []
+
+    def observed_import(name, *args, **kwargs):
+        if name == "pyarrow" or name.startswith("pyarrow."):
+            calls.append(name)
+            raise AssertionError("unexpected PyArrow import")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", observed_import)
+    diagnostic = module.MemoryDiagnostics(True, private_bytes_reader=lambda: None)
+    with caplog.at_level(logging.INFO, logger=module.__name__):
+        diagnostic.start()
+        diagnostic.log("cycle_start")
+        diagnostic.collect_and_log()
+        diagnostic.stop()
+    assert calls == []
+    assert all("arrow_current_mib=n/a arrow_peak_mib=n/a arrow_backend=n/a" in r.message for r in caplog.records)
+
+
+def test_basic_uses_already_loaded_arrow_pool(monkeypatch, caplog):
+    """Loaded Arrow current/peak remain available without tracing."""
+    import sys
+    from types import SimpleNamespace
+    from knowmate.collector import memory_diagnostics as module
+
+    monkeypatch.setitem(sys.modules, "pyarrow", SimpleNamespace(default_memory_pool=_FakeArrowPool))
+    diagnostic = module.MemoryDiagnostics(True, private_bytes_reader=lambda: None)
+    with caplog.at_level(logging.INFO, logger=module.__name__):
+        diagnostic.log("cycle_start")
+    assert "arrow_current_mib=30.0 arrow_peak_mib=40.0 arrow_backend=mimalloc" in caplog.text
+
+
+def test_failed_private_sample_breaks_delta_chain_and_redacts_exception(caplog):
+    """A failed reading and the next valid reading both have unknown delta."""
+    from knowmate.collector import memory_diagnostics as module
+
+    readings = iter([100, OSError("secret body C:/Users/private/file.pdf"), 110, 115])
+
+    def read():
+        value = next(readings)
+        if isinstance(value, Exception):
+            raise value
+        return value * 1024 * 1024
+
+    diagnostic = module.MemoryDiagnostics(True, private_bytes_reader=read, arrow_pool_getter=lambda: None)
+    with caplog.at_level(logging.INFO, logger=module.__name__):
+        for _ in range(4):
+            diagnostic.log("mail_sample")
+    messages = [r.message for r in caplog.records if "phase=mail_sample " in r.message]
+    assert ["private_delta_mib=n/a" in message for message in messages] == [True, True, True, False]
+    assert "private_delta_mib=5.0" in messages[-1]
+    assert "error_type=OSError" in caplog.text
+    assert "secret" not in caplog.text and "C:/Users" not in caplog.text
+
+
+def test_sample_failure_does_not_escape_and_owned_stop_releases_snapshots(monkeypatch, caplog):
+    """Formatting/snapshot failure must not retain state or interrupt owned stop."""
+    from knowmate.collector import memory_diagnostics as module
+
+    active = [False]
+    actions = []
+    monkeypatch.setattr(module.tracemalloc, "is_tracing", lambda: active[0])
+    monkeypatch.setattr(module.tracemalloc, "start", lambda depth: active.__setitem__(0, True))
+    monkeypatch.setattr(module.tracemalloc, "stop", lambda: (actions.append("stop"), active.__setitem__(0, False)))
+    monkeypatch.setattr(module.tracemalloc, "reset_peak", lambda: None)
+    monkeypatch.setattr(module.tracemalloc, "take_snapshot", object)
+    diagnostic = module.MemoryDiagnostics(True, mode="detailed", private_bytes_reader=lambda: None, arrow_pool_getter=lambda: None)
+    diagnostic.start()
+    monkeypatch.setattr(diagnostic, "_log", lambda *_args, **_kwargs: (_ for _ in ()).throw(ValueError("secret body")))
+    with caplog.at_level(logging.INFO, logger=module.__name__):
+        diagnostic.log("after_mail")
+        diagnostic.stop()
+    assert actions == ["stop"]
+    assert diagnostic._cycle_snapshot is None
+    assert diagnostic._before_optimize_snapshot is None
+    assert not diagnostic._started and not diagnostic._owns_tracing
+    assert "error_type=ValueError" in caplog.text and "secret body" not in caplog.text
+
+
+def test_diagnostic_failure_report_cannot_escape_a_broken_log_handler(monkeypatch):
+    """The optional diagnostic's own error report is also best-effort."""
+    from knowmate.collector import memory_diagnostics as module
+
+    def fail(*_args, **_kwargs):
+        raise OSError("broken diagnostic handler")
+
+    monkeypatch.setattr(module.logger, "warning", fail)
+    diagnostic = module.MemoryDiagnostics(True, private_bytes_reader=fail, arrow_pool_getter=fail)
+    diagnostic.start()
+    diagnostic.log("after_mail")
+    diagnostic.collect_and_log()
+    diagnostic.stop()
+    assert not diagnostic._started
+
+
+def test_partial_arrow_failure_reports_all_arrow_values_unknown(caplog):
+    """A pool read failure cannot mix stale partial numbers into a valid sample."""
+    from knowmate.collector import memory_diagnostics as module
+
+    class BrokenPool(_FakeArrowPool):
+        def max_memory(self):
+            raise OSError("private body in arrow exception")
+
+    diagnostic = module.MemoryDiagnostics(True, private_bytes_reader=lambda: 1024, arrow_pool_getter=BrokenPool)
+    with caplog.at_level(logging.INFO, logger=module.__name__):
+        diagnostic.log("before_optimize_chunks")
+    assert "arrow_current_mib=n/a arrow_peak_mib=n/a arrow_backend=n/a" in caplog.text
+    assert "error_type=OSError" in caplog.text
+    assert "private body" not in caplog.text

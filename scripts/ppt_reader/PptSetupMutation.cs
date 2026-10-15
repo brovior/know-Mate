@@ -22,7 +22,8 @@ namespace AegisDesk.PptSetup
         public static void Protect(string directory)
         {
             Machine.NoLinks(directory);
-            Directory.CreateDirectory(directory);
+            string parent = Path.GetDirectoryName(directory);
+            if (!Directory.Exists(parent) || String.Equals(directory, Machine.Root, StringComparison.OrdinalIgnoreCase)) Protect(parent);
             var acl = new DirectorySecurity();
             acl.SetAccessRuleProtection(true, false);
             acl.SetOwner(new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null));
@@ -31,7 +32,20 @@ namespace AegisDesk.PptSetup
                     InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
             acl.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null), FileSystemRights.ReadAndExecute,
                 InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
-            Directory.SetAccessControl(directory, acl);
+            RequestDirectory.Create(directory, acl);
+            Machine.NoLinks(directory);
+            DirectorySecurity existing = Directory.GetAccessControl(directory);
+            var owner = (SecurityIdentifier)existing.GetOwner(typeof(SecurityIdentifier));
+            if (!owner.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid) && !owner.IsWellKnown(WellKnownSidType.LocalSystemSid))
+                throw new IOException("acl_unavailable");
+            foreach (FileSystemAccessRule rule in existing.GetAccessRules(true, true, typeof(SecurityIdentifier)))
+            {
+                var sid = (SecurityIdentifier)rule.IdentityReference;
+                if (rule.AccessControlType == AccessControlType.Allow && !sid.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid) &&
+                    !sid.IsWellKnown(WellKnownSidType.LocalSystemSid) &&
+                    (rule.FileSystemRights & (FileSystemRights.Write | FileSystemRights.Delete | FileSystemRights.DeleteSubdirectoriesAndFiles |
+                        FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership)) != 0) throw new IOException("acl_unavailable");
+            }
         }
         public static bool Owned()
         {
@@ -168,7 +182,8 @@ namespace AegisDesk.PptSetup
 
         public static void Apply(bool remove, string own)
         {
-            if (!Machine.Admin || !Machine.OfficeClosed() || !Machine.ReservationsSafe(own)) throw new IOException("mutation_blocked");
+            if (!Machine.OfficeClosed()) throw new IOException("office_busy");
+            if (!Machine.Admin || !Machine.ReservationsSafe(own)) throw new IOException("mutation_blocked");
             Protect(Machine.Root);
             Recover();
             Result state = Machine.Check("check", true, false, own);

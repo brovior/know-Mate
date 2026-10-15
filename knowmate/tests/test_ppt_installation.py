@@ -13,15 +13,15 @@ from knowmate.secure import ppt_installation as installation
 
 def result_json(**changes):
     value = dict(schema=1, operation="check", status="ready", reason="registration_ok",
-                 required_version="1.0.0.0", installed_version="1.0.0.0", office_bitness=64,
-                 scope="Machine", machine_safe=True, auto_install_validated=False)
+                 required_version="1.0.2.0", installed_version="1.0.2.0", office_bitness=64,
+                 scope="Machine", machine_safe=True, auto_install_validated=False, auto_install_mode="disabled")
     value.update(changes)
     return json.dumps(value)
 
 
 def reservation(**changes):
     value = dict(schema=1, request_id="33e979c6-c5c4-40af-845a-64c80517d1ae",
-                 required_version="1.0.0.0", helper_sid="S-1-5-21-1-2-3-1001", helper_pid=123,
+                 required_version="1.0.2.0", helper_sid="S-1-5-21-1-2-3-1001", helper_pid=123,
                  helper_creation_ticks="638901000000000000", child_pid=None,
                  child_creation_ticks=None, state="complete")
     value.update(changes)
@@ -46,7 +46,7 @@ def test_malformed_setup_never_ready(changes, code):
 
 def test_manifest_cannot_enable_auto_install():
     assert not installation.parse_setup_result(result_json(auto_install_validated=True), 0).auto_install_validated
-    assert installation.AUTO_INSTALL_VALIDATED is False
+    assert not installation.auto_install_enabled()
 
 
 @pytest.mark.parametrize("changes", [dict(schema=True), dict(helper_pid=True), dict(helper_creation_ticks="0"),
@@ -179,13 +179,18 @@ def test_detached_setup_gate_and_close_does_not_kill(monkeypatch):
     assert closed == [True]
 
 
-def test_setup_csharp_contract_without_installation(tmp_path):
+@pytest.mark.parametrize("mode", ["disabled", "candidate", "released"])
+def test_setup_csharp_contract_without_installation(tmp_path, mode):
     compiler = Path(os.environ.get("WINDIR", "")) / "Microsoft.NET/Framework/v4.0.30319/csc.exe"
     if os.name != "nt" or not compiler.is_file():
         pytest.skip("Windows .NET compiler required; setup native operations not executed")
     root = Path(__file__).resolve().parents[2]
     sources = [root / "scripts/ppt_reader/PptReaderSetup.cs", *sorted((root / "scripts/ppt_reader").glob("PptSetup*.cs")),
                root / "knowmate/tests/ppt_setup_harness.cs"]
+    policy = tmp_path / "PptBuildPolicy.cs"
+    policy.write_text('namespace AegisDesk.PptSetup { internal static class BuildPolicy { '
+                      f'public const string AutoInstallMode = "{mode}"; }} }}')
+    sources.append(policy)
     executable = tmp_path / "SetupHarness.exe"
     commands = [[str(compiler), "/nologo", "/main:SetupHarness", f"/out:{executable}",
                  "/reference:System.Core.dll", "/reference:System.Web.Extensions.dll", "/reference:System.Security.dll",
@@ -194,3 +199,34 @@ def test_setup_csharp_contract_without_installation(tmp_path):
         result = subprocess.run(command, capture_output=True, text=True, timeout=30,
                                 creationflags=subprocess.CREATE_NO_WINDOW)
         assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("mode", ["disabled", "candidate", "released"])
+def test_embedded_policy_and_result_must_match(monkeypatch, mode):
+    monkeypatch.setattr(installation, "auto_install_mode", lambda: mode)
+    result = installation.parse_setup_result(result_json(auto_install_mode=mode,
+        auto_install_validated=mode == "released"), 0)
+    assert result.status == "ready"
+    assert result.auto_install_enabled == (mode != "disabled")
+    wrong = installation.parse_setup_result(result_json(auto_install_mode=mode,
+        auto_install_validated=mode != "released"), 0)
+    assert not wrong.machine_safe
+    for foreign in {"disabled", "candidate", "released"} - {mode}:
+        assert not installation.parse_setup_result(result_json(auto_install_mode=foreign,
+            auto_install_validated=foreign == "released"), 0).machine_safe
+
+
+def test_source_cannot_enable_installation_with_generated_module(monkeypatch):
+    from knowmate.secure import ppt_policy
+    monkeypatch.setattr(ppt_policy.sys, "frozen", False, raising=False)
+    monkeypatch.setattr(ppt_policy, "get_build_info", lambda: {"ppt_auto_install_mode": "candidate"})
+    assert ppt_policy.auto_install_mode() == "disabled"
+    assert not ppt_policy.auto_install_enabled()
+
+
+@pytest.mark.parametrize("filename", ["journal.json.abc.tmp", "installation.json.abc.tmp"])
+def test_metadata_atomic_write_residue_blocks_fallback_com(monkeypatch, tmp_path, filename):
+    _, installed = fake_folders(monkeypatch, tmp_path)
+    installed.mkdir(parents=True)
+    (installed / filename).write_text("incomplete")
+    assert not installation._machine_records_safe()

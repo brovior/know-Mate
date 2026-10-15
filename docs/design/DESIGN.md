@@ -28,6 +28,16 @@ Block = TextBlock | SourcesBlock | TableBlock | ChartBlock
 
 ---
 
+## 질문 실행과 읽기 보호
+
+질문은 요청별 QThread에서 처리하고 수집기와 DB/HTTP/crypto 핸들을 공유하지 않는다.
+기존 인덱스와 키만 읽으며 스키마 이전·Office/추출기·키 생성을 호출하지 않는다.
+결과 수신 뒤에도 실제 `wait(0)` 종료 전까지 다음 질문과 검색 정책 쓰기를 막는다.
+대화 ID·화면 세대·저장 ACK·목록/복원 순번으로 늦은 응답과 삭제 대화의 재생성을 차단한다.
+취소·시간초과·실제 앱 종료 규칙과 검증 범위는 [질문 비동기화](ISSUE_B_query_async.md)를 따른다.
+
+---
+
 ## LanceDB 스키마 (`rag/indexer.py`)
 
 ```python
@@ -329,29 +339,39 @@ chunks·emails 테이블 **전체**를 `to_arrow().to_pandas()`로 로드했고,
 
 앱 크래시 가설, 진단 로그의 한계와 추가 검증 순서는 [DIAGNOSTICS.md](../DIAGNOSTICS.md)를 따른다.
 
-**수집 사이클 메모리 진단** (`collector.memory_diagnostics_enabled`, 기본 `false`): 메모리 증가의
-소유 영역을 나누기 위해 `cycle_start` → `after_document_indexing` → `after_documents`(orphan·purge
-정리와 상태 저장 뒤) → `after_mail` → `after_gc_collect` 시점마다 한 줄 INFO 로그를 남긴다.
-로그에는 PID·cycle ID, Windows Process Private Bytes, `tracemalloc` current/peak, PyArrow 기본 메모리
-풀의 current/peak/backend와 직전 표본 대비 `private_delta_mib`를 포함한다. Python 값은 추적 시작
-이후의 살아 있는 추적 대상 할당이며 전체 Python 메모리가 아니다. `python_scope`는 자체 시작이면
-`cycle_since_start`, 외부 추적이면 `external_start_unknown`, 비활성이면 `inactive`다.
-`trace_started_at_ns`는 자체 추적 시작의 Unix 나노초 시각(외부 추적은 `n/a`), `tracemalloc_mib`는
-추적 기록을 관리하는 tracemalloc 자체 사용량이며 진단 비용 전체를 뜻하지 않는다.
-메일 처리 중에는 50건마다 attempted·commit·cache-hit·상태조회 누적값과 prepared_chunks·
-embedding_input_chunks·embed_calls·pending_chunks·queued_mails를 함께 표본화한다.
-메일 목록 조회 전후와 첫 임베딩 묶음·약 50건 진행 뒤의 묶음·마지막 남은 묶음의 임베딩/DB 저장
-전후도 기록한다. 이 표본은 추가 스냅샷을 만들지 않으며 본문·제목은 남기지 않는다.
-COM 정리·GC·추적 시작/종료·기준 스냅샷 전후, 스냅샷 비교 시작/완료를 표시하고 스냅샷 참조를
-해제한 뒤 마지막 표본을 남긴다. 전후 기록은 정상 성공뿐 아니라 예외로 돌아온 경우도 포함한다.
-Windows Private Bytes는 번들에
-새 의존성을 추가하지 않고 `GetProcessMemoryInfo`로 조회한다. 진단을 켠 사이클에서만
-`tracemalloc`과 마지막 `gc.collect()`를 실행하며, 운영 메모리 동작을 바꾸는 Arrow
-`release_unused()`는 호출하지 않는다. Arrow 값은 기본 메모리 풀 범위이며 peak는 풀 생성 이후의
-누적 고수위다. Private에서 Python·Arrow를 빼서 네이티브 사용량을 확정하지 않는다.
-진단이 tracing을 시작할 때만 depth 10을 사용하고, 외부 tracing 중이면 depth/lifetime을 보존한다.
-cycle baseline과 optimize 전후, after_mail/after_gc_collect snapshot diff는 상위 코드 위치의
-size/count delta만 로그에 남기며 snapshot·원문·AppData/사용자 절대경로는 저장하지 않는다.
+**수집 사이클 메모리 진단**: `collector.memory_diagnostics_enabled`는 정확한 boolean `true`만
+활성화하며 기본값은 `false`다. `collector.memory_diagnostics_mode` 기본값은 `basic`이다.
+구형 설정의 `enabled: true`도 mode가 없거나 잘못됐으면 basic으로 처리하고 사용자 파일에는 새
+mode를 강제로 저장하지 않는다. 잘못된 mode는 프로세스에서 한 번만 경고한다. 설정은 사이클 시작에
+고정하며 운영 중 수정은 앱 재시작 후 적용한다.
+
+- **OFF**: 사용량 조회·Arrow 접근·tracemalloc·스냅샷·진단 GC·메모리 로그를 실행하지 않는다.
+- **basic**: Windows Private Bytes와 직전 표본 대비 delta, 이미 로드된 PyArrow 기본 풀의
+  current/peak/backend만 조회한다. PyArrow를 새로 import하지 않고 tracemalloc API 전체·스냅샷·
+  강제 GC·Arrow `release_unused()`를 호출하지 않는다. Python 값은 `n/a`,
+  `python_scope=not_measured`다. 외부 tracing은 조회하거나 변경하지 않으므로 그 자체의 부하는 남는다.
+- **detailed**: 명시적으로 선택했을 때만 depth 10 추적·기준/단계 스냅샷 비교·종료 GC를 실행한다.
+  외부 tracing의 depth·peak·수명은 보존하고 자체 시작한 추적만 종료한다. 전체 추적의 CPU/메모리
+  비용을 첫 사용에 경고하며 짧은 재현에만 사용한다. `python_scope`는 자체 추적
+  `cycle_since_start`, 외부 추적 `external_start_unknown`, 추적 없음 `inactive`다.
+
+기존 PID·cycle ID·phase·수치 키를 유지하고 `mode`를 함께 기록한다. 단계 표본은 `cycle_start` →
+`after_document_indexing` → `after_documents`(orphan·purge·상태 저장 뒤) → `after_mail` 순서다.
+메일 첫 묶음·약 50건 진행 뒤·마지막 묶음의 임베딩/DB 저장 전후와 50건 누적 수치 표본은 유지한다.
+본문·제목·벡터·예외 문자열은 진단 로그에 추가하지 않으며 detailed 코드 위치는 사용자 경로를 축약한다.
+
+종료는 COM 정리 → 마지막 표본 → 자체 추적 정리 → 진단 참조 해제 → 워커 idle 순서다. basic의
+마지막 표본은 `cycle_resources_released`, detailed는 실제 GC 전후 `before/after_gc_collect`다.
+`cycle_diagnostics_released`는 스냅샷 참조 해제 뒤 남긴다. 이 명칭은 모든 Python/Office 메모리의
+OS 반환을 보장하지 않는다. 진단 예외와 그 오류 보고 실패도 수집·COM 정리·취소·다음 사이클을
+막지 않으며, optimize 전후 콜백 실패는 최적화 성공 상태나 재시도 대기시간을 바꾸지 않는다.
+
+Windows 이외 Private은 `n/a`다. Private 조회 실패 표본과 다음 유효 표본의 delta도 `n/a`이며
+0으로 대신하지 않는다. Arrow 값은 기본 풀 범위이고 peak는 풀 생성 이후의 고수위다.
+`python_current_mib`는 추적 이후 살아 있는 할당으로 전체 Python 사용량이 아니다.
+`trace_started_at_ns`는 자체 추적 시작 시각, `tracemalloc_mib`는 추적 기록 자체 사용량이다.
+Private에서 Python·Arrow를 빼서 네이티브 메모리 사용량을 확정하지 않는다. detailed 스냅샷 비교는
+상위 5개 size/count delta만 로그에 남겨도 전체 추적 기록을 대상으로 한다.
 
 ---
 

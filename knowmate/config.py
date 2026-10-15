@@ -4,6 +4,7 @@ import math
 import os
 import sys
 from copy import deepcopy
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,7 @@ _cache: dict[str, Any] | None = None
 _APP_DIR_NAME = "AegisDesk"
 _LEGACY_DIR_NAME = "KnowMate"
 _data_dir_migrated = False
+_memory_mode_warned = False
 
 
 def get_data_dir() -> Path:
@@ -171,6 +173,23 @@ def ppt_reader_mode(collector: dict[str, Any]) -> str:
     return mode
 
 
+def memory_diagnostics_settings(collector: dict[str, Any]) -> tuple[bool, str]:
+    """Resolve strict opt-in and basic/detailed mode without changing user config."""
+    global _memory_mode_warned
+    if collector.get("memory_diagnostics_enabled") is not True:
+        return False, "basic"
+    if "memory_diagnostics_mode" in collector:
+        mode = collector["memory_diagnostics_mode"]
+        if isinstance(mode, str) and mode in {"basic", "detailed"}:
+            return True, mode
+        if not _memory_mode_warned:
+            logger.warning("잘못된 collector.memory_diagnostics_mode 설정을 basic으로 처리합니다")
+            _memory_mode_warned = True
+    with _bundled_config_source().open(encoding="utf-8") as handle:
+        bundled = yaml.safe_load(handle) or {}
+    return True, bundled["collector"]["memory_diagnostics_mode"]
+
+
 def _bundled_document_state_defaults() -> dict[str, Any]:
     """Read document checkpoint defaults from the bundled YAML source."""
     with _bundled_config_source().open(encoding="utf-8") as handle:
@@ -273,3 +292,26 @@ def _save_config(cfg: dict[str, Any]) -> None:
     with tmp.open("w", encoding="utf-8") as f:
         yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
     tmp.replace(target)
+
+
+@lru_cache(maxsize=1)
+def _bundled_query_timeout_seconds() -> float:
+    with _bundled_config_source().open(encoding="utf-8") as handle:
+        bundled = yaml.safe_load(handle) or {}
+    return float(bundled["ui"]["query_timeout_seconds"])
+
+
+def query_timeout_ms(config: dict[str, Any]) -> int:
+    """Resolve a finite positive QTimer-compatible request budget."""
+    default = _bundled_query_timeout_seconds()
+    ui = config.get("ui", {})
+    value = ui.get("query_timeout_seconds", default) if isinstance(ui, dict) else default
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        value = default
+    try:
+        value = float(value)
+    except (ValueError, OverflowError):
+        value = default
+    if not math.isfinite(value) or value <= 0 or value > 2_147_483.647:
+        value = default
+    return max(1, int(value * 1000))
