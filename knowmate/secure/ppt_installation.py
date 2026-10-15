@@ -11,10 +11,11 @@ import sys
 import re
 import uuid
 from dataclasses import dataclass
-from typing import Callable
+from typing import BinaryIO, Callable
 
 from knowmate.secure.ppt_operation import PptPreparationPending
 from knowmate.secure.ppt_policy import auto_install_mode, auto_install_enabled, REQUIRED_VERSION
+from knowmate.secure.ppt_setup_output import create_setup_output
 
 MUTEX_NAME = r"Global\AegisDesk.PptReader.Machine.v1"
 _STATUSES = frozenset({"ready", "missing", "outdated", "repairable", "disabled",
@@ -25,6 +26,11 @@ _REASONS = frozenset({"registration_ok", "not_installed", "version_old",
     "reservation_unresolved", "journal_unresolved", "prototype_gate",
     "payload_invalid", "acl_unavailable", "permission_declined", "launch_failed",
     "child_unconfirmed", "mutation_failed", "removed", "check_failed"})
+_DIAGNOSTIC_STAGES = frozenset({"anchor_open", "parent_open", "parent_policy", "child_open",
+    "child_policy", "request_create", "request_acl", "request_commit", "lease_recheck"})
+_DIAGNOSTIC_ERRORS = frozenset({"policy", "Win32Exception", "UnauthorizedAccessException",
+    "IOException", "SecurityException", "InvalidOperationException", "ArgumentException", "NotSupportedException", "Exception"})
+_MAX_SETUP_OUTPUT = 16384
 
 
 @dataclass(frozen=True)
@@ -38,6 +44,9 @@ class SetupResult:
     machine_safe: bool = False
     auto_install_validated: bool = False
     auto_install_mode: str = "disabled"
+    stage: str | None = None
+    error_type: str | None = None
+    winerror: int | None = None
 
     @property
     def auto_install_enabled(self) -> bool:
@@ -51,17 +60,39 @@ class PptMachineBusy(PptPreparationPending):
     """The shared installation state does not permit a PPT COM read."""
 
 
+class SetupLaunchNotStarted(PptMachineBusy):
+    """A prelaunch check failed before any setup process was created."""
+
+
+def _unique_json_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    value: dict[str, object] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("setup_duplicate_field")
+        value[key] = item
+    return value
+
+
 def parse_setup_result(stdout: str, exit_code: int, operation: str = "check") -> SetupResult:
     """Reject malformed output and mismatched operation/version/exit status."""
     try:
-        if len(stdout) > 16384 or exit_code not in {0, 10, 11, 12, 13}:
+        if (not isinstance(stdout, str) or len(stdout.encode("utf-8")) > _MAX_SETUP_OUTPUT
+                or type(exit_code) is not int or exit_code not in {0, 10, 11, 12, 13}):
             raise ValueError("setup_contract")
-        value = json.loads(stdout)
+        value = json.loads(stdout, object_pairs_hook=_unique_json_fields)
         allowed = {"schema", "operation", "status", "reason", "required_version",
                    "installed_version", "office_bitness", "scope", "machine_safe",
                    "auto_install_validated", "auto_install_mode"}
-        if not isinstance(value, dict) or set(value) != allowed:
+        diagnostic = {"stage", "error_type", "winerror"}
+        if not isinstance(value, dict) or set(value) not in (allowed, allowed | diagnostic):
             raise ValueError("setup_fields")
+        if diagnostic <= value.keys():
+            if value["stage"] not in _DIAGNOSTIC_STAGES or value["error_type"] not in _DIAGNOSTIC_ERRORS:
+                raise ValueError("setup_diagnostic")
+            if value["winerror"] is not None and (type(value["winerror"]) is not int
+                    or not 0 <= value["winerror"] <= 2**31 - 1
+                    or value["error_type"] != "Win32Exception"):
+                raise ValueError("setup_winerror")
         if type(value["schema"]) is not int or value["schema"] != 1:
             raise ValueError("setup_schema")
         if value["operation"] != operation or value["required_version"] != REQUIRED_VERSION:
@@ -77,7 +108,7 @@ def parse_setup_result(stdout: str, exit_code: int, operation: str = "check") ->
             raise ValueError("setup_policy")
         installed = value["installed_version"]
         if installed is not None and (not isinstance(installed, str) or len(installed) > 32
-                or len(installed.split(".")) != 4 or not all(s.isdigit() for s in installed.split("."))):
+                or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+", installed)):
             raise ValueError("setup_version")
         bitness = value["office_bitness"]
         if bitness is not None and (type(bitness) is not int or bitness not in (32, 64)):
@@ -88,9 +119,10 @@ def parse_setup_result(stdout: str, exit_code: int, operation: str = "check") ->
         if exit_code != 0 and value["status"] in {"ready", "missing", "outdated", "repairable"}:
             raise ValueError("setup_exit")
         return SetupResult(value["status"], value["reason"], installed, bitness,
-                           value["machine_safe"], value["auto_install_validated"], value["auto_install_mode"])
-    except (ValueError, TypeError, KeyError):
-        return SetupResult()
+                           value["machine_safe"], value["auto_install_validated"], value["auto_install_mode"],
+                           value.get("stage"), value.get("error_type"), value.get("winerror"))
+    except (ValueError, TypeError, KeyError, UnicodeError):
+        return SetupResult(reason="diagnostic_unavailable")
 
 
 def setup_helper_path() -> Path:
@@ -232,29 +264,63 @@ class DetachedSetupProcess:
         self.path = Path(helper_path) if helper_path is not None else setup_helper_path()
         self.operation = operation
         self._process: subprocess.Popen | None = None
+        self._output: BinaryIO | None = None
 
     def start(self) -> None:
         """Launch only a validated payload after the automatic-install release gate."""
         if os.name != "nt" or self.operation != "prepare" or not auto_install_enabled():
-            raise PptMachineBusy("prototype_gate")
+            raise SetupLaunchNotStarted("prototype_gate")
         if not _validate_helper(self.path):
-            raise PptMachineBusy("payload_invalid")
-        self._process = subprocess.Popen([str(self.path), "/prepare"],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            close_fds=True, creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
+            raise SetupLaunchNotStarted("payload_invalid")
+        if self._process is not None:
+            raise RuntimeError("setup_already_started")
+        # The private file survives until the inherited stdout handle's final
+        # close. A pipe would break helper writes when the application exits.
+        try:
+            self._output = create_setup_output()
+        except (OSError, ValueError) as exc:
+            raise SetupLaunchNotStarted("diagnostic_unavailable") from exc
+        try:
+            self._process = subprocess.Popen([str(self.path), "/prepare"],
+                stdin=subprocess.DEVNULL, stdout=self._output, stderr=subprocess.DEVNULL,
+                close_fds=True, creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
+        except BaseException:
+            self.close()
+            raise
 
     def poll(self) -> int | None:
         """Return actual helper termination, never a launch-success substitute."""
         return self._process.poll() if self._process is not None else None
 
+    def read_result(self) -> SetupResult:
+        """Read bounded output only after actual exit; observation failures stay unknown."""
+        if self._process is None or self._output is None:
+            return SetupResult(reason="diagnostic_unavailable")
+        try:
+            code = self._process.poll()
+            if code is None:
+                return SetupResult(reason="diagnostic_unavailable")
+            self._output.seek(0)
+            output = self._output.read(_MAX_SETUP_OUTPUT + 1)
+            if len(output) > _MAX_SETUP_OUTPUT:
+                return SetupResult(reason="diagnostic_unavailable")
+            return parse_setup_result(output.decode("utf-8-sig"), code, self.operation)
+        except (OSError, ValueError, UnicodeError):
+            return SetupResult(reason="diagnostic_unavailable")
+
     def close(self) -> None:
         """Release observation handles without kill/terminate/waiting for completion."""
         process, self._process = self._process, None
-        if process is not None and os.name == "nt":
-            # CPython's Windows process handle is independent of child lifetime.
-            handle = getattr(process, "_handle", None)
-            if handle is not None:
-                handle.Close()
+        output, self._output = self._output, None
+        try:
+            if process is not None and os.name == "nt":
+                # CPython's Windows process handle is independent of child lifetime.
+                handle = getattr(process, "_handle", None)
+                if handle is not None:
+                    handle.Close()
+        finally:
+            if output is not None:
+                output.close()
 
 
 class MachineReadGuard:

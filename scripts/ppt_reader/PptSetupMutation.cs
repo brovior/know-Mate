@@ -180,11 +180,13 @@ namespace AegisDesk.PptSetup
         private static void Set(RegistryKey root, string path, string name, object value, RegistryValueKind kind = RegistryValueKind.String)
         { using (RegistryKey key = root.CreateSubKey(path)) key.SetValue(name, value, kind); }
 
-        public static void Apply(bool remove, string own)
+        public static void Apply(bool remove, string own, RequestDirectoryLease lease)
         {
             if (!Machine.OfficeClosed()) throw new IOException("office_busy");
             if (!Machine.Admin || !Machine.ReservationsSafe(own)) throw new IOException("mutation_blocked");
+            lease.Recheck();
             Protect(Machine.Root);
+            lease.Recheck();
             Recover();
             Result state = Machine.Check("check", true, false, own);
             if (!state.machine_safe || state.office_bitness == null || state.status == "conflict" || (!remove && state.status == "disabled")) throw new IOException("mutation_blocked");
@@ -194,10 +196,12 @@ namespace AegisDesk.PptSetup
             {
                 // Expose the journal before any own registry mutation; every
                 // interrupted stage is restored under the next mutation lock.
+                lease.Recheck();
                 Journal(root, state.office_bitness.Value);
                 try
                 {
                     if (!Machine.OfficeClosed()) throw new IOException("office_busy");
+                    lease.Recheck();
                     if (remove)
                     {
                         foreach (string key in Contract.Keys) root.DeleteSubKeyTree(key, false);

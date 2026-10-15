@@ -1,6 +1,6 @@
 # 운영 PPT Reader 개발 검증
 
-현재 요구 버전은 **1.0.2.0**이다. 기본 빌드는 자동 설치를 끈 `disabled`이며,
+현재 요구 버전은 **1.0.3.0**이다. 기본 빌드는 자동 설치를 끈 `disabled`이며,
 개발 빌드의 `candidate`/`released`에서 앱 시작부터 자동 설치를 실행한다.
 시험 DLL의 내용 일치/속도 결과를 운영 DLL·자동 설치의 성공으로 간주하지 않는다.
 아래 명령은 Windows 개발 PC에서 실행한다. 문서 원문은 로그/파일로 기록하지 않는다.
@@ -44,6 +44,48 @@ if ($LASTEXITCODE -ne 0) { throw 'ppt_reader_build_failed' }
 파일·Machine 등록 확인이며 실제 PowerPoint 내부의 로드·읽기 성공을 뜻하지 않는다.
 `machine_safe=false`이면 PPT COM 수집을 미룬다. disabled/candidate의 `auto_install_validated`는 false다.
 candidate는 자동 실행이 허용되며, true/false 표시 자체는 Windows 시험 완료 증거가 아니다.
+
+## 기존 설치 준비 폴더와 native lease 검증
+
+기존 1.0.0.0 설치를 업데이트할 때 AppData·ProgramData·dist를 지워야 하는 것은 아니다.
+`%ProgramData%\AegisDesk`가 상속을 허용하고 준비 자식만 보호된 과거 구조도,
+실제 owner/DACL이 안전한 경우 그대로 재사용한다. 부모 false·자식 true만으로 성공을 판정하지 않는다.
+기존 owner·DACL·파일·구버전 DLL은 보존한다. 수동 ACL 변경이나 관리자 앱 실행을 선행하지 않는다.
+
+먼저 일반 권한 Windows 개발 PC의 NTFS 임시 루트에서 아래 테스트를 실행한다.
+운영 ProgramData를 수정하는 테스트가 아니다. 관리자 실행 또는 Windows 외 환경의 skip은
+필수 native 검증 **미실행**이다.
+
+```powershell
+& .\.venv\Scripts\python.exe -m pytest .\knowmate\tests\test_ppt_acl_native.py -v
+```
+
+이 하네스는 실제 `Directory.CreateDirectory`로 상속 부모를 재현하고 보호 자식을 생성한다.
+누락 폴더의 원자 생성과 두 lease 동시 열기, anchor/부모/자식 rename·자식 삭제 거절, 예약 파일 원자 생성·교체,
+기존 owner/DACL 불변과 기존 DELETE handle 충돌을 검사한다. 같은 프로세스의 두 handle 시험은
+실제 helper·승격 자식의 다른 계정 권한 시험을 대신하지 않는다.
+
+그다음 candidate EXE로 기존 1.0.0.0 → 1.0.3.0 업데이트와 새 설치를 각각 확인한다.
+필수 기록은 `required_version=1.0.3.0`, 실제 `installed_version`, 일반 helper/승격 자식 종료,
+원래 사용자 `/check`의 `ready`, 인덱싱의 `method=addin`이다. 같은 계정 및 다른 관리자 UAC,
+앱만 종료했을 때 helper/자식 생존·stdout 쓰기/마지막 handle 정리, 점유/거절/공유 충돌,
+중간 helper 종료·자식 생존·`/recover`와 32/64비트 Office는 별도 실제 시험한다.
+
+사용자 간 시험은 A=디렉터리 owner, B=예약 owner, C=비소유 일반 사용자로 구분한다.
+C의 B 예약 갱신·삭제는 거절되고 B의 자기 예약과 Admin/System 작업은 가능해야 한다.
+A의 암묵적 WRITE_DAC에 의한 DACL 변경은 lease로 막지 못한다. owner까지 적대적으로 격리해야 하면
+이 후보를 활성화하지 말고 관리자 소유 저장 구조 등으로 재설계한다.
+
+실패 로그는 고정 요약 code와 검증된 `reason/stage/error_type/winerror`를 표시한다.
+`parent_open/parent_policy/child_open/child_policy/request_create/request_acl/request_commit`으로
+실패 위치를 구분하며 실제 Win32 오류가 없으면 `winerror`는 null이다. 원문 예외·SID·SDDL은 쓰지 않는다.
+미수집·잘못된 출력은 `diagnostic_unavailable`이며, 최종 안전 여부는 독립 `post_check`가 결정한다.
+예약 전 실패 후 safe 구버전이면 auto는 COM을 유지하고, 미완료 예약/종료 미확인은 PPT 준비 대기다.
+명시 UAC 거절 11만 영구 억제하고 일시 오류는 다음 실행에서 다시 점검한다.
+
+Linux에서는 native ACL·파일 공유·UAC·Office를 실행하지 않았다. 하네스 작성이나 모형 회귀 통과는
+이 Windows 승인 시험의 성공을 뜻하지 않는다. source/기본 disabled, candidate 시험,
+released의 자동종료 OFF 정책을 유지하며 최종 released 파일의 실제 승인 후 동일 파일을 배포한다.
 
 ## 명시적인 최초 설치 후보 시험
 

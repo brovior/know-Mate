@@ -2,8 +2,8 @@ using System;
 using System.IO;
 using System.Reflection;
 
-[assembly: AssemblyVersion("1.0.2.0")]
-[assembly: AssemblyFileVersion("1.0.2.0")]
+[assembly: AssemblyVersion("1.0.3.0")]
+[assembly: AssemblyFileVersion("1.0.3.0")]
 
 namespace AegisDesk.PptSetup
 {
@@ -26,9 +26,13 @@ namespace AegisDesk.PptSetup
                     if (!Machine.Admin || !Contract.PayloadValid()) throw new IOException("payload_invalid");
                     using (var gate = new MachineLock())
                     {
-                        Reservation request = Reservation.Load(args[1]);
-                        request.EnterChild();
-                        Mutation.Apply(operation == "elevated-remove", request.request_id);
+                        using (var lease = RequestDirectoryLease.AcquireExisting())
+                        {
+                            Reservation request = Reservation.Load(args[1], lease);
+                            request.EnterChild();
+                            lease.Recheck();
+                            Mutation.Apply(operation == "elevated-remove", request.request_id, lease);
+                        }
                     }
                     // The ordinary helper owns reservation completion and the
                     // final original-user check. No administrator HKCU writes.
@@ -40,11 +44,15 @@ namespace AegisDesk.PptSetup
                     using (var gate = new MachineLock())
                     {
                         if (!Machine.OfficeClosed()) throw new IOException("office_busy");
-                        if (args[1] != "journal") Reservation.Load(args[1]).Recover();
-                        if (!Machine.ReservationsSafe()) throw new IOException("reservation_unresolved");
-                        Mutation.Recover();
-                        result = Machine.Check(operation, true);
-                        code = result.machine_safe ? 0 : 13;
+                        using (var lease = RequestDirectoryLease.Acquire())
+                        {
+                            if (args[1] != "journal") Reservation.Load(args[1], lease).Recover();
+                            if (!Machine.ReservationsSafe()) throw new IOException("reservation_unresolved");
+                            lease.Recheck();
+                            Mutation.Recover();
+                            result = Machine.Check(operation, true);
+                            code = result.machine_safe ? 0 : 13;
+                        }
                     }
                 }
                 else if ((operation == "prepare" || operation == "remove") &&
@@ -55,6 +63,11 @@ namespace AegisDesk.PptSetup
                     { result = Machine.Check(operation); result.status = "failed"; result.reason = "prototype_gate"; code = 12; }
                     else code = Prepare(operation == "remove", ref result);
                 }
+            }
+            catch (SetupFailure ex)
+            {
+                ex.Apply(result); result.status = "failed"; result.reason = "acl_unavailable";
+                result.machine_safe = false; code = 12;
             }
             catch (IOException ex)
             {
@@ -75,8 +88,15 @@ namespace AegisDesk.PptSetup
 
         private static int Prepare(bool remove, ref Result result)
         {
-            string operation = remove ? "remove" : "prepare";
             if (!Contract.PayloadValid()) { result.reason = "payload_invalid"; return 12; }
+            RequestDirectoryLease lease = null;
+            try { return PrepareLeased(remove, ref result, ref lease); }
+            finally { if (lease != null) lease.Dispose(); }
+        }
+
+        private static int PrepareLeased(bool remove, ref Result result, ref RequestDirectoryLease lease)
+        {
+            string operation = remove ? "remove" : "prepare";
             Reservation request;
             using (var gate = new MachineLock())
             {
@@ -85,9 +105,23 @@ namespace AegisDesk.PptSetup
                 if (!Machine.OfficeClosed()) { result.status = "busy"; result.reason = "office_busy"; return 10; }
                 if (result.status == "conflict" || (!remove && result.status == "disabled")) return 12;
                 if (!remove && result.status == "ready") return 0;
-                try { request = Reservation.Create(); }
-                catch { result.status = "failed"; result.reason = "acl_unavailable"; result.machine_safe = false; return 12; }
+                try
+                {
+                    lease = RequestDirectoryLease.Acquire();
+                    // Re-read reservations in the leased namespace: the path
+                    // observed by the earlier read-only check may have raced.
+                    result = Machine.Check(operation, true);
+                    if (!result.machine_safe || result.office_bitness == null || result.status == "conflict" ||
+                        (!remove && result.status == "disabled")) return 12;
+                    if (!Machine.OfficeClosed()) { result.status = "busy"; result.reason = "office_busy"; return 10; }
+                    request = Reservation.Create(lease);
+                }
+                catch (SetupFailure error)
+                { error.Apply(result); result.status = "failed"; result.reason = "acl_unavailable"; result.machine_safe = false; return 12; }
+                catch (Exception error)
+                { SetupFailure.From("request_create", error).Apply(result); result.status = "failed"; result.reason = "acl_unavailable"; result.machine_safe = false; return 12; }
             }
+            lease.Recheck();
             int code = Elevation.Run(remove, request);
             if (code == 14)
             {
@@ -99,15 +133,22 @@ namespace AegisDesk.PptSetup
             {
                 using (var gate = new MachineLock())
                 {
+                    lease.Recheck();
                     result = Machine.Check(operation, true, true, request.request_id);
                     if (result.machine_safe)
                     {
-                        request = Reservation.Load(request.request_id);
+                        request = Reservation.Load(request.request_id, lease);
                         request.state = "complete"; request.Save();
                         result = Machine.Check(operation, true);
                     }
                     else if (code == 0) code = 13;
                 }
+            }
+            catch (SetupFailure error)
+            {
+                error.Apply(result); result.machine_safe = false;
+                result.status = "busy"; result.reason = "reservation_unresolved";
+                code = CompletionCode(code, 13);
             }
             catch (IOException ex)
             {

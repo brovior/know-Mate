@@ -135,7 +135,7 @@ def test_untrusted_office_path_never_calls_createprocess_or_dispatch(launch, mon
 def origin(launch, monkeypatch):
     app, client, _ = launch
     app, proof, ticket = shutdown.launch_and_bind(client, 64)
-    service = SimpleNamespace(ProtocolVersion=lambda: 3, ReaderVersion=lambda: "1.0.2.0",
+    service = SimpleNamespace(ProtocolVersion=lambda: 3, ReaderVersion=lambda: "1.0.3.0",
                               TryQuitIfIdle=Mock(return_value="quit_requested"))
     app.COMAddIns = SimpleNamespace(Item=Mock(return_value=SimpleNamespace(Connect=True, Object=service)))
     monkeypatch.setattr(ppt_policy, "auto_shutdown_enabled", lambda: True)
@@ -329,12 +329,12 @@ def test_installation_stamp_detects_registry_dll_and_record_mutations(monkeypatc
     monkeypatch.setitem(sys.modules, "winreg", module)
     monkeypatch.setattr(ppt_installation, "_known_folder", lambda identifier: tmp_path)
     directory = tmp_path / "AegisDesk/PptReader"
-    versioned = directory / "1.0.2.0"
+    versioned = directory / "1.0.3.0"
     versioned.mkdir(parents=True)
     dll = versioned / "AegisDesk.PptReader.dll"
     dll.write_bytes(b"compiled candidate")
     record = directory / "installation.json"
-    metadata = {"version": "1.0.2.0", "sha256": hashlib.sha256(dll.read_bytes()).hexdigest()}
+    metadata = {"version": "1.0.3.0", "sha256": hashlib.sha256(dll.read_bytes()).hexdigest()}
     record.write_text(json.dumps(metadata))
     first = ppt_launch.installation_stamp()
     assert first is not None

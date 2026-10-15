@@ -27,7 +27,7 @@ $setupSources = @(Get-ChildItem (Join-Path $PSScriptRoot 'PptSetup*.cs') | ForEa
     (Join-Path $PSScriptRoot 'PptReaderSetup.cs') $policySource @setupSources
 if ($LASTEXITCODE -ne 0) { throw 'ppt_setup_build_failed' }
 foreach ($payload in @($reader, $setup)) {
-    if ([Reflection.AssemblyName]::GetAssemblyName($payload).Version.ToString() -ne '1.0.2.0') {
+    if ([Reflection.AssemblyName]::GetAssemblyName($payload).Version.ToString() -ne '1.0.3.0') {
         throw 'ppt_payload_assembly_version_mismatch'
     }
 }

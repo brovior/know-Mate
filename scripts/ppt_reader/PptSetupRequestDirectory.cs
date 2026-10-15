@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.AccessControl;
@@ -49,15 +50,38 @@ namespace AegisDesk.PptSetup
         internal static bool Compatible(DirectorySecurity actual, bool parent)
         {
             var owner = actual.GetOwner(typeof(SecurityIdentifier)) as SecurityIdentifier;
-            // A first ordinary-user creation is owned by that account. Later
-            // users may reuse it only with exactly the protected shared ACL.
             if (owner == null || (!owner.IsAccountSid() &&
                 !owner.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid) &&
                 !owner.IsWellKnown(WellKnownSidType.LocalSystemSid))) return false;
-            return actual.AreAccessRulesProtected && actual.AreAccessRulesCanonical && Rules(actual).SetEquals(Rules(Expected(parent)));
+            if (!actual.AreAccessRulesCanonical) return false;
+            var raw = new RawSecurityDescriptor(actual.GetSecurityDescriptorBinaryForm(), 0);
+            if (raw.DiscretionaryAcl == null) return false;
+            foreach (GenericAce entry in raw.DiscretionaryAcl)
+            {
+                var ace = entry as CommonAce;
+                // Conditional/object/unknown ACEs cannot be safely interpreted
+                // by this deliberately narrow compatibility policy.
+                if (ace == null || ace.IsCallback ||
+                    (ace.AceQualifier != AceQualifier.AccessAllowed && ace.AceQualifier != AceQualifier.AccessDenied)) return false;
+                if (!parent || ace.AceQualifier != AceQualifier.AccessAllowed ||
+                    (ace.AceFlags & AceFlags.InheritOnly) != 0) continue;
+                SecurityIdentifier sid = ace.SecurityIdentifier;
+                if (sid == owner || sid.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid) ||
+                    sid.IsWellKnown(WellKnownSidType.LocalSystemSid)) continue;
+                const FileSystemRights dangerous = FileSystemRights.WriteData | FileSystemRights.WriteAttributes |
+                    FileSystemRights.WriteExtendedAttributes | FileSystemRights.Delete | FileSystemRights.DeleteSubdirectoriesAndFiles |
+                    FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership;
+                if ((((FileSystemRights)ace.AccessMask) & dangerous) != 0) return false;
+                // Generic rights are not normalized by every native descriptor.
+                if ((ace.AccessMask & unchecked((int)0x50000000)) != 0) return false;
+            }
+            // Existing inherited parents are accepted only by the policy above.
+            // Child permissions remain the original exact protected contract.
+            // An account owner retains implicit WRITE_DAC: this trusts that owner.
+            return parent || (actual.AreAccessRulesProtected && Rules(actual).SetEquals(Rules(Expected(false))));
         }
 
-        internal static bool Create(string path, DirectorySecurity acl)
+        internal static bool Create(string path, DirectorySecurity acl, bool nativeErrors = false)
         {
             Machine.NoLinks(path);
             byte[] bytes = acl.GetSecurityDescriptorBinaryForm();
@@ -66,23 +90,19 @@ namespace AegisDesk.PptSetup
             {
                 var attributes = new SecurityAttributes { length = Marshal.SizeOf(typeof(SecurityAttributes)), descriptor = pinned.AddrOfPinnedObject() };
                 bool created = CreateDirectory(path, ref attributes);
-                if (!created && Marshal.GetLastWin32Error() != 183) throw new IOException("acl_unavailable");
+                if (!created)
+                {
+                    int code = Marshal.GetLastWin32Error();
+                    if (code != 183)
+                    {
+                        if (nativeErrors) throw new Win32Exception(code);
+                        throw new IOException("acl_unavailable");
+                    }
+                }
                 return created;
             }
             finally { pinned.Free(); }
         }
 
-        private static void Ensure(string path, bool parent)
-        {
-            Create(path, Expected(parent));
-            Machine.NoLinks(path);
-            if (!Directory.Exists(path) || !Compatible(Directory.GetAccessControl(path), parent)) throw new IOException("acl_unavailable");
-        }
-
-        internal static void Ensure()
-        {
-            Ensure(Path.GetDirectoryName(Machine.Requests), true);
-            Ensure(Machine.Requests, false);
-        }
     }
 }
