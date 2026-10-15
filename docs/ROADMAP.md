@@ -68,7 +68,7 @@ Phase 1~4 완료(RAG 지식검색), 5a 완료(Knox `.mysingle` + 표준 `.eml` �
 | 메일 처리 중 종료 후 Office 잔류 | 문서 완료 시 Office 정리·임베딩 취소·단계별 종료 로그 구현, fake·localhost 회귀 통과 | [진단 §4](DIAGNOSTICS.md#4-office-종료-정리-확인)의 사내 종료·PID 확인 대기 |
 | 상태 JSON·유휴 스캔 | 단계별 실측 대기 | JSON 처리와 실제 파일 접근 비용을 구분한 뒤 개선 선택 |
 | 검색·임베딩·COM 성능 | 실측 대기 | 진단 문서의 검증 자료 확보 |
-| PowerPoint 추가 기능 운영 적용 | 운영 리더·준비 점검·설치 도구 후보 구현 및 fake/managed 검사 완료, 자동 설치 출하 보류 | [운영 설계](design/PPT_ADDIN_INDEXING.md)·[검증 절차](guides/PPT_READER.md)에 따라 운영 DLL 내용 일치·최초 예약 ACL/UAC·32/64비트 Office·중단 복구·다른 사용자/세션 경합과 사내 연속 인덱싱을 검증한 뒤 자동 설치 가드 해제 여부 결정 |
+| PowerPoint 추가 기능 운영 적용 | 자동 설치 후보·일시 보류 재시도·거절 기록·내장 빌드 정책·최초 예약 권한 구현, 기본 disabled 유지 | [운영 설계](design/PPT_ADDIN_INDEXING.md)·[검증 절차](guides/PPT_READER.md)에 따라 최종 released 파일의 최초 ACL/UAC·32/64비트 Office·중단 복구·사용자/세션 경합·내용 일치·연속 인덱싱을 실제 검증한 뒤 동일 파일 배포 |
 | 질문 비동기화 | 미착수 | [상세 설계](design/ISSUE_B_query_async.md)에 따른 별도 변경·검증 |
 | 실패 원인 판별 6b | 보류 | 오류 코드 실측, 워치독 밖 probe I/O의 행오버 위험 해소 |
 | 공용 인덱스 5b | 예정 | 로컬 캐시 복사 배포 설계·검증 |

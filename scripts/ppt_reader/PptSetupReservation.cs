@@ -60,24 +60,7 @@ namespace AegisDesk.PptSetup
         }
         public static Reservation Create()
         {
-            // Prototype candidate: first-user creation/ACL is deliberately gated.
-            // Failure here stops before UAC, never requests manual bootstrap.
-            Machine.NoLinks(Machine.Requests);
-            Directory.CreateDirectory(Machine.Requests);
-            var acl = new DirectorySecurity();
-            acl.SetAccessRuleProtection(true, false);
-            foreach (WellKnownSidType sid in new[] { WellKnownSidType.BuiltinAdministratorsSid, WellKnownSidType.LocalSystemSid })
-                acl.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(sid, null), FileSystemRights.FullControl,
-                    InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
-            var users = new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null);
-            acl.AddAccessRule(new FileSystemAccessRule(users, FileSystemRights.ReadAndExecute | FileSystemRights.CreateFiles,
-                InheritanceFlags.None, PropagationFlags.None, AccessControlType.Allow));
-            acl.AddAccessRule(new FileSystemAccessRule(users, FileSystemRights.Read,
-                InheritanceFlags.ObjectInherit, PropagationFlags.InheritOnly, AccessControlType.Allow));
-            acl.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.CreatorOwnerSid, null), FileSystemRights.FullControl,
-                InheritanceFlags.ObjectInherit, PropagationFlags.InheritOnly, AccessControlType.Allow));
-            // Never alter an established directory's ACL as another user.
-            if (Directory.GetFiles(Machine.Requests).Length == 0) Directory.SetAccessControl(Machine.Requests, acl);
+            RequestDirectory.Ensure();
             using (Process current = Process.GetCurrentProcess())
             using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
             {

@@ -11,7 +11,7 @@ from knowmate.secure.office_guard import OfficeBusyError, OfficeCleanupPendingEr
 
 logger = logging.getLogger(__name__)
 PROG_ID = "AegisDesk.PptReader"
-REQUIRED_VERSION = "1.0.0.0"
+from knowmate.secure.ppt_policy import REQUIRED_VERSION
 PROTOCOL = 2
 
 

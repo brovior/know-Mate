@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Diagnostics;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using AegisDesk.PptSetup;
 
 internal static class SetupHarness
@@ -10,15 +12,35 @@ internal static class SetupHarness
     private static Dictionary<string, object> Record()
     {
         return new Dictionary<string, object> { { "schema", 1 }, { "request_id", "33e979c6-c5c4-40af-845a-64c80517d1ae" },
-            { "required_version", "1.0.0.0" }, { "helper_sid", "S-1-5-21-1-2-3-1001" }, { "helper_pid", 123 },
+            { "required_version", "1.0.1.0" }, { "helper_sid", "S-1-5-21-1-2-3-1001" }, { "helper_pid", 123 },
             { "helper_creation_ticks", "638901000000000000" }, { "child_pid", null }, { "child_creation_ticks", null }, { "state", "complete" } };
     }
     public static int Main(string[] args)
     {
         string id = "33e979c6-c5c4-40af-845a-64c80517d1ae";
-        Require(!Contract.AutoInstallValidated, "gate_not_closed");
+        Require(Contract.AutoInstallMode == "disabled" || Contract.AutoInstallMode == "candidate" || Contract.AutoInstallMode == "released", "policy_mode");
+        Require(Contract.AutoInstallValidated == (Contract.AutoInstallMode == "released"), "policy_validated");
+        Require(Contract.AutoInstallEnabled == (Contract.AutoInstallMode != "disabled"), "policy_enabled");
+        var result = new Result("check");
+        Require(result.auto_install_mode == Contract.AutoInstallMode && result.auto_install_validated == Contract.AutoInstallValidated, "result_policy");
+        Require(Program.FailureCode(new IOException("mutex_busy")) == 10, "mutex_transient");
+        Require(Program.FailureCode(new IOException("office_busy")) == 10, "office_transient");
+        Require(Program.FailureCode(new IOException("payload_invalid")) == 13, "payload_not_transient");
+        foreach (int failure in new[] { 10, 12, 13 })
+            Require(Program.CompletionCode(11, failure) == 11, "denial_evidence_survives_" + failure);
+        Require(Program.CompletionCode(0, 10) == 10, "post_mutex_transient");
+        foreach (bool parent in new[] { true, false })
+        {
+            DirectorySecurity acl = RequestDirectory.Expected(parent);
+            acl.SetOwner(new SecurityIdentifier("S-1-5-21-1-2-3-1001"));
+            Require(RequestDirectory.Compatible(acl, parent), "expected_acl");
+            Require(!RequestDirectory.Compatible(acl, !parent), "parent_child_acl_distinct");
+            acl.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null),
+                FileSystemRights.FullControl, AccessControlType.Allow));
+            Require(!RequestDirectory.Compatible(acl, parent), "existing_unsafe_acl_rejected");
+        }
         // These are Windows paths even when the pure harness runs under Mono.
-        string suffix = "/AegisDesk/PptReader/1.0.0.0/AegisDesk.PptReader.dll";
+        string suffix = "/AegisDesk/PptReader/1.0.1.0/AegisDesk.PptReader.dll";
         foreach (string directory in new[] { "Program Files", "Program Files (x86)", "프로그램 파일", "literal%20folder" })
         {
             string file = @"C:\" + directory + suffix.Replace('/', '\\');

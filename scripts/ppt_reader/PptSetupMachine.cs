@@ -73,6 +73,13 @@ namespace AegisDesk.PptSetup
             }
             return true;
         }
+        private static bool MetadataTemporaryFiles()
+        {
+            if (!Directory.Exists(Root)) return false;
+            foreach (string pattern in new[] { "journal.json.*.tmp", "installation.json.*.tmp" })
+                if (Directory.GetFileSystemEntries(Root, pattern).Length != 0) return true;
+            return false;
+        }
         public static bool OfficeClosed()
         {
             foreach (Process process in Process.GetProcesses())
@@ -121,7 +128,7 @@ namespace AegisDesk.PptSetup
                 if (!held) gate = new MachineLock();
                 NoLinks(Root);
                 if (!ReservationsSafe(own)) { result.status = "busy"; result.reason = "reservation_unresolved"; return result; }
-                if (File.Exists(Journal)) { result.status = "busy"; result.reason = "journal_unresolved"; return result; }
+                if (File.Exists(Journal) || MetadataTemporaryFiles()) { result.status = "busy"; result.reason = "journal_unresolved"; return result; }
                 result.machine_safe = true;
                 result.office_bitness = OfficeBitness();
                 using (RegistryKey machine = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, View(result.office_bitness.Value)))
@@ -151,7 +158,7 @@ namespace AegisDesk.PptSetup
                     result.status = "ready"; result.reason = "registration_ok"; return result;
                 }
             }
-            catch (IOException ex) { result.reason = ex.Message == "mutex_busy" ? "mutex_busy" : "office_unknown"; result.status = "unknown"; if (result.reason == "mutex_busy") result.machine_safe = false; return result; }
+            catch (IOException ex) { result.reason = ex.Message == "mutex_busy" ? "mutex_busy" : "office_unknown"; result.status = result.reason == "mutex_busy" ? "busy" : "unknown"; if (result.reason == "mutex_busy") result.machine_safe = false; return result; }
             catch { result.status = "unknown"; result.reason = "check_failed"; result.machine_safe = false; return result; }
             finally { if (gate != null) gate.Dispose(); }
         }

@@ -42,6 +42,8 @@ test_docs/
 write_test4.py
 debug.log
 .aegisdesk_build/
+/build/
+/dist/
 
 # IDE
 .idea/

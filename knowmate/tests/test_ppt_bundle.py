@@ -15,16 +15,17 @@ from knowmate.secure.ppt_bundle import PAYLOAD_FILES, validate_manifest, verify_
 
 @pytest.fixture
 def payload(tmp_path):
-    build = {"commit": "a" * 40, "source_fingerprint": "12345678", "dirty": True}
+    build = {"commit": "a" * 40, "source_fingerprint": "12345678", "dirty": True, "ppt_auto_install_mode": "disabled"}
     for name in PAYLOAD_FILES:
         (tmp_path / name).write_bytes(b"synthetic payload")
     manifest = {
-        "schema": 1, "reader_version": "1.0.0.0", "protocol": 2, "payload_schema": 1,
+        "schema": 1, "reader_version": "1.0.1.0", "protocol": 2, "payload_schema": 1,
         "prog_id": "AegisDesk.PptReader", "reader_class": "AegisDesk.PptReader.Connect",
         "reader_clsid": "287A80D2-804A-46D3-A0E9-CA31C6FC3D09",
         "reader_iid": "65152412-DFD3-47EC-8346-3F2675ED0C15",
-        "auto_install_validated": False, "build": build,
-        "assembly_versions": {name: "1.0.0.0" for name in PAYLOAD_FILES},
+        "auto_install_validated": False, "auto_install_mode": "disabled",
+        "auto_install_enabled": False, "build": build,
+        "assembly_versions": {name: "1.0.1.0" for name in PAYLOAD_FILES},
         "files": {name: hashlib.sha256(b"synthetic payload").hexdigest() for name in PAYLOAD_FILES},
     }
     (tmp_path / "manifest.json").write_text(json.dumps(manifest))
@@ -109,3 +110,59 @@ def test_manifest_generation_rejects_metadata_for_changed_source(monkeypatch, pa
     monkeypatch.setattr(module.runpy, "run_path", fake_run)
     with pytest.raises(ValueError, match="source_changed"):
         module.create_manifest(path, path)
+
+
+@pytest.mark.parametrize("mode", ["disabled", "candidate", "released"])
+def test_profile_payload_rejects_other_profile_and_source(payload, mode):
+    directory, original, build = payload
+    manifest = copy.deepcopy(original)
+    build = dict(build, ppt_auto_install_mode=mode)
+    manifest.update(auto_install_mode=mode, auto_install_enabled=mode != "disabled",
+                    auto_install_validated=mode == "released")
+    manifest["build"] = dict(build)
+    assert validate_manifest(manifest, directory, build) == manifest
+    for other in {"disabled", "candidate", "released"} - {mode}:
+        with pytest.raises(ValueError, match="auto_install_gate"):
+            validate_manifest(manifest, directory, dict(build, ppt_auto_install_mode=other))
+    with pytest.raises(ValueError, match="source_mismatch"):
+        validate_manifest(manifest, directory, dict(build, commit="b" * 40))
+
+
+def test_runtime_helper_rejects_dll_corruption_and_foreign_source(monkeypatch, payload):
+    from knowmate.secure import ppt_installation
+    import knowmate.build_info
+    directory, manifest, build = payload
+    monkeypatch.setattr(ppt_installation.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(knowmate.build_info, "get_build_info", lambda: build)
+    assert ppt_installation._validate_helper(directory / "PptReaderSetup.exe")
+    monkeypatch.setattr(knowmate.build_info, "get_build_info", lambda: dict(build, commit="b" * 40))
+    assert not ppt_installation._validate_helper(directory / "PptReaderSetup.exe")
+    monkeypatch.setattr(knowmate.build_info, "get_build_info", lambda: build)
+    (directory / PAYLOAD_FILES[0]).write_bytes(b"corrupt reader")
+    assert not ppt_installation._validate_helper(directory / "PptReaderSetup.exe")
+
+
+@pytest.mark.parametrize("mode", ["disabled", "candidate", "released"])
+def test_manifest_generator_binds_compiled_policy(monkeypatch, payload, mode):
+    import importlib.util
+    directory, _, info = payload
+    info = dict(info, ppt_auto_install_mode=mode)
+    root = Path(__file__).resolve().parents[2]
+    spec = importlib.util.spec_from_file_location("ppt_manifest_policy_test", root / "scripts/ppt_reader/manifest.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    def fake_run(filename):
+        if filename.endswith("aegisdesk_build_info.py"):
+            return {"BUILD_INFO": info}
+        return {"_build_info": lambda: info}
+    monkeypatch.setattr(module.runpy, "run_path", fake_run)
+    policy = directory / "PptBuildPolicy.cs"
+    policy.write_text('namespace AegisDesk.PptSetup { internal static class BuildPolicy { '
+                      f'public const string AutoInstallMode = "{mode}";' + ' } }\n')
+    manifest = module.create_manifest(directory, directory)
+    assert manifest["auto_install_mode"] == mode
+    assert manifest["auto_install_validated"] == (mode == "released")
+    policy.write_text('namespace AegisDesk.PptSetup { internal static class BuildPolicy { '
+                      'public const string AutoInstallMode = "wrong"; } }\n')
+    with pytest.raises(ValueError, match="build_policy_changed"):
+        module.create_manifest(directory, directory)

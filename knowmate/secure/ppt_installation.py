@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import ctypes
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -15,11 +14,8 @@ from dataclasses import dataclass
 from typing import Callable
 
 from knowmate.secure.ppt_operation import PptPreparationPending
+from knowmate.secure.ppt_policy import auto_install_mode, auto_install_enabled, REQUIRED_VERSION
 
-REQUIRED_VERSION = "1.0.0.0"
-# This is a release gate, not a user configuration option. No Windows prototype
-# has verified first-user reservation ACLs, UAC/restart and cross-session races.
-AUTO_INSTALL_VALIDATED = False
 MUTEX_NAME = r"Global\AegisDesk.PptReader.Machine.v1"
 _STATUSES = frozenset({"ready", "missing", "outdated", "repairable", "disabled",
                        "conflict", "busy", "unknown", "failed"})
@@ -41,6 +37,14 @@ class SetupResult:
     office_bitness: int | None = None
     machine_safe: bool = False
     auto_install_validated: bool = False
+    auto_install_mode: str = "disabled"
+
+    @property
+    def auto_install_enabled(self) -> bool:
+        """Permit candidates without claiming Windows validation passed."""
+        return (self.auto_install_mode == auto_install_mode()
+                and self.auto_install_mode in {"candidate", "released"}
+                and self.auto_install_validated == (self.auto_install_mode == "released"))
 
 
 class PptMachineBusy(PptPreparationPending):
@@ -55,7 +59,7 @@ def parse_setup_result(stdout: str, exit_code: int, operation: str = "check") ->
         value = json.loads(stdout)
         allowed = {"schema", "operation", "status", "reason", "required_version",
                    "installed_version", "office_bitness", "scope", "machine_safe",
-                   "auto_install_validated"}
+                   "auto_install_validated", "auto_install_mode"}
         if not isinstance(value, dict) or set(value) != allowed:
             raise ValueError("setup_fields")
         if type(value["schema"]) is not int or value["schema"] != 1:
@@ -68,6 +72,9 @@ def parse_setup_result(stdout: str, exit_code: int, operation: str = "check") ->
             raise ValueError("setup_reason")
         if type(value["machine_safe"]) is not bool or type(value["auto_install_validated"]) is not bool:
             raise ValueError("setup_flags")
+        if (value["auto_install_mode"] != auto_install_mode()
+                or value["auto_install_validated"] != (value["auto_install_mode"] == "released")):
+            raise ValueError("setup_policy")
         installed = value["installed_version"]
         if installed is not None and (not isinstance(installed, str) or len(installed) > 32
                 or len(installed.split(".")) != 4 or not all(s.isdigit() for s in installed.split("."))):
@@ -81,7 +88,7 @@ def parse_setup_result(stdout: str, exit_code: int, operation: str = "check") ->
         if exit_code != 0 and value["status"] in {"ready", "missing", "outdated", "repairable"}:
             raise ValueError("setup_exit")
         return SetupResult(value["status"], value["reason"], installed, bitness,
-                           value["machine_safe"], value["auto_install_validated"] and AUTO_INSTALL_VALIDATED)
+                           value["machine_safe"], value["auto_install_validated"], value["auto_install_mode"])
     except (ValueError, TypeError, KeyError):
         return SetupResult()
 
@@ -94,13 +101,17 @@ def setup_helper_path() -> Path:
 
 
 def _validate_helper(path: Path) -> bool:
+    from knowmate.build_info import get_build_info
+    from knowmate.secure.ppt_bundle import verify_payload
+
     try:
-        manifest = json.loads((path.parent / "manifest.json").read_text(encoding="utf-8"))
-        expected = manifest["files"]["PptReaderSetup.exe"]
-        return (path.name == "PptReaderSetup.exe" and manifest["schema"] == 1
-                and manifest["reader_version"] == REQUIRED_VERSION
-                and isinstance(expected, str) and len(expected) == 64
-                and hashlib.sha256(path.read_bytes()).hexdigest() == expected)
+        if path.name != "PptReaderSetup.exe":
+            return False
+        # Source mode remains disabled; frozen payloads must match the embedded
+        # app build, not merely a caller-editable manifest's helper hash.
+        info = get_build_info() if getattr(sys, "frozen", False) else None
+        verify_payload(path.parent, info)
+        return True
     except (OSError, ValueError, TypeError, KeyError):
         return False
 
@@ -181,7 +192,14 @@ def _machine_records_safe() -> bool:
                 value = json.loads(path.read_text(encoding="utf-8"))
                 if not _valid_reservation(value, path.stem) or value["state"] != "complete":
                     return False
-        return not any((root / "journal.json").exists() for root in roots)
+        for root in roots:
+            if (root / "journal.json").exists():
+                return False
+            if root.exists():
+                for pattern in ("journal.json.*.tmp", "installation.json.*.tmp"):
+                    if any(root.glob(pattern)):
+                        return False
+        return True
     except (OSError, KeyError, ValueError, TypeError, AttributeError):
         return False
 
@@ -217,7 +235,7 @@ class DetachedSetupProcess:
 
     def start(self) -> None:
         """Launch only a validated payload after the automatic-install release gate."""
-        if os.name != "nt" or self.operation != "prepare" or not AUTO_INSTALL_VALIDATED:
+        if os.name != "nt" or self.operation != "prepare" or not auto_install_enabled():
             raise PptMachineBusy("prototype_gate")
         if not _validate_helper(self.path):
             raise PptMachineBusy("payload_invalid")

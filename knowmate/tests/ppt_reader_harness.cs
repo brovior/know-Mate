@@ -10,7 +10,7 @@ public static class ReaderHarness
     public static int Main(string[] args)
     {
         Assembly assembly = Assembly.LoadFrom(args[0]);
-        if (assembly.GetName().Version.ToString() != "1.0.0.0") throw new Exception("version_mismatch");
+        if (assembly.GetName().Version.ToString() != "1.0.1.0") throw new Exception("version_mismatch");
         Type type = assembly.GetType("AegisDesk.PptReader.Connect", true);
         if (type.GUID != new Guid("287A80D2-804A-46D3-A0E9-CA31C6FC3D09")) throw new Exception("clsid_mismatch");
         if (((ProgIdAttribute)Attribute.GetCustomAttribute(type, typeof(ProgIdAttribute))).Value != "AegisDesk.PptReader")
@@ -28,7 +28,7 @@ public static class ReaderHarness
         type.GetMethod("OnConnection").Invoke(instance, new object[] { new ReaderHost(), 1, addin, null });
         if (!Object.ReferenceEquals(instance, addin.Object)
             || (int)type.GetMethod("ProtocolVersion").Invoke(instance, null) != 2
-            || (string)type.GetMethod("ReaderVersion").Invoke(instance, null) != "1.0.0.0")
+            || (string)type.GetMethod("ReaderVersion").Invoke(instance, null) != "1.0.1.0")
             throw new Exception("production_connection_mismatch");
         type.GetMethod("OnDisconnection").Invoke(instance, new object[] { 1, null });
         Console.WriteLine("PASS production identity/version/dual ABI/managed lifecycle; native Office not verified");
