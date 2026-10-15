@@ -1,37 +1,240 @@
-// Pure managed production metadata/lifecycle contract; no registration or Office.
+// Managed state-machine tests only; native Office/event ABI remains unverified.
 using System;
 using System.Reflection;
 using System.Runtime.InteropServices;
-public sealed class ReaderHost { }
+using System.Runtime.InteropServices.ComTypes;
+using System.Threading;
+
+public sealed class ReaderCollection
+{
+    public int Value;
+    public bool Fail;
+    public bool Fatal;
+    public int Count { get { if (Fatal) throw new COMException("fatal_count", unchecked((int)0x80010108)); if (Fail) throw new Exception("count_failure"); return Value; } }
+}
+public sealed class ReaderHost
+{
+    public ReaderCollection Presentations { get; set; }
+    public ReaderCollection ProtectedViewWindows { get; set; }
+    public ReaderCollection SlideShowWindows { get; set; }
+    public Action OnQuit;
+    public int QuitCount;
+    public bool FailAlerts;
+    private int alerts;
+    public int DisplayAlerts
+    {
+        get { return alerts; }
+        set { if (FailAlerts) throw new Exception("alerts_failure"); alerts = value; }
+    }
+    public ReaderHost()
+    {
+        Presentations = new ReaderCollection(); ProtectedViewWindows = new ReaderCollection();
+        SlideShowWindows = new ReaderCollection();
+    }
+    public void Quit() { QuitCount++; if (OnQuit != null) OnQuit(); }
+}
 public sealed class ReaderAddin { public object Object { get; set; } }
+public sealed class ReaderConnectionPoint : IConnectionPoint
+{
+    public object Sink;
+    public bool FailAdvise;
+    public bool FailUnadvise;
+    public int Unadvised;
+    public void GetConnectionInterface(out Guid iid) { iid = new Guid("914934C2-5A91-11CF-8700-00AA0060263B"); }
+    public void GetConnectionPointContainer(out IConnectionPointContainer container) { container = null; }
+    public void Advise(object sink, out int cookie)
+    { if (FailAdvise) throw new Exception("advise_failure"); Sink = sink; cookie = 1; }
+    public void Unadvise(int cookie) { Unadvised++; if (FailUnadvise) throw new Exception("unadvise_failure"); }
+    public void EnumConnections(out IEnumConnections enumerator) { enumerator = null; }
+    public bool Cancel(string method, bool initial)
+    {
+        object[] args = method == "PresentationBeforeClose" ? new object[] { null, initial }
+            : new object[] { null, 0, initial };
+        Sink.GetType().GetMethod(method).Invoke(Sink, args);
+        return (bool)args[args.Length - 1];
+    }
+}
 public static class ReaderHarness
 {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct DispatchParameters
+    {
+        public IntPtr Arguments, Named;
+        public uint Count, NamedCount;
+    }
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int InvokeEvent(IntPtr self, int id, ref Guid iid, uint locale, ushort flags,
+        ref DispatchParameters parameters, IntPtr result, IntPtr exception, IntPtr argumentError);
+
+    private static Type guardType;
+    private static object Guard(ReaderHost host, ReaderConnectionPoint point)
+    {
+        Func<object, IConnectionPoint> resolver = delegate(object ignored) { return point; };
+        return Activator.CreateInstance(guardType, BindingFlags.Instance | BindingFlags.NonPublic,
+            null, new object[] { host, Thread.CurrentThread.ManagedThreadId, resolver }, null);
+    }
+    private static string Request(object guard, bool reading)
+    {
+        return (string)guardType.GetMethod("TryQuitIfIdle", BindingFlags.Instance | BindingFlags.NonPublic)
+            .Invoke(guard, new object[] { reading });
+    }
+    private static void Expect(bool condition, string code) { if (!condition) throw new Exception(code); }
+
     [STAThread]
     public static int Main(string[] args)
     {
         Assembly assembly = Assembly.LoadFrom(args[0]);
-        if (assembly.GetName().Version.ToString() != "1.0.1.0") throw new Exception("version_mismatch");
+        Expect(assembly.GetName().Version.ToString() == "1.0.2.0", "version_mismatch");
         Type type = assembly.GetType("AegisDesk.PptReader.Connect", true);
-        if (type.GUID != new Guid("287A80D2-804A-46D3-A0E9-CA31C6FC3D09")) throw new Exception("clsid_mismatch");
-        if (((ProgIdAttribute)Attribute.GetCustomAttribute(type, typeof(ProgIdAttribute))).Value != "AegisDesk.PptReader")
-            throw new Exception("progid_mismatch");
+        Expect(type.GUID == new Guid("287A80D2-804A-46D3-A0E9-CA31C6FC3D09"), "clsid_mismatch");
+        Expect(((ProgIdAttribute)Attribute.GetCustomAttribute(type, typeof(ProgIdAttribute))).Value == "AegisDesk.PptReader", "progid_mismatch");
         Type reader = assembly.GetType("AegisDesk.PptReader.IPptReader", true);
-        if (reader.GUID != new Guid("65152412-DFD3-47EC-8346-3F2675ED0C15")) throw new Exception("reader_iid_mismatch");
+        Expect(reader.GUID == new Guid("65152412-DFD3-47EC-8346-3F2675ED0C15") && reader.GetMethods().Length == 3,
+            "legacy_reader_abi_mismatch");
+        Type lifecycle = assembly.GetType("AegisDesk.PptReader.IPptReaderLifecycle", true);
+        Expect(lifecycle.GUID == new Guid("9A20F4A6-6364-4BA7-930B-3E8857BEAF60")
+            && lifecycle.GetMethods().Length == 4
+            && ((ComDefaultInterfaceAttribute)Attribute.GetCustomAttribute(type, typeof(ComDefaultInterfaceAttribute))).Value == lifecycle,
+            "lifecycle_abi_mismatch");
+        Expect(((DispIdAttribute)Attribute.GetCustomAttribute(lifecycle.GetMethod("TryQuitIfIdle"), typeof(DispIdAttribute))).Value == 4,
+            "quit_dispid_mismatch");
         Type office = assembly.GetType("AegisDesk.PptReader.IDTExtensibility2", true);
-        if (office.GUID != new Guid("B65AD801-ABAF-11D0-BB8B-00A0C90F2744")
-            || ((InterfaceTypeAttribute)Attribute.GetCustomAttribute(office, typeof(InterfaceTypeAttribute))).Value != ComInterfaceType.InterfaceIsDual)
-            throw new Exception("office_abi_mismatch");
+        Expect(office.GUID == new Guid("B65AD801-ABAF-11D0-BB8B-00A0C90F2744")
+            && ((InterfaceTypeAttribute)Attribute.GetCustomAttribute(office, typeof(InterfaceTypeAttribute))).Value == ComInterfaceType.InterfaceIsDual,
+            "office_abi_mismatch");
         object instance = Activator.CreateInstance(type);
         try { type.GetMethod("ReaderVersion").Invoke(instance, null); throw new Exception("disconnected_accepted"); }
         catch (TargetInvocationException exc) { if (!(exc.InnerException is COMException)) throw; }
         var addin = new ReaderAddin();
         type.GetMethod("OnConnection").Invoke(instance, new object[] { new ReaderHost(), 1, addin, null });
-        if (!Object.ReferenceEquals(instance, addin.Object)
-            || (int)type.GetMethod("ProtocolVersion").Invoke(instance, null) != 2
-            || (string)type.GetMethod("ReaderVersion").Invoke(instance, null) != "1.0.1.0")
-            throw new Exception("production_connection_mismatch");
+        Expect(Object.ReferenceEquals(instance, addin.Object)
+            && (int)type.GetMethod("ProtocolVersion").Invoke(instance, null) == 3
+            && (string)type.GetMethod("ReaderVersion").Invoke(instance, null) == "1.0.2.0", "production_connection_mismatch");
+        // A fake host has no native typelib: it must never reach Quit even in candidate builds.
+        Expect((string)type.GetMethod("TryQuitIfIdle").Invoke(instance, null) == "not_supported", "unverified_host_accepted");
         type.GetMethod("OnDisconnection").Invoke(instance, new object[] { 1, null });
-        Console.WriteLine("PASS production identity/version/dual ABI/managed lifecycle; native Office not verified");
+        guardType = assembly.GetType("AegisDesk.PptReader.PptShutdownGuard", true);
+        TestGuard();
+        if (Environment.OSVersion.Platform == PlatformID.Win32NT) TestNativeEventSink(assembly);
+        Console.WriteLine("PASS production ABI/version/managed guard; native Office not verified");
         return 0;
+    }
+
+    private static void TestNativeEventSink(Assembly assembly)
+    {
+        Type sinkType = assembly.GetType("AegisDesk.PptReader.PptCloseEventSink", true);
+        Type events = assembly.GetType("AegisDesk.PptReader.IPptCloseEvents", true);
+        Expect(events.GUID == new Guid("914934C2-5A91-11CF-8700-00AA0060263B"), "events_iid");
+        object sink = Activator.CreateInstance(sinkType, true);
+        FieldInfo active = sinkType.GetField("Active", BindingFlags.Instance | BindingFlags.NonPublic);
+        IntPtr pointer = Marshal.GetComInterfaceForObject(sink, events);
+        try
+        {
+            IntPtr table = Marshal.ReadIntPtr(pointer);
+            var invoke = (InvokeEvent)Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(table, 6 * IntPtr.Size), typeof(InvokeEvent));
+            foreach (int id in new int[] { 2025, 2028 })
+            foreach (bool enabled in new bool[] { false, true })
+            foreach (bool initial in new bool[] { false, true })
+            {
+                active.SetValue(sink, enabled);
+                int count = id == 2025 ? 2 : 3;
+                int variantSize = IntPtr.Size == 8 ? 24 : 16;
+                IntPtr arguments = Marshal.AllocCoTaskMem(variantSize * count);
+                IntPtr cancel = Marshal.AllocCoTaskMem(2);
+                try
+                {
+                    for (int i = 0; i < variantSize * count; i++) Marshal.WriteByte(arguments, i, 0);
+                    Marshal.WriteInt16(cancel, initial ? (short)-1 : (short)0);
+                    // IDispatch reverses argument order: Cancel, reason?, document.
+                    Marshal.WriteInt16(arguments, (short)(0x4000 | 11)); // VT_BYREF|VT_BOOL
+                    Marshal.WriteIntPtr(arguments, 8, cancel);
+                    if (id == 2028)
+                    {
+                        Marshal.WriteInt16(arguments, variantSize, (short)3); // VT_I4
+                        Marshal.WriteInt32(arguments, variantSize + 8, 0);
+                    }
+                    Marshal.WriteInt16(arguments, variantSize * (count - 1), (short)9); // VT_DISPATCH null
+                    var parameters = new DispatchParameters { Arguments = arguments, Count = (uint)count };
+                    Guid empty = Guid.Empty;
+                    int result = invoke(pointer, id, ref empty, 0, 1, ref parameters, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+                    Expect(result == 0 && (Marshal.ReadInt16(cancel) != 0) == (enabled || initial), "native_cancel_marshalling_" + id);
+                }
+                finally { Marshal.FreeCoTaskMem(cancel); Marshal.FreeCoTaskMem(arguments); }
+            }
+        }
+        finally { Marshal.Release(pointer); GC.KeepAlive(sink); }
+    }
+
+    private static void TestGuard()
+    {
+        foreach (string collection in new string[] { "Presentations", "ProtectedViewWindows", "SlideShowWindows" })
+        {
+            var host = new ReaderHost(); var point = new ReaderConnectionPoint();
+            ((ReaderCollection)typeof(ReaderHost).GetProperty(collection).GetValue(host, null)).Value = 1;
+            Expect(Request(Guard(host, point), false) == "protected" && host.QuitCount == 0
+                && host.DisplayAlerts == 2 && point.Unadvised == 1, "nonempty_" + collection);
+            Expect(!point.Cancel("PresentationBeforeClose", false), "manual_close_blocked");
+            Expect(point.Cancel("PresentationBeforeClose", true), "prior_cancel_reset");
+        }
+        foreach (string close in new string[] { "PresentationBeforeClose", "ProtectedViewWindowBeforeClose" })
+        {
+            var host = new ReaderHost(); var point = new ReaderConnectionPoint(); object guard = Guard(host, point);
+            host.OnQuit = delegate {
+                Expect(point.Cancel(close, false), "late_document_unprotected");
+                Expect(Request(guard, false) == "protected", "reentrant_quit");
+                guardType.GetMethod("Disconnect", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(guard, null);
+                Expect(point.Cancel(close, false), "disconnect_cleared_active_guard");
+            };
+            Expect(Request(guard, false) == "protected" && host.QuitCount == 1 && point.Unadvised == 0, "late_document_result");
+            Expect(!point.Cancel(close, false), "finally_guard_active");
+        }
+        {
+            var host = new ReaderHost(); var point = new ReaderConnectionPoint(); object guard = Guard(host, point);
+            Expect(Request(guard, true) == "protected" && host.QuitCount == 0, "reading_quit");
+            string other = null;
+            var thread = new Thread(delegate() { other = Request(guard, false); });
+            thread.SetApartmentState(ApartmentState.MTA); thread.Start(); thread.Join();
+            Expect(other == "not_supported" && host.QuitCount == 0, "foreign_thread_quit");
+            Expect(Request(guard, false) == "quit_requested" && Request(guard, false) == "protected"
+                && host.QuitCount == 1, "duplicate_quit");
+        }
+        {
+            var host = new ReaderHost(); var point = new ReaderConnectionPoint { FailAdvise = true };
+            Expect(Request(Guard(host, point), false) == "not_supported" && host.QuitCount == 0, "advise_failure_quit");
+        }
+        {
+            var host = new ReaderHost { FailAlerts = true }; var point = new ReaderConnectionPoint();
+            Expect(Request(Guard(host, point), false) == "failed" && host.QuitCount == 0 && point.Unadvised == 1,
+                "alerts_failure_quit");
+        }
+        {
+            var host = new ReaderHost(); host.Presentations.Fail = true; var point = new ReaderConnectionPoint();
+            Expect(Request(Guard(host, point), false) == "failed" && host.QuitCount == 0
+                && !point.Cancel("PresentationBeforeClose", false), "count_failure_quit");
+        }
+        {
+            var host = new ReaderHost(); host.Presentations.Fatal = true;
+            var point = new ReaderConnectionPoint(); object guard = Guard(host, point);
+            try { Request(guard, false); throw new Exception("fatal_hidden"); }
+            catch (TargetInvocationException exc)
+            { Expect(exc.InnerException is COMException && ((COMException)exc.InnerException).ErrorCode == unchecked((int)0x80010108), "fatal_hresult_lost"); }
+            Expect(point.Unadvised == 0 && host.QuitCount == 0 && !point.Cancel("PresentationBeforeClose", false)
+                && Request(guard, false) == "not_supported", "fatal_extra_rpc");
+        }
+        {
+            var host = new ReaderHost(); var point = new ReaderConnectionPoint { FailUnadvise = true };
+            object guard = Guard(host, point);
+            Expect(Request(guard, false) == "quit_requested" && Request(guard, false) == "not_supported"
+                && !point.Cancel("PresentationBeforeClose", false), "unadvise_failure_guard_active");
+        }
+        {
+            var host = new ReaderHost(); var point = new ReaderConnectionPoint(); object guard = Guard(host, point);
+            host.OnQuit = delegate { throw new COMException("disconnect"); };
+            try { Request(guard, false); throw new Exception("quit_exception_hidden"); }
+            catch (TargetInvocationException exc)
+            { Expect(exc.InnerException is COMException && exc.InnerException.Message == "ppt_quit_outcome_unknown", "quit_exception_type"); }
+            Expect(point.Unadvised == 0 && !point.Cancel("PresentationBeforeClose", false)
+                && Request(guard, false) == "protected" && host.QuitCount == 1, "failed_quit_retried");
+        }
     }
 }

@@ -1,6 +1,6 @@
 # PowerPoint 추가 기능의 운영 인덱싱 적용 설계
 
-상태: **자동 설치 후보 구현, Windows 승인 시험 전** (2026-10-15). 기본 `disabled` 빌드는
+상태: **자동 설치·정상종료 후보 구현, Windows 승인 시험 전** (2026-10-15). 기본 `disabled` 빌드는
 설치 상태만 점검하고, Machine 안전을 확인하면 미설치 auto는 기존 COM으로 읽는다.
 개발 시 명시한 `candidate`/`released` 빌드는 앱 시작부터 UAC·설치·원래 사용자 재점검을
 실행한다. 설치 모드는 빌드 출처에 내장하며 사용자 설정·환경변수·manifest 편집으로 켜지지 않는다.
@@ -28,7 +28,8 @@ PowerPoint가 열려 있으면 설치를 미루고 기존 방식으로 읽는다
 - `.ppt`와 현재 COM으로 라우팅되는 DRM/OLE2 `.pptx`에 적용한다. 일반 ZIP `.pptx`는 PlainReader를 사용한다.
 - CollectorWorker의 기존 QThread, Office 점유·소유 확인, 파일 단위 실패 격리와 DB 커밋 계약을 유지한다.
 - 추가 기능은 PowerPoint의 연결 콜백으로 받은 호스트에 이미 열린 문서만 읽는다.
-  파일 저장·변환·새로 열기·닫기·Quit, 클립보드 사용을 하지 않는다.
+  추출은 파일 저장·변환·새로 열기·닫기·Quit, 클립보드 사용을 하지 않는다.
+  정상종료는 별도 lifecycle 계약으로만 요청한다([자동종료](#9-powerpoint-자동종료-후보)).
 - 추출 코어는 시험 DLL 0.1.3.0에서 검증한 코드와 공유한다. 시험용과 운영용의 설치 식별자는 분리한다.
 - 사내 보고는 소수 문서의 정확성·시간 비교다. 대량 인덱싱·사용자 Office 실행 경합·장시간 메모리 안정성은 미검증이다.
 
@@ -37,8 +38,8 @@ PowerPoint가 열려 있으면 설치를 미루고 기존 방식으로 읽는다
 | 항목 | 결정 |
 |---|---|
 | 운영 추가 기능 | 표시 이름 `Aegis Desk PPT Reader`, ProgID `AegisDesk.PptReader` |
-| DLL | `AegisDesk.PptReader.dll`, 현재 요구 버전 `1.0.1.0` |
-| COM 계약 | 경로·슬라이드 번호 전달 규약 2, 추출 결과 JSON 스키마 1 |
+| DLL | `AegisDesk.PptReader.dll`, 현재 요구 버전 `1.0.2.0` |
+| COM 계약 | 경로·슬라이드 번호 전달 규약 3, 추출 결과 JSON 스키마 1 |
 | 식별자 | 시험용과 다른 운영 CLSID·추출 인터페이스 IID를 구현 시 고정. Office 연결 IID는 기존 규약 유지 |
 | 설치 위치 | `%ProgramFiles%/AegisDesk/PptReader/<version>/`의 보호된 고정 경로 |
 | 설치 범위 | HKLM Machine. Office 비트수에 해당하는 Registry32 또는 Registry64 |
@@ -374,7 +375,7 @@ HKCU 충돌이나 시험용 등록을 함께 제거하지 않는다. 설치 기�
 
 ### 8-5. 운영 읽기 성공 조건
 
-운영 서비스는 `ProtocolVersion()=2`, `ReaderVersion()=1.0.1.0`, JSON schema 1을 최초에 확인한다.
+운영 서비스는 `ProtocolVersion()=3`, `ReaderVersion()=1.0.2.0`, JSON schema 1을 최초에 확인한다.
 첫 릴리스는 요구 운영 버전과 정확히 일치할 때만 선택한다. 향후 호환 범위를 넓히는 것은 별도 변경이다.
 경로는 원본을 연 Python의 절대 경로와 host Presentations의 FullName을 비교한다.
 UNC·대소문자·중복·상대경로는 기존 하네스 계약을 유지하고 경로 alias는 추측해서 동일시하지 않는다.
@@ -493,3 +494,33 @@ candidate 시험 결과를 다른 released 파일의 승인으로 사용하지 �
 
 현재의 운영 등록·읽기 검증 명령과 자동 설치 출하 전 확인 항목은
 [운영 PPT Reader 개발 검증](../guides/PPT_READER.md)에 있다.
+
+
+## 9. PowerPoint 자동종료 후보
+
+자동종료는 `candidate` 빌드에서만 시험한다. 기본·소스·`released`에서는 자동종료를
+활성화하지 않는다. 설치의 released 모드와 정상종료 승인 여부는 별개다.
+실제 Windows·Office의 직접 실행 연결 및 취소 이벤트 검증 전에는 정상종료 기능을 배포하지 않는다.
+
+읽기용 소유 등록은 종료 권한이 아니다. 신뢰한 Office 실행파일을 `/EMBEDDING`으로 직접
+실행한 프로세스의 handle·PID·생성 identity와 COM 호스트 증명이 모두 일치할 때만 종료를
+요청한다. 기존 Dispatch-only, 실행 인계, identity 불명, 다른 호스트는 추측해서 종료하지 않는다.
+실행 결과 불명의 기록은 COM을 담지 않는 프로세스 전체 상태로 유지해 새 워커의 중복 실행도 막는다.
+
+문서 처리 완료·사이클 종료·기존 주기 재기동에서 호스트 세대마다 최대 한 번 요청한다.
+동일 호스트의 호환 추가 기능이 주 STA에서 문서·보호된 보기·슬라이드 쇼가 모두 비어 있는지
+확인하고, 종료 중 문서 닫기 취소 이벤트로 사용자 문서를 보호한다. 처음부터 PowerPoint
+경고를 표시하며, 사용자 문서 Close/Save/Saved 변경이나 알림 억제로 종료하지 않는다.
+
+Quit 반환·연결 단절은 실제 종료 증거가 아니다. COM 참조를 놓은 뒤 동일 프로세스의 실제
+종료를 관찰한다. 미확인은 보류하고, 사용자가 문서를 열었으면 종료 권한을 폐기해 외부 점유로
+취급한다. PPT `terminable=False` 및 read/quit watchdog·poison·앱 종료의 강제종료 금지는 유지한다.
+poison 이후에는 Count·Quit을 포함한 새 RPC를 요청하지 않는다.
+
+설치 읽기 잠금 안에서 생성·호환 서비스 확인·정상종료 요청을 수행한다. COM 객체는 생성
+QThread의 MTA에서만 사용하며 UI·타이머·OS 종료 helper로 넘기지 않는다. 동기 RPC가 멈췄다고
+타임아웃만으로 취소됐다고 간주하지 않는다. 앱의 제한된 종료는 PowerPoint 강제종료를 허용하지 않는다.
+
+기존 dual 인터페이스는 유지하고 새 기본 인터페이스로 lifecycle을 노출한다. 요구 버전은
+reader/setup 모두 1.0.2.0, protocol 3이며 추출 JSON schema 1·청크·인덱스 형식은 바꾸지 않는다.
+사전 검증과 사용자 문서 보호 시험은 [운영 검증 절차](../guides/PPT_READER.md#powerpoint-자동종료-후보-검증)를 따른다.

@@ -12,7 +12,7 @@ internal static class SetupHarness
     private static Dictionary<string, object> Record()
     {
         return new Dictionary<string, object> { { "schema", 1 }, { "request_id", "33e979c6-c5c4-40af-845a-64c80517d1ae" },
-            { "required_version", "1.0.1.0" }, { "helper_sid", "S-1-5-21-1-2-3-1001" }, { "helper_pid", 123 },
+            { "required_version", "1.0.2.0" }, { "helper_sid", "S-1-5-21-1-2-3-1001" }, { "helper_pid", 123 },
             { "helper_creation_ticks", "638901000000000000" }, { "child_pid", null }, { "child_creation_ticks", null }, { "state", "complete" } };
     }
     public static int Main(string[] args)
@@ -20,6 +20,7 @@ internal static class SetupHarness
         string id = "33e979c6-c5c4-40af-845a-64c80517d1ae";
         Require(Contract.AutoInstallMode == "disabled" || Contract.AutoInstallMode == "candidate" || Contract.AutoInstallMode == "released", "policy_mode");
         Require(Contract.AutoInstallValidated == (Contract.AutoInstallMode == "released"), "policy_validated");
+        Require(Contract.AutoShutdownEnabled == (Contract.AutoInstallMode == "candidate"), "shutdown_policy_candidate_only");
         Require(Contract.AutoInstallEnabled == (Contract.AutoInstallMode != "disabled"), "policy_enabled");
         var result = new Result("check");
         Require(result.auto_install_mode == Contract.AutoInstallMode && result.auto_install_validated == Contract.AutoInstallValidated, "result_policy");
@@ -40,7 +41,7 @@ internal static class SetupHarness
             Require(!RequestDirectory.Compatible(acl, parent), "existing_unsafe_acl_rejected");
         }
         // These are Windows paths even when the pure harness runs under Mono.
-        string suffix = "/AegisDesk/PptReader/1.0.1.0/AegisDesk.PptReader.dll";
+        string suffix = "/AegisDesk/PptReader/1.0.2.0/AegisDesk.PptReader.dll";
         foreach (string directory in new[] { "Program Files", "Program Files (x86)", "프로그램 파일", "literal%20folder" })
         {
             string file = @"C:\" + directory + suffix.Replace('/', '\\');

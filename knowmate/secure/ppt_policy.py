@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from knowmate.build_info import get_build_info
 
-REQUIRED_VERSION = "1.0.1.0"
+REQUIRED_VERSION = "1.0.2.0"
 AUTO_INSTALL_MODES = frozenset({"disabled", "candidate", "released"})
 
 
@@ -19,3 +19,8 @@ def auto_install_mode() -> str:
 def auto_install_enabled() -> bool:
     """Allow an explicit build candidate without claiming it is validated."""
     return auto_install_mode() in {"candidate", "released"}
+
+
+def auto_shutdown_enabled() -> bool:
+    """Permit only candidate experiments until Windows callback safety is verified."""
+    return auto_install_mode() == "candidate"

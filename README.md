@@ -89,7 +89,8 @@ build.bat clean released   # 최종 산출물 승인 시험용
 # 배포 가이드: docs/guides/BETA_GUIDE.md
 ```
 
-PPT 자동 설치 변경과 검증 범위는 [이번 수정노트](docs/updates/2026-10-15-ppt-auto-install.md)에 정리돼 있습니다.
+PPT [자동 설치](docs/updates/2026-10-15-ppt-auto-install.md)와
+[자동종료 후보](docs/updates/2026-10-15-ppt-auto-shutdown.md)의 변경·검증 범위를 수정노트에 정리했습니다.
 
 빌드 기본값이 '클린'인 이유: 배포용 결과물이라 PyInstaller 증분 캐시가 stale해져
 깨진 exe가 테스터에게 나가는 비용이 빌드 시간보다 크다. 반복 확인이 필요할 때만

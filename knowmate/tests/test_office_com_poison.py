@@ -246,7 +246,7 @@ def test_hwnd_unsupported_com_member_tries_uppercase(monkeypatch):
 
 def test_dispatch_retries_ownership_on_same_app_and_baseline(monkeypatch):
     """지연 준비된 HWND는 재생성 없이 같은 COM 앱·원래 baseline으로 재검증한다."""
-    app = object()
+    app = SimpleNamespace(DisplayAlerts=2)
     dispatched = []
     probes = []
     monkeypatch.setattr("knowmate.secure.office_resiliency.clear_resiliency_markers", lambda exe: None)
@@ -359,7 +359,7 @@ def test_word_excel_use_dispatchex_and_ppt_uses_dispatch(monkeypatch):
             return object()
         def Dispatch(self, prog_id):
             calls.append(("Dispatch", prog_id))
-            return object()
+            return SimpleNamespace(DisplayAlerts=2)
 
     client = _Client()
     com_reader._dispatch_and_own(client, "Word.Application", "WINWORD.EXE")
@@ -441,7 +441,7 @@ def test_powerpoint_multiuse_is_tracked_but_never_terminable(monkeypatch):
 
 
 def test_cycle_cleanup_releases_ppt_without_quit(monkeypatch, caplog):
-    """PPT MultiUse 세션은 cycle end에도 Quit/강제종료 대신 참조만 해제한다."""
+    """직접 실행 증명이 없는 PPT는 cycle end에도 Quit/강제종료 없이 참조 해제한다."""
     class _Ppt:
         quit_called = False
         def Quit(self):
@@ -456,7 +456,7 @@ def test_cycle_cleanup_releases_ppt_without_quit(monkeypatch, caplog):
     com_reader.quit_com_apps(grace_sec=0)
     assert ppt.quit_called is False
     assert getattr(com_reader._tls, "ppt", None) is None
-    assert "quit_requested=False reason=multiuse_protection" in caplog.text
+    assert "[ppt] 정상 종료 결과: status=not_supported" in caplog.text
 
 
 def test_ppt_poison_recovery_defers_same_cycle_without_kill(monkeypatch):
@@ -867,7 +867,7 @@ def test_all_registration_failures_retain_app_and_gate(monkeypatch, exe, prog_id
     class _Fatal(Exception):
         hresult = -2147023174
 
-    app = object()
+    app = SimpleNamespace(DisplayAlerts=2)
     dispatched = []
     attempts = []
 

@@ -116,6 +116,9 @@ def prepare(output_dir: Path, ppt_auto_install_mode: str = "disabled") -> None:
     policy.write_text(
         'namespace AegisDesk.PptSetup { internal static class BuildPolicy { '
         f'public const string AutoInstallMode = "{ppt_auto_install_mode}";'
+        ' } }\n'
+        'namespace AegisDesk.PptReader { internal static class ShutdownBuildPolicy { '
+        f'public const bool Enabled = {str(ppt_auto_install_mode == "candidate").lower()};'
         ' } }\n', encoding="utf-8",
     )
     print(f"[확인] PPT 자동 설치: {ppt_auto_install_mode}")

@@ -446,6 +446,15 @@ def _dispatch_owned_app(win32com, prog_id: str, exe_name: str) -> DispatchedOffi
     except Exception as exc:
         _poison_if_fatal(exc, exe_name)
         raise
+    if exe_name == "POWERPNT.EXE":
+        try:
+            app.DisplayAlerts = 2
+            if app.DisplayAlerts != 2:
+                raise RuntimeError("ppt_alerts_unconfirmed")
+        except Exception as exc:
+            _retain_unverified_app(exe_name, app)
+            _poison_if_fatal(exc, exe_name)
+            raise
     # PowerPoint는 MultiUse라 Dispatch가 기존 사용자 프로세스를 반환할 수 있다.
     # Windows에서 새 PID 또는 같은 기존 소유 기록과 HWND/exe를 확인하지 못하면 추측하지 않고
     # 이 자동화 요청 자체를 연기한다. 비Windows fake 객체는 office_guard의
@@ -572,15 +581,55 @@ def _get_excel_app() -> Any:
     return _get_word_excel_app("excel", "EXCEL.EXE", "Excel.Application")
 
 
+def _release_ppt_references(*, poisoned: bool = False) -> None:
+    """Release worker-owned PPT references without creating any further RPC."""
+    from knowmate.secure.ppt_shutdown import abandon
+    if poisoned:
+        abandon(getattr(_tls, "ppt_launch_ticket", None))
+    for name in ("ppt", "ppt_proof", "ppt_service", "ppt_launch_ticket", "ppt_launch_ready"):
+        setattr(_tls, name, None)
+
+
 def _get_ppt_app() -> Any:
-    """Return the PowerPoint app without requesting Quit or process termination."""
-    if getattr(_tls, "ppt", None) is None:
-        _ensure_com_initialized()
-        dispatched = _dispatch_owned_app(_require_win32com(), "PowerPoint.Application", "POWERPNT.EXE")
-        app = dispatched.app
-        _configure_app(app, "POWERPNT.EXE", ((app, "DisplayAlerts", 1), (app, "AutomationSecurity", _MSO_SEC_FORCE_DISABLE)))
-        _tls.ppt = app
-    return _tls.ppt
+    """Reuse the exact read proof, acquiring quit authority only by direct launch."""
+    from knowmate.secure import office_guard, ppt_shutdown
+    office_guard.ensure_application_open("POWERPNT.EXE")
+    ppt_shutdown.ensure_admitted()
+    app = getattr(_tls, "ppt", None)
+    if app is not None:
+        proof = getattr(_tls, "ppt_proof", None)
+        if sys.platform == "win32":
+            try:
+                if proof is None:
+                    raise office_guard.OfficeCleanupPendingError("POWERPNT.EXE", "read_proof_missing")
+                office_guard.assert_registered_app_admitted("POWERPNT.EXE", *proof)
+            except office_guard.OfficeCleanupPendingError:
+                _release_ppt_references(poisoned=True)
+                raise
+        return app
+    _ensure_com_initialized()
+    client = _require_win32com()
+    prepared = getattr(_tls, "ppt_launch_ready", None)
+    launched = ppt_shutdown.launch_and_bind(client, prepared[0].office_bitness) if prepared is not None else None
+    if launched is None:
+        dispatched = _dispatch_owned_app(client, "PowerPoint.Application", "POWERPNT.EXE")
+        app, proof, ticket = dispatched.app, dispatched.proved, None
+    else:
+        app, proof, ticket = launched
+    # Retain the exact references before configuration so a setter failure cannot
+    # leave an untracked host. A fatal setter never triggers restoration RPCs.
+    _tls.ppt, _tls.ppt_proof, _tls.ppt_launch_ticket = app, proof, ticket
+    try:
+        app.DisplayAlerts = 2  # ppAlertsAll, including the first Open.
+        if app.DisplayAlerts != 2:
+            raise RuntimeError("ppt_alerts_unconfirmed")
+        _configure_app(app, "POWERPNT.EXE", ((app, "AutomationSecurity", _MSO_SEC_FORCE_DISABLE),))
+        office_guard.ensure_application_open("POWERPNT.EXE")
+    except Exception as exc:
+        _release_ppt_references(poisoned=True)
+        _poison_if_fatal(exc, "POWERPNT.EXE")
+        raise
+    return app
 
 
 class WordComReader:
@@ -933,6 +982,16 @@ class PowerPointComReader:
         from knowmate.secure.office_guard import OfficeBusyError, OfficeCleanupPendingError
         if self.policy == "ppt_pending":
             raise PptPreparationPending("preparation_pending")
+        from knowmate.secure.ppt_policy import auto_shutdown_enabled
+        _tls.ppt_launch_ready = None
+        if (auto_shutdown_enabled() and self.policy == "ready"
+                and getattr(_tls, "ppt", None) is None):
+            from knowmate.secure.ppt_installation import check_installation
+            from knowmate.secure.ppt_launch import installation_stamp
+            before = installation_stamp()
+            preparation = check_installation()  # helper uses the same machine mutex
+            if before is not None and preparation.status == "ready":
+                _tls.ppt_launch_ready = (preparation, before)
         timer = com_stage.StageTimer(path)
         prs = None
         poison = False
@@ -943,6 +1002,12 @@ class PowerPointComReader:
         fallback = "none"
         try:
             with MachineReadGuard():
+                if getattr(_tls, "ppt_launch_ready", None) is not None:
+                    from knowmate.secure.ppt_installation import _validate_helper, setup_helper_path
+                    from knowmate.secure.ppt_launch import installation_stamp
+                    if (not _validate_helper(setup_helper_path())
+                            or installation_stamp() != _tls.ppt_launch_ready[1]):
+                        _tls.ppt_launch_ready = None
                 try:
                     self._check("dispatch")
                     with timer.stage(com_stage.STAGE_DISPATCH):
@@ -991,8 +1056,7 @@ class PowerPointComReader:
                     if exc.evidence is None:
                         fault = make_fault(exc, timer.failed_stage or "open", app_exe="POWERPNT.EXE")
                         exc.evidence = ComFailureEvidence(fault, (), fault, exc.hresult)
-                    _tls.ppt = None
-                    _tls.ppt_service = None
+                    _release_ppt_references(poisoned=True)
                     raise
                 except Exception as exc:
                     primary_error = make_fault(exc, timer.failed_stage or "read", app_exe="POWERPNT.EXE")
@@ -1000,8 +1064,7 @@ class PowerPointComReader:
                         _poison_if_fatal(exc, "POWERPNT.EXE", stage=primary_error.stage, primary=primary_error)
                     except OfficeComPoisonError:
                         poison = True
-                        _tls.ppt = None
-                        _tls.ppt_service = None
+                        _release_ppt_references(poisoned=True)
                         raise
                     from knowmate.secure.ppt_payload import PptPayloadError
                     if isinstance(exc, (PptOperationError, PptPreparationPending, PptPayloadError,
@@ -1024,8 +1087,7 @@ class PowerPointComReader:
                             close_fault = make_fault(error, "close", app_exe="POWERPNT.EXE")
                             _poison_if_fatal(error, "POWERPNT.EXE", stage="close", primary=primary_error, cleanup=(close_fault,))
                         except OfficeComPoisonError:
-                            _tls.ppt = None
-                            _tls.ppt_service = None
+                            _release_ppt_references(poisoned=True)
                             raise
                         safe = PptOperationError("close_unconfirmed")
                         close_fault = make_fault(error, "close", app_exe="POWERPNT.EXE")
@@ -1049,12 +1111,11 @@ class PowerPointComReader:
 def quit_com_apps(
     grace_sec: float = 5.0, wait_fn=None, quit_timeout_sec: float | None = None,
 ) -> OfficeCleanupResult:
-    """현재 스레드의 Word/Excel 앱은 Quit하고 모든 COM 참조를 비운다.
+    """생성 워커에서 Office를 정리하고 PowerPoint는 증명된 정상종료만 요청한다.
 
-    COM 객체는 생성한 스레드에서만 Quit할 수 있으므로(STA),
-    반드시 COM 앱을 생성한 워커 스레드 내부에서 호출해야 한다.
-    PowerPoint는 MultiUse라 사용자 창일 가능성을 배제할 수 없어 Quit·강제 종료하지
-    않고 참조 해제와 gc에 맡긴다. 검증 소유 Word/Excel 프로세스만 정리한다.
+    COM 객체는 생성한 워커 스레드 내부에서만 호출한다. PowerPoint는 직접 실행
+    증명과 호환 호스트의 보호 기능이 모두 확인된 후보 빌드에서만 정상 Quit을
+    요청한다. PowerPoint 강제종료는 모든 경로에서 금지한다.
 
     Quit 자체가 멈추면 별도 daemon 타이머가 캡처한 Word/Excel 프로세스만 정리한다.
     반환 후에는 grace_sec 동안 자연 종료를 기다린다(0이면 유예 생략). 타이머가
@@ -1076,6 +1137,7 @@ def quit_com_apps(
     owned = office_guard.begin_owned_cleanup()
     results: list[OfficeCleanupResult] = []
     timed_out_pids: set[int] = set()
+    ppt_snapshot: dict[int, Any] = {}
     gc.collect()
     for attr, exe in (("word", "WINWORD.EXE"), ("excel", "EXCEL.EXE"), ("ppt", "POWERPNT.EXE")):
         app = getattr(_tls, attr, None)
@@ -1115,21 +1177,26 @@ def quit_com_apps(
                             else:
                                 results.append(office_guard.OfficeCleanupResult(remaining=frozenset(terminable)))
             else:
-                logger.info(
-                    "[com] PowerPoint 종료 정책: action=release_reference quit_requested=False reason=multiuse_protection",
+                from knowmate.secure.ppt_shutdown import request_quit
+                status, ppt_snapshot = request_quit(
+                    app, getattr(_tls, "ppt_proof", None),
+                    getattr(_tls, "ppt_launch_ticket", None), _tls,
                 )
+                logger.info("[ppt] 정상 종료 결과: status=%s PID=%s", status, sorted(ppt_snapshot))
         finally:
             # Quit 예외에도 스레드 로컬 COM 참조를 반드시 놓는다.
             if attr in {"word", "excel"}:
                 previous = _clear_reusable_word_excel_app(attr)
                 del previous
             else:
-                setattr(_tls, attr, None)
-            if attr == "ppt":
-                _tls.ppt_service = None
+                _release_ppt_references()
             app = None
-    # PowerPoint 참조만 해제되고 Quit/강제종료되지 않는다.
     gc.collect()
+    if ppt_snapshot:
+        from knowmate.secure.ppt_shutdown import observe_exit
+        ppt_result = observe_exit(ppt_snapshot, min(max(0, grace_sec), quit_timeout_sec), wait_fn)
+        results.append(ppt_result)
+        office_guard._log_cleanup_result("POWERPNT.EXE", ppt_result, "graceful_observation")
     office_guard.prune_released_nonterminable_processes()
     terminable = {
         pid: record for pid, record in owned.items()
@@ -1170,13 +1237,16 @@ def quit_com_apps(
             failed=frozenset(terminable),
         )
     results.append(cleanup_result)
+    from knowmate.secure.ppt_shutdown import pending_cleanup_result
+    results.append(pending_cleanup_result())
     return office_guard.OfficeCleanupResult(
         confirmed_exited=frozenset().union(*(item.confirmed_exited for item in results)),
         remaining=frozenset().union(*(item.remaining for item in results)),
         identity_unknown=frozenset().union(*(item.identity_unknown for item in results)),
         failed=frozenset().union(*(item.failed for item in results)),
         forced_exited=frozenset().union(*(item.forced_exited for item in results)),
-        ownership_pending=office_guard.unverified_cleanup_pending(),
+        ownership_pending=office_guard.unverified_cleanup_pending().union(
+            *(item.ownership_pending for item in results)),
     )
 
 

@@ -19,13 +19,13 @@ def payload(tmp_path):
     for name in PAYLOAD_FILES:
         (tmp_path / name).write_bytes(b"synthetic payload")
     manifest = {
-        "schema": 1, "reader_version": "1.0.1.0", "protocol": 2, "payload_schema": 1,
+        "schema": 1, "reader_version": "1.0.2.0", "protocol": 3, "payload_schema": 1,
         "prog_id": "AegisDesk.PptReader", "reader_class": "AegisDesk.PptReader.Connect",
         "reader_clsid": "287A80D2-804A-46D3-A0E9-CA31C6FC3D09",
-        "reader_iid": "65152412-DFD3-47EC-8346-3F2675ED0C15",
+        "reader_iid": "9A20F4A6-6364-4BA7-930B-3E8857BEAF60",
         "auto_install_validated": False, "auto_install_mode": "disabled",
-        "auto_install_enabled": False, "build": build,
-        "assembly_versions": {name: "1.0.1.0" for name in PAYLOAD_FILES},
+        "auto_install_enabled": False, "auto_shutdown_enabled": False, "build": build,
+        "assembly_versions": {name: "1.0.2.0" for name in PAYLOAD_FILES},
         "files": {name: hashlib.sha256(b"synthetic payload").hexdigest() for name in PAYLOAD_FILES},
     }
     (tmp_path / "manifest.json").write_text(json.dumps(manifest))
@@ -77,14 +77,18 @@ def test_production_managed_harness_on_windows(tmp_path):
         pytest.skip("Windows .NET Framework compiler needed")
     root = Path(__file__).resolve().parents[2]
     dll = tmp_path / "AegisDesk.PptReader.dll"
+    policy = tmp_path / "PptBuildPolicy.cs"
+    policy.write_text('namespace AegisDesk.PptReader { internal static class ShutdownBuildPolicy { public const bool Enabled = true; } }')
     commands = [[str(compiler), "/nologo", "/target:library", f"/out:{dll}",
                  "/reference:Microsoft.CSharp.dll", "/reference:System.Core.dll", "/reference:System.Web.Extensions.dll",
-                 str(root / "scripts/ppt_reader/PptReader.cs"), str(root / "scripts/ppt_shared/PptExtractionCore.cs")]]
+                 str(root / "scripts/ppt_reader/PptReader.cs"), str(root / "scripts/ppt_shared/PptExtractionCore.cs"),
+                 str(root / "scripts/ppt_reader/PptShutdownEvents.cs"),
+                 str(root / "scripts/ppt_reader/PptShutdownGuard.cs"), str(policy)]]
     for name, args in (("ppt_reader_harness.cs", []),
                        ("ppt_probe_harness.cs", ["AegisDesk.PptReader.Connect"]),
                        ("ppt_probe_connection_harness.cs", ["--production"])):
         exe = tmp_path / (name + ".exe")
-        commands.extend([[str(compiler), "/nologo", f"/out:{exe}", str(root / "knowmate/tests" / name)],
+        commands.extend([[str(compiler), "/nologo", "/reference:Microsoft.CSharp.dll", "/reference:System.Core.dll", f"/out:{exe}", str(root / "knowmate/tests" / name)],
                          [str(exe), str(dll), *args]])
     for command in commands:
         result = subprocess.run(command, capture_output=True, text=True, timeout=30,
@@ -118,7 +122,7 @@ def test_profile_payload_rejects_other_profile_and_source(payload, mode):
     manifest = copy.deepcopy(original)
     build = dict(build, ppt_auto_install_mode=mode)
     manifest.update(auto_install_mode=mode, auto_install_enabled=mode != "disabled",
-                    auto_install_validated=mode == "released")
+                    auto_install_validated=mode == "released", auto_shutdown_enabled=mode == "candidate")
     manifest["build"] = dict(build)
     assert validate_manifest(manifest, directory, build) == manifest
     for other in {"disabled", "candidate", "released"} - {mode}:
@@ -158,7 +162,9 @@ def test_manifest_generator_binds_compiled_policy(monkeypatch, payload, mode):
     monkeypatch.setattr(module.runpy, "run_path", fake_run)
     policy = directory / "PptBuildPolicy.cs"
     policy.write_text('namespace AegisDesk.PptSetup { internal static class BuildPolicy { '
-                      f'public const string AutoInstallMode = "{mode}";' + ' } }\n')
+                      f'public const string AutoInstallMode = "{mode}";' + ' } }\n'
+                      'namespace AegisDesk.PptReader { internal static class ShutdownBuildPolicy { '
+                      f'public const bool Enabled = {str(mode == "candidate").lower()};' + ' } }\n')
     manifest = module.create_manifest(directory, directory)
     assert manifest["auto_install_mode"] == mode
     assert manifest["auto_install_validated"] == (mode == "released")

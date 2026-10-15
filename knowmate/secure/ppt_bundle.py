@@ -27,10 +27,10 @@ def validate_manifest(
     if not isinstance(manifest, dict):
         raise ValueError("ppt_manifest_schema")
     expected = {
-        "schema": 1, "reader_version": REQUIRED_VERSION, "protocol": 2, "payload_schema": 1,
+        "schema": 1, "reader_version": REQUIRED_VERSION, "protocol": 3, "payload_schema": 1,
         "prog_id": "AegisDesk.PptReader", "reader_class": "AegisDesk.PptReader.Connect",
         "reader_clsid": "287A80D2-804A-46D3-A0E9-CA31C6FC3D09",
-        "reader_iid": "65152412-DFD3-47EC-8346-3F2675ED0C15",
+        "reader_iid": "9A20F4A6-6364-4BA7-930B-3E8857BEAF60",
     }
     for key, value in expected.items():
         if type(manifest.get(key)) is not type(value) or manifest[key] != value:
@@ -44,6 +44,9 @@ def validate_manifest(
             or type(manifest.get("auto_install_validated")) is not bool
             or manifest["auto_install_validated"] != (mode == "released")):
         raise ValueError("ppt_auto_install_gate")
+    if (type(manifest.get("auto_shutdown_enabled")) is not bool
+            or manifest["auto_shutdown_enabled"] != (mode == "candidate")):
+        raise ValueError("ppt_auto_shutdown_gate")
     source = manifest.get("build")
     if not isinstance(source, dict) or not isinstance(source.get("commit"), str):
         raise ValueError("ppt_manifest_build")

@@ -27,16 +27,19 @@ def create_manifest(payload_dir: Path, build_info_dir: Path) -> dict[str, object
     if mode not in AUTO_INSTALL_MODES:
         raise ValueError("ppt_auto_install_mode")
     expected_policy = ('namespace AegisDesk.PptSetup { internal static class BuildPolicy { '
-                       f'public const string AutoInstallMode = "{mode}";' + ' } }\n')
+                       f'public const string AutoInstallMode = "{mode}";' + ' } }\n'
+                       'namespace AegisDesk.PptReader { internal static class ShutdownBuildPolicy { '
+                       f'public const bool Enabled = {str(mode == "candidate").lower()};' + ' } }\n')
     if (build_info_dir / "PptBuildPolicy.cs").read_text(encoding="utf-8") != expected_policy:
         raise ValueError("ppt_build_policy_changed")
     manifest: dict[str, object] = {
-        "schema": 1, "reader_version": REQUIRED_VERSION, "protocol": 2, "payload_schema": 1,
+        "schema": 1, "reader_version": REQUIRED_VERSION, "protocol": 3, "payload_schema": 1,
         "prog_id": "AegisDesk.PptReader", "reader_class": "AegisDesk.PptReader.Connect",
         "reader_clsid": "287A80D2-804A-46D3-A0E9-CA31C6FC3D09",
-        "reader_iid": "65152412-DFD3-47EC-8346-3F2675ED0C15",
+        "reader_iid": "9A20F4A6-6364-4BA7-930B-3E8857BEAF60",
         "auto_install_mode": mode, "auto_install_enabled": mode != "disabled",
         "auto_install_validated": mode == "released",
+        "auto_shutdown_enabled": mode == "candidate",
         "build": {key: build_info[key] for key in ("commit", "source_fingerprint", "dirty")},
         "assembly_versions": {name: REQUIRED_VERSION for name in PAYLOAD_FILES},
         "files": {name: hashlib.sha256((payload_dir / name).read_bytes()).hexdigest()

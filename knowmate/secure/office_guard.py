@@ -120,8 +120,13 @@ def guard_epoch() -> int:
 
 
 def _gate_reason_unlocked(exe: str) -> str | None:
-    if exe in {"WINWORD.EXE", "EXCEL.EXE"} and _application_closing.is_set():
+    if exe in _OFFICE_EXES and _application_closing.is_set():
         return "application_closing"
+    if exe == "POWERPNT.EXE":
+        from knowmate.secure.ppt_shutdown import admission_reason
+        reason = admission_reason()
+        if reason:
+            return reason
     if _unverified_cleanup.get(exe):
         return "unverified_cleanup"
     if _cleanup_inflight.get(exe):
@@ -147,13 +152,13 @@ def assert_registered_app_admitted(exe: str, pid: int, record: OwnedOfficeProces
 
 
 def begin_application_shutdown() -> None:
-    """Block new Word/Excel automation without waiting on the ownership lock."""
+    """Block new Office automation without waiting on the ownership lock."""
     _application_closing.set()
 
 
 def ensure_application_open(exe: str) -> None:
-    """Reject Word/Excel reads and activations once application exit begins."""
-    if exe.upper() in {"WINWORD.EXE", "EXCEL.EXE"} and _application_closing.is_set():
+    """Reject Office reads and activations once application exit begins."""
+    if exe.upper() in _OFFICE_EXES and _application_closing.is_set():
         raise OfficeCleanupPendingError(exe, "application_closing")
 
 
@@ -937,6 +942,8 @@ def clear_owned_pids() -> set[int]:
         _unverified_cleanup.clear()
         _application_closing.clear()
         _state_changed_unlocked()
+    from knowmate.secure.ppt_shutdown import reset_for_tests
+    reset_for_tests()
     return prev
 
 
@@ -1033,6 +1040,9 @@ def ensure_office_available(exe: str, retry_cooldown_sec: float = 30.0) -> None:
     """Retry pending cleanup at most once per cooldown, then gate COM if unresolved."""
     up = exe.upper()
     ensure_application_open(up)
+    if up == "POWERPNT.EXE":
+        from knowmate.secure.ppt_shutdown import ensure_admitted
+        ensure_admitted()
     with _owned_lock:
         tokens = set(_unverified_cleanup.get(up, ()))
     if tokens:

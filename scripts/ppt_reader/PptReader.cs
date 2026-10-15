@@ -5,8 +5,8 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading;
 
-[assembly: AssemblyVersion("1.0.1.0")]
-[assembly: AssemblyFileVersion("1.0.1.0")]
+[assembly: AssemblyVersion("1.0.2.0")]
+[assembly: AssemblyFileVersion("1.0.2.0")]
 [assembly: ComVisible(false)]
 
 namespace AegisDesk.PptReader
@@ -41,19 +41,33 @@ namespace AegisDesk.PptReader
         [DispId(3)] string ReaderVersion();
     }
 
+    /// <summary>Protocol 3 service; the legacy dual IID above remains unchanged.</summary>
+    [ComVisible(true), Guid("9A20F4A6-6364-4BA7-930B-3E8857BEAF60")]
+    [InterfaceType(ComInterfaceType.InterfaceIsDual)]
+    public interface IPptReaderLifecycle
+    {
+        [DispId(1)] int ProtocolVersion();
+        [DispId(2)] string ExtractSlide([MarshalAs(UnmanagedType.BStr)] string presentationPath, int slide);
+        [DispId(3)] string ReaderVersion();
+        [DispId(4)] string TryQuitIfIdle();
+    }
+
     /// <summary>PowerPoint 주 STA에서 슬라이드를 읽는 운영 추가 기능.</summary>
     [ComVisible(true), Guid("287A80D2-804A-46D3-A0E9-CA31C6FC3D09")]
     [ProgId("AegisDesk.PptReader"), ClassInterface(ClassInterfaceType.None)]
-    [ComDefaultInterface(typeof(IPptReader))]
-    public sealed class Connect : StandardOleMarshalObject, IDTExtensibility2, IPptReader
+    [ComDefaultInterface(typeof(IPptReaderLifecycle))]
+    public sealed class Connect : StandardOleMarshalObject, IDTExtensibility2, IPptReader, IPptReaderLifecycle
     {
         private object application;
         private int mainThread;
         private bool reading;
+        private PptShutdownGuard shutdown;
 
         /// <summary>Office가 로드할 때 주 STA와 자동화 객체를 연결한다.</summary>
         public void OnConnection(object app, int connectMode, object addin, ref Array custom)
         {
+            if (shutdown != null) shutdown.Disconnect();
+            shutdown = null;
             application = null;
             mainThread = 0;
             if (Thread.CurrentThread.GetApartmentState() != ApartmentState.STA)
@@ -62,24 +76,33 @@ namespace AegisDesk.PptReader
                 throw new COMException("probe_missing_host");
             application = app;
             mainThread = Thread.CurrentThread.ManagedThreadId;
+            shutdown = new PptShutdownGuard(app, mainThread, PptEventContract.Resolve);
             try { ((dynamic)addin).Object = this; }
             catch (Exception exc)
             {
                 // 연결 실패 뒤 ProtocolVersion이 정상 연결로 오판하지 않게 한다.
-                application = null;
-                mainThread = 0;
+                DisconnectHost();
                 throw new COMException("probe_connect_failed", Marshal.GetHRForException(exc));
             }
         }
 
         /// <summary>Office 연결이 끝나면 보유 참조만 해제한다.</summary>
-        public void OnDisconnection(int removeMode, ref Array custom) { application = null; mainThread = 0; }
+        public void OnDisconnection(int removeMode, ref Array custom) { DisconnectHost(); }
         /// <summary>추가 기능 목록 변경에는 작업하지 않는다.</summary>
         public void OnAddInsUpdate(ref Array custom) { }
         /// <summary>Office 시작 완료에는 문서를 열거나 읽지 않는다.</summary>
         public void OnStartupComplete(ref Array custom) { }
         /// <summary>Office 종료에는 보유 참조만 해제한다.</summary>
-        public void OnBeginShutdown(ref Array custom) { application = null; mainThread = 0; }
+        public void OnBeginShutdown(ref Array custom) { DisconnectHost(); }
+
+        private void DisconnectHost()
+        {
+            // Never clear/unadvise an active call's local event guard here.
+            if (shutdown != null) shutdown.Disconnect();
+            shutdown = null;
+            application = null;
+            mainThread = 0;
+        }
 
         private void RequireHostThread()
         {
@@ -91,15 +114,22 @@ namespace AegisDesk.PptReader
         }
 
         /// <summary>시험 스크립트와 맞춰야 하는 응답 버전을 반환한다.</summary>
-        public int ProtocolVersion() { RequireHostThread(); return 2; }
+        public int ProtocolVersion() { RequireHostThread(); return 3; }
         /// <summary>Exact production assembly version after trusted connection.</summary>
         public string ReaderVersion() { RequireHostThread(); return typeof(Connect).Assembly.GetName().Version.ToString(); }
+
+        /// <summary>Candidate-only request; OS process exit is observed by the caller.</summary>
+        public string TryQuitIfIdle()
+        {
+            if (!ShutdownBuildPolicy.Enabled || shutdown == null) return "not_supported";
+            return shutdown.TryQuitIfIdle(reading);
+        }
 
         /// <summary>Already opened host document only; shared core preserves trial output.</summary>
         public string ExtractSlide(string presentationPath, int slide)
         {
             RequireHostThread();
-            if (reading) throw new COMException("probe_reentrant_request");
+            if (reading || (shutdown != null && shutdown.Entered)) throw new COMException("probe_reentrant_request");
             reading = true;
             try { return AegisDesk.PptShared.PptExtractionCore.ExtractSlide(application, presentationPath, slide); }
             finally { reading = false; }
