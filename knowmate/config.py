@@ -21,6 +21,7 @@ _cache: dict[str, Any] | None = None
 _APP_DIR_NAME = "AegisDesk"
 _LEGACY_DIR_NAME = "KnowMate"
 _data_dir_migrated = False
+_memory_mode_warned = False
 
 
 def get_data_dir() -> Path:
@@ -169,6 +170,23 @@ def ppt_reader_mode(collector: dict[str, Any]) -> str:
         logger.warning("잘못된 collector.ppt_reader_mode 설정을 com으로 복구합니다")
         return "com"
     return mode
+
+
+def memory_diagnostics_settings(collector: dict[str, Any]) -> tuple[bool, str]:
+    """Resolve strict opt-in and basic/detailed mode without changing user config."""
+    global _memory_mode_warned
+    if collector.get("memory_diagnostics_enabled") is not True:
+        return False, "basic"
+    if "memory_diagnostics_mode" in collector:
+        mode = collector["memory_diagnostics_mode"]
+        if isinstance(mode, str) and mode in {"basic", "detailed"}:
+            return True, mode
+        if not _memory_mode_warned:
+            logger.warning("잘못된 collector.memory_diagnostics_mode 설정을 basic으로 처리합니다")
+            _memory_mode_warned = True
+    with _bundled_config_source().open(encoding="utf-8") as handle:
+        bundled = yaml.safe_load(handle) or {}
+    return True, bundled["collector"]["memory_diagnostics_mode"]
 
 
 def _bundled_document_state_defaults() -> dict[str, Any]:

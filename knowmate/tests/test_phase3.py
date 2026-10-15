@@ -351,8 +351,9 @@ def test_memory_diagnostics_cover_collector_cycle_phases(tmp_path: Path, monkeyp
     events: list[str] = []
 
     class _FakeMemoryDiagnostics:
-        def __init__(self, enabled: bool) -> None:
+        def __init__(self, enabled: bool, *, mode: str) -> None:
             assert enabled is True
+            assert mode == "basic"
 
         def start(self) -> None:
             events.append("start")
@@ -361,7 +362,7 @@ def test_memory_diagnostics_cover_collector_cycle_phases(tmp_path: Path, monkeyp
             events.append(phase)
 
         def collect_and_log(self) -> None:
-            events.append("after_gc_collect")
+            events.append("cycle_resources_released")
 
         def stop(self) -> None:
             events.append("stop")
@@ -386,7 +387,7 @@ def test_memory_diagnostics_cover_collector_cycle_phases(tmp_path: Path, monkeyp
     assert events == ["start", "cycle_start", *cycle_phases,
         "before_com_cleanup",
         "after_com_cleanup",
-        "after_gc_collect",
+        "cycle_resources_released",
         "stop",
     ]
 
@@ -3290,3 +3291,83 @@ class TestMailFailureMigration:
         assert set(failure_state.load_failures(failure_file)) == {document, mail}
         assert not legacy_file.exists()
         assert legacy_file.with_name("mail_index_failure.migrated.json").exists()
+
+
+@pytest.mark.parametrize("mode", ["off", "basic", "detailed"])
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancel"])
+@pytest.mark.parametrize("broken_operation", [None, "initialize", "start", "log", "collect_and_log", "stop"])
+def test_memory_diagnostic_errors_preserve_cycle_cleanup_and_restart(tmp_path, monkeypatch, mode, outcome, broken_operation):
+    """Normal/error/cancel runs still clean COM, release diagnostics and become idle."""
+    import sys
+    from types import SimpleNamespace
+    from knowmate.collector import scheduler
+    from knowmate.secure import com_reader
+    from knowmate.rag.embedding_cancel import EmbeddingCancelledError
+
+    events = []
+
+    class Diagnostic:
+        def __init__(self, enabled, *, mode):
+            self.enabled = enabled
+            self.mode = mode
+            self._action("initialize")
+
+        def _action(self, operation):
+            events.append(operation)
+            if operation == broken_operation:
+                raise ValueError("secret diagnostic failure")
+
+        def start(self):
+            self._action("start")
+
+        def log(self, phase):
+            self._action("log")
+            events.append(phase)
+
+        def collect_and_log(self):
+            self._action("collect_and_log")
+
+        def stop(self):
+            self._action("stop")
+
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    worker, _, _ = _make_worker(tmp_path, str(folder))
+    worker._config["collector"].update(memory_diagnostics_enabled=mode != "off", memory_diagnostics_mode=mode)
+    errors = []
+    worker.error.connect(errors.append)
+    monkeypatch.setattr(scheduler, "MemoryDiagnostics", Diagnostic)
+    monkeypatch.setitem(sys.modules, "pythoncom", SimpleNamespace(
+        COINIT_MULTITHREADED=0,
+        CoInitializeEx=lambda _: events.append("com_initialize"),
+        CoUninitialize=lambda: events.append("com_uninitialize"),
+    ))
+    monkeypatch.setattr(worker, "_cleanup_com_apps", lambda _: events.append("com_cleanup"))
+    monkeypatch.setattr(com_reader, "release_unverified_com_refs", lambda: events.append("unverified_refs"))
+    monkeypatch.setattr(com_reader, "release_verified_pending_com_refs", lambda: events.append("verified_refs"))
+
+    def cycle():
+        events.append("cycle_work")
+        worker._work_phase = "indexing"
+        if outcome == "failure":
+            raise RuntimeError("cycle failure")
+        if outcome == "cancel":
+            worker.cancel()
+            raise EmbeddingCancelledError("cancelled")
+
+    monkeypatch.setattr(worker, "_run_cycle", cycle)
+    # Reporting a diagnostic exception may fail as well; this must remain optional.
+    monkeypatch.setattr(scheduler.logger, "warning", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("handler failed")))
+    for _ in range(2):
+        events.clear()
+        worker.run()
+        assert events.count("cycle_work") == 1
+        ordered = ["com_initialize", "cycle_work", "com_cleanup", "unverified_refs", "verified_refs", "com_uninitialize"]
+        positions = [events.index(event) for event in ordered]
+        assert positions == sorted(positions)
+        if broken_operation != "initialize":
+            assert events.index("collect_and_log") > events.index("com_uninitialize")
+            assert events.index("stop") > events.index("collect_and_log")
+        assert worker._memory_diagnostics is None
+        assert worker._work_phase == "idle"
+    assert len(errors) == (2 if outcome == "failure" else 0)

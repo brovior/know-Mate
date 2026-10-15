@@ -64,6 +64,7 @@ Phase 1~4 완료(RAG 지식검색), 5a 완료(Knox `.mysingle` + 표준 `.eml` �
 | 항목 | 상태·다음 행동 | 시작 조건 |
 |---|---|---|
 | COM poison 복구 뒤 점유 오판·오류 혼합 | 2초 캐시 epoch·정확한 앱 증명·최초/닫기 오류 분리 및 fake 회귀 구현 | [진단 §COM poison](DIAGNOSTICS.md#com-poison-복구-일관성-2026-10-15)의 실제 Windows·Office·DRM 검증 대기 |
+| 메모리 진단 부하 분리 | OFF 유지·basic 수치 로그·명시적 detailed 추적과 진단 예외 격리 구현, 로컬 합성 비교 완료 | [진단 §1](DIAGNOSTICS.md#1-앱-크래시와-메모리-진단)의 실제 Windows OFF/basic 성능 비교·장시간/취소 시험 대기. 크래시 해결은 미확정 |
 | 앱 크래시 | 사내 로그·Windows 오류 기록 확보 | 기존 기록이 부족하면 진단 보강을 먼저 설계 |
 | 메일 처리 중 종료 후 Office 잔류 | 문서 완료 시 Office 정리·임베딩 취소·단계별 종료 로그 구현, fake·localhost 회귀 통과 | [진단 §4](DIAGNOSTICS.md#4-office-종료-정리-확인)의 사내 종료·PID 확인 대기 |
 | 상태 JSON·유휴 스캔 | 단계별 실측 대기 | JSON 처리와 실제 파일 접근 비용을 구분한 뒤 개선 선택 |

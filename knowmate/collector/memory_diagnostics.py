@@ -6,6 +6,7 @@ import gc
 import logging
 import os
 from pathlib import Path
+import sys
 import time
 import tracemalloc
 from collections.abc import Callable
@@ -15,6 +16,7 @@ from typing import Any, Mapping
 logger = logging.getLogger(__name__)
 
 _MIB = 1024 * 1024
+_detailed_warning_logged = False
 
 
 class _ProcessMemoryCountersEx(ctypes.Structure):
@@ -60,10 +62,9 @@ def get_process_private_bytes() -> int | None:
 
 
 def _default_arrow_pool() -> Any:
-    """PyArrow 기본 메모리 풀을 지연 로드해 반환한다."""
-    import pyarrow as pa
-
-    return pa.default_memory_pool()
+    """Return the already loaded PyArrow pool without importing the package."""
+    pa = sys.modules.get("pyarrow")
+    return None if pa is None else pa.default_memory_pool()
 
 
 def _format_mib(value: int | None) -> str:
@@ -78,12 +79,14 @@ class MemoryDiagnostics:
         self,
         enabled: bool,
         *,
+        mode: str = "basic",
         private_bytes_reader: Callable[[], int | None] = get_process_private_bytes,
         arrow_pool_getter: Callable[[], Any] = _default_arrow_pool,
         pid: int | None = None,
         cycle_id: str | None = None,
     ) -> None:
-        self.enabled = enabled
+        self.enabled = enabled is True
+        self.mode = "detailed" if mode == "detailed" else "basic"
         self._private_bytes_reader = private_bytes_reader
         self._arrow_pool_getter = arrow_pool_getter
         self._owns_tracing = False
@@ -96,11 +99,18 @@ class MemoryDiagnostics:
         self._cycle_id = cycle_id or f"{self._pid}-{time.time_ns()}"
 
     def start(self) -> None:
-        """필요할 때만 tracemalloc 추적을 시작하고 사이클 peak를 초기화한다."""
+        """Start whole-process tracing only in explicitly selected detailed mode."""
+        global _detailed_warning_logged
         if not self.enabled or self._started:
             return
-        self.log("before_tracemalloc_start")
+        if self.mode == "basic":
+            self._started = True
+            return
         try:
+            if not _detailed_warning_logged:
+                logger.warning("[memory] detailed mode traces all allocations and uses snapshots/GC; use only for short diagnostics")
+                _detailed_warning_logged = True
+            self.log("before_tracemalloc_start")
             if not tracemalloc.is_tracing():
                 tracemalloc.start(10)
                 self._owns_tracing = True
@@ -123,43 +133,62 @@ class MemoryDiagnostics:
                     self.log("after_cycle_snapshot", counters={
                         "snapshot_ok": int(self._cycle_snapshot is not None),
                     })
-        except Exception:
-            logger.debug("[memory] tracemalloc 시작 실패", exc_info=True)
-        self._started = True
+        except Exception as exc:
+            self._log_failure("start", exc)
+        finally:
+            self._started = True
 
     def log(self, phase: str, *, counters: Mapping[str, int] | None = None) -> None:
-        """한 시점의 Private/Python/Arrow 메모리를 한 줄 INFO로 기록한다."""
+        """Record memory scalars without allowing diagnostic failures to affect work."""
         if not self.enabled:
             return
+        try:
+            self._log(phase, counters=counters)
+        except Exception as exc:
+            self._log_failure("sample", exc)
+
+    def _log_failure(self, operation: str, exc: Exception) -> None:
+        """Log only the failing operation and exception type, never its message."""
+        try:
+            logger.warning("[memory] pid=%d cycle_id=%s diagnostic_failed operation=%s error_type=%s",
+                           self._pid, self._cycle_id, operation, type(exc).__name__)
+        except Exception:
+            pass  # A failing diagnostic log handler cannot report its own failure safely.
+
+    def _log(self, phase: str, *, counters: Mapping[str, int] | None = None) -> None:
 
         private_bytes: int | None = None
         python_current: int | None = None
         python_peak: int | None = None
         tracer_bytes: int | None = None
-        trace_scope = "inactive"
+        trace_scope = "not_measured" if self.mode == "basic" else "inactive"
         arrow_current: int | None = None
         arrow_peak: int | None = None
         arrow_backend = "n/a"
 
         try:
             private_bytes = self._private_bytes_reader()
-        except Exception:
-            logger.debug("[memory] Windows Private Bytes 조회 실패", exc_info=True)
-        try:
-            if tracemalloc.is_tracing():
-                trace_scope = "cycle_since_start" if self._owns_tracing else "external_start_unknown"
-                python_current, python_peak = tracemalloc.get_traced_memory()
-                tracer_bytes = tracemalloc.get_tracemalloc_memory()
-        except Exception:
-            logger.debug("[memory] tracemalloc 조회 실패", exc_info=True)
+        except Exception as exc:
+            self._log_failure("private_bytes", exc)
+        if self.mode == "detailed":
+            try:
+                if tracemalloc.is_tracing():
+                    trace_scope = "cycle_since_start" if self._owns_tracing else "external_start_unknown"
+                    python_current, python_peak = tracemalloc.get_traced_memory()
+                    tracer_bytes = tracemalloc.get_tracemalloc_memory()
+            except Exception as exc:
+                self._log_failure("tracemalloc_read", exc)
         try:
             pool = self._arrow_pool_getter()
-            arrow_current = int(pool.bytes_allocated())
-            arrow_peak_value = pool.max_memory()
-            arrow_peak = None if arrow_peak_value is None else int(arrow_peak_value)
-            arrow_backend = str(pool.backend_name)
-        except Exception:
-            logger.debug("[memory] PyArrow 메모리 풀 조회 실패", exc_info=True)
+            if pool is not None:
+                arrow_current = int(pool.bytes_allocated())
+                arrow_peak_value = pool.max_memory()
+                arrow_peak = None if arrow_peak_value is None else int(arrow_peak_value)
+                arrow_backend = str(pool.backend_name)
+        except Exception as exc:
+            arrow_current = arrow_peak = None
+            arrow_backend = "n/a"
+            self._log_failure("arrow_pool", exc)
 
         counter_text = "" if not counters else " " + " ".join(
             f"{key}={value}" for key, value in sorted(counters.items())
@@ -172,7 +201,7 @@ class MemoryDiagnostics:
         logger.info(
             "[memory] pid=%d cycle_id=%s phase=%s private_mib=%s python_current_mib=%s "
             "python_peak_mib=%s arrow_current_mib=%s arrow_peak_mib=%s arrow_backend=%s "
-            "private_delta_mib=%s python_scope=%s trace_started_at_ns=%s tracemalloc_mib=%s%s",
+            "private_delta_mib=%s python_scope=%s trace_started_at_ns=%s tracemalloc_mib=%s mode=%s%s",
             self._pid,
             self._cycle_id,
             phase,
@@ -186,9 +215,11 @@ class MemoryDiagnostics:
             trace_scope,
             self._trace_started_at_ns if self._trace_started_at_ns is not None else "n/a",
             _format_mib(tracer_bytes),
+            self.mode,
             counter_text,
         )
-        self._log_snapshot_diff(phase)
+        if self.mode == "detailed":
+            self._log_snapshot_diff(phase)
 
     @staticmethod
     def _display_trace_filename(filename: str) -> str:
@@ -204,7 +235,7 @@ class MemoryDiagnostics:
 
     def _log_snapshot_diff(self, phase: str) -> None:
         """Log top code-location deltas only; snapshots never leave process memory."""
-        if not self.enabled or not tracemalloc.is_tracing():
+        if not self.enabled or self.mode != "detailed" or not tracemalloc.is_tracing():
             return
         is_before_optimize = phase.startswith("before_optimize_")
         is_after_optimize = phase.startswith("after_optimize_")
@@ -235,21 +266,24 @@ class MemoryDiagnostics:
                     "[memory] pid=%d cycle_id=%s snapshot_diff phase=%s top=%s",
                     self._pid, self._cycle_id, phase, " | ".join(items),
                 )
-        except Exception:
+        except Exception as exc:
             status = "failed"
-            logger.debug("[memory] tracemalloc snapshot diff failed", exc_info=True)
+            self._log_failure("snapshot_diff", exc)
         finally:
             logger.info("[memory] pid=%d cycle_id=%s snapshot_diff phase=%s action=end status=%s", self._pid, self._cycle_id, phase, status)
 
     def collect_and_log(self) -> None:
-        """진단 모드에서만 Python GC를 실행한 뒤 마지막 메모리를 기록한다."""
+        """Sample released resources; only detailed mode explicitly collects GC."""
         if not self.enabled:
+            return
+        if self.mode == "basic":
+            self.log("cycle_resources_released")
             return
         self.log("before_gc_collect")
         try:
             gc.collect()
-        except Exception:
-            logger.debug("[memory] gc.collect 실패", exc_info=True)
+        except Exception as exc:
+            self._log_failure("gc_collect", exc)
         self.log("after_gc_collect")
 
     def stop(self) -> None:
@@ -257,21 +291,25 @@ class MemoryDiagnostics:
         if not self.enabled:
             return
         try:
-            if self._owns_tracing:
-                self.log("before_tracemalloc_stop")
-                if tracemalloc.is_tracing():
-                    tracemalloc.stop()
-                self.log("after_tracemalloc_stop")
-            else:
-                self.log(
-                    "tracemalloc_preserved_external" if tracemalloc.is_tracing()
-                    else "tracemalloc_inactive"
-                )
-        except Exception:
-            logger.debug("[memory] tracemalloc 종료 실패", exc_info=True)
-        self._owns_tracing = False
-        self._started = False
-        self._cycle_snapshot = None
-        self._before_optimize_snapshot = None
-        self._trace_started_at_ns = None
+            if self.mode == "detailed":
+                if self._owns_tracing:
+                    try:
+                        self.log("before_tracemalloc_stop")
+                    finally:
+                        if tracemalloc.is_tracing():
+                            tracemalloc.stop()
+                    self.log("after_tracemalloc_stop")
+                else:
+                    self.log(
+                        "tracemalloc_preserved_external" if tracemalloc.is_tracing()
+                        else "tracemalloc_inactive"
+                    )
+        except Exception as exc:
+            self._log_failure("stop", exc)
+        finally:
+            self._owns_tracing = False
+            self._started = False
+            self._cycle_snapshot = None
+            self._before_optimize_snapshot = None
+            self._trace_started_at_ns = None
         self.log("cycle_diagnostics_released")
