@@ -1,6 +1,7 @@
 """문서·메일 경계 정리와 임베딩 취소의 종료·데이터 보존 회귀."""
 import json
 import ssl
+import sys
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -266,6 +267,12 @@ def test_tray_shutdown_during_mail_embedding_finishes_worker_cleanup(tmp_path, m
 
     entered, release = threading.Event(), threading.Event()
     events = []
+    com_events = []
+    monkeypatch.setitem(sys.modules, "pythoncom", SimpleNamespace(
+        COINIT_MULTITHREADED=0,
+        CoInitializeEx=lambda _mode: com_events.append(("init", threading.get_ident())),
+        CoUninitialize=lambda: com_events.append(("uninit", threading.get_ident())),
+    ))
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
@@ -311,6 +318,7 @@ def test_tray_shutdown_during_mail_embedding_finishes_worker_cleanup(tmp_path, m
             assert not worker.isRunning()
             assert len(events) == 2  # 정상 종료의 최종 정리도 생성 워커에서 실행됐다.
             assert events[0][1] == events[1][1] != threading.get_ident()
+            assert com_events == [("init", events[0][1]), ("uninit", events[0][1])]
             assert worker.work_stage == "idle"
             assert mail_indexer.table.count_rows() == 0
         finally:

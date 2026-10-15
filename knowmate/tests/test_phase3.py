@@ -2610,7 +2610,27 @@ class TestSingleInstance:
         yield
         QLocalServer.removeServer(server_name)
 
-    def test_first_instance_acquires(self):
+    @pytest.fixture
+    def _local_socket_transport(self, tmp_path):
+        """Unix socket을 금지한 환경에서만 실제 IPC 통합 검증을 생략한다."""
+        import errno
+        import socket
+        import sys
+
+        if sys.platform == "win32":
+            return  # Windows QLocalServer는 named pipe를 사용한다.
+        probe_path = tmp_path / "ipc-probe"
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as probe:
+                probe.bind(str(probe_path))
+        except OSError as exc:
+            if exc.errno not in {errno.EPERM, errno.EACCES, errno.EAFNOSUPPORT}:
+                raise
+            pytest.skip(f"실제 Unix IPC 사용 불가: errno={exc.errno}")
+        finally:
+            probe_path.unlink(missing_ok=True)
+
+    def test_first_instance_acquires(self, _local_socket_transport):
         """서버가 없으면 listen으로 선점한 primary server를 반환한다."""
         from knowmate.app.single_instance import acquire_or_notify_existing
         result = acquire_or_notify_existing()
@@ -2621,7 +2641,7 @@ class TestSingleInstance:
             if result.server is not None:
                 result.server.close()
 
-    def test_server_emits_show_requested_on_message(self):
+    def test_server_emits_show_requested_on_message(self, _local_socket_transport):
         """서버는 'show' 메시지를 받으면 show_requested를 발동한다.
 
         원자 선점은 별도 테스트에서 덮고, 여기서는 소켓을 직접 유지해 수신 큐 처리만
@@ -2659,7 +2679,7 @@ class TestSingleInstance:
             sock.disconnectFromServer()
             server.close()
 
-    def test_server_close_allows_new_acquisition(self):
+    def test_server_close_allows_new_acquisition(self, _local_socket_transport):
         """서버를 닫으면 이후 다시 첫 인스턴스로 획득할 수 있다."""
         from knowmate.app.single_instance import (
             acquire_or_notify_existing,
@@ -2699,6 +2719,45 @@ class TestSingleInstance:
         assert not result.acquired
         assert not result.secondary_notified
         assert not lock.stale_remove_called
+
+    @pytest.mark.parametrize("listens,notified,acquired,removals", [
+        ([True], False, True, 0),
+        ([False, True], False, True, 1),
+        ([False], True, False, 0),
+        ([False, False], False, False, 1),
+    ])
+    def test_authority_holder_handles_listen_outcomes_without_real_ipc(
+        self, monkeypatch, listens, notified, acquired, removals,
+    ):
+        """IPC 제한과 무관하게 선점·기존 알림·stale 복구·실패 시 정리를 검증한다."""
+        from knowmate.app import single_instance
+
+        lock = MagicMock()
+        lock.tryLock.return_value = True
+        server = MagicMock()
+        server.listen.side_effect = listens
+        remove_server = MagicMock()
+
+        def make_server(parent, *, authority_lock):
+            assert authority_lock is lock
+            return server
+
+        monkeypatch.setattr(single_instance, "_new_authority_lock", lambda: lock)
+        monkeypatch.setattr(single_instance, "SingleInstanceServer", make_server)
+        monkeypatch.setattr(single_instance, "_notify_existing", lambda: notified)
+        monkeypatch.setattr(single_instance.QLocalServer, "removeServer", remove_server)
+
+        result = single_instance.acquire_or_notify_existing()
+
+        assert result.acquired is acquired
+        assert result.secondary_notified is notified
+        assert result.server is (server if acquired else None)
+        lock.tryLock.assert_called_once_with(0)
+        assert server.listen.call_count == len(listens)
+        assert remove_server.call_count == removals
+        if removals:
+            remove_server.assert_called_once_with(single_instance._SERVER_NAME)
+        assert server.close.call_count == int(not acquired)
 
 
 # ============================================================
