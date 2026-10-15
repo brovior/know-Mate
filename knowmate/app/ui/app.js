@@ -3,7 +3,27 @@
 
 let bridge = null;
 let currentMode = "knowledge";
-let waiting = false;
+let waiting = false; // visible response animation only
+let frontendSubmitting = false;
+let backendBusy = true; // remain conservative until the backend state is known
+let queryState = "IDLE";
+let stateRequestId = null;
+let queryStateEpoch = 0;
+let queryStateReadSeq = 0;
+let activeRequest = null;
+let viewGeneration = 0;
+let recentListSeq = 0;
+let historyMutationEpoch = 0;
+let restoreSeq = 0;
+let navigationSeq = 0;
+let navigationPending = false;
+let querySafetyTimer = null;
+let queryTimeoutMs = 0;
+const threadVersions = new WeakMap();
+const savedThreadVersions = new WeakMap();
+const threadSaves = new Map();
+const deletingThreads = new Set();
+const unsentUserMessages = new WeakMap();
 let currentThread = null;   // 현재 대화 스레드 {id, title, mode, created_at, messages}
 
 // QWebEngineView 환경에서 .checked 동적 읽기가 불안정한 경우를 방어하기 위해 JS 변수로 별도 추적
@@ -15,6 +35,7 @@ let scopeMail   = true;
 new QWebChannel(qt.webChannelTransport, function(channel) {
   bridge = channel.objects.bridge;
   bridge.responseReady.connect(onResponse);
+  bridge.queryStateChanged.connect(onQueryStateChanged);
   bridge.indexProgress.connect(onIndexProgress);
   bridge.indexFinished.connect(onIndexFinished);
   bridge.indexAlert.connect(onIndexAlert);
@@ -24,6 +45,7 @@ new QWebChannel(qt.webChannelTransport, function(channel) {
 
 function onBridgeReady() {
   renderEmptyState();
+  refreshQueryState();
   initTitlebarDrag();
   initScopeCheckboxes();
   bridge.getIndexStatus().then(json => {
@@ -97,57 +119,225 @@ function windowMaximize() {
 function windowClose()    { if (bridge) bridge.closeWindow(); }
 
 /* -- 모드 전환 -- */
-function switchMode(mode) {
+async function switchMode(mode) {
+  if (mode === currentMode) return;
+  if (!await prepareNavigation()) return;
   currentMode = mode;
+  currentThread = null;
   document.getElementById("segKnow").classList.toggle("active", mode === "knowledge");
-  document.getElementById("segMes").classList.toggle("active",  mode === "mes");
+  document.getElementById("segMes").classList.toggle("active", mode === "mes");
   document.getElementById("panelKnow").style.display = mode === "knowledge" ? "" : "none";
-  document.getElementById("panelMes").style.display  = mode === "mes"       ? "" : "none";
+  document.getElementById("panelMes").style.display = mode === "mes" ? "" : "none";
+  renderEmptyState();
   loadRecentQuestions();
 }
 
-/* -- 입력 전송 -- */
+/* -- 입력 전송 / 질문 수명 -- */
 function handleKey(e) {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sendMsg(); }
 }
 
-function sendMsg() {
-  if (waiting || !bridge) return;
+function queryLocked() {
+  return frontendSubmitting || backendBusy || navigationPending || Boolean(currentThread &&
+    deletingThreads.has(currentThread.mode + ":" + currentThread.id));
+}
+
+function updateQueryControls() {
   const inp = document.getElementById("inputPill");
-  const text = inp.value.trim();
-  if (!text) return;
-
-  // 첫 메시지면 스레드 초기화
-  if (!currentThread) {
-    currentThread = {
-      id: _genId(),
-      title: text.substring(0, 30),
-      mode: currentMode,
-      created_at: new Date().toISOString(),
-      messages: [],
-    };
+  if (inp) {
+    inp.disabled = false;
+    inp.placeholder = queryState === "RETIRED_PENDING_EXIT"
+      ? "이전 요청을 정리하는 중입니다. 다음 질문을 작성할 수 있습니다."
+      : "질문을 입력하세요";
   }
-  currentThread.messages.push({ role: "user", content: text });
+  document.querySelectorAll(".btn-send").forEach(button => {
+    button.disabled = queryLocked();
+    button.title = queryLocked() ? "이전 질문 처리가 끝난 뒤 전송할 수 있습니다." : "전송";
+  });
+  document.querySelectorAll(".btn-settings-save, .btn-add-folder, #folderList button, " +
+    "#failBody button[data-act='exclude'], #failBody button[data-act='unexclude']").forEach(button => {
+    button.disabled = frontendSubmitting || backendBusy;
+  });
+  const bulk = document.getElementById("btnBulkFailAction");
+  if (bulk && (frontendSubmitting || backendBusy)) bulk.disabled = true;
+}
 
-  appendUserMsg(text);
-  inp.value = "";
-  setWaiting(true);
+function policyWriteBlocked() {
+  if (!frontendSubmitting && !backendBusy) return false;
+  showToast(queryState === "RETIRED_PENDING_EXIT"
+    ? "이전 요청을 정리하는 중입니다. 완료 후 다시 시도해 주세요."
+    : "질문 처리가 끝난 뒤 다시 시도해 주세요.");
+  return true;
+}
 
+async function refreshQueryState() {
+  if (!bridge) return;
+  const request = activeRequest;
+  const epoch = queryStateEpoch;
+  const seq = ++queryStateReadSeq;
+  try {
+    const state = await bridge.getQueryState();
+    if (activeRequest === request && epoch === queryStateEpoch && seq === queryStateReadSeq) {
+      onQueryStateChanged(state, true);
+    }
+  }
+  catch { showToast("질문 처리 상태를 확인하지 못했습니다."); }
+}
+
+function armQuerySafetyTimer(request) {
+  clearTimeout(querySafetyTimer);
+  if (!Number.isFinite(queryTimeoutMs) || queryTimeoutMs <= 0) return;
+  querySafetyTimer = setTimeout(async () => {
+    if (activeRequest !== request || !backendBusy) return;
+    await refreshQueryState();
+    if (activeRequest === request && backendBusy) {
+      bridge.cancelQuery(request.request_id);
+      setWaiting(false);
+      showToast("이전 요청을 정리하는 중입니다.");
+    }
+  }, Math.min(queryTimeoutMs + 1000, 2147483647));
+}
+
+function onQueryStateChanged(json, authoritative = false) {
+  let data;
+  try { data = typeof json === "string" ? JSON.parse(json) : json; } catch { return; }
+  if (!data || typeof data.busy !== "boolean" || typeof data.state !== "string") return;
+  if (!authoritative && stateRequestId && data.request_id !== stateRequestId) return;
+  queryStateEpoch++;
+  stateRequestId = data.request_id || null;
+  backendBusy = data.busy;
+  queryState = data.state;
+  if (Number.isFinite(data.timeout_ms) && data.timeout_ms > 0) queryTimeoutMs = data.timeout_ms;
+  if (!backendBusy) {
+    clearTimeout(querySafetyTimer);
+    setWaiting(false);
+  }
+  else if (activeRequest && !activeRequest.timerArmed) {
+    activeRequest.timerArmed = true;
+    armQuerySafetyTimer(activeRequest);
+  }
+  if (queryState === "RETIRED_PENDING_EXIT" || queryState === "CLOSING") setWaiting(false);
+  updateQueryControls();
+  if (!backendBusy) renderFailuresPanel();
+}
+
+function touchHistory() {
+  historyMutationEpoch++;
+  recentListSeq++;
+  restoreSeq++;
+}
+
+function markThreadDirty(thread) {
+  threadVersions.set(thread, (threadVersions.get(thread) || 0) + 1);
+}
+
+async function persistThread(thread = currentThread) {
+  if (!thread || !bridge) return true;
+  while (threadSaves.has(thread.id)) await threadSaves.get(thread.id);
+  const version = threadVersions.get(thread) || 0;
+  if ((savedThreadVersions.get(thread) || 0) === version) return true;
+  touchHistory();
+  const pending = (async () => {
+    try {
+      const result = JSON.parse(await bridge.saveThread(thread.mode, JSON.stringify(thread)));
+      if (!result || result.ok !== true) throw new Error("save failed");
+      savedThreadVersions.set(thread, version);
+      loadRecentQuestions();
+      return true;
+    } catch {
+      showToast("대화를 저장하지 못했습니다. 현재 대화를 유지하고 다시 시도해 주세요.");
+      return false;
+    }
+  })();
+  threadSaves.set(thread.id, pending);
+  const ok = await pending;
+  if (threadSaves.get(thread.id) === pending) threadSaves.delete(thread.id);
+  return ok;
+}
+
+async function prepareNavigation() {
+  const seq = ++navigationSeq;
+  navigationPending = true;
+  viewGeneration++;
+  restoreSeq++;
+  recentListSeq++;
+  if (activeRequest) {
+    activeRequest.invalidated = true;
+    if (bridge) bridge.cancelQuery(activeRequest.request_id);
+  }
+  setWaiting(false);
+  const saved = await persistThread();
+  if (seq !== navigationSeq) return false;
+  navigationPending = false;
+  updateQueryControls();
+  return saved;
+}
+
+async function sendMsg() {
+  if (queryLocked() || !bridge) return;
+  const inp = document.getElementById("inputPill");
+  const inputValue = inp.value;
+  const text = inputValue.trim();
+  if (!text) return;
   const scopes = [];
   if (currentMode === "knowledge") {
-    if (scopeLocal)  scopes.push("local");
+    if (scopeLocal) scopes.push("local");
     if (scopeShared) scopes.push("shared");
-    if (scopeMail)   scopes.push("mail");
-
+    if (scopeMail) scopes.push("mail");
     if (scopes.length === 0) {
-      setWaiting(false);
-      removeLoading();
-      appendAiBlocks([{ type: "text", content: "검색 범위를 하나 이상 선택해주세요. (내 PC 문서 또는 공유 폴더)" }]);
+      showToast("검색 범위를 하나 이상 선택해주세요.");
       return;
     }
   }
-
-  bridge.sendQuery(JSON.stringify({ query: text, mode: currentMode, scopes }));
+  frontendSubmitting = true;
+  const submissionGeneration = viewGeneration;
+  updateQueryControls();
+  try {
+    if (!await persistThread()) return;
+    if (submissionGeneration !== viewGeneration || navigationPending) return;
+    if (!currentThread) {
+      currentThread = { id: _genId(), title: text.substring(0, 30), mode: currentMode,
+        created_at: new Date().toISOString(), messages: [] };
+    }
+    const thread = currentThread;
+    const generation = viewGeneration;
+    const pendingMessage = unsentUserMessages.get(thread);
+    if (pendingMessage && thread.messages[thread.messages.length - 1] === pendingMessage) {
+      if (pendingMessage.content !== text) {
+        pendingMessage.content = text;
+        markThreadDirty(thread);
+        renderThreadMessages(thread);
+      }
+    } else {
+      const message = { role: "user", content: text };
+      thread.messages.push(message);
+      unsentUserMessages.set(thread, message);
+      markThreadDirty(thread);
+      appendUserMsg(text);
+    }
+    if (!await persistThread(thread)) return;
+    if (generation !== viewGeneration || currentThread !== thread || navigationPending) return;
+    const request = { request_id: _genId(), mode: currentMode, thread_id: thread.id,
+      view_generation: generation, terminalSeen: false, invalidated: false, timerArmed: false };
+    activeRequest = request;
+    backendBusy = true;
+    stateRequestId = request.request_id;
+    queryState = "RUNNING";
+    setWaiting(true);
+    // Reserve before calling: a fast Qt response may arrive during this invocation.
+    await bridge.sendQuery(JSON.stringify({ query: text, scopes, request_id: request.request_id,
+      mode: request.mode, thread_id: request.thread_id, view_generation: generation }));
+    unsentUserMessages.delete(thread);
+    if (generation === viewGeneration && currentThread === thread && inp.value === inputValue) inp.value = "";
+    armQuerySafetyTimer(request);
+  } catch {
+    setWaiting(false);
+    showToast("질문 전송 상태를 확인하지 못했습니다.");
+    refreshQueryState();
+  } finally {
+    frontendSubmitting = false;
+    updateQueryControls();
+  }
 }
 
 function _genId() {
@@ -156,29 +346,37 @@ function _genId() {
 
 function setWaiting(on) {
   waiting = on;
-  const inp = document.getElementById("inputPill");
-  inp.disabled = on;
-  if (on) showLoading(true);
+  showLoading(on);
+  updateQueryControls();
 }
 
-/* -- Python 응답 수신 -- */
-function onResponse(json) {
-  showLoading(false);
-  setWaiting(false);
-
+/* -- Python 응답 수신: 실행권은 상태 신호의 실제 종료 확인으로만 해제 -- */
+async function onResponse(json) {
   let data;
   try { data = JSON.parse(json); } catch { return; }
-
-  removeLoading();
-  appendAiBlocks(data.blocks || []);
-  document.getElementById("inputPill").focus();
-
-  // 스레드에 AI 응답 저장
-  if (currentThread && bridge) {
-    currentThread.messages.push({ role: "ai", blocks: data.blocks || [] });
-    bridge.saveThread(currentThread.mode, JSON.stringify(currentThread));
-    loadRecentQuestions();
+  const request = activeRequest;
+  if (!request || !data || data.request_id !== request.request_id || request.terminalSeen ||
+      data.mode !== request.mode || data.thread_id !== request.thread_id ||
+      data.view_generation !== request.view_generation) return;
+  if (!["success", "error", "cancelled", "timeout", "rejected"].includes(data.status)) return;
+  if (data.status === "rejected") {
+    showToast("이전 질문 처리가 끝난 뒤 다시 시도해 주세요.");
+    refreshQueryState();
+    return;
   }
+  request.terminalSeen = true;
+  if (request.invalidated || request.view_generation !== viewGeneration ||
+      currentMode !== request.mode || !currentThread || currentThread.id !== request.thread_id) return;
+  setWaiting(false);
+  const blocks = Array.isArray(data.blocks) ? data.blocks : [];
+  if (data.status === "cancelled" || data.status === "timeout") {
+    showToast(data.status === "timeout" ? "응답 시간이 초과되었습니다. 이전 요청을 정리합니다." : "질문을 취소했습니다.");
+    return;
+  }
+  appendAiBlocks(blocks);
+  currentThread.messages.push({ role: "ai", blocks });
+  markThreadDirty(currentThread);
+  await persistThread();
 }
 
 /* -- 인덱싱 시그널 핸들러 -- */
@@ -481,17 +679,18 @@ function renderFolderList(folders) {
     removeBtn.addEventListener("click", () => removeFolder(removeBtn, path));
     list.appendChild(row);
   });
+  updateQueryControls();
 }
 
 function removeFolder(btn, path) {
-  if (!bridge) return;
+  if (!bridge || policyWriteBlocked()) return;
   bridge.removeWatchFolder(path).then(json => renderFolderList(JSON.parse(json)));
 }
 
 function addFolder() {
-  if (!bridge) return;
+  if (!bridge || policyWriteBlocked()) return;
   bridge.selectFolder().then(path => {
-    if (!path) return;
+    if (!path || policyWriteBlocked()) return;
     bridge.addWatchFolder(path).then(json => renderFolderList(JSON.parse(json)));
   });
 }
@@ -531,21 +730,28 @@ function cancelReindex() {
   if (bridge) bridge.cancelReindex();
 }
 
-function newThread() {
+async function newThread() {
+  if (!await prepareNavigation()) return;
   currentThread = null;
   renderEmptyState();
   document.getElementById("inputPill").focus();
   loadRecentQuestions();
 }
 
-/* -- 최근 질문 -- */
+/* -- 최근 질문: 변경 및 조회 순서가 지난 응답은 반영하지 않음 -- */
 function loadRecentQuestions() {
   if (!bridge) return;
-  bridge.getThreads(currentMode).then(json => {
+  const seq = ++recentListSeq;
+  const epoch = historyMutationEpoch;
+  const mode = currentMode;
+  const generation = viewGeneration;
+  bridge.getThreads(mode).then(json => {
+    if (seq !== recentListSeq || epoch !== historyMutationEpoch ||
+        mode !== currentMode || generation !== viewGeneration) return;
     let threads;
     try { threads = JSON.parse(json); } catch { return; }
-    renderRecentList(threads);
-  });
+    if (Array.isArray(threads)) renderRecentList(threads);
+  }).catch(() => showToast("최근 질문을 불러오지 못했습니다."));
 }
 
 function renderRecentList(threads) {
@@ -555,7 +761,7 @@ function renderRecentList(threads) {
     const div = document.createElement("div");
     div.className = "recent-item" + (currentThread && currentThread.id === t.id ? " active" : "");
     div.title = t.title;
-    div.onclick = () => restoreThread(t);
+    div.onclick = () => restoreThread({ id: t.id, mode: currentMode });
 
     const label = document.createElement("span");
     label.className = "recent-label";
@@ -573,29 +779,66 @@ function renderRecentList(threads) {
   });
 }
 
-function deleteQuestion(thread) {
+async function deleteQuestion(thread) {
   if (!bridge) return;
-  bridge.deleteThread(currentMode, thread.id);
-  // 현재 열려 있는 스레드를 삭제하면 화면을 비우고 목록 갱신
-  if (currentThread && currentThread.id === thread.id) {
-    newThread();              // 내부에서 loadRecentQuestions 호출
-  } else {
+  const mode = thread.mode || currentMode;
+  const isCurrent = currentThread && currentThread.id === thread.id && currentThread.mode === mode;
+  if (isCurrent && !await prepareNavigation()) return;
+  const key = mode + ":" + thread.id;
+  if (deletingThreads.has(key)) return;
+  deletingThreads.add(key);
+  updateQueryControls();
+  touchHistory();
+  try {
+    const result = JSON.parse(await bridge.deleteThread(mode, thread.id));
+    if (!result || result.ok !== true) throw new Error("delete failed");
+    if (currentThread && currentThread.id === thread.id && currentThread.mode === mode) {
+      currentThread = null;
+      renderEmptyState();
+    }
     loadRecentQuestions();
+  } catch { showToast("대화를 삭제하지 못했습니다."); }
+  finally { deletingThreads.delete(key); updateQueryControls(); }
+}
+
+async function restoreThread(thread) {
+  if (!bridge) return;
+  const mode = thread.mode || currentMode;
+  if (deletingThreads.has(mode + ":" + thread.id)) {
+    showToast("대화를 삭제하는 중입니다.");
+    return;
+  }
+  if (!await prepareNavigation()) return;
+  const seq = ++restoreSeq;
+  const epoch = historyMutationEpoch;
+  const generation = viewGeneration;
+  navigationPending = true;
+  updateQueryControls();
+  try {
+    const restored = JSON.parse(await bridge.getThread(mode, thread.id));
+    if (seq !== restoreSeq || epoch !== historyMutationEpoch || generation !== viewGeneration || mode !== currentMode) return;
+    if (!restored || restored.id !== thread.id || restored.mode !== mode) {
+      showToast("대화를 찾을 수 없습니다.");
+      return;
+    }
+    currentThread = restored;
+    renderThreadMessages(restored);
+    loadRecentQuestions();
+  } catch { showToast("대화를 불러오지 못했습니다."); }
+  finally {
+    if (generation === viewGeneration) {
+      navigationPending = false;
+      updateQueryControls();
+    }
   }
 }
 
-function restoreThread(thread) {
-  currentThread = thread;
-  const scroll = document.getElementById("chatScroll");
-  scroll.innerHTML = "";
+function renderThreadMessages(thread) {
+  document.getElementById("chatScroll").innerHTML = "";
   (thread.messages || []).forEach(msg => {
-    if (msg.role === "user") {
-      appendUserMsg(msg.content);
-    } else if (msg.role === "ai") {
-      appendAiBlocks(msg.blocks || []);
-    }
+    if (msg.role === "user") appendUserMsg(msg.content);
+    else if (msg.role === "ai") appendAiBlocks(msg.blocks || []);
   });
-  loadRecentQuestions();  // active 상태 반영
 }
 
 /* -- 유틸 -- */
@@ -700,6 +943,7 @@ function _segValue(groupId) {
 }
 
 function saveSettings() {
+  if (policyWriteBlocked()) return;
   if (!bridge) { showToast("브리지가 준비되지 않았습니다."); return; }
 
   const patch = {
@@ -744,7 +988,7 @@ function saveSettings() {
       showToast("설정이 저장되었습니다. 일부 항목은 재시작 후 적용됩니다.");
       closeSettings();
     } else {
-      showToast("설정 저장 실패: " + (result.error || "알 수 없는 오류"));
+      showToast(result.error === "query_busy" || result.code === "query_busy" ? "질문 처리가 끝난 뒤 다시 시도해 주세요." : "설정 저장 실패");
     }
   }).catch(() => showToast("설정 저장 실패"));
 }
@@ -863,6 +1107,7 @@ function renderFailuresPanel() {
   }
   body.innerHTML = visible.map(_renderFailCard).join("");
   _bindFailCardActions(body, visible);
+  updateQueryControls();
 }
 
 function _bulkFailureTargets(visible) {
@@ -877,12 +1122,12 @@ function _renderBulkFailureAction(visible) {
   const targets = _bulkFailureTargets(visible);
   button.textContent = isUnexclude ? `${targets.length}건 제외 해제` : `${targets.length}건 제외`;
   button.classList.toggle("unexclude", isUnexclude);
-  button.disabled = _failBulkRunning || targets.length === 0;
+  button.disabled = _failBulkRunning || frontendSubmitting || backendBusy || targets.length === 0;
   retryAll.style.display = isUnexclude ? "none" : "";
 }
 
 function runBulkFailureAction() {
-  if (!bridge || _failBulkRunning) return;
+  if (!bridge || _failBulkRunning || policyWriteBlocked()) return;
   const visible = _failCards.filter(c => _failFilter === "all" || _failCategory(c) === _failFilter);
   const targets = _bulkFailureTargets(visible);
   if (targets.length === 0) return;
@@ -909,7 +1154,9 @@ function runBulkFailureAction() {
     const message = _bulkFailureSuccessMessage(isUnexclude, result);
     showToast(refreshFailed ? `${message} 목록을 새로고침하지 못했습니다.` : message);
   }).catch(error => {
-    if (error && error.message === "busy") {
+    if (error && error.message === "query_busy") {
+      showToast("질문 처리가 끝난 뒤 다시 시도해 주세요.");
+    } else if (error && error.message === "busy") {
       showToast("인덱싱이 끝난 후 다시 시도해 주세요.");
     } else {
       showToast(isUnexclude ? "일괄 제외 해제에 실패했습니다." : "일괄 인덱싱 제외에 실패했습니다.");
@@ -1056,8 +1303,9 @@ function retryFailureFile(path) {
 }
 
 function excludeFailureFile(path) {
-  if (!bridge) return;
+  if (!bridge || policyWriteBlocked()) return;
   bridge.excludeFile(path).then(result => {
+    if (result === "query_busy") { showToast("질문 처리가 끝난 뒤 다시 시도해 주세요."); return; }
     if (result === "busy") { showToast("인덱싱이 끝난 후 다시 시도해 주세요."); return; }
     if (result !== "ok") { showToast("인덱싱 제외에 실패했습니다."); return; }
     bridge.getFailures().then(json => {
@@ -1069,8 +1317,9 @@ function excludeFailureFile(path) {
 }
 
 function unexcludeFailureFile(path) {
-  if (!bridge) return;
+  if (!bridge || policyWriteBlocked()) return;
   bridge.unexcludeFile(path).then(result => {
+    if (result === "query_busy") { showToast("질문 처리가 끝난 뒤 다시 시도해 주세요."); return; }
     if (result === "busy") { showToast("인덱싱이 끝난 후 다시 시도해 주세요."); return; }
     if (result !== "ok") { showToast("제외 해제에 실패했습니다."); return; }
     bridge.getFailures().then(json => {

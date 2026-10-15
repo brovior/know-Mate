@@ -400,7 +400,7 @@ fragment 수 기반 DB 정리, Office RPC 단절 복구다.
 
 - [PERF_ANALYSIS.md](archive/PERF_ANALYSIS.md): 2026-09-06 분석 초안. 일부 근거가 반박됐으며 현행 지시가 아님.
 - [PERF_ANALYSIS_REVIEW.md](archive/PERF_ANALYSIS_REVIEW.md): 교차검증·결함 발견 이력. 발견 후 수정된 항목 포함.
-- [ISSUE_B_query_async.md](design/ISSUE_B_query_async.md): 미구현 비동기화 상세 설계. 현행 구현의 안전성을 증명하는 자료가 아님.
+- [ISSUE_B_query_async.md](design/ISSUE_B_query_async.md): 질문 비동기 실행·읽기/대화/종료 보호 계약. 실제 사내 Windows·Office 장시간 검증은 남아 있음.
 
 과거 3,000개 파일 부하와 ‘상태에 색인 추가’의 정확한 기록은 이번 문서·Git 이력 검색에서
 찾지 못했다. SQLite 보류 기록만으로 같은 논의였다고 단정하지 않는다.

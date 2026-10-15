@@ -45,3 +45,11 @@ def delete_thread(mode: str, thread_id: str) -> None:
     data = load_threads()
     data[mode] = [t for t in data.get(mode, []) if t.get("id") != thread_id]
     save_threads(data)
+
+
+def get_thread(mode: str, thread_id: str) -> dict[str, Any] | None:
+    """Read the latest saved conversation and leave missing IDs absent."""
+    for thread in load_threads().get(mode, []):
+        if thread.get("id") == thread_id:
+            return thread
+    return None

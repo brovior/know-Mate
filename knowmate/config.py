@@ -4,6 +4,7 @@ import math
 import os
 import sys
 from copy import deepcopy
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
@@ -291,3 +292,26 @@ def _save_config(cfg: dict[str, Any]) -> None:
     with tmp.open("w", encoding="utf-8") as f:
         yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
     tmp.replace(target)
+
+
+@lru_cache(maxsize=1)
+def _bundled_query_timeout_seconds() -> float:
+    with _bundled_config_source().open(encoding="utf-8") as handle:
+        bundled = yaml.safe_load(handle) or {}
+    return float(bundled["ui"]["query_timeout_seconds"])
+
+
+def query_timeout_ms(config: dict[str, Any]) -> int:
+    """Resolve a finite positive QTimer-compatible request budget."""
+    default = _bundled_query_timeout_seconds()
+    ui = config.get("ui", {})
+    value = ui.get("query_timeout_seconds", default) if isinstance(ui, dict) else default
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        value = default
+    try:
+        value = float(value)
+    except (ValueError, OverflowError):
+        value = default
+    if not math.isfinite(value) or value <= 0 or value > 2_147_483.647:
+        value = default
+    return max(1, int(value * 1000))

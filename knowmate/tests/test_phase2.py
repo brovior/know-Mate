@@ -390,6 +390,9 @@ class TestEmbeddingApiResponse:
         attempts = {"count": 0}
 
         class Connection:
+            def close(self):
+                pass
+
             def __init__(self, *_args, **_kwargs):
                 pass
 
@@ -425,6 +428,9 @@ class TestEmbeddingApiResponse:
                 return json.dumps({"data": [{"index": 0, "embedding": vector}]}).encode()
 
         class Connection:
+            def close(self):
+                pass
+
             def __init__(self, *_args, **_kwargs):
                 pass
 
@@ -659,7 +665,7 @@ class TestKnowledgeAgentFake:
             # config를 fake 모드로 패치
             monkeypatch.setattr(
                 "knowmate.agents.knowledge_agent._build_pipeline",
-                lambda: _make_fake_pipeline(tmpdir),
+                lambda *_args: _make_fake_pipeline(tmpdir),
             )
 
             agent = KnowledgeAgent()
@@ -672,7 +678,7 @@ class TestKnowledgeAgentFake:
         """파이프라인 초기화 실패 시 mock 블록을 반환함을 확인한다."""
         from knowmate.agents.knowledge_agent import KnowledgeAgent
 
-        def _fail():
+        def _fail(*_args):
             raise RuntimeError("의도적 실패")
 
         monkeypatch.setattr(
@@ -680,7 +686,7 @@ class TestKnowledgeAgentFake:
         )
 
         agent = KnowledgeAgent()
-        result = agent.handle("테스트", {})
+        result = agent.handle("테스트", {"scopes": ["local"]})
         assert isinstance(result, list)
         assert len(result) >= 1
         assert result[0]["type"] == "text"
@@ -992,6 +998,9 @@ class TestSlowEmbedCallLogging:
                 return json.dumps(body).encode("utf-8")
 
         class FakeConn:
+            def close(self):
+                pass
+
             def __init__(self, host, port, timeout=None):
                 pass
             def connect(self):

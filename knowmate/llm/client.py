@@ -113,13 +113,16 @@ class LLMClient:
         user_message = f"참고 문서:\n{context_text}\n\n질문: {query}"
 
         client = anthropic.Anthropic(api_key=self._api_key or None)
-        message = client.messages.create(
-            model=self._model,
-            max_tokens=1024,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_message}],
-        )
-        return message.content[0].text
+        try:
+            message = client.messages.create(
+                model=self._model,
+                max_tokens=1024,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_message}],
+            )
+            return message.content[0].text
+        finally:
+            client.close()
 
     def _call_openrouter(self, query: str, context_chunks: list[str], system_prompt: str) -> str:
         """OpenRouter API(OpenAI 호환)를 호출해 답변을 반환한다."""

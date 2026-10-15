@@ -28,6 +28,16 @@ Block = TextBlock | SourcesBlock | TableBlock | ChartBlock
 
 ---
 
+## 질문 실행과 읽기 보호
+
+질문은 요청별 QThread에서 처리하고 수집기와 DB/HTTP/crypto 핸들을 공유하지 않는다.
+기존 인덱스와 키만 읽으며 스키마 이전·Office/추출기·키 생성을 호출하지 않는다.
+결과 수신 뒤에도 실제 `wait(0)` 종료 전까지 다음 질문과 검색 정책 쓰기를 막는다.
+대화 ID·화면 세대·저장 ACK·목록/복원 순번으로 늦은 응답과 삭제 대화의 재생성을 차단한다.
+취소·시간초과·실제 앱 종료 규칙과 검증 범위는 [질문 비동기화](ISSUE_B_query_async.md)를 따른다.
+
+---
+
 ## LanceDB 스키마 (`rag/indexer.py`)
 
 ```python

@@ -5,10 +5,8 @@ fake 모드 → FakeCryptoManager (암·복호화 없이 평문 그대로).
 """
 import base64
 import logging
-import os
 import secrets
 from pathlib import Path
-from typing import Union
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +34,9 @@ class CryptoManager:
     파일이 없으면 새 키를 생성해 DPAPI로 암호화 저장한다.
     """
 
-    def __init__(self, key_file: Path) -> None:
+    def __init__(self, key_file: Path, *, create_if_missing: bool = True) -> None:
         """CryptoManager를 초기화한다. win32crypt 없으면 CryptoUnavailableError."""
-        self._key: bytes = self._load_or_create_key(key_file)
+        self._key: bytes = self._load_or_create_key(key_file, create_if_missing=create_if_missing)
 
     # ------------------------------------------------------------------
     # 공개 API
@@ -76,7 +74,7 @@ class CryptoManager:
     # 내부 헬퍼
     # ------------------------------------------------------------------
 
-    def _load_or_create_key(self, key_file: Path) -> bytes:
+    def _load_or_create_key(self, key_file: Path, *, create_if_missing: bool = True) -> bytes:
         """키 파일에서 DPAPI 복호화로 AES 키를 로드한다. 없으면 생성 후 저장한다."""
         try:
             import win32crypt  # type: ignore
@@ -89,8 +87,10 @@ class CryptoManager:
         if key_file.exists():
             encrypted = key_file.read_bytes()
             _, aes_key = win32crypt.CryptUnprotectData(encrypted)
-            logger.info("DPAPI 키 로드 완료: %s", key_file)
+            logger.info("DPAPI 키 로드 완료")
             return aes_key
+        elif not create_if_missing:
+            raise FileNotFoundError("기존 암호화 키가 필요합니다")
         else:
             aes_key = secrets.token_bytes(32)  # 256-bit
             encrypted = win32crypt.CryptProtectData(aes_key)
@@ -104,7 +104,9 @@ class CryptoManager:
 # 팩토리
 # ------------------------------------------------------------------
 
-def get_crypto_manager(cfg: dict) -> Union[CryptoManager, FakeCryptoManager]:
+def get_crypto_manager(
+    cfg: dict, *, data_dir: Path | None = None, create_if_missing: bool = True,
+) -> CryptoManager | FakeCryptoManager:
     """config dict를 받아 적합한 CryptoManager를 반환한다.
 
     extractor=fake이면 FakeCryptoManager, 그 외 CryptoManager.
@@ -113,5 +115,5 @@ def get_crypto_manager(cfg: dict) -> Union[CryptoManager, FakeCryptoManager]:
         return FakeCryptoManager()
 
     from knowmate.config import get_data_dir
-    key_file = get_data_dir() / "km.key"
-    return CryptoManager(key_file)
+    key_file = (data_dir if data_dir is not None else get_data_dir()) / "km.key"
+    return CryptoManager(key_file, create_if_missing=create_if_missing)

@@ -12,15 +12,27 @@ class Bridge(QObject):
     """JS에서 호출하는 슬롯과 JS로 내보내는 시그널을 모두 여기에 둔다."""
 
     # Python -> JS
+    queryStateChanged = pyqtSignal(str)
     responseReady  = pyqtSignal(str)  # JSON 문자열
     indexProgress  = pyqtSignal(str)  # 인덱싱 진행률 JSON
     indexFinished  = pyqtSignal(str)  # 인덱싱 완료 메시지
     indexAlert     = pyqtSignal(str)  # 대량삭제 차단 등 UI 알림
     statusUpdated  = pyqtSignal(str)  # 인덱싱 완료 후 건수 현황 JSON
 
-    def __init__(self, agent_registry=None, main_window=None, collector_worker=None, parent=None):
+    def __init__(self, main_window=None, collector_worker=None, parent=None, *,
+                 query_config: dict | None = None, query_data_dir: Path | None = None,
+                 query_worker_factory=None):
         super().__init__(parent)
-        self._registry = agent_registry
+        from knowmate.app.query_controller import QueryController
+        kwargs = {} if query_worker_factory is None else {"worker_factory": query_worker_factory}
+        self._query = QueryController(self, **kwargs)
+        self._query.responseReady.connect(self.responseReady)
+        self._query.stateChanged.connect(self.queryStateChanged)
+        self._query_config = query_config
+        self._query_data_dir = query_data_dir
+        if query_config is not None:
+            from knowmate.config import query_timeout_ms
+            query_timeout_ms(query_config)  # Warm bundled defaults before interactive queries.
         self._win = main_window
         self._worker = collector_worker
         self._last_indexed: str = ""
@@ -35,32 +47,66 @@ class Bridge(QObject):
 
     @pyqtSlot(str)
     def sendQuery(self, payload: str) -> None:
-        """JS가 호출하는 진입점. payload = JSON {"query": "...", "mode": "..."}"""
+        """Validate and submit a request without running search on the GUI thread."""
+        data: dict = {}
         try:
-            data = json.loads(payload)
-        except json.JSONDecodeError:
-            self._emit_error("invalid JSON payload")
-            return
-
-        query  = data.get("query", "").strip()
-        mode   = data.get("mode", "knowledge")
-        scopes = data.get("scopes", [])
-
-        if not query:
-            self._emit_error("empty query")
-            return
-
-        if self._registry is None:
-            blocks = [{"type": "text", "content": f"[echo] {query}"}]
-        else:
-            try:
-                agent = self._registry.get(mode)
-                blocks = agent.handle(query, {"mode": mode, "scopes": scopes})
-            except Exception as exc:
-                self._emit_error(str(exc))
+            parsed = json.loads(payload)
+            if not isinstance(parsed, dict):
+                raise ValueError("object required")
+            data = parsed
+            if not isinstance(data.get("query"), str) or not data["query"].strip():
+                raise ValueError("query required")
+            if data.get("mode") not in {"knowledge", "mes"}:
+                raise ValueError("unsupported mode")
+            if any(not isinstance(data.get(key), str) or not data[key].strip()
+                   for key in ("request_id", "thread_id")):
+                raise ValueError("identifiers required")
+            generation = data.get("view_generation")
+            if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+                raise ValueError("invalid generation")
+            scopes = data.get("scopes")
+            if (not isinstance(scopes, list) or
+                    any(not isinstance(scope, str) or scope not in {"local", "shared", "mail"}
+                        for scope in scopes)):
+                raise ValueError("invalid scopes")
+            if data["mode"] == "knowledge" and not scopes:
+                self._query.reject(data, "검색 범위를 하나 이상 선택해 주세요.")
                 return
+        except (ValueError, TypeError):
+            self._query.reject(data, "질문 요청 형식이 올바르지 않습니다.")
+            return
+        if self._query.busy or self._query.closing:
+            self._query.reject(data, "이전 질문 처리가 끝난 뒤 다시 시도해 주세요.")
+            return
+        try:
+            from knowmate.config import get_config, get_data_dir, query_timeout_ms
+            config = self._query_config if self._query_config is not None else get_config()
+            data_dir = self._query_data_dir if self._query_data_dir is not None else get_data_dir()
+            self._query.submit(data, config, data_dir, query_timeout_ms(config))
+        except Exception as exc:
+            logging.getLogger(__name__).warning("[query] admission failed: error_type=%s", type(exc).__name__)
+            self._query.reject(data, "질문을 시작하지 못했습니다. 잠시 후 다시 시도해 주세요.")
 
-        self.responseReady.emit(json.dumps({"blocks": blocks}, ensure_ascii=False))
+    @pyqtSlot(result=str)
+    def getQueryState(self) -> str:
+        """Return the current execution lease and its timeout budget."""
+        return json.dumps(self._query.state(), ensure_ascii=False)
+
+    @pyqtSlot(str)
+    def cancelQuery(self, request_id: str) -> None:
+        """Retire a matching query without allowing another worker to overlap."""
+        self._query.cancel(request_id)
+
+    def begin_query_shutdown(self) -> None:
+        """Seal admission and suppress late UI deliveries on actual app exit."""
+        self._query.begin_shutdown()
+
+    def wait_query_shutdown(self, timeout_ms: int = 8000) -> bool:
+        """Confirm actual query termination within the application-exit grace."""
+        return self._query.wait_for_shutdown(timeout_ms)
+
+    def _query_policy_busy(self) -> bool:
+        return self._query.busy or self._query.closing
 
     # ------------------------------------------------------------------
     # 윈도우 컨트롤
@@ -156,6 +202,8 @@ class Bridge(QObject):
     @pyqtSlot(str, result=str)
     def saveSettings(self, payload: str) -> str:
         """설정 UI에서 받은 patch를 저장한다. 결과를 {"ok": bool, "error": str} JSON으로 반환."""
+        if self._query_policy_busy():
+            return json.dumps({"ok": False, "error": "질문 처리가 끝난 뒤 다시 시도해 주세요.", "code": "query_busy"})
         try:
             patch = json.loads(payload)
         except json.JSONDecodeError:
@@ -234,6 +282,9 @@ class Bridge(QObject):
     @pyqtSlot(str, result=str)
     def addWatchFolder(self, path: str) -> str:
         """폴더를 watch_folders에 추가하고 갱신된 목록을 JSON으로 반환한다."""
+        if self._query_policy_busy():
+            self.indexAlert.emit("질문 처리가 끝난 뒤 다시 시도해 주세요.")
+            return self.getFolders()
         from knowmate.config import get_config, update_watch_folders
         folders: list[str] = get_config().get("collector", {}).get("watch_folders", [])
         normalized = path.replace("\\", "/")
@@ -245,6 +296,9 @@ class Bridge(QObject):
     @pyqtSlot(str, result=str)
     def removeWatchFolder(self, path: str) -> str:
         """폴더를 watch_folders에서 제거하고 갱신된 목록을 JSON으로 반환한다."""
+        if self._query_policy_busy():
+            self.indexAlert.emit("질문 처리가 끝난 뒤 다시 시도해 주세요.")
+            return self.getFolders()
         from knowmate.config import get_config, update_watch_folders
         folders: list[str] = get_config().get("collector", {}).get("watch_folders", [])
         normalized = path.replace("\\", "/")
@@ -508,7 +562,7 @@ class Bridge(QObject):
         result = json.loads(self.excludeFiles(json.dumps([path], ensure_ascii=False)))
         if result.get("ok"):
             return "ok"
-        return "busy" if result.get("error") == "busy" else "error"
+        return result["error"] if result.get("error") in {"busy", "query_busy"} else "error"
 
     @pyqtSlot(str, result=str)
     def unexcludeFile(self, path: str) -> str:
@@ -519,11 +573,13 @@ class Bridge(QObject):
         result = json.loads(self.unexcludeFiles(json.dumps([path], ensure_ascii=False)))
         if result.get("ok"):
             return "ok"
-        return "busy" if result.get("error") == "busy" else "error"
+        return result["error"] if result.get("error") in {"busy", "query_busy"} else "error"
 
     @pyqtSlot(str, result=str)
     def excludeFiles(self, payload: str) -> str:
         """여러 파일을 한 번에 인덱싱에서 제외하고 결과 요약 JSON을 반환한다."""
+        if self._query_policy_busy():
+            return json.dumps({"ok": False, "error": "query_busy"})
         paths, error = self._parse_failure_paths(payload)
         if error:
             return json.dumps({"ok": False, "error": error})
@@ -620,6 +676,8 @@ class Bridge(QObject):
     @pyqtSlot(str, result=str)
     def unexcludeFiles(self, payload: str) -> str:
         """여러 파일을 한 번에 인덱싱 제외에서 해제하고 결과 요약 JSON을 반환한다."""
+        if self._query_policy_busy():
+            return json.dumps({"ok": False, "error": "query_busy"})
         paths, error = self._parse_failure_paths(payload)
         if error:
             return json.dumps({"ok": False, "error": error})
@@ -744,23 +802,41 @@ class Bridge(QObject):
         data = load_threads()
         return json.dumps(data.get(mode, []), ensure_ascii=False)
 
-    @pyqtSlot(str, str)
-    def saveThread(self, mode: str, thread_json: str) -> None:
-        """스레드를 저장한다. id 기준 upsert."""
+    @pyqtSlot(str, str, result=str)
+    def getThread(self, mode: str, thread_id: str) -> str:
+        """Read a current conversation by identity without creating it."""
+        from knowmate.app.threads import get_thread
+        return json.dumps(get_thread(mode, thread_id), ensure_ascii=False)
+
+    @pyqtSlot(str, str, result=str)
+    def saveThread(self, mode: str, thread_json: str) -> str:
+        """Acknowledge conversation persistence, preserving caller state on failure."""
         from knowmate.app.threads import upsert_thread
+        if self._query.closing:
+            return json.dumps({"ok": False, "error": "closing"})
         try:
             thread = json.loads(thread_json)
+            if (mode not in {"knowledge", "mes"} or not isinstance(thread, dict)
+                    or not isinstance(thread.get("id"), str) or not thread["id"]
+                    or thread.get("mode") != mode or not isinstance(thread.get("messages"), list)):
+                raise ValueError("invalid conversation")
             upsert_thread(mode, thread)
+            return json.dumps({"ok": True})
         except Exception as exc:
-            import logging
-            logging.getLogger(__name__).warning("스레드 저장 실패: %s", exc)
+            logging.getLogger(__name__).warning("대화 저장 실패: error_type=%s", type(exc).__name__)
+            return json.dumps({"ok": False, "error": "대화를 저장하지 못했습니다."}, ensure_ascii=False)
 
-    @pyqtSlot(str, str)
-    def deleteThread(self, mode: str, thread_id: str) -> None:
-        """스레드를 삭제한다."""
+    @pyqtSlot(str, str, result=str)
+    def deleteThread(self, mode: str, thread_id: str) -> str:
+        """Acknowledge a conversation deletion without masking storage failures."""
         from knowmate.app.threads import delete_thread
-        delete_thread(mode, thread_id)
-
-    def _emit_error(self, msg: str) -> None:
-        err = [{"type": "text", "content": f"오류: {msg}"}]
-        self.responseReady.emit(json.dumps({"blocks": err}, ensure_ascii=False))
+        if self._query.closing:
+            return json.dumps({"ok": False, "error": "closing"})
+        try:
+            if mode not in {"knowledge", "mes"} or not isinstance(thread_id, str) or not thread_id:
+                raise ValueError("invalid conversation")
+            delete_thread(mode, thread_id)
+            return json.dumps({"ok": True})
+        except Exception as exc:
+            logging.getLogger(__name__).warning("대화 삭제 실패: error_type=%s", type(exc).__name__)
+            return json.dumps({"ok": False, "error": "대화를 삭제하지 못했습니다."}, ensure_ascii=False)

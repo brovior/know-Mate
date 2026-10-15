@@ -12,7 +12,11 @@ from contextlib import nullcontext
 from typing import Any
 from urllib.parse import urlparse
 
-from knowmate.rag.embedding_cancel import EmbeddingCancellation, EmbeddingCancelledError, current_embedding_cancellation
+from knowmate.rag.embedding_cancel import (
+    EmbeddingCancellation,
+    EmbeddingCancelledError,
+    current_embedding_cancellation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +119,13 @@ class EmbeddingClient:
     @_conn.setter
     def _conn(self, connection: http.client.HTTPConnection | None) -> None:
         self._connections.connection = connection
+
+    def close(self) -> None:
+        """현재 스레드가 소유한 HTTP 연결을 해제한다."""
+        connection = self._conn
+        self._conn = None
+        if connection is not None:
+            connection.close()
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         """텍스트 리스트를 임베딩 벡터 리스트로 변환한다."""
@@ -268,10 +279,10 @@ class EmbeddingClient:
                 # WARNING으로 올린다(이전엔 DEBUG): 재시도 자체가 느린 호출의
                 # 원인일 수 있는데, 기본 로그 레벨(INFO)에서 안 보여 진단이 막혔다.
                 logger.warning(
-                    "[embed] API 연결 재시도 (attempt=%d, %.2f초 소요 후): %s",
-                    attempt, time.perf_counter() - call_t0, exc,
+                    "[embed] API 연결 재시도 (attempt=%d, %.2f초 소요 후): error_type=%s",
+                    attempt, time.perf_counter() - call_t0, type(exc).__name__,
                 )
-                self._conn = None
+                self.close()
                 last_exc = exc
         raise EmbeddingTransientError(f"임베딩 API 호출 실패: {last_exc}") from last_exc
 

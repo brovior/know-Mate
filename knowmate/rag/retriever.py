@@ -3,13 +3,15 @@ import getpass
 import logging
 import re
 import time
+from collections.abc import Callable
+from copy import deepcopy
 from typing import Any
 
 import pandas as pd
 
 from knowmate.rag.date_filter import parse_date_range_ko
 from knowmate.rag.embedding import EmbeddingClient
-from knowmate.rag.indexer import Indexer
+from knowmate.rag.embedding_cancel import EmbeddingCancelledError
 
 logger = logging.getLogger(__name__)
 
@@ -32,13 +34,15 @@ def _keyword_where(query: str) -> str | None:
 class Retriever:
     def __init__(
         self,
-        indexer: Indexer,
+        indexer: Any,
         embed_client: EmbeddingClient,
         top_k: int = 10,
         score_threshold: float = 0.4,
         crypto=None,
         rerank_enabled: bool = False,
         email_indexer=None,
+        config: dict | None = None,
+        cancel_check: Callable[[], None] | None = None,
     ) -> None:
         """Retriever를 초기화한다.
 
@@ -48,7 +52,9 @@ class Retriever:
                         사내 rerank API가 준비된 시점에 config로 활성화한다.
         email_indexer: EmailIndexer 인스턴스. None이면 메일 검색 비활성.
         """
-        self._table = indexer.table
+        self._table = indexer.table if indexer is not None else None
+        self._config = deepcopy(config) if config is not None else None
+        self._cancel_check = cancel_check
         self._embed = embed_client
         self._top_k = top_k
         self._score_threshold = score_threshold
@@ -62,12 +68,28 @@ class Retriever:
         else:
             self._crypto = crypto
 
+    def _check_cancel(self) -> None:
+        if self._cancel_check is not None:
+            self._cancel_check()
+
+    def set_cancel_check(self, check: Callable[[], None]) -> None:
+        """이 요청의 협력적 취소 콜백을 지정한다."""
+        self._cancel_check = check
+
+    def close(self) -> None:
+        """현재 요청의 테이블·암호화·임베딩 참조를 해제한다."""
+        self._table = self._email_indexer = self._crypto = self._embed = None
+        self._cancel_check = None
+        self._config = None
+
     def search(
         self, query: str, scopes: list[str] | None = None
     ) -> list[dict[str, Any]]:
         """쿼리를 벡터 검색해 권한 필터·복호화·샌드위치 배열 후 청크 dict 리스트를 반환한다."""
+        self._check_cancel()
         t0 = time.perf_counter()
         vec = self._embed.embed([query])[0]
+        self._check_cancel()
         embed_sec = time.perf_counter() - t0
 
         # 질의에서 날짜 범위 파싱 ("지난주", "3월", "25주차" 등) — 매칭 없으면 None
@@ -82,12 +104,37 @@ class Retriever:
             date_limit_override = self._top_k * 5
             logger.debug("날짜 필터 적용: %.0f ~ %.0f", start, end)
 
+        from knowmate.collector.mail_scan_state import normalize_path_key
+        from knowmate.config import get_config
+        cfg = self._config if self._config is not None else get_config()
+        raw_excluded = cfg.get("collector", {}).get("exclude_files", [])
+        excluded_paths = [path for path in raw_excluded if isinstance(path, str)]
+        excluded_keys = {normalize_path_key(path) for path in excluded_paths}
+        document_where = chunks_date_where
+        document_exclusion = None
+        if excluded_paths:
+            sql_paths = {
+                variant.casefold()
+                for path in excluded_paths
+                for variant in (path.replace("\\", "/"), path.replace("/", "\\"))
+            }
+            quoted = ", ".join(
+                f"'{path.replace(chr(39), chr(39) * 2)}'" for path in sorted(sql_paths)
+            )
+            document_exclusion = f"lower(file_path) NOT IN ({quoted})"
+            document_where = (
+                f"({document_where}) AND ({document_exclusion})"
+                if document_where else document_exclusion
+            )
+
         # chunks 테이블 검색 (날짜 필터 적용 시 점수 문턱 완화 — 해당 기간을 폭넓게 회수)
         chunks_rows = self._search_table(
             self._table, vec, scopes, use_owner_filter=True,
-            extra_where=chunks_date_where,
+            extra_where=document_where,
             apply_threshold=(date_range is None),
-            limit_override=date_limit_override,
+            limit_override=max(date_limit_override or 0, self._top_k * 5)
+            if excluded_keys else date_limit_override,
+            excluded_path_keys=excluded_keys, path_column="file_path",
         )
 
         # 키워드 보강: 질의 단어가 파일명/경로와 일치하는 문서 청크를 강제 포함
@@ -98,24 +145,23 @@ class Retriever:
                 kw_rows = self._search_table(
                     self._table, vec, scopes,
                     use_owner_filter=True,
-                    extra_where=kw_where,
+                    extra_where=f"({kw_where}) AND ({document_exclusion})"
+                    if document_exclusion else kw_where,
+                    excluded_path_keys=excluded_keys, path_column="file_path",
                     apply_threshold=False,   # 파일명 직접 지목 → 점수 문턱 완화
                 )
                 if kw_rows:
                     logger.debug("키워드 보강 히트: %d건", len(kw_rows))
                 chunks_rows = self._merge(chunks_rows, kw_rows)
-            except Exception as exc:
-                logger.debug("키워드 보강 검색 실패(무시): %s", exc)
+            except EmbeddingCancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - isolate search/resource failures without exposing payloads
+                logger.debug("키워드 보강 검색 실패(무시): error_type=%s", type(exc).__name__)
 
         # emails 테이블 병합 (local scope 포함 시 또는 scopes=None)
         if self._email_indexer and (scopes is None or "local" in scopes):
             try:
                 from knowmate.collector.mail_exclusion import mail_exclusion_paths
-                from knowmate.collector.mail_scan_state import normalize_path_key
-                from knowmate.config import get_config
-
-                cfg = get_config()
-                raw_excluded = cfg.get("collector", {}).get("exclude_files", [])
                 excluded_mail_paths = mail_exclusion_paths(
                     [path for path in raw_excluded if isinstance(path, str)], cfg,
                 )
@@ -151,9 +197,12 @@ class Retriever:
                     if "file_path" not in row or not row.get("file_path"):
                         row["file_path"] = row.get("source_file", "")
                 chunks_rows = self._merge(chunks_rows, email_rows)
-            except Exception as exc:
-                logger.warning("[emails] 메일 검색 실패, 문서 결과만 반환: %s", exc)
+            except EmbeddingCancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - isolate search/resource failures without exposing payloads
+                logger.warning("[emails] 메일 검색 실패, 문서 결과만 반환: error_type=%s", type(exc).__name__)
 
+        self._check_cancel()
         if self._rerank_enabled and chunks_rows:
             chunks_rows = self._rerank(chunks_rows, query)
 
@@ -188,17 +237,28 @@ class Retriever:
         limit_override: 지정 시 기본 후보 수(top_k*2) 대신 이 값을 사용한다
                          (날짜 필터 적용 시 해당 기간을 폭넓게 회수하기 위해 상향).
         """
+        self._check_cancel()
+        if table is None:
+            return []
+        columns = [
+            "chunk_id", "text", "file_path", "file_type", "scope", "owner",
+            "mtime", "source_file", "source_type", "subject", "sender",
+            "recipients", "mail_date", "mail_date_ts",
+        ]
+        columns = [name for name in columns if name in table.schema.names]
         where = "is_deleted = false"
         if extra_where:
             where += f" AND ({extra_where})"
         raw = (
             table.search(vec)
             .where(where)
+            .select(columns + ["_distance"])
             .limit(limit_override or self._top_k * 2)
             .to_arrow()
             .to_pandas()
         )
 
+        self._check_cancel()
         if raw.empty:
             return []
 
@@ -249,12 +309,16 @@ class Retriever:
 
         # text 컬럼 복호화
         for row in rows:
+            self._check_cancel()
             try:
                 row["text"] = self._crypto.decrypt(row["text"])
-            except Exception as exc:
-                logger.warning("청크 복호화 실패 (chunk_id=%s): %s", row.get("chunk_id"), exc)
+            except EmbeddingCancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - isolate search/resource failures without exposing payloads
+                logger.warning("청크 복호화 실패: error_type=%s", type(exc).__name__)
                 row["text"] = ""
 
+        self._check_cancel()
         return rows
 
     def _merge(

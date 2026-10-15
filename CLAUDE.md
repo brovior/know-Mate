@@ -106,7 +106,7 @@
 | 베타 배포와 사용자 안내 | [`docs/guides/BETA_GUIDE.md`](docs/guides/BETA_GUIDE.md) |
 | 사용자 관점 변경 이력 | [`docs/UPDATE_NOTES.md`](docs/UPDATE_NOTES.md) |
 | 수정노트 작성 규칙 | [`docs/dev/WORKFLOW.md`](docs/dev/WORKFLOW.md) |
-| 쿼리 비동기화 보류 설계 | [`docs/design/ISSUE_B_query_async.md`](docs/design/ISSUE_B_query_async.md) |
+| 질문 비동기 실행·읽기 보호·대화 정합성 | [`docs/design/ISSUE_B_query_async.md`](docs/design/ISSUE_B_query_async.md) |
 | 보안 패키지 운영·수동 검증 | [`knowmate/secure/README.md`](knowmate/secure/README.md) |
 
 `docs/ai-workflow/` 기반 설계 원장과 자동 GPT 리뷰 절차는 폐지됐다. 과거 판단이 필요하면 Git
