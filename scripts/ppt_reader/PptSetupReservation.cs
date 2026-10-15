@@ -10,6 +10,7 @@ namespace AegisDesk.PptSetup
 {
     internal sealed class Reservation
     {
+        private RequestDirectoryLease lease;
         public int schema = 1;
         public string request_id, required_version = Contract.Version, helper_sid;
         public int helper_pid;
@@ -50,35 +51,38 @@ namespace AegisDesk.PptSetup
         }
         public void Save()
         {
+            if (lease == null) throw new SetupFailure("lease_recheck", "policy");
+            lease.Recheck();
             var acl = new FileSecurity();
             acl.SetAccessRuleProtection(true, false);
             acl.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(helper_sid), FileSystemRights.FullControl, AccessControlType.Allow));
             foreach (WellKnownSidType sid in new[] { WellKnownSidType.BuiltinAdministratorsSid, WellKnownSidType.LocalSystemSid })
                 acl.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(sid, null), FileSystemRights.FullControl, AccessControlType.Allow));
             acl.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null), FileSystemRights.Read, AccessControlType.Allow));
-            Contract.AtomicWrite(Path, Values(this), acl);
+            Contract.AtomicWrite(Path, Values(this), acl, true);
         }
-        public static Reservation Create()
+        public static Reservation Create(RequestDirectoryLease lease)
         {
-            RequestDirectory.Ensure();
+            lease.Recheck();
             using (Process current = Process.GetCurrentProcess())
             using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
             {
-                var request = new Reservation { request_id = Guid.NewGuid().ToString("D"), helper_sid = identity.User.Value,
+                var request = new Reservation { lease = lease, request_id = Guid.NewGuid().ToString("D"), helper_sid = identity.User.Value,
                     helper_pid = current.Id, helper_creation_ticks = current.StartTime.ToUniversalTime().Ticks.ToString() };
                 request.Save();
                 return request;
             }
         }
-        public static Reservation Load(string id)
+        public static Reservation Load(string id, RequestDirectoryLease lease)
         {
+            lease.Recheck();
             Guid guid;
             if (!Guid.TryParseExact(id, "D", out guid) || guid.ToString("D") != id) throw new IOException("reservation_identity");
             string path = System.IO.Path.Combine(Machine.Requests, id + ".json");
             Machine.NoLinks(path);
             var data = Contract.Read(path);
             if (!Valid(data, id)) throw new IOException("reservation_identity");
-            return new Reservation { request_id = id, helper_sid = (string)data["helper_sid"], helper_pid = (int)data["helper_pid"],
+            return new Reservation { lease = lease, request_id = id, helper_sid = (string)data["helper_sid"], helper_pid = (int)data["helper_pid"],
                 required_version = (string)data["required_version"], helper_creation_ticks = (string)data["helper_creation_ticks"], child_pid = data["child_pid"] == null ? (int?)null : (int)data["child_pid"],
                 child_creation_ticks = data["child_creation_ticks"] as string, state = (string)data["state"] };
         }

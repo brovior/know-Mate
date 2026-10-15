@@ -38,7 +38,7 @@ PowerPoint가 열려 있으면 설치를 미루고 기존 방식으로 읽는다
 | 항목 | 결정 |
 |---|---|
 | 운영 추가 기능 | 표시 이름 `Aegis Desk PPT Reader`, ProgID `AegisDesk.PptReader` |
-| DLL | `AegisDesk.PptReader.dll`, 현재 요구 버전 `1.0.2.0` |
+| DLL | `AegisDesk.PptReader.dll`, 현재 요구 버전 `1.0.3.0` |
 | COM 계약 | 경로·슬라이드 번호 전달 규약 3, 추출 결과 JSON 스키마 1 |
 | 식별자 | 시험용과 다른 운영 CLSID·추출 인터페이스 IID를 구현 시 고정. Office 연결 IID는 기존 규약 유지 |
 | 설치 위치 | `%ProgramFiles%/AegisDesk/PptReader/<version>/`의 보호된 고정 경로 |
@@ -274,12 +274,12 @@ Windows/Office에서 실행하지 못한 항목과 기존 실패는 따로 보�
 `/check`는 Office 실행 없이 읽기 전용이고, 다음 구조의 본문 없는 JSON 한 건만 stdout으로 반환한다.
 
 ```json
-{"schema":1,"operation":"check","status":"ready","reason":"registration_ok","required_version":"1.0.1.0","installed_version":"1.0.1.0","office_bitness":64,"scope":"Machine","machine_safe":true,"auto_install_mode":"candidate","auto_install_validated":false}
+{"schema":1,"operation":"check","status":"ready","reason":"registration_ok","required_version":"1.0.3.0","installed_version":"1.0.3.0","office_bitness":64,"scope":"Machine","machine_safe":true,"auto_install_mode":"candidate","auto_install_validated":false}
 ```
 
 상태는 `ready/missing/outdated/repairable/disabled/conflict/busy/unknown/failed`를 구분하고,
 Machine 예약·저널의 안전 확인 여부를 별도 필드로 반환한다.
-앱은 구조·허용값·exit code·작업 요청의 일치를 검증한다. 출력 없음·깨진 출력·시간초과는 실패다.
+앱은 구조·허용값·exit code·작업 요청의 일치를 검증한다. 실패 JSON에는 고정 문자열 `stage/error_type`과 실제 Win32 오류 또는 null인 `winerror`를 묶어 선택적으로 추가한다. 원문 예외·SID·SDDL은 출력하지 않는다. 출력 없음·깨진 출력·시간초과는 실패다.
 설치 요청의 종료 코드는 `0=작업 완료`, `10=Office/설치 점유`, `11=권한 거절`,
 `12=환경/정책 미확인`, `13=수정 실패`로 고정하고 schema 버전에 포함한다.
 `0`만으로 ready가 되지 않으며 원래 사용자 권한의 `/check`를 다시 수행한다.
@@ -299,7 +299,7 @@ UAC 대기·설치의 관찰 제한 시간이 지나면 Qt coordinator만 대기
 helper·승격 자식을 kill/terminate하지 않는다. 다른 문서·메일은 계속 가능하다.
 `/check`는 짧은 읽기 전용 QProcess로 실행할 수 있지만 `/prepare`는 QProcess 소유 수명에 묶지 않는다.
 일반 helper를 Windows CreateProcess의 독립 process로 실행하고 앱은 별도 handle로 관찰한다.
-앱 종료 시 그 handle만 닫으며 helper/자식을 kill-on-close job에 넣지 않는다.
+앱 종료 시 관찰 handle과 자기 stdout 임시 파일 handle만 닫으며 helper/자식을 kill-on-close job에 넣지 않는다. stdout은 PIPE가 아닌 부모 생성 임시 파일 handle을 상속한다. Windows에서는 현재 사용자/Admin/System의 protected DACL을 생성 시 적용하고 CREATE_NEW·공유 없음·DELETE_ON_CLOSE로 열며, helper는 새 경로 open 대신 복제된 handle을 상속한다. 실제 helper 종료 뒤에만 최대 16KiB+1을 읽어 검증하며, 관찰 종료는 상속 handle의 쓰기를 중단하지 않는다. 읽기·정리 실패도 독립 `/check`를 생략할 근거가 아니다.
 일반 helper는 UAC 요청 전부터 자식의 실제 종료·재점검까지 계속 살아서 준비 예약을 보유한다.
 부모 helper의 종료·관찰 timeout·QProcess finished를 승격 자식 종료와 동일시하지 않는다.
 
@@ -326,9 +326,26 @@ Machine 상태를 재점검해 안전한 완료 상태를 기록한다. handle�
 예약을 지우지 않고 unresolved로 판정한다. 거절도 수정 미실행이 확정된 뒤 완료로 기록한다.
 
 예약 디렉터리는 Users 읽기/열거·새 요청 생성, Creator Owner 자기 요청 갱신,
-Administrators/System 관리 권한으로 제한한다. 일반 사용자가 타인의 예약을 삭제/완료 처리하지 못한다.
-신규 디렉터리는 원자적 생성 결과와 함께 초기 ACL을 적용한다. 기존 디렉터리는 소유·보호 ACL을
-검사해 재사용하며, 비어 있다는 이유로 소유권·ACL을 변경하지 않는다. 같은 원칙을 설치 디렉터리에도 적용한다.
+Administrators/System 관리 권한으로 제한한다. 디렉터리 owner/Admin/System을 신뢰하는 기존 모델에서
+비소유 일반 사용자의 타인 예약 갱신·삭제를 제한한다. owner의 암묵적 WRITE_DAC는 남아 있으므로
+적대적인 owner로부터의 격리는 보장하지 않는다. 이 격리가 필요하면 관리자 소유 저장 구조 등으로
+재설계하기 전 활성화하지 않는다.
+
+기존 `%ProgramData%/AegisDesk`는 상속 차단 여부만으로 거절하지 않는다. 유효 account owner 또는
+Admin/System, canonical·비null DACL과 해석 가능한 ACE를 요구한다. 부모에 적용되는 Allow에서
+owner/Admin/System 외 주체의 파일 생성·attributes/EA 쓰기·삭제/DELETE_CHILD·DACL/owner 변경은
+거절하고 읽기·실행·하위 디렉터리 생성은 허용한다. deny 상쇄를 추정하지 않는다.
+`PptReaderRequests`는 기존 protected·canonical·정확한 SID/권한/상속 규칙을 유지한다.
+비호환·빈 기존 폴더를 자동 인수하거나 재ACL하지 않는다. 신규 폴더는 생성 시 ACL을 원자 적용하며,
+ProgramFiles 설치 보호의 기존 엄격한 판정은 유지한다.
+
+일반 helper와 승격 자식은 OS CommonApplicationData의 로컬 NTFS 고정 경로를 부모부터 열어
+`RequestDirectoryLease`를 유지한다. reparse를 거절하고 같은 handle의 파일 ID·최종 경로·owner/DACL을
+확인한다. READ만 공유하는 handle은 namespace 교체를 제한하며 WRITE_DAC·모든 attributes/EA를
+동결하지 않는다. 민감 작업 전 재확인도 마지막 검사 이후의 owner 권한 변경까지 막는 보장은 아니다.
+helper는 예약 전부터 UAC·실제 자식 종료·완료 저장까지 lease를 보유하고, 자식은 Load/EnterChild/수정과
+복구를 자기 lease 안에서 수행한다. 충돌하는 기존 handle은 대기 대신 보류한다. 실제 Windows에서
+lease 공존·원자 저장·같은/다른 관리자 UAC를 확인하기 전 설치 성공으로 간주하지 않는다.
 일반권한 최초 생성·ACL 설정이 해당 Windows/회사 정책에서 가능한지 **미검증**이다.
 필요 권한을 확보하지 못하면 자동 prepare를 시작하지 않는다. 수정 미실행과 Machine 안전이
 확인되면 auto는 기존 COM, 안전 확인이 불가능하면 PPT 준비 대기로 처리한다.
@@ -375,7 +392,7 @@ HKCU 충돌이나 시험용 등록을 함께 제거하지 않는다. 설치 기�
 
 ### 8-5. 운영 읽기 성공 조건
 
-운영 서비스는 `ProtocolVersion()=3`, `ReaderVersion()=1.0.2.0`, JSON schema 1을 최초에 확인한다.
+운영 서비스는 `ProtocolVersion()=3`, `ReaderVersion()=1.0.3.0`, JSON schema 1을 최초에 확인한다.
 첫 릴리스는 요구 운영 버전과 정확히 일치할 때만 선택한다. 향후 호환 범위를 넓히는 것은 별도 변경이다.
 경로는 원본을 연 Python의 절대 경로와 host Presentations의 FullName을 비교한다.
 UNC·대소문자·중복·상대경로는 기존 하네스 계약을 유지하고 경로 alias는 추측해서 동일시하지 않는다.
@@ -522,5 +539,5 @@ QThread의 MTA에서만 사용하며 UI·타이머·OS 종료 helper로 넘기�
 타임아웃만으로 취소됐다고 간주하지 않는다. 앱의 제한된 종료는 PowerPoint 강제종료를 허용하지 않는다.
 
 기존 dual 인터페이스는 유지하고 새 기본 인터페이스로 lifecycle을 노출한다. 요구 버전은
-reader/setup 모두 1.0.2.0, protocol 3이며 추출 JSON schema 1·청크·인덱스 형식은 바꾸지 않는다.
+reader/setup 모두 1.0.3.0, protocol 3이며 추출 JSON schema 1·청크·인덱스 형식은 바꾸지 않는다.
 사전 검증과 사용자 문서 보호 시험은 [운영 검증 절차](../guides/PPT_READER.md#powerpoint-자동종료-후보-검증)를 따른다.

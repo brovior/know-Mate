@@ -24,6 +24,24 @@ PowerPoint 내부 추가 기능은 VDI와 사내 PC의 소수 문서에서 내�
 사례의 원본 로그는 없어 실제 원인이 Quit hang, 강제종료 실패, identity 조회 실패 중 무엇인지는
 확정하지 않았다. 새 로그는 PID·EXE·시간·정리 결과만 남기며 문서 내용은 기록하지 않는다.
 
+### PPT 설치 준비 폴더 호환성 (2026-10-16)
+
+이전 설치가 기본 상속으로 만든 `AegisDesk` 부모를 strict 검사로 거절하는 호환성 결함을
+확인했다. 부모의 상속 차단 false·준비 자식 true인 조합에서 `/prepare`는 UAC 전에
+`acl_unavailable`/12로 중단될 수 있었다. 부모 플래그만으로 새 정책 전체 통과를 단정할 수
+없으며 실제 owner/DACL·고정 경로·파일시스템 검사를 함께 통과해야 한다.
+AppData 삭제로 ProgramData/HKLM 설치 상태는 초기화되지 않는다.
+
+1.0.3.0 후보는 부모의 실제 권한을 보수적으로 판정하고 자식의 정확한 보호 ACL은 유지한다.
+폴더 검사에서 기존 owner/DACL·파일을 보존하며 directory lease와 민감 작업 전 재확인을 추가한다.
+owner/Admin/System을 신뢰하는 기존 경계는 유지한다. lease는 owner의 DACL 변경 권한을 동결하지 않는다.
+앱 로그의 `required_version/installed_version`과 고정 `stage/error_type/winerror`로 실패 위치를 판독한다.
+
+별도 임시 루트의 Windows native 하네스를 추가했다. Linux에서 실제 Windows ACL·공유 handle·UAC·
+Office는 **미실행**이며, 하네스 소스나 모형 통과를 설치 성공으로 보고하지 않는다.
+[기존 폴더 검증 절차](guides/PPT_READER.md#기존-설치-준비-폴더와-native-lease-검증)를 통과한 뒤
+같은/다른 관리자 UAC, A(owner)/B(예약 owner)/C(비소유 사용자), 실제 ProgramData 업데이트를 확인한다.
+
 ### COM poison 복구 일관성 (2026-10-15)
 
 실제 종료·소유 기록 제거 후 2초 목록이 남는 문제, 진행 중인 열거/guard가 옛 결과를 사용하는

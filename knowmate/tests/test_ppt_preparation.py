@@ -51,6 +51,9 @@ class Process:
 
     terminate = kill
 
+    def read_result(self):
+        return SetupResult(reason="diagnostic_unavailable")
+
 
 def wait_until(predicate):
     deadline = time.monotonic() + 3
@@ -163,6 +166,60 @@ def test_helper_exit_requires_safe_recheck(tmp_path):
                     SetupResult(status="ready", machine_safe=False)])
     process = Process(exit_code=0)
     gate, policies, _ = coordinator(tmp_path, checker=lambda: next(results), process_factory=lambda: process)
+    gate.begin()
+    wait_until(lambda: process.started == 1)
+    gate._poll_setup()
+    wait_until(lambda: bool(policies))
+    assert policies == ["ppt_pending"]
+    gate.shutdown()
+
+
+@pytest.mark.parametrize("failure", ["none", "read", "close"])
+def test_diagnostic_failures_do_not_replace_independent_postcheck(tmp_path, caplog, failure):
+    class DiagnosticProcess(Process):
+        def read_result(self):
+            if failure == "read":
+                raise OSError("confidential-marker")
+            return SetupResult(status="failed", reason="acl_unavailable", installed_version="1.0.0.0",
+                machine_safe=False, stage="parent_policy", error_type="policy")
+
+        def close(self):
+            super().close()
+            if failure == "close":
+                raise OSError("confidential-marker")
+
+    result = SetupResult(status="outdated", reason="version_old", installed_version="1.0.0.0",
+        machine_safe=True, office_bitness=64, auto_install_mode="candidate")
+    process = DiagnosticProcess(exit_code=12)
+    checks = []
+    def check():
+        checks.append(1)
+        return result
+    gate, policies, _ = coordinator(tmp_path, checker=check, process_factory=lambda: process)
+    with caplog.at_level("INFO"):
+        gate.begin()
+        wait_until(lambda: process.started == 1)
+        gate._poll_setup()
+        wait_until(lambda: bool(policies))
+    assert len(checks) == 2 and policies == ["com_only"]
+    assert process.closed == 1 and "confidential-marker" not in caplog.text
+    assert f"required_version={REQUIRED_VERSION} installed_version=1.0.0.0" in caplog.text
+    if failure == "read":
+        assert "reason=diagnostic_unavailable" in caplog.text
+    else:
+        assert "reason=acl_unavailable stage=parent_policy error_type=policy winerror=None" in caplog.text
+    assert not (tmp_path / "ppt_reader_preparation.json").exists()
+    gate.shutdown()
+
+
+def test_invalid_or_forged_helper_ready_does_not_override_postcheck(tmp_path):
+    class ReadyProcess(Process):
+        def read_result(self):
+            return SetupResult(status="ready", reason="registration_ok", machine_safe=True)
+    process = ReadyProcess(exit_code=0)
+    checks = iter([SetupResult(status="outdated", machine_safe=True, office_bitness=64,
+        auto_install_mode="candidate"), SetupResult(machine_safe=False)])
+    gate, policies, _ = coordinator(tmp_path, checker=lambda: next(checks), process_factory=lambda: process)
     gate.begin()
     wait_until(lambda: process.started == 1)
     gate._poll_setup()
@@ -401,6 +458,22 @@ def test_launch_exception_remains_pending_without_terminal_observation(tmp_path)
     wait_until(lambda: bool(policies))
     assert policies == ["ppt_pending"] and process.closed == 1
     assert not (tmp_path / "ppt_reader_preparation.json").exists()
+    gate.shutdown()
+
+
+@pytest.mark.parametrize("safe,expected", [(True, "com_only"), (False, "ppt_pending")])
+def test_confirmed_prelaunch_failure_uses_independent_postcheck(tmp_path, safe, expected):
+    class NotLaunchedProcess(Process):
+        def start(self):
+            self.started += 1
+            raise ppt_installation.SetupLaunchNotStarted("diagnostic_unavailable")
+    process = NotLaunchedProcess()
+    checks = iter([SetupResult(status="outdated", machine_safe=True, office_bitness=64,
+        auto_install_mode="candidate"), SetupResult(status="outdated", machine_safe=safe)])
+    gate, policies, _ = coordinator(tmp_path, checker=lambda: next(checks), process_factory=lambda: process)
+    gate.begin()
+    wait_until(lambda: bool(policies))
+    assert policies == [expected] and process.closed == 1
     gate.shutdown()
 
 

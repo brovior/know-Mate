@@ -16,13 +16,26 @@ namespace AegisDesk.PptSetup
         public string scope = "Machine";
         public bool machine_safe, auto_install_validated = Contract.AutoInstallValidated;
         public string auto_install_mode = Contract.AutoInstallMode;
+        public string stage, error_type;
+        public int? winerror;
         public Result(string op) { operation = op; }
-        public void Emit() { Console.WriteLine(Contract.Json.Serialize(this)); }
+        internal Dictionary<string, object> Values()
+        {
+            var values = new Dictionary<string, object> {
+                { "schema", schema }, { "operation", operation }, { "status", status }, { "reason", reason },
+                { "required_version", required_version }, { "installed_version", installed_version },
+                { "office_bitness", office_bitness }, { "scope", scope }, { "machine_safe", machine_safe },
+                { "auto_install_validated", auto_install_validated }, { "auto_install_mode", auto_install_mode }
+            };
+            if (stage != null) { values["stage"] = stage; values["error_type"] = error_type; values["winerror"] = winerror; }
+            return values;
+        }
+        public void Emit() { Console.WriteLine(Contract.Json.Serialize(Values())); }
     }
 
     internal static class Contract
     {
-        public const string Version = "1.0.2.0";
+        public const string Version = "1.0.3.0";
         public const string ProgId = "AegisDesk.PptReader";
         public const string ClassId = "{287A80D2-804A-46D3-A0E9-CA31C6FC3D09}";
         public const string ReaderIid = "9A20F4A6-6364-4BA7-930B-3E8857BEAF60";
@@ -79,15 +92,21 @@ namespace AegisDesk.PptSetup
             if (new FileInfo(path).Length > 1048576) throw new InvalidDataException("metadata_size");
             return Json.Deserialize<Dictionary<string, object>>(File.ReadAllText(path));
         }
-        public static void AtomicWrite(string path, object value, System.Security.AccessControl.FileSecurity security = null)
+        public static void AtomicWrite(string path, object value, System.Security.AccessControl.FileSecurity security = null, bool request = false)
         {
             string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
             Machine.NoLinks(Path.GetDirectoryName(path));
-            using (FileStream stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-            using (StreamWriter writer = new StreamWriter(stream))
-            { writer.Write(Json.Serialize(value)); writer.Flush(); stream.Flush(true); }
-            if (security != null) File.SetAccessControl(temp, security);
-            if (File.Exists(path)) File.Replace(temp, path, null); else File.Move(temp, path);
+            try
+            {
+                using (FileStream stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                using (StreamWriter writer = new StreamWriter(stream))
+                { writer.Write(Json.Serialize(value)); writer.Flush(); stream.Flush(true); }
+            }
+            catch (Exception error) { if (request) throw SetupFailure.From("request_create", error); throw; }
+            try { if (security != null) File.SetAccessControl(temp, security); }
+            catch (Exception error) { if (request) throw SetupFailure.From("request_acl", error); throw; }
+            try { if (File.Exists(path)) File.Replace(temp, path, null); else File.Move(temp, path); }
+            catch (Exception error) { if (request) throw SetupFailure.From("request_commit", error); throw; }
             // An interrupted write is unresolved evidence. Do not erase the
             // temporary file automatically; /check must keep mutation blocked.
         }

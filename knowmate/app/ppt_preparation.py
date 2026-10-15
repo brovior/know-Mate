@@ -17,7 +17,7 @@ import weakref
 from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 
 from knowmate.secure.ppt_installation import (
-    DetachedSetupProcess, REQUIRED_VERSION, SetupResult, check_installation,
+    DetachedSetupProcess, REQUIRED_VERSION, SetupLaunchNotStarted, SetupResult, check_installation,
 )
 
 logger = logging.getLogger(__name__)
@@ -145,9 +145,11 @@ class PptPreparationCoordinator(QObject):
             return
         if self._closed or self._worker is not None or self.state == "installing":
             return
-        logger.info("PPT 준비 점검: phase=%s status=%s reason=%s machine_safe=%s version=%s",
+        logger.info("PPT 준비 점검: phase=%s status=%s reason=%s machine_safe=%s "
+                    "required_version=%s installed_version=%s stage=%s error_type=%s winerror=%s",
                     "post_check" if self._after_install else "check", result.status,
-                    result.reason, result.machine_safe, REQUIRED_VERSION)
+                    result.reason, result.machine_safe, REQUIRED_VERSION, result.installed_version,
+                    result.stage, result.error_type, result.winerror)
         if self._after_install:
             # An exited helper is not evidence of repaired registrations or locks.
             self._finish("ppt_pending" if self._install_unconfirmed else
@@ -165,7 +167,7 @@ class PptPreparationCoordinator(QObject):
             except Exception as exc:
                 logger.warning("PPT 준비 도구 실행 실패: %s", type(exc).__name__)
                 self._close_observation()
-                self._install_unconfirmed = True
+                self._install_unconfirmed = not isinstance(exc, SetupLaunchNotStarted)
                 # Failure may have happened after creation; recheck safety first.
                 self._after_install = True
                 self.state = "rechecking"
@@ -190,7 +192,17 @@ class PptPreparationCoordinator(QObject):
             self._install_exit = exit_code
             outcome = {0: "completed", 10: "deferred", 11: "permission_declined",
                        12: "check_failed", 13: "mutation_failed"}.get(exit_code, "unknown")
-            logger.info("PPT 설치 도구 종료: code=%s result=%s version=%s", exit_code, outcome, REQUIRED_VERSION)
+            diagnostic = SetupResult(reason="diagnostic_unavailable")
+            try:
+                diagnostic = self._process.read_result()
+            except Exception:  # noqa: BLE001 - optional diagnostics cannot prevent the safety recheck
+                # Diagnostic I/O is never the authority for machine safety and
+                # must not prevent the independent post_check below.
+                logger.debug("PPT 설치 도구 진단: reason=diagnostic_unavailable")
+            logger.info("PPT 설치 도구 종료: code=%s result=%s reason=%s stage=%s error_type=%s "
+                        "winerror=%s required_version=%s installed_version=%s", exit_code, outcome,
+                        diagnostic.reason, diagnostic.stage, diagnostic.error_type, diagnostic.winerror,
+                        REQUIRED_VERSION, diagnostic.installed_version)
             if exit_code == 11:
                 self._save_suppression("permission_declined")
             self._close_observation()

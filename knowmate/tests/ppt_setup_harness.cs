@@ -12,7 +12,7 @@ internal static class SetupHarness
     private static Dictionary<string, object> Record()
     {
         return new Dictionary<string, object> { { "schema", 1 }, { "request_id", "33e979c6-c5c4-40af-845a-64c80517d1ae" },
-            { "required_version", "1.0.2.0" }, { "helper_sid", "S-1-5-21-1-2-3-1001" }, { "helper_pid", 123 },
+            { "required_version", "1.0.3.0" }, { "helper_sid", "S-1-5-21-1-2-3-1001" }, { "helper_pid", 123 },
             { "helper_creation_ticks", "638901000000000000" }, { "child_pid", null }, { "child_creation_ticks", null }, { "state", "complete" } };
     }
     public static int Main(string[] args)
@@ -40,8 +40,75 @@ internal static class SetupHarness
                 FileSystemRights.FullControl, AccessControlType.Allow));
             Require(!RequestDirectory.Compatible(acl, parent), "existing_unsafe_acl_rejected");
         }
+        // Production ACL predicate, not a second implementation of its policy.
+        var accountOwner = new SecurityIdentifier("S-1-5-21-1-2-3-1001");
+        var ordinary = new SecurityIdentifier("S-1-5-21-1-2-3-1002");
+        var inheritedParent = RequestDirectory.Expected(true);
+        inheritedParent.SetOwner(accountOwner);
+        inheritedParent.SetAccessRuleProtection(false, true);
+        Require(!inheritedParent.AreAccessRulesProtected && RequestDirectory.Compatible(inheritedParent, true), "safe_inherited_parent");
+        Require(!RequestDirectory.Compatible(inheritedParent, false), "inherited_child_rejected");
+        foreach (FileSystemRights danger in new[] { FileSystemRights.WriteData, FileSystemRights.WriteAttributes,
+            FileSystemRights.WriteExtendedAttributes, FileSystemRights.Delete, FileSystemRights.DeleteSubdirectoriesAndFiles,
+            FileSystemRights.ChangePermissions, FileSystemRights.TakeOwnership })
+        {
+            var unsafeParent = RequestDirectory.Expected(true); unsafeParent.SetOwner(accountOwner);
+            unsafeParent.AddAccessRule(new FileSystemAccessRule(ordinary, danger, AccessControlType.Allow));
+            Require(!RequestDirectory.Compatible(unsafeParent, true), "parent_danger_" + danger);
+        }
+        var trustedOwner = RequestDirectory.Expected(true); trustedOwner.SetOwner(accountOwner);
+        trustedOwner.AddAccessRule(new FileSystemAccessRule(accountOwner, FileSystemRights.FullControl, AccessControlType.Allow));
+        Require(RequestDirectory.Compatible(trustedOwner, true), "existing_owner_trust_boundary");
+        var inheritOnly = RequestDirectory.Expected(true); inheritOnly.SetOwner(accountOwner);
+        inheritOnly.AddAccessRule(new FileSystemAccessRule(ordinary, FileSystemRights.FullControl,
+            InheritanceFlags.ObjectInherit, PropagationFlags.InheritOnly, AccessControlType.Allow));
+        Require(RequestDirectory.Compatible(inheritOnly, true), "inherit_only_not_parent_access");
+        var foreignOwner = RequestDirectory.Expected(true);
+        foreignOwner.SetOwner(new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null));
+        Require(!RequestDirectory.Compatible(foreignOwner, true), "non_account_owner_rejected");
+        foreach (bool callback in new[] { false, true })
+        {
+            var rawAcl = new RawAcl(2, 1);
+            rawAcl.InsertAce(0, new CommonAce(AceFlags.None, AceQualifier.AccessAllowed,
+                unchecked((int)0x40000000), ordinary, callback, callback ? new byte[4] : null));
+            var raw = new RawSecurityDescriptor(ControlFlags.DiscretionaryAclPresent | ControlFlags.SelfRelative,
+                accountOwner, null, null, rawAcl);
+            var bytes = new byte[raw.BinaryLength]; raw.GetBinaryForm(bytes, 0);
+            var unknown = new DirectorySecurity(); unknown.SetSecurityDescriptorBinaryForm(bytes);
+            Require(!RequestDirectory.Compatible(unknown, true), callback ? "callback_ace_rejected" : "generic_write_rejected");
+        }
+        var objectAcl = new RawAcl(4, 1);
+        objectAcl.InsertAce(0, new ObjectAce(AceFlags.None, AceQualifier.AccessAllowed,
+            (int)FileSystemRights.Read, ordinary, ObjectAceFlags.None, Guid.Empty, Guid.Empty, false, null));
+        var noncanonicalAcl = new RawAcl(2, 2);
+        noncanonicalAcl.InsertAce(0, new CommonAce(AceFlags.None, AceQualifier.AccessAllowed, (int)FileSystemRights.Read, ordinary, false, null));
+        noncanonicalAcl.InsertAce(1, new CommonAce(AceFlags.None, AceQualifier.AccessDenied, (int)FileSystemRights.WriteData, ordinary, false, null));
+        foreach (RawAcl unsupported in new[] { objectAcl, noncanonicalAcl })
+        {
+            var raw = new RawSecurityDescriptor(ControlFlags.DiscretionaryAclPresent | ControlFlags.SelfRelative,
+                accountOwner, null, null, unsupported);
+            var bytes = new byte[raw.BinaryLength]; raw.GetBinaryForm(bytes, 0);
+            var actual = new DirectorySecurity(); actual.SetSecurityDescriptorBinaryForm(bytes);
+            Require(!RequestDirectory.Compatible(actual, true), unsupported == objectAcl ? "object_ace_rejected" : "noncanonical_dacl_rejected");
+        }
+        var wrongChild = RequestDirectory.Expected(false); wrongChild.SetOwner(accountOwner);
+        wrongChild.AddAccessRule(new FileSystemAccessRule(ordinary, FileSystemRights.Read, AccessControlType.Allow));
+        Require(wrongChild.AreAccessRulesProtected && !RequestDirectory.Compatible(wrongChild, false), "protected_child_wrong_rules_rejected");
+        var noDacl = new RawSecurityDescriptor(ControlFlags.DiscretionaryAclPresent | ControlFlags.SelfRelative,
+            accountOwner, null, null, null);
+        var noDaclBytes = new byte[noDacl.BinaryLength]; noDacl.GetBinaryForm(noDaclBytes, 0);
+        var noDaclSecurity = new DirectorySecurity(); noDaclSecurity.SetSecurityDescriptorBinaryForm(noDaclBytes);
+        Require(!RequestDirectory.Compatible(noDaclSecurity, true), "null_dacl_rejected");
+        var diag = new Result("prepare");
+        Require(diag.Values().Count == 11, "legacy_result_shape");
+        SetupFailure.From("parent_open", new System.ComponentModel.Win32Exception(5)).Apply(diag);
+        Require(diag.Values().Count == 14 && diag.stage == "parent_open" && diag.winerror == 5, "native_error_additive_shape");
+        var secretError = SetupFailure.From("request_acl", new IOException("SECRET-MARKER"));
+        secretError.Apply(diag);
+        string safeJson = Contract.Json.Serialize(diag.Values());
+        Require(!safeJson.Contains("SECRET-MARKER") && diag.winerror == null, "raw_exception_not_emitted");
         // These are Windows paths even when the pure harness runs under Mono.
-        string suffix = "/AegisDesk/PptReader/1.0.2.0/AegisDesk.PptReader.dll";
+        string suffix = "/AegisDesk/PptReader/1.0.3.0/AegisDesk.PptReader.dll";
         foreach (string directory in new[] { "Program Files", "Program Files (x86)", "프로그램 파일", "literal%20folder" })
         {
             string file = @"C:\" + directory + suffix.Replace('/', '\\');

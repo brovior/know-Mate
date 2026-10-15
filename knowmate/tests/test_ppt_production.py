@@ -33,7 +33,7 @@ def office(tmp_path, monkeypatch):
     path.write_bytes(b"not a document body")
     prs = SimpleNamespace(Slides=Collection([SimpleNamespace(Shapes=Collection([shape("baseline")]))]), Close=Mock())
     app = SimpleNamespace(Presentations=SimpleNamespace(Open=Mock(return_value=prs)))
-    service = SimpleNamespace(ProtocolVersion=lambda: 3, ReaderVersion=lambda: "1.0.2.0", ExtractSlide=Mock(return_value=reply()))
+    service = SimpleNamespace(ProtocolVersion=lambda: 3, ReaderVersion=lambda: "1.0.3.0", ExtractSlide=Mock(return_value=reply()))
     app.COMAddIns = SimpleNamespace(Item=Mock(return_value=SimpleNamespace(Connect=True, Object=service)))
     monkeypatch.setattr(com_reader, "_get_ppt_app", lambda: app)
     monkeypatch.setattr(com_reader._tls, "ppt_service", None, raising=False)
