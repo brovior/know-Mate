@@ -69,7 +69,7 @@ Phase 1~4 완료(RAG 지식검색), 5a 완료(Knox `.mysingle` + 표준 `.eml` �
 | 메일 처리 중 종료 후 Office 잔류 | 문서 완료 시 Office 정리·임베딩 취소·단계별 종료 로그 구현, fake·localhost 회귀 통과 | [진단 §4](DIAGNOSTICS.md#4-office-종료-정리-확인)의 사내 종료·PID 확인 대기 |
 | 상태 JSON·유휴 스캔 | 단계별 실측 대기 | JSON 처리와 실제 파일 접근 비용을 구분한 뒤 개선 선택 |
 | 검색·임베딩·COM 성능 | 실측 대기 | 진단 문서의 검증 자료 확보 |
-| PowerPoint 추가 기능 운영 적용 | 1.0.3.0 기존 상속 부모 ACL 호환·디렉터리 lease·실패 단계 전달 후보 구현, 기본 disabled 유지 | [운영 설계](design/PPT_ADDIN_INDEXING.md)·[검증 절차](guides/PPT_READER.md)에 따라 최종 released 파일의 최초 ACL/UAC·32/64비트 Office·중단 복구·사용자/세션 경합·내용 일치·연속 인덱싱을 실제 검증한 뒤 동일 파일 배포 |
+| PowerPoint 추가 기능 운영 적용 | 1.0.3.0 후보의 lease 보유 저장 정체를 별도 비교 시험으로 확인 중, 기본 disabled 유지 | [저장 충돌 비교](guides/PPT_READER.md#ppt-저장-충돌-비교-시험) 후 제품 수정 여부 결정. [운영 설계](design/PPT_ADDIN_INDEXING.md)·[검증 절차](guides/PPT_READER.md)에 따라 최종 released 파일의 최초 ACL/UAC·32/64비트 Office·중단 복구·사용자/세션 경합·내용 일치·연속 인덱싱을 실제 검증한 뒤 동일 파일 배포 |
 | PowerPoint 인덱싱 후 자동종료 #116 | 직접 실행 증명·호스트 정상종료·사용자 문서 보호 후보 구현, candidate만 시험 | [자동종료 검증](guides/PPT_READER.md#powerpoint-자동종료-후보-검증)의 실제 Windows·Office 시험 후 별도 배포 활성화 |
 | 질문 비동기화 | 요청별 QThread·기존 인덱스 읽기·대화 ACK/오래된 응답 차단·종료 보호 구현 | [상세 설계](design/ISSUE_B_query_async.md)의 사내 Windows·Office·DPAPI·실제 UI/장시간 질문 검증 대기 |
 | 실패 원인 판별 6b | 보류 | 오류 코드 실측, 워치독 밖 probe I/O의 행오버 위험 해소 |
