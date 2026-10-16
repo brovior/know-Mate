@@ -12,7 +12,7 @@ internal static class SetupHarness
     private static Dictionary<string, object> Record()
     {
         return new Dictionary<string, object> { { "schema", 1 }, { "request_id", "33e979c6-c5c4-40af-845a-64c80517d1ae" },
-            { "required_version", "1.0.3.0" }, { "helper_sid", "S-1-5-21-1-2-3-1001" }, { "helper_pid", 123 },
+            { "required_version", "1.0.4.0" }, { "helper_sid", "S-1-5-21-1-2-3-1001" }, { "helper_pid", 123 },
             { "helper_creation_ticks", "638901000000000000" }, { "child_pid", null }, { "child_creation_ticks", null }, { "state", "complete" } };
     }
     public static int Main(string[] args)
@@ -21,6 +21,52 @@ internal static class SetupHarness
         Require(Contract.AutoInstallMode == "disabled" || Contract.AutoInstallMode == "candidate" || Contract.AutoInstallMode == "released", "policy_mode");
         Require(typeof(Contract).GetMethod("TraceAtomic", System.Reflection.BindingFlags.Static |
             System.Reflection.BindingFlags.NonPublic) == null, "shipping_atomic_trace_erased");
+        foreach (string hook in new[] { "TraceRequest", "InterceptNative" })
+            Require(typeof(RequestWriter).GetMethod(hook, System.Reflection.BindingFlags.Static |
+                System.Reflection.BindingFlags.NonPublic) == null, "shipping_request_hook_erased_" + hook);
+        RequestWriter.NativeLayout();
+        Require(RequestWriter.Basename(id) == id + ".json", "request_fixed_basename");
+        foreach (string invalidId in new[] { "../" + id, id + ":stream", id.ToUpperInvariant(), id + ".json", "request.json" })
+        {
+            bool invalidRejected = false;
+            try { RequestWriter.Basename(invalidId); } catch (IOException) { invalidRejected = true; }
+            Require(invalidRejected, "request_invalid_basename");
+        }
+        byte[] encoded = RequestWriter.Encode(Record(), RequestWriteMode.ReplaceExisting);
+        Require(encoded.Length > 0 && encoded.Length <= 8192 && encoded[0] == (byte)'{', "request_utf8_no_bom");
+        var decode = (Func<byte[], string, Dictionary<string, object>>)Delegate.CreateDelegate(
+            typeof(Func<byte[], string, Dictionary<string, object>>), typeof(RequestWriter).GetMethod("Decode",
+                System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.NonPublic));
+        Require((string)decode(encoded, id)["request_id"] == id, "request_decode_identity");
+        var legacy = new List<byte>(new byte[] { 0xef, 0xbb, 0xbf }); legacy.AddRange(encoded);
+        Require((string)decode(legacy.ToArray(), id)["request_id"] == id, "request_legacy_bom");
+        var uppercase = Record(); uppercase["request_id"] = id.ToUpperInvariant();
+        bool uppercaseRejected = false;
+        try { decode(System.Text.Encoding.UTF8.GetBytes(Contract.Json.Serialize(uppercase)), id); }
+        catch (IOException) { uppercaseRejected = true; }
+        Require(uppercaseRejected, "request_noncanonical_json_identity");
+        foreach (int invalidKind in new[] { 0, 1, 2, 3 })
+        {
+            var invalidRecord = Record();
+            if (invalidKind == 0) invalidRecord["required_version"] = "1." + new string('1', 9000) + ".0.0";
+            if (invalidKind == 1) invalidRecord["schema"] = true;
+            if (invalidKind == 2) invalidRecord["request_id"] = "../" + id;
+            bool invalidRejected = false;
+            try { RequestWriter.Encode(invalidRecord, invalidKind == 3 ? (RequestWriteMode)99 : RequestWriteMode.ReplaceExisting); }
+            catch (IOException) { invalidRejected = true; }
+            Require(invalidRejected, "request_serialization_reject_" + invalidKind);
+        }
+        var unchanged = Record(); unchanged["state"] = "reserved";
+        bool transitionRejected = false;
+        try { RequestWriter.ValidateTransition(unchanged, unchanged); } catch (IOException) { transitionRejected = true; }
+        Require(transitionRejected, "request_reserved_not_update");
+        foreach (string immutable in new[] { "schema", "request_id", "required_version", "helper_sid", "helper_pid", "helper_creation_ticks" })
+        {
+            var changed = Record(); changed[immutable] = null;
+            transitionRejected = false;
+            try { RequestWriter.ValidateTransition(Record(), changed); } catch (IOException) { transitionRejected = true; }
+            Require(transitionRejected, "request_immutable_" + immutable);
+        }
         Require(Contract.AutoInstallValidated == (Contract.AutoInstallMode == "released"), "policy_validated");
         Require(Contract.AutoShutdownEnabled == (Contract.AutoInstallMode == "candidate"), "shutdown_policy_candidate_only");
         Require(Contract.AutoInstallEnabled == (Contract.AutoInstallMode != "disabled"), "policy_enabled");
@@ -110,7 +156,7 @@ internal static class SetupHarness
         string safeJson = Contract.Json.Serialize(diag.Values());
         Require(!safeJson.Contains("SECRET-MARKER") && diag.winerror == null, "raw_exception_not_emitted");
         // These are Windows paths even when the pure harness runs under Mono.
-        string suffix = "/AegisDesk/PptReader/1.0.3.0/AegisDesk.PptReader.dll";
+        string suffix = "/AegisDesk/PptReader/1.0.4.0/AegisDesk.PptReader.dll";
         foreach (string directory in new[] { "Program Files", "Program Files (x86)", "프로그램 파일", "literal%20folder" })
         {
             string file = @"C:\" + directory + suffix.Replace('/', '\\');

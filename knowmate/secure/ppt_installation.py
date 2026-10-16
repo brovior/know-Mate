@@ -30,6 +30,7 @@ _DIAGNOSTIC_STAGES = frozenset({"anchor_open", "parent_open", "parent_policy", "
     "child_policy", "request_create", "request_acl", "request_commit", "lease_recheck"})
 _DIAGNOSTIC_ERRORS = frozenset({"policy", "Win32Exception", "UnauthorizedAccessException",
     "IOException", "SecurityException", "InvalidOperationException", "ArgumentException", "NotSupportedException", "Exception"})
+_NATIVE_STAGES = frozenset({"commit_return", "commit_verify", "commit_close"})
 _MAX_SETUP_OUTPUT = 16384
 
 
@@ -47,6 +48,20 @@ class SetupResult:
     stage: str | None = None
     error_type: str | None = None
     winerror: int | None = None
+    native_stage: str | None = None
+    ntstatus: str | None = None
+    io_status: str | None = None
+
+    @property
+    def native_diagnostic(self) -> tuple[str | None, str | None, str | None]:
+        """Expose only fixed native fields, including for injected observations."""
+        if (self.stage == "request_commit" and isinstance(self.status, str) and self.status in {"failed", "busy"}
+                and self.machine_safe is False and isinstance(self.error_type, str)
+                and self.error_type in _DIAGNOSTIC_ERRORS
+                and _valid_native_diagnostic(self.native_stage, self.ntstatus, self.io_status,
+                                             self.error_type, self.winerror)):
+            return self.native_stage, self.ntstatus, self.io_status
+        return None, None, None
 
     @property
     def auto_install_enabled(self) -> bool:
@@ -73,6 +88,16 @@ def _unique_json_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return value
 
 
+def _valid_native_diagnostic(stage: object, status: object, io_status: object,
+                             error_type: object, winerror: object) -> bool:
+    return (isinstance(stage, str) and stage in _NATIVE_STAGES
+            and isinstance(status, str) and re.fullmatch(r"[0-9A-F]{8}", status) is not None
+            and (io_status is None or (isinstance(io_status, str)
+                 and re.fullmatch(r"[0-9A-F]{8}", io_status) is not None))
+            and ((stage == "commit_return" and error_type == "IOException" and winerror is None)
+                 or (status == "00000000" and stage in {"commit_verify", "commit_close"})))
+
+
 def parse_setup_result(stdout: str, exit_code: int, operation: str = "check") -> SetupResult:
     """Reject malformed output and mismatched operation/version/exit status."""
     try:
@@ -84,7 +109,8 @@ def parse_setup_result(stdout: str, exit_code: int, operation: str = "check") ->
                    "installed_version", "office_bitness", "scope", "machine_safe",
                    "auto_install_validated", "auto_install_mode"}
         diagnostic = {"stage", "error_type", "winerror"}
-        if not isinstance(value, dict) or set(value) not in (allowed, allowed | diagnostic):
+        native = {"native_stage", "ntstatus", "io_status"}
+        if not isinstance(value, dict) or set(value) not in (allowed, allowed | diagnostic, allowed | diagnostic | native):
             raise ValueError("setup_fields")
         if diagnostic <= value.keys():
             if value["stage"] not in _DIAGNOSTIC_STAGES or value["error_type"] not in _DIAGNOSTIC_ERRORS:
@@ -93,6 +119,12 @@ def parse_setup_result(stdout: str, exit_code: int, operation: str = "check") ->
                     or not 0 <= value["winerror"] <= 2**31 - 1
                     or value["error_type"] != "Win32Exception"):
                 raise ValueError("setup_winerror")
+        if native <= value.keys() and (
+                value["stage"] != "request_commit" or value["status"] not in {"failed", "busy"} or exit_code == 0
+                or value["machine_safe"] is not False
+                or not _valid_native_diagnostic(value["native_stage"], value["ntstatus"], value["io_status"],
+                                                 value["error_type"], value["winerror"])):
+            raise ValueError("setup_native_diagnostic")
         if type(value["schema"]) is not int or value["schema"] != 1:
             raise ValueError("setup_schema")
         if value["operation"] != operation or value["required_version"] != REQUIRED_VERSION:
@@ -120,7 +152,8 @@ def parse_setup_result(stdout: str, exit_code: int, operation: str = "check") ->
             raise ValueError("setup_exit")
         return SetupResult(value["status"], value["reason"], installed, bitness,
                            value["machine_safe"], value["auto_install_validated"], value["auto_install_mode"],
-                           value.get("stage"), value.get("error_type"), value.get("winerror"))
+                           value.get("stage"), value.get("error_type"), value.get("winerror"),
+                           value.get("native_stage"), value.get("ntstatus"), value.get("io_status"))
     except (ValueError, TypeError, KeyError, UnicodeError):
         return SetupResult(reason="diagnostic_unavailable")
 

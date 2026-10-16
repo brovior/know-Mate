@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
-using System.Security.AccessControl;
 using System.Security.Principal;
 
 namespace AegisDesk.PptSetup
@@ -18,7 +17,7 @@ namespace AegisDesk.PptSetup
         public int? child_pid;
         public string child_creation_ticks;
         public string state = "reserved";
-        public string Path { get { return System.IO.Path.Combine(Machine.Requests, request_id + ".json"); } }
+        public string Path { get { return System.IO.Path.Combine(lease.ChildPath, request_id + ".json"); } }
         public static bool Valid(Dictionary<string, object> data, string filename)
         {
             try
@@ -50,17 +49,7 @@ namespace AegisDesk.PptSetup
                 { "child_creation_ticks", value.child_creation_ticks }, { "state", value.state } };
         }
         public void Save()
-        {
-            if (lease == null) throw new SetupFailure("lease_recheck", "policy");
-            lease.Recheck();
-            var acl = new FileSecurity();
-            acl.SetAccessRuleProtection(true, false);
-            acl.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(helper_sid), FileSystemRights.FullControl, AccessControlType.Allow));
-            foreach (WellKnownSidType sid in new[] { WellKnownSidType.BuiltinAdministratorsSid, WellKnownSidType.LocalSystemSid })
-                acl.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(sid, null), FileSystemRights.FullControl, AccessControlType.Allow));
-            acl.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null), FileSystemRights.Read, AccessControlType.Allow));
-            Contract.AtomicWrite(Path, Values(this), acl, true);
-        }
+        { RequestWriter.Write(lease, (Dictionary<string, object>)Values(this), RequestWriteMode.ReplaceExisting); }
         public static Reservation Create(RequestDirectoryLease lease)
         {
             lease.Recheck();
@@ -69,7 +58,7 @@ namespace AegisDesk.PptSetup
             {
                 var request = new Reservation { lease = lease, request_id = Guid.NewGuid().ToString("D"), helper_sid = identity.User.Value,
                     helper_pid = current.Id, helper_creation_ticks = current.StartTime.ToUniversalTime().Ticks.ToString() };
-                request.Save();
+                RequestWriter.Write(lease, (Dictionary<string, object>)Values(request), RequestWriteMode.CreateOnly);
                 return request;
             }
         }
@@ -78,10 +67,7 @@ namespace AegisDesk.PptSetup
             lease.Recheck();
             Guid guid;
             if (!Guid.TryParseExact(id, "D", out guid) || guid.ToString("D") != id) throw new IOException("reservation_identity");
-            string path = System.IO.Path.Combine(Machine.Requests, id + ".json");
-            Machine.NoLinks(path);
-            var data = Contract.Read(path);
-            if (!Valid(data, id)) throw new IOException("reservation_identity");
+            var data = RequestWriter.Read(lease, id);
             return new Reservation { lease = lease, request_id = id, helper_sid = (string)data["helper_sid"], helper_pid = (int)data["helper_pid"],
                 required_version = (string)data["required_version"], helper_creation_ticks = (string)data["helper_creation_ticks"], child_pid = data["child_pid"] == null ? (int?)null : (int)data["child_pid"],
                 child_creation_ticks = data["child_creation_ticks"] as string, state = (string)data["state"] };

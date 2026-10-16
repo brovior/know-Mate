@@ -84,7 +84,7 @@ public static class ReaderHarness
     public static int Main(string[] args)
     {
         Assembly assembly = Assembly.LoadFrom(args[0]);
-        Expect(assembly.GetName().Version.ToString() == "1.0.3.0", "version_mismatch");
+        Expect(assembly.GetName().Version.ToString() == "1.0.4.0", "version_mismatch");
         Type type = assembly.GetType("AegisDesk.PptReader.Connect", true);
         Expect(type.GUID == new Guid("287A80D2-804A-46D3-A0E9-CA31C6FC3D09"), "clsid_mismatch");
         Expect(((ProgIdAttribute)Attribute.GetCustomAttribute(type, typeof(ProgIdAttribute))).Value == "AegisDesk.PptReader", "progid_mismatch");
@@ -109,7 +109,7 @@ public static class ReaderHarness
         type.GetMethod("OnConnection").Invoke(instance, new object[] { new ReaderHost(), 1, addin, null });
         Expect(Object.ReferenceEquals(instance, addin.Object)
             && (int)type.GetMethod("ProtocolVersion").Invoke(instance, null) == 3
-            && (string)type.GetMethod("ReaderVersion").Invoke(instance, null) == "1.0.3.0", "production_connection_mismatch");
+            && (string)type.GetMethod("ReaderVersion").Invoke(instance, null) == "1.0.4.0", "production_connection_mismatch");
         // A fake host has no native typelib: it must never reach Quit even in candidate builds.
         Expect((string)type.GetMethod("TryQuitIfIdle").Invoke(instance, null) == "not_supported", "unverified_host_accepted");
         type.GetMethod("OnDisconnection").Invoke(instance, new object[] { 1, null });

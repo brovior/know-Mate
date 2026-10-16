@@ -38,7 +38,7 @@ PowerPoint가 열려 있으면 설치를 미루고 기존 방식으로 읽는다
 | 항목 | 결정 |
 |---|---|
 | 운영 추가 기능 | 표시 이름 `Aegis Desk PPT Reader`, ProgID `AegisDesk.PptReader` |
-| DLL | `AegisDesk.PptReader.dll`, 현재 요구 버전 `1.0.3.0` |
+| DLL | `AegisDesk.PptReader.dll`, 현재 요구 버전 `1.0.4.0` |
 | COM 계약 | 경로·슬라이드 번호 전달 규약 3, 추출 결과 JSON 스키마 1 |
 | 식별자 | 시험용과 다른 운영 CLSID·추출 인터페이스 IID를 구현 시 고정. Office 연결 IID는 기존 규약 유지 |
 | 설치 위치 | `%ProgramFiles%/AegisDesk/PptReader/<version>/`의 보호된 고정 경로 |
@@ -274,12 +274,18 @@ Windows/Office에서 실행하지 못한 항목과 기존 실패는 따로 보�
 `/check`는 Office 실행 없이 읽기 전용이고, 다음 구조의 본문 없는 JSON 한 건만 stdout으로 반환한다.
 
 ```json
-{"schema":1,"operation":"check","status":"ready","reason":"registration_ok","required_version":"1.0.3.0","installed_version":"1.0.3.0","office_bitness":64,"scope":"Machine","machine_safe":true,"auto_install_mode":"candidate","auto_install_validated":false}
+{"schema":1,"operation":"check","status":"ready","reason":"registration_ok","required_version":"1.0.4.0","installed_version":"1.0.4.0","office_bitness":64,"scope":"Machine","machine_safe":true,"auto_install_mode":"candidate","auto_install_validated":false}
 ```
 
 상태는 `ready/missing/outdated/repairable/disabled/conflict/busy/unknown/failed`를 구분하고,
 Machine 예약·저널의 안전 확인 여부를 별도 필드로 반환한다.
 앱은 구조·허용값·exit code·작업 요청의 일치를 검증한다. 실패 JSON에는 고정 문자열 `stage/error_type`과 실제 Win32 오류 또는 null인 `winerror`를 묶어 선택적으로 추가한다. 원문 예외·SID·SDDL은 출력하지 않는다. 출력 없음·깨진 출력·시간초과는 실패다.
+요청의 native 호출 후 실패는 기존 진단 세 필드와 함께 `native_stage/ntstatus/io_status` 세 필드를
+모두 추가한다. `native_stage`는 `commit_return/commit_verify/commit_close`만 허용하며,
+상태는 8자리 대문자 16진수이고 미수집 `io_status`는 null이다. 이 묶음은 `stage=request_commit`,
+`machine_safe=false`, 비정상 종료의 `failed/busy`에만 허용한다. 호출 자체의 NT 실패는
+`IOException`·`winerror=null`로 남기고, 호출 성공 뒤 검증·닫기 실패는 실제 오류 종류와 Win32
+코드를 유지한다. schema 1과 기존 JSON 형식도 계속 읽으며 부분 묶음·잘못된 값은 거절한다.
 설치 요청의 종료 코드는 `0=작업 완료`, `10=Office/설치 점유`, `11=권한 거절`,
 `12=환경/정책 미확인`, `13=수정 실패`로 고정하고 schema 버전에 포함한다.
 `0`만으로 ready가 되지 않으며 원래 사용자 권한의 `/check`를 다시 수행한다.
@@ -354,6 +360,26 @@ lease 공존·원자 저장·같은/다른 관리자 UAC를 확인하기 전 설
 이 후보가 gate를 통과하지 못하면 다른 자동 동기화 메커니즘을 설계·검증해야 하며,
 수동 초기화에 성공한 결과를 자동 설치 완료로 보고하지 않는다.
 
+준비 요청은 `RequestWriter`의 명시적 CreateOnly/ReplaceExisting으로 저장한다. lease의 검증된
+자식 아래 정규 UUID 이름만 사용하며 schema1·8192byte 상한·불변 필드·상태 전이를 검증한다.
+같은 폴더의 CREATE_NEW 임시파일에 owner와 protected/canonical DACL을 생성 시 적용하고,
+같은 source handle로 기록·Flush(true)·내용/ID/보안 검증·native rename을 수행한다.
+`NtSetInformationFile(FileRenameInformation=10)`은 RootDirectory=NULL·단순 basename만 받는다.
+기존 대상의 검사 handle은 모두 닫고 lease를 재확인한 뒤 교체한다. 외부 reader 때문에 실패하면
+기존 대상·임시 증거를 보존하며 공유/ACL 완화·POSIX 플래그·delete+move로 우회하지 않는다.
+ProgramFiles 설치 기록·저널의 `Contract.AtomicWrite`는 기존 managed 저장을 유지한다.
+
+요청 file owner는 일반 helper의 SID, 승격 시 Administrators, System 실행 시 System으로 제한한다.
+해당 token이 정상 설정할 수 있는 경우만 허용하고 새 특권을 켜지 않는다. helper의 FullControl,
+Admin/System FullControl·Users Read는 계속 유지한다. 디렉터리 owner/DACL은 변경하지 않는다.
+검사 후 대상 handle을 닫는 구간은 기존 mutex/ACL/lease 신뢰 경계로 보호하며 hostile owner나
+동일 helper 계정 내 비협조 프로세스까지 원자 CAS로 격리한다고 주장하지 않는다.
+
+정상 완료는 동기 native SUCCESS와 유효한 IO 상태·최종 source 검증·정리를 함께 확인한다.
+계약 밖 미완료 반환은 buffer/source/lease/mutex를 보존한 채 더 진행하지 않고 앱 관찰만 분리한다.
+뒤늦은 file-handle signal을 성공으로 바꾸거나 helper를 종료하지 않는다. 실제 발생 시 후보 활성화를 중단한다.
+기존 미완료 예약/저널/임시파일은 자동 정리하지 않으며 orphan-only 임시파일의 관리 복구는 별도 과제다.
+
 새 앱과 다른 사용자/세션의 `/check`는 전체 예약을 읽고 helper/자식 PID와 생성시각을 확인한다.
 PID 재사용·identity/프로세스 조회 불가·기록 파손은 unresolved다. helper 부재만으로 예약을 제거하지 않는다.
 재부팅·오래된 예약도 시간 경과로 자동 만료하지 않는다. 실제 프로세스 종료와 Machine 저널/등록 안전을
@@ -392,7 +418,7 @@ HKCU 충돌이나 시험용 등록을 함께 제거하지 않는다. 설치 기�
 
 ### 8-5. 운영 읽기 성공 조건
 
-운영 서비스는 `ProtocolVersion()=3`, `ReaderVersion()=1.0.3.0`, JSON schema 1을 최초에 확인한다.
+운영 서비스는 `ProtocolVersion()=3`, `ReaderVersion()=1.0.4.0`, JSON schema 1을 최초에 확인한다.
 첫 릴리스는 요구 운영 버전과 정확히 일치할 때만 선택한다. 향후 호환 범위를 넓히는 것은 별도 변경이다.
 경로는 원본을 연 Python의 절대 경로와 host Presentations의 FullName을 비교한다.
 UNC·대소문자·중복·상대경로는 기존 하네스 계약을 유지하고 경로 alias는 추측해서 동일시하지 않는다.
@@ -539,5 +565,5 @@ QThread의 MTA에서만 사용하며 UI·타이머·OS 종료 helper로 넘기�
 타임아웃만으로 취소됐다고 간주하지 않는다. 앱의 제한된 종료는 PowerPoint 강제종료를 허용하지 않는다.
 
 기존 dual 인터페이스는 유지하고 새 기본 인터페이스로 lifecycle을 노출한다. 요구 버전은
-reader/setup 모두 1.0.3.0, protocol 3이며 추출 JSON schema 1·청크·인덱스 형식은 바꾸지 않는다.
+reader/setup 모두 1.0.4.0, protocol 3이며 추출 JSON schema 1·청크·인덱스 형식은 바꾸지 않는다.
 사전 검증과 사용자 문서 보호 시험은 [운영 검증 절차](../guides/PPT_READER.md#powerpoint-자동종료-후보-검증)를 따른다.

@@ -19,7 +19,7 @@ from knowmate.secure import ppt_installation as installation
 
 def result_json(**changes):
     value = dict(schema=1, operation="check", status="ready", reason="registration_ok",
-                 required_version="1.0.3.0", installed_version="1.0.3.0", office_bitness=64,
+                 required_version="1.0.4.0", installed_version="1.0.4.0", office_bitness=64,
                  scope="Machine", machine_safe=True, auto_install_validated=False, auto_install_mode="disabled")
     value.update(changes)
     return json.dumps(value)
@@ -27,7 +27,7 @@ def result_json(**changes):
 
 def reservation(**changes):
     value = dict(schema=1, request_id="33e979c6-c5c4-40af-845a-64c80517d1ae",
-                 required_version="1.0.3.0", helper_sid="S-1-5-21-1-2-3-1001", helper_pid=123,
+                 required_version="1.0.4.0", helper_sid="S-1-5-21-1-2-3-1001", helper_pid=123,
                  helper_creation_ticks="638901000000000000", child_pid=None,
                  child_creation_ticks=None, state="complete")
     value.update(changes)
@@ -62,6 +62,81 @@ def test_optional_setup_diagnostic_bundle_preserves_observed_safety():
     assert value.reason == "acl_unavailable" and value.stage == "parent_policy"
     assert value.error_type == "policy" and value.winerror is None
     assert value.installed_version == "1.0.0.0" and not value.machine_safe
+
+
+def native_failure_json(**changes):
+    value = {"operation": "prepare", "status": "failed", "reason": "acl_unavailable",
+        "machine_safe": False, "stage": "request_commit", "error_type": "IOException", "winerror": None,
+        "native_stage": "commit_return", "ntstatus": "C0000035", "io_status": None}
+    value.update(changes)
+    return result_json(**value)
+
+
+@pytest.mark.parametrize("stage,ntstatus,io_status", [
+    ("commit_return", "C0000035", None),
+    ("commit_verify", "00000000", "00000000"),
+    ("commit_close", "00000000", "00000000")])
+def test_native_failure_preserves_separate_status_and_unknown_io(stage, ntstatus, io_status):
+    value = installation.parse_setup_result(native_failure_json(
+        native_stage=stage, ntstatus=ntstatus, io_status=io_status), 12, "prepare")
+    assert value.native_diagnostic == (stage, ntstatus, io_status)
+    assert value.error_type == "IOException" and value.winerror is None
+    assert not value.machine_safe and value.status == "failed"
+
+
+@pytest.mark.parametrize("code", [11, 12, 13])
+def test_native_completion_failure_preserves_busy_and_original_exit(code):
+    value = installation.parse_setup_result(native_failure_json(
+        status="busy", reason="reservation_unresolved"), code, "prepare")
+    assert value.status == "busy" and value.reason == "reservation_unresolved"
+    assert value.native_diagnostic == ("commit_return", "C0000035", None)
+    assert not value.machine_safe
+
+
+@pytest.mark.parametrize("stage,error_type,winerror", [
+    ("commit_verify", "Win32Exception", 5), ("commit_close", "Win32Exception", 6),
+    ("commit_verify", "UnauthorizedAccessException", None)])
+def test_native_success_followed_by_validation_or_close_failure_preserves_actual_error(stage, error_type, winerror):
+    value = installation.parse_setup_result(native_failure_json(native_stage=stage,
+        ntstatus="00000000", io_status="00000000", error_type=error_type, winerror=winerror), 12, "prepare")
+    assert value.native_diagnostic == (stage, "00000000", "00000000")
+    assert value.error_type == error_type and value.winerror == winerror
+    assert not value.machine_safe
+
+
+@pytest.mark.parametrize("changes", [
+    {"native_stage": "confidential-marker"}, {"native_stage": []},
+    {"ntstatus": "c0000035"}, {"ntstatus": "0xC0000035"}, {"ntstatus": "C000035"},
+    {"ntstatus": None}, {"ntstatus": 3221225525}, {"ntstatus": True},
+    {"io_status": "c0000035"}, {"io_status": "000000000"}, {"io_status": 0},
+    {"stage": "parent_open"}, {"status": "unknown"}, {"winerror": 53},
+    {"error_type": "Win32Exception", "winerror": 32}, {"machine_safe": True},
+    {"native_stage": "commit_verify"}, {"native_stage": "commit_close"}])
+def test_native_diagnostic_rejects_noncanonical_values(changes):
+    value = installation.parse_setup_result(native_failure_json(**changes), 12, "prepare")
+    assert value == installation.SetupResult(reason="diagnostic_unavailable")
+    assert "confidential-marker" not in repr(value)
+
+
+@pytest.mark.parametrize("omitted", ["native_stage", "ntstatus", "io_status", "stage", "error_type", "winerror"])
+def test_native_diagnostic_requires_both_complete_groups(omitted):
+    value = json.loads(native_failure_json())
+    del value[omitted]
+    assert installation.parse_setup_result(json.dumps(value), 12, "prepare").reason == "diagnostic_unavailable"
+
+
+def test_native_diagnostic_cannot_be_added_without_existing_diagnostic_group():
+    value = json.loads(native_failure_json())
+    for key in ("stage", "error_type", "winerror"):
+        del value[key]
+    assert installation.parse_setup_result(json.dumps(value), 12, "prepare").reason == "diagnostic_unavailable"
+
+
+def test_native_diagnostic_duplicate_oversize_and_success_rejected():
+    duplicate = native_failure_json()[:-1] + ', "ntstatus":"00000000"}'
+    for output, code in ((duplicate, 12), (native_failure_json() + " " * 16384, 12),
+                         (native_failure_json(status="ready", reason="registration_ok", machine_safe=True), 0)):
+        assert installation.parse_setup_result(output, code, "prepare").reason == "diagnostic_unavailable"
 
 
 @pytest.mark.parametrize("changes", [{"stage": "parent_policy"},
@@ -264,6 +339,16 @@ def test_detached_actual_exit_reads_failure_detail():
     process.close()
 
 
+def test_detached_actual_exit_reads_native_diagnostics_without_promoting_safety():
+    process = installation.DetachedSetupProcess()
+    process._process = SimpleNamespace(poll=lambda: 12)
+    process._output = io.BytesIO(native_failure_json().encode())
+    result = process.read_result()
+    assert result.native_diagnostic == ("commit_return", "C0000035", None)
+    assert not result.machine_safe and result.winerror is None
+    process.close()
+
+
 def test_detached_read_failure_remains_unknown():
     process = installation.DetachedSetupProcess()
     process._process = SimpleNamespace(poll=lambda: 12)
@@ -435,6 +520,7 @@ def test_windows_helper_stdout_survives_observer_close_and_deletes_on_last_close
     assert done.exists()
     with pytest.raises(FileNotFoundError):
         filename.stat()
+    print("PPT_STDOUT_SUMMARY result=PASS", flush=True)
 
 
 @pytest.mark.parametrize("mode", ["disabled", "candidate", "released"])

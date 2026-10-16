@@ -45,6 +45,7 @@ namespace AegisDesk.PptSetup
 
         private readonly List<Entry> entries = new List<Entry>();
         private bool disposed;
+        internal string ChildPath { get { if (disposed || entries.Count == 0) throw new SetupFailure("lease_recheck", "policy"); return entries[entries.Count - 1].path; } }
         internal static RequestDirectoryLease Acquire()
         { return AcquireAt(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), true); }
         internal static RequestDirectoryLease AcquireExisting()
