@@ -60,6 +60,18 @@ candidate는 자동 실행이 허용되며, true/false 표시 자체는 Windows 
 & .\.venv\Scripts\python.exe -m pytest .\knowmate\tests\test_ppt_acl_native.py -v
 ```
 
+stdout 상속·실제 자식 종료·마지막 handle 삭제 시험도 일반 권한으로 실행한다.
+
+```powershell
+& .\.venv\Scripts\python.exe -m pytest .\knowmate\tests\test_ppt_installation.py -k windows_helper_stdout_survives -v
+```
+
+하네스가 시간초과하면 `PPT ACL timeout: phase=compile|harness last_stage=... limit_sec=30`의
+고정 값을 확인한다. `last_stage=unavailable`은 단계 출력 미수집이며 원인 확정이 아니다.
+시간초과는 통과로 바꾸지 않고, 마지막 단계로 컴파일·junction 생성·lease·원자 저장·정리를 구분한다.
+stdout 파일 열기 거절은 Win32 오류뿐 아니라 CRT의 `errno=EACCES/EPERM`도 인정한다.
+파일 없음·일반 I/O 오류는 거절 성공으로 인정하지 않으며 ACL·상속·실제 종료·삭제 검사는 계속 수행한다.
+
 이 하네스는 실제 `Directory.CreateDirectory`로 상속 부모를 재현하고 보호 자식을 생성한다.
 누락 폴더의 원자 생성과 두 lease 동시 열기, anchor/부모/자식 rename·자식 삭제 거절, 예약 파일 원자 생성·교체,
 기존 owner/DACL 불변과 기존 DELETE handle 충돌을 검사한다. 같은 프로세스의 두 handle 시험은

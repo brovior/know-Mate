@@ -1,5 +1,6 @@
 """Installation contracts and fake native boundaries, without Office/registry writes."""
 
+import errno
 import io
 import json
 import os
@@ -296,8 +297,33 @@ def test_private_output_failure_never_launches_helper(monkeypatch):
         installation.DetachedSetupProcess().start()
 
 
+def _assert_output_open_denied(error: OSError) -> None:
+    native_error = getattr(error, "winerror", None)
+    if native_error is None:
+        # CRT file opens can expose errno without a native Windows error.
+        assert error.errno in (errno.EACCES, errno.EPERM)
+    else:
+        assert native_error in (5, 32, 303)
+
+
+@pytest.mark.parametrize("number,native,accepted", [
+    (errno.EACCES, None, True), (errno.EPERM, None, True),
+    (errno.EACCES, 5, True), (errno.EACCES, 32, True),
+    (errno.EACCES, 303, True), (errno.ENOENT, None, False),
+    (errno.EIO, None, False), (errno.EACCES, 2, False),
+])
+def test_stdout_denial_accepts_crt_errno_but_rejects_unrelated_errors(number, native, accepted):
+    error = OSError(number, "fixture")
+    error.winerror = native
+    if accepted:
+        _assert_output_open_denied(error)
+    else:
+        with pytest.raises(AssertionError):
+            _assert_output_open_denied(error)
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows inherited temporary stdout lifetime required")
-def test_windows_helper_stdout_survives_observer_close_and_deletes_on_last_close(monkeypatch, tmp_path):
+def test_windows_helper_stdout_survives_observer_close_and_deletes_on_last_close(monkeypatch, tmp_path, request):
     """Native handle inheritance, delayed write and last-close deletion without Office."""
     monkeypatch.setattr(installation, "auto_install_enabled", lambda: True)
     monkeypatch.setattr(installation, "_validate_helper", lambda _: True)
@@ -312,10 +338,25 @@ def test_windows_helper_stdout_survives_observer_close_and_deletes_on_last_close
         return launch([sys.executable, "-c", script, str(ready), str(release), str(done)], **kwargs)
     monkeypatch.setattr(installation.subprocess, "Popen", native_launch)
     process = installation.DetachedSetupProcess()
+    def release_observer():
+        release.touch()
+        process.close()
+    request.addfinalizer(release_observer)
     process.start()
     import ctypes
     import msvcrt
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetCurrentProcess.restype = ctypes.c_void_p
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel.DuplicateHandle.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+    kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+    kernel.WaitForSingleObject.restype = ctypes.c_uint32
+    verifier_handle = ctypes.c_void_p()
+    current = kernel.GetCurrentProcess()
+    assert kernel.DuplicateHandle(current, int(process._process._handle), current,
+        ctypes.byref(verifier_handle), 0, False, 2)
+    request.addfinalizer(lambda: kernel.CloseHandle(verifier_handle))
     kernel.GetFinalPathNameByHandleW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
         ctypes.c_uint32, ctypes.c_uint32]
     name = ctypes.create_unicode_buffer(32768)
@@ -324,7 +365,7 @@ def test_windows_helper_stdout_survives_observer_close_and_deletes_on_last_close
     filename = Path(name.value)
     with pytest.raises(OSError) as denied:
         filename.open("rb")
-    assert denied.value.winerror in (5, 32, 303)  # access/sharing/delete-pending denial
+    _assert_output_open_denied(denied.value)
     security = ctypes.WinDLL("advapi32", use_last_error=True)
     security.GetSecurityInfo.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
@@ -367,12 +408,16 @@ def test_windows_helper_stdout_survives_observer_close_and_deletes_on_last_close
     while not ready.exists() and time.monotonic() < deadline:
         time.sleep(.01)
     assert ready.exists()
+    assert kernel.WaitForSingleObject(verifier_handle, 0) == 258, "helper_exited_before_observer_close"
     process.close()  # no kill/wait, and helper still owns its stdout handle
+    assert kernel.WaitForSingleObject(verifier_handle, 0) == 258, "helper_exited_before_release"
     release.touch()
-    deadline = time.monotonic() + 5
-    while (not done.exists() or filename.exists()) and time.monotonic() < deadline:
-        time.sleep(.01)
-    assert done.exists() and not filename.exists()
+    # A separate test observer proves actual exit. exists() alone can mistake
+    # access denial/delete-pending for deletion while the helper is still live.
+    assert kernel.WaitForSingleObject(verifier_handle, 5000) == 0, "helper_actual_exit_unconfirmed"
+    assert done.exists()
+    with pytest.raises(FileNotFoundError):
+        filename.stat()
 
 
 @pytest.mark.parametrize("mode", ["disabled", "candidate", "released"])
