@@ -46,6 +46,10 @@ Windows 시험에서 CRT 파일 열기는 native `winerror` 없이 `errno=EACCES
 거절 판정은 이 표현을 수용하고 무관한 오류는 거절한다. 실제 helper 종료와 삭제 확인은 별도 유지한다.
 native 하네스의 30초 시간초과는 컴파일/실행 phase와 flush된 마지막 고정 stage를 표시한다.
 멈춘 단계가 확인되기 전에는 원인을 특정하거나 설치 성공으로 간주하지 않는다.
+저장 진입 이후 위치는 lease 없는 대조군과 lease 보유 시험에서 실제 `AtomicWrite`의 열기·기록·flush·close·
+ACL·rename 단계를 나눠 확인한다. 계측은 native 시험 빌드에서만 포함한다.
+명시적으로 닫힌 관찰 handle을 `Popen` 소멸자가 다시 조회할 수 있는 수명 경로는 별도로 차단한다.
+관찰 해제를 가짜 종료 코드로 대체하거나 helper를 종료하지 않는다.
 
 ### COM poison 복구 일관성 (2026-10-15)
 

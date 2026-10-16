@@ -257,6 +257,25 @@ def check_installation(helper_path: Path | None = None, timeout_sec: float = 10)
         return SetupResult()
 
 
+class _DetachedPopen(subprocess.Popen):
+    """Keep Windows observation disposal independent of child termination."""
+
+    _observation_closed = False
+
+    def close_observation(self) -> None:
+        """Close the Windows observation handle once without fabricating an exit."""
+        if self._observation_closed:
+            return
+        self._observation_closed = True
+        self._handle.Close()
+
+    def __del__(self) -> None:
+        # Popen's finalizer polls its handle. Once explicitly detached, the
+        # Windows handle is closed and is no longer valid for that poll.
+        if not self._observation_closed:
+            super().__del__()
+
+
 class DetachedSetupProcess:
     """Observe a detached helper; closing observation never terminates setup."""
 
@@ -281,7 +300,7 @@ class DetachedSetupProcess:
         except (OSError, ValueError) as exc:
             raise SetupLaunchNotStarted("diagnostic_unavailable") from exc
         try:
-            self._process = subprocess.Popen([str(self.path), "/prepare"],
+            self._process = _DetachedPopen([str(self.path), "/prepare"],
                 stdin=subprocess.DEVNULL, stdout=self._output, stderr=subprocess.DEVNULL,
                 close_fds=True, creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP)
         except BaseException:
@@ -315,9 +334,13 @@ class DetachedSetupProcess:
         try:
             if process is not None and os.name == "nt":
                 # CPython's Windows process handle is independent of child lifetime.
-                handle = getattr(process, "_handle", None)
-                if handle is not None:
-                    handle.Close()
+                closer = getattr(process, "close_observation", None)
+                if closer is not None:
+                    closer()
+                else:
+                    handle = getattr(process, "_handle", None)
+                    if handle is not None:
+                        handle.Close()
         finally:
             if output is not None:
                 output.close()

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -219,6 +220,22 @@ def test_detached_setup_gate_and_close_does_not_kill(monkeypatch):
     assert closed == [True]
 
 
+def test_detached_finalizer_never_polls_a_closed_handle_or_fabricates_exit():
+    process = object.__new__(installation._DetachedPopen)
+    closed = []
+    process._handle = SimpleNamespace(Close=lambda: closed.append(True))
+    process._child_created = True
+    process.pid = 12345
+    process.returncode = None
+    process._internal_poll = lambda **kwargs: pytest.fail("closed handle polled")
+    process.close_observation()
+    process.close_observation()
+    with warnings.catch_warnings(record=True) as captured:
+        warnings.simplefilter("always")
+        process.__del__()
+    assert not captured and closed == [True] and process.returncode is None
+
+
 def test_detached_result_never_reads_a_live_helper():
     process = installation.DetachedSetupProcess()
     process._process = SimpleNamespace(poll=lambda: None)
@@ -279,7 +296,7 @@ def test_detached_launch_uses_file_and_cleans_failed_launch(monkeypatch):
         assert kwargs["stdout"] != subprocess.PIPE
         assert kwargs["close_fds"] and kwargs["stderr"] == subprocess.DEVNULL
         raise OSError("launch")
-    monkeypatch.setattr(installation.subprocess, "Popen", launch)
+    monkeypatch.setattr(installation, "_DetachedPopen", launch)
     process = installation.DetachedSetupProcess()
     with pytest.raises(OSError):
         process.start()
@@ -292,7 +309,7 @@ def test_private_output_failure_never_launches_helper(monkeypatch):
     monkeypatch.setattr(installation, "_validate_helper", lambda _: True)
     monkeypatch.setattr(installation, "create_setup_output", lambda:
         (_ for _ in ()).throw(OSError("private_output_failed")))
-    monkeypatch.setattr(installation.subprocess, "Popen", lambda *args, **kwargs: pytest.fail("no helper"))
+    monkeypatch.setattr(installation, "_DetachedPopen", lambda *args, **kwargs: pytest.fail("no helper"))
     with pytest.raises(installation.SetupLaunchNotStarted):
         installation.DetachedSetupProcess().start()
 
@@ -327,7 +344,7 @@ def test_windows_helper_stdout_survives_observer_close_and_deletes_on_last_close
     """Native handle inheritance, delayed write and last-close deletion without Office."""
     monkeypatch.setattr(installation, "auto_install_enabled", lambda: True)
     monkeypatch.setattr(installation, "_validate_helper", lambda _: True)
-    launch = subprocess.Popen
+    launch = installation._DetachedPopen
     ready, release, done = (tmp_path / name for name in ("ready", "release", "done"))
     script = ("from pathlib import Path; import sys,time\n"
         "ready,release,done=map(Path,sys.argv[1:]); ready.touch()\n"
@@ -336,7 +353,7 @@ def test_windows_helper_stdout_survives_observer_close_and_deletes_on_last_close
         "print('{}',flush=True); done.touch()\n")
     def native_launch(command, **kwargs):
         return launch([sys.executable, "-c", script, str(ready), str(release), str(done)], **kwargs)
-    monkeypatch.setattr(installation.subprocess, "Popen", native_launch)
+    monkeypatch.setattr(installation, "_DetachedPopen", native_launch)
     process = installation.DetachedSetupProcess()
     def release_observer():
         release.touch()
