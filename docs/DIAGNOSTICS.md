@@ -51,6 +51,15 @@ ACL·rename 단계를 나눠 확인한다. 계측은 native 시험 빌드에서�
 명시적으로 닫힌 관찰 handle을 `Popen` 소멸자가 다시 조회할 수 있는 수명 경로는 별도로 차단한다.
 관찰 해제를 가짜 종료 코드로 대체하거나 helper를 종료하지 않는다.
 
+lease 없는 대조군 통과 후 lease 보유 시험이 `atomic_move_call`에서 정체하면 폴더 공유 모드와
+경로 기반 이름 변경의 충돌을 우선 검증한다. 시간초과만으로 `ERROR_SHARING_VIOLATION(32)`의
+실제 반환을 확정하지 않는다. [별도 비교 시험](guides/PPT_READER.md#ppt-저장-충돌-비교-시험)은
+기존 `AtomicWrite`와 시험 전용 native 같은 폴더 이름 변경을 독립 프로세스로 실행한다.
+대안은 `NtSetInformationFile(FileRenameInformation=10)`에 `RootDirectory=NULL`과 단순 파일명을
+전달한다([Microsoft 계약](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information)).
+WRITE 공유 추가·lease 일시 해제·ACL 변경은 하지 않는다. 비교 결과는 대안 선택의 근거이며
+기존 필수 native gate나 UAC·다른 사용자 검증을 대체하지 않는다. 제품 반영과 Windows 성공은 미확정이다.
+
 ### COM poison 복구 일관성 (2026-10-15)
 
 실제 종료·소유 기록 제거 후 2초 목록이 남는 문제, 진행 중인 열거/guard가 옛 결과를 사용하는

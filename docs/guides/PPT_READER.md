@@ -45,6 +45,34 @@ if ($LASTEXITCODE -ne 0) { throw 'ppt_reader_build_failed' }
 `machine_safe=false`이면 PPT COM 수집을 미룬다. disabled/candidate의 `auto_install_validated`는 false다.
 candidate는 자동 실행이 허용되며, true/false 표시 자체는 Windows 시험 완료 증거가 아니다.
 
+## PPT 저장 충돌 비교 시험
+
+기존 필수 시험이 lease 보유 중 `atomic_move_call`에서 멈추면 아래 비교 시험을 먼저 실행한다.
+일반 권한 Windows·로컬 NTFS에서 실행하며, 앱 재빌드는 필요 없다. 시험 C# 실행 파일은 자동 컴파일한다.
+AppData·ProgramData와 기존 설치는 변경하지 않는다.
+
+```powershell
+powershell -NoProfile -File .\scripts\diagnose_ppt_rename.ps1
+```
+
+마지막 `Diagnostic log:`에 표시된 파일 하나에 OS/Python/PowerShell의 비트수·버전,
+컴파일러 존재 여부·소스 커밋·전체 비교 결과를 모은다. 실패해도 파일을 남긴다.
+기본 `.venv` 대신 다른 Python을 쓸 때는 `-PythonPath 'C:\경로\python.exe'`를 붙인다.
+스크립트 대신 pytest를 직접 실행할 수도 있다.
+
+```powershell
+& .\.venv\Scripts\python.exe -m pytest .\knowmate\tests\test_ppt_rename_probe.py -s -v -o addopts=
+```
+
+기존 `AtomicWrite`의 신규 저장·교체와 시험 전용 native 이름 변경의 신규 저장·교체·이름 충돌을
+lease 없음/1개/2개로 비교한다. 각 경우를 별도 프로세스로 최대 30초 실행하고, 실패해도 나머지를
+계속 실행한다. 전체 실패 시 몇 분 걸릴 수 있다. 비교 결과는 로그 파일 하나로 전달하면 된다.
+직접 실행할 때 `-s`를 생략하면 정상 종료한 시험의 출력이 숨겨질 수 있다.
+
+기존 방식이 멈추거나 실패하면 최종 pytest 결과도 실패로 남는다. 대안 성공은 제품 수정 완료가
+아니며, 모든 비교가 통과해도 아래 기존 필수 native 시험·다른 사용자/UAC 검증은 별도로 필요하다.
+공유 모드와 ACL은 그대로 유지한다. 관리자 실행·Windows 외 환경의 skip은 미검증으로 해석한다.
+
 ## 기존 설치 준비 폴더와 native lease 검증
 
 기존 1.0.0.0 설치를 업데이트할 때 AppData·ProgramData·dist를 지워야 하는 것은 아니다.
