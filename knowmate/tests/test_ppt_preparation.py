@@ -228,6 +228,36 @@ def test_invalid_or_forged_helper_ready_does_not_override_postcheck(tmp_path):
     gate.shutdown()
 
 
+@pytest.mark.parametrize("safe", [False, True])
+@pytest.mark.parametrize("valid", [False, True])
+def test_native_helper_diagnostic_logs_fixed_fields_and_always_rechecks(tmp_path, caplog, safe, valid):
+    class NativeProcess(Process):
+        def read_result(self):
+            return SetupResult(status="failed", reason="acl_unavailable", machine_safe=False,
+                stage="request_commit", error_type="IOException", native_stage="commit_return",
+                ntstatus="C0000035" if valid else "confidential-marker", io_status=None)
+
+    results = iter([SetupResult(status="outdated", machine_safe=True, office_bitness=64,
+        auto_install_mode="candidate"), SetupResult(status="outdated", machine_safe=safe)])
+    checks = []
+    def check():
+        checks.append(1)
+        return next(results)
+    process = NativeProcess(exit_code=12)
+    gate, policies, _ = coordinator(tmp_path, checker=check, process_factory=lambda: process)
+    with caplog.at_level("INFO"):
+        gate.begin()
+        wait_until(lambda: process.started == 1)
+        gate._poll_setup()
+        wait_until(lambda: bool(policies))
+    assert len(checks) == 2 and policies == (["com_only"] if safe else ["ppt_pending"])
+    expected = "native_stage=commit_return ntstatus=C0000035 io_status=None" if valid else (
+        "native_stage=None ntstatus=None io_status=None")
+    assert expected in caplog.text and "confidential-marker" not in caplog.text
+    assert process.closed == 1
+    gate.shutdown()
+
+
 def test_decline_is_persisted_for_original_user_version(tmp_path):
     result = SetupResult(status="missing", machine_safe=True, office_bitness=64, auto_install_mode="candidate")
     process = Process(exit_code=11)

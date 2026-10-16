@@ -51,14 +51,21 @@ ACL·rename 단계를 나눠 확인한다. 계측은 native 시험 빌드에서�
 명시적으로 닫힌 관찰 handle을 `Popen` 소멸자가 다시 조회할 수 있는 수명 경로는 별도로 차단한다.
 관찰 해제를 가짜 종료 코드로 대체하거나 helper를 종료하지 않는다.
 
-lease 없는 대조군 통과 후 lease 보유 시험이 `atomic_move_call`에서 정체하면 폴더 공유 모드와
-경로 기반 이름 변경의 충돌을 우선 검증한다. 시간초과만으로 `ERROR_SHARING_VIOLATION(32)`의
-실제 반환을 확정하지 않는다. [별도 비교 시험](guides/PPT_READER.md#ppt-저장-충돌-비교-시험)은
-기존 `AtomicWrite`와 시험 전용 native 같은 폴더 이름 변경을 독립 프로세스로 실행한다.
-대안은 `NtSetInformationFile(FileRenameInformation=10)`에 `RootDirectory=NULL`과 단순 파일명을
-전달한다([Microsoft 계약](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information)).
-WRITE 공유 추가·lease 일시 해제·ACL 변경은 하지 않는다. 비교 결과는 대안 선택의 근거이며
-기존 필수 native gate나 UAC·다른 사용자 검증을 대체하지 않는다. 제품 반영과 Windows 성공은 미확정이다.
+사내 비교에서는 managed 신규 저장이 lease 보유 시 Win32 32, 교체는 1175로 실패했고,
+저수준 native 신규·교체는 lease 0/1/2에서 통과했다. native 이름 충돌의 NTSTATUS는
+`C0000035`였으나 기존 시험이 자기 DELETE handle을 열어둔 채 소스를 다시 읽어 Win32 32를
+덧붙였다. 이제 소스를 닫은 뒤 충돌 보존 상태를 확인한다. managed 교체 대조군의
+`target_security_changed`는 아직 분류하지 않았으며 owner/DACL/보호·정규화/control flags의
+차이를 숫자·불리언으로 나눠 기록한다. 실제 권한 약화라면 별도 출시 차단 사유다.
+
+1.0.4.0 후보는 **요청 파일만** 실제 `RequestWriter`의 같은 폴더 native 이름 변경으로 저장한다.
+WRITE 공유를 추가하거나 lease를 풀지 않는다. ProgramFiles 기록·저널의 managed 저장은 유지한다.
+[한 번의 진단 명령과 짧은 결과 판독](guides/PPT_READER.md#ppt-요청-저장과-충돌-진단)은
+기존 대조군과 실제 제품 저장, 필수 ACL·stdout 수명 시험을 구분해서 보고한다.
+미확인 native 반환은 성공 처리하지 않고 helper·버퍼·lease·mutex를 유지하며 보류한다.
+Linux 회귀·Mono 컴파일은 Windows 저장 성공의 근거가 아니다. 실제 Windows writer/lease,
+다른 사용자, 같은/다른 관리자 UAC, 32/64비트 Office 시험은 **미실행**이다.
+기존 orphan temp만 남은 상태의 명시 복구는 별도 과제이며 자동 삭제·재권한 부여로 우회하지 않는다.
 
 ### COM poison 복구 일관성 (2026-10-15)
 

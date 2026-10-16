@@ -18,7 +18,9 @@ _STAGES = frozenset({
     "control_atomic_create", "control_atomic_replace", "atomic_path_check", "atomic_file_open",
     "atomic_writer_open", "atomic_serialize", "atomic_writer_flush", "atomic_disk_flush",
     "atomic_writer_close", "atomic_file_close", "atomic_acl_apply", "atomic_commit_probe",
-    "atomic_replace_call", "atomic_move_call", "atomic_done",
+    "atomic_replace_call", "atomic_move_call", "atomic_done", "target_open", "target_validated", "target_close",
+    "target_closed", "source_open", "source_written", "commit_call", "commit_return", "commit_verify",
+    "source_close", "source_closed", "source_close_failed", "source_acl", "source_write", "source_flush", "native_unconfirmed", "write_conflict_open", "write_conflict_acquire",
 })
 
 
@@ -105,3 +107,4 @@ def test_ppt_native_legacy_directory_lease(tmp_path: Path) -> None:
         pytest.skip(result.stdout.strip())
     assert result.returncode == 0, result.stdout + result.stderr
     assert "PASS native inherited parent" in result.stdout
+    print("PPT_ACL_SUMMARY result=PASS actual_request_writer=true", flush=True)

@@ -10,6 +10,7 @@ namespace AegisDesk.PptSetup
     {
         internal readonly string Stage, ErrorType;
         internal readonly int? WinError;
+        internal string NativeStage, NtStatus, IoStatus;
         internal SetupFailure(string stage, string type, int? winerror = null) : base("acl_unavailable")
         { Stage = stage; ErrorType = type; WinError = winerror; }
         internal static SetupFailure From(string stage, Exception error)
@@ -25,7 +26,16 @@ namespace AegisDesk.PptSetup
             // HResult is deliberately never truncated into a claimed Win32 code.
             return new SetupFailure(stage, type);
         }
+        internal static SetupFailure Native(string nativeStage, uint status, uint? ioStatus)
+        { return new SetupFailure("request_commit", "IOException") { NativeStage = nativeStage, NtStatus = status.ToString("X8"), IoStatus = ioStatus.HasValue ? ioStatus.Value.ToString("X8") : null }; }
+        internal static SetupFailure WithNative(Exception error, string nativeStage, uint status, uint? ioStatus)
+        {
+            SetupFailure failure = From("request_commit", error);
+            failure.NativeStage = nativeStage; failure.NtStatus = status.ToString("X8");
+            failure.IoStatus = ioStatus.HasValue ? ioStatus.Value.ToString("X8") : null; return failure;
+        }
         internal void Apply(Result result)
-        { result.stage = Stage; result.error_type = ErrorType; result.winerror = WinError; }
+        { result.stage = Stage; result.error_type = ErrorType; result.winerror = WinError;
+          result.native_stage = NativeStage; result.ntstatus = NtStatus; result.io_status = IoStatus; }
     }
 }

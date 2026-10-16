@@ -17,6 +17,7 @@ namespace AegisDesk.PptSetup
         public bool machine_safe, auto_install_validated = Contract.AutoInstallValidated;
         public string auto_install_mode = Contract.AutoInstallMode;
         public string stage, error_type;
+        public string native_stage, ntstatus, io_status;
         public int? winerror;
         public Result(string op) { operation = op; }
         internal Dictionary<string, object> Values()
@@ -28,6 +29,7 @@ namespace AegisDesk.PptSetup
                 { "auto_install_validated", auto_install_validated }, { "auto_install_mode", auto_install_mode }
             };
             if (stage != null) { values["stage"] = stage; values["error_type"] = error_type; values["winerror"] = winerror; }
+            if (native_stage != null) { values["native_stage"] = native_stage; values["ntstatus"] = ntstatus; values["io_status"] = io_status; }
             return values;
         }
         public void Emit() { Console.WriteLine(Contract.Json.Serialize(Values())); }
@@ -37,7 +39,7 @@ namespace AegisDesk.PptSetup
     {
         // No implementation in shipping builds: compiler removes every call.
         static partial void TraceAtomic(string stage);
-        public const string Version = "1.0.3.0";
+        public const string Version = "1.0.4.0";
         public const string ProgId = "AegisDesk.PptReader";
         public const string ClassId = "{287A80D2-804A-46D3-A0E9-CA31C6FC3D09}";
         public const string ReaderIid = "9A20F4A6-6364-4BA7-930B-3E8857BEAF60";

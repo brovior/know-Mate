@@ -106,6 +106,7 @@ internal static class RenameProbeNative
             int ioSize = Marshal.SizeOf(typeof(IoStatusBlock));
             ioBuffer = Marshal.AllocHGlobal(ioSize);
             Marshal.Copy(new byte[ioSize], 0, ioBuffer, ioSize);
+            Marshal.WriteIntPtr(ioBuffer, new IntPtr(0x7fffffff));
             Marshal.Copy(new byte[size], 0, buffer, size);
             Marshal.WriteByte(buffer, replace ? (byte)1 : (byte)0);
             Marshal.WriteIntPtr(buffer, rootOffset, IntPtr.Zero);
@@ -126,7 +127,7 @@ internal static class RenameProbeNative
             }
             var io = (IoStatusBlock)Marshal.PtrToStructure(ioBuffer, typeof(IoStatusBlock));
             Console.WriteLine("PPT_RENAME_STATUS ntstatus=" + unchecked((uint)status).ToString("X8")
-                + " io_status=" + unchecked((uint)io.Status.ToInt64()).ToString("X8")
+                + " io_status=" + (io.Status.ToInt64() == 0x7fffffff ? "none" : unchecked((uint)io.Status.ToInt64()).ToString("X8"))
                 + " io_information=" + io.Information.ToUInt64());
             Console.Out.Flush();
             if (status == 0) Require(io.Status == IntPtr.Zero, "native_io_status_not_success");

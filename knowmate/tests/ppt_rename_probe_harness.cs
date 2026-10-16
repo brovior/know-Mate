@@ -37,6 +37,26 @@ internal static class RenameProbeHarness
         return acl.GetSecurityDescriptorSddlForm(AccessControlSections.Owner | AccessControlSections.Access);
     }
 
+    private static void CompareSecurity(string expected, string target)
+    {
+        var before = new RawSecurityDescriptor(expected);
+        FileSecurity actual = File.GetAccessControl(target);
+        var after = new RawSecurityDescriptor(actual.GetSecurityDescriptorBinaryForm(), 0);
+        var beforeSecurity = new FileSecurity(); beforeSecurity.SetSecurityDescriptorSddlForm(expected);
+        byte[] first = new byte[before.DiscretionaryAcl.BinaryLength];
+        byte[] second = new byte[after.DiscretionaryAcl.BinaryLength];
+        before.DiscretionaryAcl.GetBinaryForm(first, 0); after.DiscretionaryAcl.GetBinaryForm(second, 0);
+        bool dacl = Convert.ToBase64String(first) == Convert.ToBase64String(second);
+        bool protectedBefore = (before.ControlFlags & ControlFlags.DiscretionaryAclProtected) != 0;
+        Console.WriteLine("PPT_RENAME_SECURITY owner_equal=" + (before.Owner == after.Owner ? "1" : "0")
+            + " dacl_equal=" + (dacl ? "1" : "0") + " protected_before=" + (protectedBefore ? "1" : "0")
+            + " protected_after=" + (actual.AreAccessRulesProtected ? "1" : "0")
+            + " canonical_before=" + (beforeSecurity.AreAccessRulesCanonical ? "1" : "0")
+            + " canonical_after=" + (actual.AreAccessRulesCanonical ? "1" : "0")
+            + " control_before=" + (int)before.ControlFlags + " control_after=" + (int)after.ControlFlags);
+        Console.Out.Flush();
+    }
+
     private static FileSecurity RequestSecurity()
     {
         var acl = new FileSecurity();
@@ -139,23 +159,31 @@ internal static class RenameProbeHarness
                     RenameProbeNative.Require(RenameProbeNative.Identity(handle) == sourceIdentity, "source_identity_changed");
                     Stage("native_rename_call");
                     int status = RenameProbeNative.Rename(handle, "request.json", replace);
+                    Stage("native_return");
                     if (collision)
                     {
                         RenameProbeNative.Require(unchecked((uint)status) == 0xC0000035, "collision_status_not_name_collision");
-                        RenameProbeNative.Require(File.ReadAllText(source) == sourceText
-                            && RenameProbeNative.Identity(source) == sourceIdentity && Security(source, false) == sourceSecurity,
-                            "collision_source_changed");
+                        // Path reopening with FileShare.Read conflicts with our own DELETE
+                        // handle. Preserve the status here; verify names only after close.
                     }
                     else RenameProbeNative.Require(status == 0 && RenameProbeNative.Identity(handle) == sourceIdentity,
                         "native_rename_failed");
                 }
                 catch { failureStage = currentStage; throw; }
                 finally { Stage("source_close"); handle.Dispose(); Stage("source_closed"); }
-                if (!collision) RenameProbeNative.Require(!File.Exists(source), "source_name_remains");
+                if (collision)
+                {
+                    Stage("collision_verify");
+                    RenameProbeNative.Require(File.ReadAllText(source) == sourceText
+                        && RenameProbeNative.Identity(source) == sourceIdentity && Security(source, false) == sourceSecurity,
+                        "collision_source_changed");
+                }
+                else RenameProbeNative.Require(!File.Exists(source), "source_name_remains");
             }
             Stage("verify");
             RenameProbeNative.Require(File.ReadAllText(request) == (collision ? "target-fixture" : sourceText), "target_content_changed");
             RenameProbeNative.Require(RenameProbeNative.Identity(request) == (collision ? oldIdentity : sourceIdentity), "target_identity_changed");
+            CompareSecurity(collision ? oldSecurity : sourceSecurity, request);
             RenameProbeNative.Require(Security(request, false) == (collision ? oldSecurity : sourceSecurity), "target_security_changed");
             RenameProbeNative.Require(File.ReadAllText(decoy) == "cwd-target-fixture" && File.ReadAllText(decoySource) == "cwd-source-fixture"
                 && RenameProbeNative.Identity(decoy) == decoyIdentity && RenameProbeNative.Identity(decoySource) == decoySourceIdentity

@@ -146,10 +146,11 @@ class PptPreparationCoordinator(QObject):
         if self._closed or self._worker is not None or self.state == "installing":
             return
         logger.info("PPT 준비 점검: phase=%s status=%s reason=%s machine_safe=%s "
-                    "required_version=%s installed_version=%s stage=%s error_type=%s winerror=%s",
+                    "required_version=%s installed_version=%s stage=%s error_type=%s winerror=%s "
+                    "native_stage=%s ntstatus=%s io_status=%s",
                     "post_check" if self._after_install else "check", result.status,
                     result.reason, result.machine_safe, REQUIRED_VERSION, result.installed_version,
-                    result.stage, result.error_type, result.winerror)
+                    result.stage, result.error_type, result.winerror, *result.native_diagnostic)
         if self._after_install:
             # An exited helper is not evidence of repaired registrations or locks.
             self._finish("ppt_pending" if self._install_unconfirmed else
@@ -200,9 +201,10 @@ class PptPreparationCoordinator(QObject):
                 # must not prevent the independent post_check below.
                 logger.debug("PPT 설치 도구 진단: reason=diagnostic_unavailable")
             logger.info("PPT 설치 도구 종료: code=%s result=%s reason=%s stage=%s error_type=%s "
-                        "winerror=%s required_version=%s installed_version=%s", exit_code, outcome,
+                        "winerror=%s required_version=%s installed_version=%s "
+                        "native_stage=%s ntstatus=%s io_status=%s", exit_code, outcome,
                         diagnostic.reason, diagnostic.stage, diagnostic.error_type, diagnostic.winerror,
-                        REQUIRED_VERSION, diagnostic.installed_version)
+                        REQUIRED_VERSION, diagnostic.installed_version, *diagnostic.native_diagnostic)
             if exit_code == 11:
                 self._save_suppression("permission_declined")
             self._close_observation()

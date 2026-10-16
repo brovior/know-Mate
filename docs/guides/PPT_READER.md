@@ -1,6 +1,6 @@
 # 운영 PPT Reader 개발 검증
 
-현재 요구 버전은 **1.0.3.0**이다. 기본 빌드는 자동 설치를 끈 `disabled`이며,
+현재 요구 버전은 **1.0.4.0**이다. 기본 빌드는 자동 설치를 끈 `disabled`이며,
 개발 빌드의 `candidate`/`released`에서 앱 시작부터 자동 설치를 실행한다.
 시험 DLL의 내용 일치/속도 결과를 운영 DLL·자동 설치의 성공으로 간주하지 않는다.
 아래 명령은 Windows 개발 PC에서 실행한다. 문서 원문은 로그/파일로 기록하지 않는다.
@@ -45,33 +45,44 @@ if ($LASTEXITCODE -ne 0) { throw 'ppt_reader_build_failed' }
 `machine_safe=false`이면 PPT COM 수집을 미룬다. disabled/candidate의 `auto_install_validated`는 false다.
 candidate는 자동 실행이 허용되며, true/false 표시 자체는 Windows 시험 완료 증거가 아니다.
 
-## PPT 저장 충돌 비교 시험
+## PPT 요청 저장과 충돌 진단
 
-기존 필수 시험이 lease 보유 중 `atomic_move_call`에서 멈추면 아래 비교 시험을 먼저 실행한다.
-일반 권한 Windows·로컬 NTFS에서 실행하며, 앱 재빌드는 필요 없다. 시험 C# 실행 파일은 자동 컴파일한다.
-AppData·ProgramData와 기존 설치는 변경하지 않는다.
+이번 수정은 **준비 요청 파일만 native 저장으로 바꾼 1.0.4.0 후보**다. 일반 권한 Windows·로컬
+NTFS에서 아래 명령 한 번으로 비교 시험, 실제 제품 저장 경로, 필수 lease·stdout 수명 시험을 모은다.
+앱 재빌드는 필요 없으며 시험 C# 실행 파일을 자동 컴파일한다. AppData·ProgramData와 기존 설치는
+변경하지 않고 UAC도 요청하지 않는다.
 
 ```powershell
 powershell -NoProfile -File .\scripts\diagnose_ppt_rename.ps1
 ```
 
-마지막 `Diagnostic log:`에 표시된 파일 하나에 OS/Python/PowerShell의 비트수·버전,
-컴파일러 존재 여부·소스 커밋·전체 비교 결과를 모은다. 실패해도 파일을 남긴다.
 기본 `.venv` 대신 다른 Python을 쓸 때는 `-PythonPath 'C:\경로\python.exe'`를 붙인다.
-스크립트 대신 pytest를 직접 실행할 수도 있다.
+마지막 `Diagnostic log:`의 파일 하나에 상세 결과를 남기고, 파일 앞뒤에는 같은 짧은 요약을 둔다.
+파일 전달이 어려우면 **`PPT_SHORT_REPORT`부터 `PPT_SHORT_END`까지**만 먼저 전달한다.
+실패해도 나머지 경우를 계속 실행한다. 각 프로세스 제한은 30초이며, 미확인 native 상태와
+저장 중단 시험은 시험 전용 프로세스의 제한 종료를 의도하므로 전체 실행에 몇 분 걸릴 수 있다.
+실제 설치 helper는 이 방식으로 종료하지 않는다.
+
+| 요약 | 판독 |
+|---|---|
+| `PPT_RENAME_SUMMARY` | 기존 managed 저장과 저수준 native 대조군. 기존 managed 실패가 남을 수 있으며 제품 통과로 대체하지 않는다. |
+| `PPT_WRITER_SUMMARY` | 실제 `Reservation.Create/Load/Save`와 `RequestWriter`의 생성·교체·충돌·거절·오류·중단 검증. `fail/timeout/skip/unexecuted`를 함께 확인한다. |
+| `PPT_ACL_SUMMARY result=PASS` | 기존 필수 폴더·lease 검증이 실제 제품 요청 저장 경로로 통과했다는 뜻이다. |
+| `PPT_STDOUT_SUMMARY result=PASS` | 관찰 해제 뒤 실제 자식 종료·마지막 handle 삭제 시험의 통과다. |
+| `PPT_REQUIRED_EXTERNAL` | 다른 사용자·UAC·Office는 이 명령에서 미실행이며 별도 검증해야 한다. |
+
+파일 symlink 생성 권한이 없으면 해당 경우는 `UNEXECUTED`로 남고 전체 필수 검증 완료로 인정하지
+않는다. 일반 사용자로 가능한 directory junction 거절도 별도 시험한다. 이 표시는 제품 저장 실패와
+구분하며, 정상 앱 실행을 위해 Developer Mode나 관리자 실행을 요구한다는 뜻은 아니다.
+기존 managed 실패는 비교 수치로 남기며 필수 제품 검증의 통과·실패와 구분한다. native 대조군의
+실패는 해당 pytest를 실패로 남긴다. `product_approval=false`는 이 명령만으로 출시 승인하지
+않는다는 고정 표시다.
+
+실제 제품 저장만 따로 재실행하려면 다음을 쓴다.
 
 ```powershell
-& .\.venv\Scripts\python.exe -m pytest .\knowmate\tests\test_ppt_rename_probe.py -s -v -o addopts=
+& .\.venv\Scripts\python.exe -m pytest .\knowmate\tests\test_ppt_request_writer.py -s -v -o addopts=
 ```
-
-기존 `AtomicWrite`의 신규 저장·교체와 시험 전용 native 이름 변경의 신규 저장·교체·이름 충돌을
-lease 없음/1개/2개로 비교한다. 각 경우를 별도 프로세스로 최대 30초 실행하고, 실패해도 나머지를
-계속 실행한다. 전체 실패 시 몇 분 걸릴 수 있다. 비교 결과는 로그 파일 하나로 전달하면 된다.
-직접 실행할 때 `-s`를 생략하면 정상 종료한 시험의 출력이 숨겨질 수 있다.
-
-기존 방식이 멈추거나 실패하면 최종 pytest 결과도 실패로 남는다. 대안 성공은 제품 수정 완료가
-아니며, 모든 비교가 통과해도 아래 기존 필수 native 시험·다른 사용자/UAC 검증은 별도로 필요하다.
-공유 모드와 ACL은 그대로 유지한다. 관리자 실행·Windows 외 환경의 skip은 미검증으로 해석한다.
 
 ## 기존 설치 준비 폴더와 native lease 검증
 
@@ -97,10 +108,11 @@ stdout 상속·실제 자식 종료·마지막 handle 삭제 시험도 일반 �
 하네스가 시간초과하면 `PPT ACL timeout: phase=compile|atomic_control|harness last_stage=... stage_started_ms=... limit_sec=30`의
 고정 값을 확인한다. `last_stage=unavailable`은 단계 출력 미수집이며 원인 확정이 아니다.
 시간초과는 통과로 바꾸지 않고, 마지막 단계로 컴파일·junction 생성·lease·원자 저장·정리를 구분한다.
-먼저 lease 없는 `atomic_control`에서 동일한 실제 저장 함수를 실행한 뒤 `harness`에서 lease를 보유한다.
-`atomic_file_open/atomic_disk_flush/atomic_acl_apply/atomic_move_call` 등으로 저장 내부 위치를 좁힌다.
-`stage_started_ms`는 해당 단계 진입 시점으로, 30초 누적 소요와 특정 단계의 정체를 구분할 근거다.
-세부 계측 구현은 native 시험 실행 파일에만 포함하고 일반 setup에서는 partial 호출이 제거된다.
+먼저 `atomic_control`에서 lease 없는 managed 대조군을 확인한 뒤 `harness`에서
+과거 상속 부모와 두 lease를 보유하고 실제 제품 요청 저장을 실행한다. `source_open/source_acl/source_write/
+source_flush/commit_call/commit_return/commit_verify/source_close`로 위치를 좁힌다.
+`stage_started_ms`는 해당 단계 진입 시점이며, 계측은 시험 실행 파일에만 들어간다.
+일반 setup의 partial 계측·오류 주입 호출은 컴파일 때 제거된다.
 stdout 파일 열기 거절은 Win32 오류뿐 아니라 CRT의 `errno=EACCES/EPERM`도 인정한다.
 파일 없음·일반 I/O 오류는 거절 성공으로 인정하지 않으며 ACL·상속·실제 종료·삭제 검사는 계속 수행한다.
 관찰 해제는 설치 도구의 실제 종료로 기록하지 않는다. 닫은 handle을 `Popen` 소멸자가 다시 조회하지 않도록
@@ -111,8 +123,8 @@ stdout 파일 열기 거절은 Win32 오류뿐 아니라 CRT의 `errno=EACCES/EP
 기존 owner/DACL 불변과 기존 DELETE handle 충돌을 검사한다. 같은 프로세스의 두 handle 시험은
 실제 helper·승격 자식의 다른 계정 권한 시험을 대신하지 않는다.
 
-그다음 candidate EXE로 기존 1.0.0.0 → 1.0.3.0 업데이트와 새 설치를 각각 확인한다.
-필수 기록은 `required_version=1.0.3.0`, 실제 `installed_version`, 일반 helper/승격 자식 종료,
+그다음 candidate EXE로 기존 1.0.0.0 → 1.0.4.0 업데이트와 새 설치를 각각 확인한다.
+필수 기록은 `required_version=1.0.4.0`, 실제 `installed_version`, 일반 helper/승격 자식 종료,
 원래 사용자 `/check`의 `ready`, 인덱싱의 `method=addin`이다. 같은 계정 및 다른 관리자 UAC,
 앱만 종료했을 때 helper/자식 생존·stdout 쓰기/마지막 handle 정리, 점유/거절/공유 충돌,
 중간 helper 종료·자식 생존·`/recover`와 32/64비트 Office는 별도 실제 시험한다.
@@ -123,6 +135,9 @@ A의 암묵적 WRITE_DAC에 의한 DACL 변경은 lease로 막지 못한다. own
 이 후보를 활성화하지 말고 관리자 소유 저장 구조 등으로 재설계한다.
 
 실패 로그는 고정 요약 code와 검증된 `reason/stage/error_type/winerror`를 표시한다.
+요청의 native 호출 후 실패에는 `native_stage/ntstatus/io_status`도 함께 남긴다.
+`ntstatus/io_status`는 8자리 대문자 16진수이며 미수집 IO 상태는 null이다.
+`commit_return`은 호출 실패, `commit_verify`는 저장 후 확인 실패, `commit_close`는 핸들 정리 실패다.
 `parent_open/parent_policy/child_open/child_policy/request_create/request_acl/request_commit`으로
 실패 위치를 구분하며 실제 Win32 오류가 없으면 `winerror`는 null이다. 원문 예외·SID·SDDL은 쓰지 않는다.
 미수집·잘못된 출력은 `diagnostic_unavailable`이며, 최종 안전 여부는 독립 `post_check`가 결정한다.

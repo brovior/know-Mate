@@ -171,14 +171,18 @@ internal static class NativeAclHarness
                 Denied(delegate { Directory.Move(parent, parent + ".renamed"); }, "parent_rename_allowed");
                 Denied(delegate { Directory.Move(child, child + ".renamed"); }, "child_rename_allowed");
                 Denied(delegate { Directory.Delete(child); }, "empty_child_delete_allowed");
-                string request = Path.Combine(child, Guid.NewGuid().ToString("D") + ".json");
-                FileSecurity acl = RequestSecurity();
-                Stage("atomic_create");
-                Contract.AtomicWrite(request, new Dictionary<string, object> { { "fixture", 1 } }, acl);
-                Stage("atomic_replace");
-                Contract.AtomicWrite(request, new Dictionary<string, object> { { "fixture", 2 } }, acl);
-                Stage("atomic_verify");
-                Require(Convert.ToInt32(Contract.Read(request)["fixture"]) == 2, "atomic_replace_failed");
+                // Exercise the actual request path, not the generic metadata writer.
+                Reservation reservation;
+                using (var mutex = new MachineLock())
+                {
+                    Stage("atomic_create"); reservation = Reservation.Create(first);
+                    Stage("atomic_replace");
+                    Reservation loaded = Reservation.Load(reservation.request_id, second);
+                    loaded.state = "complete"; loaded.Save();
+                    Stage("atomic_verify");
+                    Require(Reservation.Load(reservation.request_id, first).state == "complete", "atomic_replace_failed");
+                }
+                string request = reservation.Path;
                 Require(Security(parent) == parentBefore && Security(child) == childBefore, "directory_security_changed");
                 first.Recheck(); second.Recheck();
                 File.Delete(request);
@@ -193,6 +197,15 @@ internal static class NativeAclHarness
                 Stage("sharing_conflict_acquire");
                 Denied(delegate { using (RequestDirectoryLease lease = RequestDirectoryLease.AcquireAt(anchor)) { } },
                     "delete_handle_conflict_accepted");
+            }
+            Stage("write_conflict_open");
+            using (SafeFileHandle conflict = CreateFile(parent, 2, 7, IntPtr.Zero, 3,
+                0x02000000 | 0x00200000, IntPtr.Zero))
+            {
+                Require(!conflict.IsInvalid, "write_conflict_fixture_open_failed");
+                Stage("write_conflict_acquire");
+                Denied(delegate { using (RequestDirectoryLease lease = RequestDirectoryLease.AcquireAt(anchor)) { } },
+                    "write_handle_conflict_accepted");
             }
             using (RequestDirectoryLease lease = Acquire(anchor, "reopen_after_conflict")) { lease.Recheck(); }
             // Confirm the earlier rename denial was caused by the live leases rather than absent caller rights.
@@ -221,5 +234,9 @@ namespace AegisDesk.PptSetup
     {
         // This implementation is compiled only into the native test executable.
         static partial void TraceAtomic(string stage) { NativeAclHarness.Stage(stage); }
+    }
+    internal static partial class RequestWriter
+    {
+        static partial void TraceRequest(string stage) { NativeAclHarness.Stage(stage); }
     }
 }
