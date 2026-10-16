@@ -48,9 +48,10 @@ candidate는 자동 실행이 허용되며, true/false 표시 자체는 Windows 
 ## PPT 요청 저장과 충돌 진단
 
 이번 수정은 **준비 요청 파일만 native 저장으로 바꾼 1.0.4.0 후보**다. 일반 권한 Windows·로컬
-NTFS에서 아래 명령 한 번으로 비교 시험, 실제 제품 저장 경로, 필수 lease·stdout 수명 시험을 모은다.
-앱 재빌드는 필요 없으며 시험 C# 실행 파일을 자동 컴파일한다. AppData·ProgramData와 기존 설치는
-변경하지 않고 UAC도 요청하지 않는다.
+NTFS에서 AegisDesk와 PowerPoint를 정상 종료한 뒤 아래 명령 한 번으로 비교 시험, 실제 제품 저장
+경로, 필수 lease·stdout 수명 시험을 모은다.
+앱 재빌드는 필요 없으며 시험 C# 실행 파일을 자동 컴파일한다. AegisDesk의 기존 AppData·ProgramData와
+설치는 변경하지 않고 UAC도 요청하지 않는다. Reader/setup 요구 버전은 계속 1.0.4.0이다.
 
 ```powershell
 powershell -NoProfile -File .\scripts\diagnose_ppt_rename.ps1
@@ -59,24 +60,35 @@ powershell -NoProfile -File .\scripts\diagnose_ppt_rename.ps1
 기본 `.venv` 대신 다른 Python을 쓸 때는 `-PythonPath 'C:\경로\python.exe'`를 붙인다.
 마지막 `Diagnostic log:`의 파일 하나에 상세 결과를 남기고, 파일 앞뒤에는 같은 짧은 요약을 둔다.
 파일 전달이 어려우면 **`PPT_SHORT_REPORT`부터 `PPT_SHORT_END`까지**만 먼저 전달한다.
-실패해도 나머지 경우를 계속 실행한다. 각 프로세스 제한은 30초이며, 미확인 native 상태와
+실패해도 나머지 경우를 계속 실행한다. writer의 각 프로세스 제한은 30초이며, 미확인 native 상태와
 저장 중단 시험은 시험 전용 프로세스의 제한 종료를 의도하므로 전체 실행에 몇 분 걸릴 수 있다.
-실제 설치 helper는 이 방식으로 종료하지 않는다.
+stdout 시험은 시작·정상 종료 관찰에 각각 30초, 실패 정리에 추가 최대 5초를 쓴다.
+실패 정리에서 종료하는 대상은 이 시험이 직접 시작한 Python 자식뿐이며, 그 정리가 성공해도
+본시험 실패는 유지한다. 실제 설치 helper는 종료하지 않는다.
 
 | 요약 | 판독 |
 |---|---|
 | `PPT_RENAME_SUMMARY` | 기존 managed 저장과 저수준 native 대조군. 기존 managed 실패가 남을 수 있으며 제품 통과로 대체하지 않는다. |
 | `PPT_WRITER_SUMMARY` | 실제 `Reservation.Create/Load/Save`와 `RequestWriter`의 생성·교체·충돌·거절·오류·중단 검증. `fail/timeout/skip/unexecuted`를 함께 확인한다. |
-| `PPT_ACL_SUMMARY result=PASS` | 기존 필수 폴더·lease 검증이 실제 제품 요청 저장 경로로 통과했다는 뜻이다. |
-| `PPT_STDOUT_SUMMARY result=PASS` | 관찰 해제 뒤 실제 자식 종료·마지막 handle 삭제 시험의 통과다. |
+| `PPT_ACL_SUMMARY` | `result=PASS`면 기존 필수 폴더·lease 검증이 실제 제품 요청 저장 경로로 통과했다는 뜻이다. |
+| `PPT_STDOUT_SUMMARY` | `result=PASS`면 관찰 해제 뒤 실제 자식의 정상 종료·마지막 handle 삭제를 확인했다는 뜻이다. |
+| `PPT_CLEANUP_SUMMARY` | 생성 ID가 없거나 다른 폴더·root junction의 정리를 거절하고, 외부 대상에 영향을 주지 않는 정리 안전성 시험이다. |
 | `PPT_REQUIRED_EXTERNAL` | 다른 사용자·UAC·Office는 이 명령에서 미실행이며 별도 검증해야 한다. |
 
-파일 symlink 생성 권한이 없으면 해당 경우는 `UNEXECUTED`로 남고 전체 필수 검증 완료로 인정하지
-않는다. 일반 사용자로 가능한 directory junction 거절도 별도 시험한다. 이 표시는 제품 저장 실패와
+링크 fixture를 만들지 못하면 원래 Win32 숫자 코드와 `UNEXECUTED`를 남기며 전체 필수 검증
+완료로 인정하지 않는다. fixture 생성 후 제품의 거절·보존·정리 검증이 실패하면 `FAIL`이다. 일반 사용자로 가능한 directory junction 거절도 별도 시험한다. 이 표시는 제품 저장 실패와
 구분하며, 정상 앱 실행을 위해 Developer Mode나 관리자 실행을 요구한다는 뜻은 아니다.
 기존 managed 실패는 비교 수치로 남기며 필수 제품 검증의 통과·실패와 구분한다. native 대조군의
 실패는 해당 pytest를 실패로 남긴다. `product_approval=false`는 이 명령만으로 출시 승인하지
 않는다는 고정 표시다.
+
+요약의 `result`와 `required_gate`는 해당 실행의 pytest 최종 결과를 기준으로 한다. 성공 문구를 출력한 뒤 정리에서 오류가 나면
+FAIL이며, skip은 UNEXECUTED, 결과 누락·깨짐·모순은 INCOMPLETE다. 원래 실패 단계와 정리 실패는
+따로 남긴다. `PPT_WRITER_PROBLEM/PPT_CLEANUP_PROBLEM`은 관련 단계와 오류 값만 짧게 표시한다.
+본문 통과 뒤 정리 실패가 나면 최종 `result=FAIL`이며 `body_result=PASS`는 앞선 본문 결과다.
+stdout 지연은 `ready/release_seen/stdout_before/stdout_after/done/before_return`의
+마지막 단계와 실제 종료 확인 여부·종료 코드로 좁힌다. `done` 파일만으로 종료를 판정하지 않는다.
+중간 결과 파일은 자동 처리하므로 전달할 자료는 기존과 같이 상세 txt 하나 또는 짧은 블록이다.
 
 실제 제품 저장만 따로 재실행하려면 다음을 쓴다.
 

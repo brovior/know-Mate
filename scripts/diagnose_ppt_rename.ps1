@@ -4,7 +4,13 @@ param([string]$PythonPath)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
 if (!$PythonPath) { $PythonPath = Join-Path $repo '.venv\Scripts\python.exe' }
-$log = Join-Path ([IO.Path]::GetTempPath()) ('AegisDesk-PptRename-' + [Guid]::NewGuid().ToString('N') + '.txt')
+$runId = [Guid]::NewGuid().ToString('N')
+$log = Join-Path ([IO.Path]::GetTempPath()) ('AegisDesk-PptRename-' + $runId + '.txt')
+$xml = Join-Path ([IO.Path]::GetTempPath()) ('AegisDesk-PptRename-' + $runId + '.xml')
+# CreateNew prevents accidental reuse even in the unlikely event of a GUID collision.
+$created = [IO.File]::Open($log, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::Read)
+$created.Dispose()
+if (Test-Path -LiteralPath $xml) { throw 'run_file_collision' }
 $exitCode = 1
 
 function Write-Diagnostic([string]$Line) {
@@ -46,7 +52,7 @@ try {
         $preflightCode = $LASTEXITCODE
         if ($preflightCode -eq 0) {
             $LASTEXITCODE = 1
-            & $PythonPath -m pytest knowmate/tests/test_ppt_rename_probe.py knowmate/tests/test_ppt_request_writer.py knowmate/tests/test_ppt_acl_native.py knowmate/tests/test_ppt_installation.py::test_windows_helper_stdout_survives_observer_close_and_deletes_on_last_close -s -v -o addopts= 2>&1 |
+            & $PythonPath -m pytest knowmate/tests/test_ppt_rename_probe.py knowmate/tests/test_ppt_request_writer.py knowmate/tests/test_ppt_acl_native.py knowmate/tests/test_ppt_installation.py::test_windows_helper_stdout_survives_observer_close_and_deletes_on_last_close -s -v --color=no -o addopts= "--junitxml=$xml" 2>&1 |
                 Tee-Object -FilePath $log -Append
             $exitCode = $LASTEXITCODE
         }
@@ -61,25 +67,23 @@ catch {
 }
 finally {
     Write-Diagnostic 'PPT_REQUIRED_EXTERNAL distinct_accounts=UNEXECUTED uac=UNEXECUTED office=UNEXECUTED x86_x64=inspect_bits'
-    $lines = @(Get-Content -LiteralPath $log)
-    $summary = @($lines | Where-Object { $_ -match '^PPT_(WRITER_SUMMARY|RENAME_SUMMARY|RENAME_SECURITY_SUMMARY|ACL_SUMMARY|STDOUT_SUMMARY) ' })
-    if (!($summary | Where-Object { $_ -match '^PPT_WRITER_SUMMARY ' })) {
-        $summary += 'PPT_WRITER_SUMMARY category=actual_writer result=INCOMPLETE product_approval=false'
+    $reportCode = 1
+    if (Test-Path -LiteralPath $PythonPath -PathType Leaf) {
+        $ErrorActionPreference = 'Continue'
+        $LASTEXITCODE = 1
+        & $PythonPath (Join-Path $PSScriptRoot 'ppt_diagnostic_report.py') --log $log --xml $xml --run-id $runId "--pytest-exit=$exitCode"
+        $reportCode = $LASTEXITCODE
+        $ErrorActionPreference = 'Stop'
     }
-    if (!($summary | Where-Object { $_ -match '^PPT_ACL_SUMMARY result=PASS ' })) {
-        $summary += 'PPT_ACL_SUMMARY result=INCOMPLETE actual_request_writer=true'
+    if ($reportCode -ne 0) {
+        # Never overwrite original evidence when collection/replacement fails.
+        Write-Diagnostic 'PPT_SHORT_REPORT status=INCOMPLETE required_gate=INCOMPLETE product_approval=false'
+        Write-Diagnostic 'PPT_COLLECTION_ERROR code=report_collection_failed'
+        Write-Diagnostic 'PPT_SHORT_END'
+        if ($exitCode -eq 0) { $exitCode = 1 }
     }
-    if (!($summary | Where-Object { $_ -match '^PPT_STDOUT_SUMMARY result=PASS$' })) {
-        $summary += 'PPT_STDOUT_SUMMARY result=INCOMPLETE'
-    }
-    $failed = @($lines | Where-Object { $_ -match '^PPT_WRITER_CASE .* result=(FAIL|TIMEOUT|SKIP|UNEXECUTED) ' })
-    $short = @('PPT_SHORT_REPORT status=complete product_approval=false') + $summary + $failed +
-        @('PPT_REQUIRED_EXTERNAL distinct_accounts=UNEXECUTED uac=UNEXECUTED office=UNEXECUTED x86_x64=inspect_bits')
-    # Put the same short block first and last. Corporate users can transcribe
-    # only this block and retain the detailed one-run evidence underneath it.
-    Set-Content -LiteralPath $log -Value ($short + @('PPT_SHORT_END') + $lines) -Encoding Unicode
-    foreach ($line in $short) { Write-Diagnostic $line }
-    Write-Diagnostic ('PPT_RENAME_REPORT pytest_exit_code=' + $exitCode + ' product_approval=false')
+    # The helper removes this run's XML only after the txt summary is committed.
+    # On collection/write failure retain both raw log and XML for investigation.
     Write-Output ('Diagnostic log: ' + $log)
 }
 exit $exitCode

@@ -7,7 +7,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
@@ -429,98 +428,112 @@ def test_windows_helper_stdout_survives_observer_close_and_deletes_on_last_close
     """Native handle inheritance, delayed write and last-close deletion without Office."""
     monkeypatch.setattr(installation, "auto_install_enabled", lambda: True)
     monkeypatch.setattr(installation, "_validate_helper", lambda _: True)
-    launch = installation._DetachedPopen
-    ready, release, done = (tmp_path / name for name in ("ready", "release", "done"))
-    script = ("from pathlib import Path; import sys,time\n"
-        "ready,release,done=map(Path,sys.argv[1:]); ready.touch()\n"
-        "deadline=time.monotonic()+10\n"
-        "while not release.exists() and time.monotonic()<deadline: time.sleep(.01)\n"
-        "print('{}',flush=True); done.touch()\n")
-    def native_launch(command, **kwargs):
-        return launch([sys.executable, "-c", script, str(ready), str(release), str(done)], **kwargs)
-    monkeypatch.setattr(installation, "_DetachedPopen", native_launch)
-    process = installation.DetachedSetupProcess()
-    def release_observer():
-        release.touch()
-        process.close()
-    request.addfinalizer(release_observer)
-    process.start()
     import ctypes
     import msvcrt
-    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel.GetCurrentProcess.restype = ctypes.c_void_p
-    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
-    kernel.DuplicateHandle.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
-    kernel.WaitForSingleObject.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
-    kernel.WaitForSingleObject.restype = ctypes.c_uint32
-    verifier_handle = ctypes.c_void_p()
-    current = kernel.GetCurrentProcess()
-    assert kernel.DuplicateHandle(current, int(process._process._handle), current,
-        ctypes.byref(verifier_handle), 0, False, 2)
-    request.addfinalizer(lambda: kernel.CloseHandle(verifier_handle))
-    kernel.GetFinalPathNameByHandleW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
-        ctypes.c_uint32, ctypes.c_uint32]
-    name = ctypes.create_unicode_buffer(32768)
-    length = kernel.GetFinalPathNameByHandleW(msvcrt.get_osfhandle(process._output.fileno()), name, len(name), 0)
-    assert 0 < length < len(name)
-    filename = Path(name.value)
-    with pytest.raises(OSError) as denied:
-        filename.open("rb")
-    _assert_output_open_denied(denied.value)
-    security = ctypes.WinDLL("advapi32", use_last_error=True)
-    security.GetSecurityInfo.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
-        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_void_p)]
-    security.GetSecurityDescriptorControl.argtypes = [ctypes.c_void_p,
-        ctypes.POINTER(ctypes.c_uint16), ctypes.POINTER(ctypes.c_uint32)]
-    security.GetAce.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
-    security.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
-    kernel.LocalFree.argtypes = [ctypes.c_void_p]
-    descriptor, owner, dacl = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
-    assert security.GetSecurityInfo(msvcrt.get_osfhandle(process._output.fileno()), 1, 5,
-        ctypes.byref(owner), None, ctypes.byref(dacl), None, ctypes.byref(descriptor)) == 0
+
+    from knowmate.tests.ppt_stdout_lifecycle import (
+        StdoutFailure,
+        StdoutLifecycle,
+        read_progress,
+    )
+    from knowmate.tests.ppt_stdout_native import NativeStdoutChild
+
+    launch = installation._DetachedPopen
+    progress, release, done = (tmp_path / name for name in ("progress", "release", "done"))
+    child_script = Path(__file__).with_name("ppt_stdout_child.py")
+    process = installation.DetachedSetupProcess()
+    native = NativeStdoutChild(process)
+    lifecycle = StdoutLifecycle(progress, done, release=release.touch,
+        close_observation=native.close_observation, wait=native.wait,
+        exit_code=native.exit_code,
+        terminate=native.terminate, close_verifier=native.close_verifier)
+    # This one finalizer owns all paths, including start/ready/ACL failures.
+    request.addfinalizer(lifecycle.finish)
+
+    def native_launch(command, **kwargs):
+        child = launch([sys.executable, str(child_script), str(progress), str(release), str(done), "normal"], **kwargs)
+        lifecycle.has_control = True
+        native.attach(child)
+        return child
+
+    monkeypatch.setattr(installation, "_DetachedPopen", native_launch)
     try:
-        control, revision = ctypes.c_uint16(), ctypes.c_uint32()
-        assert security.GetSecurityDescriptorControl(descriptor, ctypes.byref(control), ctypes.byref(revision))
-        assert control.value & 0x1004 == 0x1004  # DACL present and protected
-        assert dacl.value
-        assert ctypes.cast(dacl, ctypes.POINTER(ctypes.c_uint16))[2] == 3
-        def sid_string(pointer):
-            text = ctypes.c_void_p()
-            assert security.ConvertSidToStringSidW(pointer, ctypes.byref(text))
-            try:
-                return ctypes.wstring_at(text)
-            finally:
-                kernel.LocalFree(text)
-        owner_sid = sid_string(owner)
-        actual_sids = set()
-        for index in range(3):
-            ace = ctypes.c_void_p()
-            assert security.GetAce(dacl, index, ctypes.byref(ace))
-            header = ctypes.cast(ace, ctypes.POINTER(ctypes.c_ubyte))
-            assert header[0] == 0 and header[1] == 0  # Allow, no inheritance flags
-            assert ctypes.cast(ace, ctypes.POINTER(ctypes.c_uint32))[1] in (0x1F01FF, 0x10000000)
-            actual_sids.add(sid_string(ace.value + 8))
-        private_principals_match = actual_sids == {owner_sid, "S-1-5-32-544", "S-1-5-18"}
-        assert private_principals_match  # never print user SID in failure output
-    finally:
-        kernel.LocalFree(descriptor)
-    deadline = time.monotonic() + 5
-    while not ready.exists() and time.monotonic() < deadline:
-        time.sleep(.01)
-    assert ready.exists()
-    assert kernel.WaitForSingleObject(verifier_handle, 0) == 258, "helper_exited_before_observer_close"
-    process.close()  # no kill/wait, and helper still owns its stdout handle
-    assert kernel.WaitForSingleObject(verifier_handle, 0) == 258, "helper_exited_before_release"
-    release.touch()
-    # A separate test observer proves actual exit. exists() alone can mistake
-    # access denial/delete-pending for deletion while the helper is still live.
-    assert kernel.WaitForSingleObject(verifier_handle, 5000) == 0, "helper_actual_exit_unconfirmed"
-    assert done.exists()
-    with pytest.raises(FileNotFoundError):
-        filename.stat()
-    print("PPT_STDOUT_SUMMARY result=PASS", flush=True)
+        process.start()
+        if native.duplicate_error is not None:
+            lifecycle.native_error = native.duplicate_error
+            raise StdoutFailure("duplicate_handle_failed")
+        lifecycle.await_stage("ready", "ready")
+        lifecycle.require_alive()
+        kernel = native.kernel
+        kernel.GetFinalPathNameByHandleW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p,
+            ctypes.c_uint32, ctypes.c_uint32]
+        name = ctypes.create_unicode_buffer(32768)
+        length = kernel.GetFinalPathNameByHandleW(msvcrt.get_osfhandle(process._output.fileno()), name, len(name), 0)
+        assert 0 < length < len(name)
+        filename = Path(name.value)
+        with pytest.raises(OSError) as denied:
+            filename.open("rb")
+        _assert_output_open_denied(denied.value)
+        security = ctypes.WinDLL("advapi32", use_last_error=True)
+        security.GetSecurityInfo.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint32,
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_void_p)]
+        security.GetSecurityDescriptorControl.argtypes = [ctypes.c_void_p,
+            ctypes.POINTER(ctypes.c_uint16), ctypes.POINTER(ctypes.c_uint32)]
+        security.GetAce.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
+        security.ConvertSidToStringSidW.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+        kernel.LocalFree.argtypes = [ctypes.c_void_p]
+        descriptor, owner, dacl = ctypes.c_void_p(), ctypes.c_void_p(), ctypes.c_void_p()
+        assert security.GetSecurityInfo(msvcrt.get_osfhandle(process._output.fileno()), 1, 5,
+            ctypes.byref(owner), None, ctypes.byref(dacl), None, ctypes.byref(descriptor)) == 0
+        try:
+            control, revision = ctypes.c_uint16(), ctypes.c_uint32()
+            assert security.GetSecurityDescriptorControl(descriptor, ctypes.byref(control), ctypes.byref(revision))
+            assert control.value & 0x1004 == 0x1004  # DACL present and protected
+            assert dacl.value
+            assert ctypes.cast(dacl, ctypes.POINTER(ctypes.c_uint16))[2] == 3
+            def sid_string(pointer):
+                text = ctypes.c_void_p()
+                assert security.ConvertSidToStringSidW(pointer, ctypes.byref(text))
+                try:
+                    return ctypes.wstring_at(text)
+                finally:
+                    kernel.LocalFree(text)
+            owner_sid = sid_string(owner)
+            actual_sids = set()
+            for index in range(3):
+                ace = ctypes.c_void_p()
+                assert security.GetAce(dacl, index, ctypes.byref(ace))
+                header = ctypes.cast(ace, ctypes.POINTER(ctypes.c_ubyte))
+                assert header[0] == 0 and header[1] == 0  # Allow, no inheritance flags
+                assert ctypes.cast(ace, ctypes.POINTER(ctypes.c_uint32))[1] in (0x1F01FF, 0x10000000)
+                actual_sids.add(sid_string(ace.value + 8))
+            private_principals_match = actual_sids == {owner_sid, "S-1-5-32-544", "S-1-5-18"}
+            assert private_principals_match  # never print user SID in failure output
+        finally:
+            kernel.LocalFree(descriptor)
+        lifecycle.phase = "close_observation"
+        lifecycle.require_alive()
+        process.close()  # The test Python still owns the real inherited stdout.
+        lifecycle.require_alive()
+        # File absence or unrelated I/O failure cannot masquerade as denial.
+        with pytest.raises(OSError) as denied:
+            filename.open("rb")
+        _assert_output_open_denied(denied.value)
+        lifecycle.phase = "release"
+        lifecycle.require_alive()
+        lifecycle.release_child()
+        lifecycle.await_stage("release_seen", "release")
+        lifecycle.await_exit()
+        assert done.is_file(), "child_done_unconfirmed"
+        observed = read_progress(progress)
+        assert observed is not None and observed[0] == "before_return", "child_progress_unavailable"
+        lifecycle.filename = filename
+        lifecycle.body_complete = True
+        lifecycle.phase = "complete"
+    except BaseException:
+        lifecycle.primary_failed = True
+        raise
 
 
 @pytest.mark.parametrize("mode", ["disabled", "candidate", "released"])
