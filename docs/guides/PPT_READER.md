@@ -66,11 +66,17 @@ stdout 상속·실제 자식 종료·마지막 handle 삭제 시험도 일반 �
 & .\.venv\Scripts\python.exe -m pytest .\knowmate\tests\test_ppt_installation.py -k windows_helper_stdout_survives -v
 ```
 
-하네스가 시간초과하면 `PPT ACL timeout: phase=compile|harness last_stage=... limit_sec=30`의
+하네스가 시간초과하면 `PPT ACL timeout: phase=compile|atomic_control|harness last_stage=... stage_started_ms=... limit_sec=30`의
 고정 값을 확인한다. `last_stage=unavailable`은 단계 출력 미수집이며 원인 확정이 아니다.
 시간초과는 통과로 바꾸지 않고, 마지막 단계로 컴파일·junction 생성·lease·원자 저장·정리를 구분한다.
+먼저 lease 없는 `atomic_control`에서 동일한 실제 저장 함수를 실행한 뒤 `harness`에서 lease를 보유한다.
+`atomic_file_open/atomic_disk_flush/atomic_acl_apply/atomic_move_call` 등으로 저장 내부 위치를 좁힌다.
+`stage_started_ms`는 해당 단계 진입 시점으로, 30초 누적 소요와 특정 단계의 정체를 구분할 근거다.
+세부 계측 구현은 native 시험 실행 파일에만 포함하고 일반 setup에서는 partial 호출이 제거된다.
 stdout 파일 열기 거절은 Win32 오류뿐 아니라 CRT의 `errno=EACCES/EPERM`도 인정한다.
 파일 없음·일반 I/O 오류는 거절 성공으로 인정하지 않으며 ACL·상속·실제 종료·삭제 검사는 계속 수행한다.
+관찰 해제는 설치 도구의 실제 종료로 기록하지 않는다. 닫은 handle을 `Popen` 소멸자가 다시 조회하지 않도록
+명시 해제 여부를 유지하며 실제 종료 판정은 열려 있는 관찰 handle로만 수행한다.
 
 이 하네스는 실제 `Directory.CreateDirectory`로 상속 부모를 재현하고 보호 자식을 생성한다.
 누락 폴더의 원자 생성과 두 lease 동시 열기, anchor/부모/자식 rename·자식 삭제 거절, 예약 파일 원자 생성·교체,

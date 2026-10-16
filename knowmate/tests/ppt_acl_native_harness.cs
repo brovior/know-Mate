@@ -12,7 +12,7 @@ internal static class NativeAclHarness
 {
     private static readonly Stopwatch Clock = Stopwatch.StartNew();
 
-    private static void Stage(string stage)
+    internal static void Stage(string stage)
     {
         Console.WriteLine("PPT_ACL_STAGE " + stage + " elapsed_ms=" + Clock.ElapsedMilliseconds);
         Console.Out.Flush();
@@ -93,6 +93,20 @@ internal static class NativeAclHarness
         string child = Path.Combine(parent, "PptReaderRequests");
         try
         {
+            if (args.Length == 2 && args[1] == "atomic-control")
+            {
+                Directory.CreateDirectory(parent);
+                Require(RequestDirectory.Create(child, RequestDirectory.Expected(false)), "control_child_create");
+                string control = Path.Combine(child, Guid.NewGuid().ToString("D") + ".json");
+                FileSecurity controlAcl = RequestSecurity();
+                Stage("control_atomic_create");
+                Contract.AtomicWrite(control, new Dictionary<string, object> { { "fixture", 1 } }, controlAcl);
+                Stage("control_atomic_replace");
+                Contract.AtomicWrite(control, new Dictionary<string, object> { { "fixture", 2 } }, controlAcl);
+                Require(Convert.ToInt32(Contract.Read(control)["fixture"]) == 2, "control_atomic_read");
+                Console.WriteLine("PASS native atomic control without directory leases");
+                return 0;
+            }
             Stage("parent_file_rejection");
             File.WriteAllText(parent, "fixture-parent-file");
             Denied(delegate { using (RequestDirectoryLease lease = RequestDirectoryLease.AcquireAt(anchor)) { } }, "parent_file_accepted");
@@ -198,5 +212,14 @@ internal static class NativeAclHarness
             Stage("cleanup");
             Cleanup(anchor);
         }
+    }
+}
+
+namespace AegisDesk.PptSetup
+{
+    internal static partial class Contract
+    {
+        // This implementation is compiled only into the native test executable.
+        static partial void TraceAtomic(string stage) { NativeAclHarness.Stage(stage); }
     }
 }

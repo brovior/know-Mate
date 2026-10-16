@@ -15,18 +15,28 @@ _STAGES = frozenset({
     "legacy_second_acquire", "legacy_recheck", "rename_denial", "atomic_create",
     "atomic_replace", "atomic_verify", "lease_release", "sharing_conflict_open",
     "sharing_conflict_acquire", "reopen_after_conflict", "rename_after_release", "cleanup", "complete",
+    "control_atomic_create", "control_atomic_replace", "atomic_path_check", "atomic_file_open",
+    "atomic_writer_open", "atomic_serialize", "atomic_writer_flush", "atomic_disk_flush",
+    "atomic_writer_close", "atomic_file_close", "atomic_acl_apply", "atomic_commit_probe",
+    "atomic_replace_call", "atomic_move_call", "atomic_done",
 })
 
 
 def _last_stage(output: str | bytes | None) -> str:
+    return _last_progress(output)[0]
+
+
+def _last_progress(output: str | bytes | None) -> tuple[str, int | None]:
     if isinstance(output, bytes):
         output = output.decode("ascii", errors="replace")
     stage = "unavailable"
+    started = None
     for line in (output or "").splitlines():
-        match = re.fullmatch(r"PPT_ACL_STAGE ([a-z_]+) elapsed_ms=[0-9]+", line)
+        match = re.fullmatch(r"PPT_ACL_STAGE ([a-z_]+) elapsed_ms=([0-9]{1,12})", line)
         if match and match[1] in _STAGES:
             stage = match[1]
-    return stage
+            started = int(match[2])
+    return stage, started
 
 
 def _run_native(command: list[str], phase: str) -> subprocess.CompletedProcess[str]:
@@ -34,11 +44,13 @@ def _run_native(command: list[str], phase: str) -> subprocess.CompletedProcess[s
         return subprocess.run(command, check=False, capture_output=True, text=True,
             timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except subprocess.TimeoutExpired as error:
-        pytest.fail(f"PPT ACL timeout: phase={phase} last_stage={_last_stage(error.stdout)} limit_sec=30",
+        stage, started = _last_progress(error.stdout)
+        pytest.fail(f"PPT ACL timeout: phase={phase} last_stage={stage} "
+                    f"stage_started_ms={started} limit_sec=30",
                     pytrace=False)
 
 
-@pytest.mark.parametrize("phase", ["compile", "harness"])
+@pytest.mark.parametrize("phase", ["compile", "atomic_control", "harness"])
 @pytest.mark.parametrize("output", [None, "PPT_ACL_STAGE atomic_create elapsed_ms=123\n",
     b"PPT_ACL_STAGE atomic_create elapsed_ms=123\n"])
 def test_native_timeout_identifies_phase_and_last_stage(monkeypatch, phase, output):
@@ -55,6 +67,7 @@ def test_native_stage_output_does_not_repeat_arbitrary_text():
     output = ("confidential-marker\nPPT_ACL_STAGE fresh_acquire elapsed_ms=1\n"
               "PPT_ACL_STAGE confidential_marker elapsed_ms=2\n")
     assert _last_stage(output) == "fresh_acquire"
+    assert _last_progress(output) == ("fresh_acquire", 1)
 
 
 def test_ppt_native_legacy_directory_lease(tmp_path: Path) -> None:
@@ -77,6 +90,13 @@ def test_ppt_native_legacy_directory_lease(tmp_path: Path) -> None:
         "compile",
     )
     assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+    control = _run_native(
+        [str(executable), str(tmp_path / "atomic-control-anchor"), "atomic-control"], "atomic_control",
+    )
+    if control.returncode == 77:
+        pytest.skip(control.stdout.strip())
+    assert control.returncode == 0, control.stdout + control.stderr
+    assert "PASS native atomic control" in control.stdout
     result = _run_native(
         [str(executable), str(tmp_path / "native-anchor")],
         "harness",

@@ -19,6 +19,8 @@ internal static class SetupHarness
     {
         string id = "33e979c6-c5c4-40af-845a-64c80517d1ae";
         Require(Contract.AutoInstallMode == "disabled" || Contract.AutoInstallMode == "candidate" || Contract.AutoInstallMode == "released", "policy_mode");
+        Require(typeof(Contract).GetMethod("TraceAtomic", System.Reflection.BindingFlags.Static |
+            System.Reflection.BindingFlags.NonPublic) == null, "shipping_atomic_trace_erased");
         Require(Contract.AutoInstallValidated == (Contract.AutoInstallMode == "released"), "policy_validated");
         Require(Contract.AutoShutdownEnabled == (Contract.AutoInstallMode == "candidate"), "shutdown_policy_candidate_only");
         Require(Contract.AutoInstallEnabled == (Contract.AutoInstallMode != "disabled"), "policy_enabled");

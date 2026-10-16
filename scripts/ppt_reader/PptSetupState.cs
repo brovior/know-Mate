@@ -33,8 +33,10 @@ namespace AegisDesk.PptSetup
         public void Emit() { Console.WriteLine(Contract.Json.Serialize(Values())); }
     }
 
-    internal static class Contract
+    internal static partial class Contract
     {
+        // No implementation in shipping builds: compiler removes every call.
+        static partial void TraceAtomic(string stage);
         public const string Version = "1.0.3.0";
         public const string ProgId = "AegisDesk.PptReader";
         public const string ClassId = "{287A80D2-804A-46D3-A0E9-CA31C6FC3D09}";
@@ -95,17 +97,34 @@ namespace AegisDesk.PptSetup
         public static void AtomicWrite(string path, object value, System.Security.AccessControl.FileSecurity security = null, bool request = false)
         {
             string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+            TraceAtomic("atomic_path_check");
             Machine.NoLinks(Path.GetDirectoryName(path));
             try
             {
+                TraceAtomic("atomic_file_open");
                 using (FileStream stream = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
-                using (StreamWriter writer = new StreamWriter(stream))
-                { writer.Write(Json.Serialize(value)); writer.Flush(); stream.Flush(true); }
+                {
+                    TraceAtomic("atomic_writer_open");
+                    using (StreamWriter writer = new StreamWriter(stream))
+                    {
+                        TraceAtomic("atomic_serialize"); writer.Write(Json.Serialize(value));
+                        TraceAtomic("atomic_writer_flush"); writer.Flush();
+                        TraceAtomic("atomic_disk_flush"); stream.Flush(true);
+                        TraceAtomic("atomic_writer_close");
+                    }
+                    TraceAtomic("atomic_file_close");
+                }
             }
             catch (Exception error) { if (request) throw SetupFailure.From("request_create", error); throw; }
-            try { if (security != null) File.SetAccessControl(temp, security); }
+            try { TraceAtomic("atomic_acl_apply"); if (security != null) File.SetAccessControl(temp, security); }
             catch (Exception error) { if (request) throw SetupFailure.From("request_acl", error); throw; }
-            try { if (File.Exists(path)) File.Replace(temp, path, null); else File.Move(temp, path); }
+            try
+            {
+                TraceAtomic("atomic_commit_probe");
+                if (File.Exists(path)) { TraceAtomic("atomic_replace_call"); File.Replace(temp, path, null); }
+                else { TraceAtomic("atomic_move_call"); File.Move(temp, path); }
+                TraceAtomic("atomic_done");
+            }
             catch (Exception error) { if (request) throw SetupFailure.From("request_commit", error); throw; }
             // An interrupted write is unresolved evidence. Do not erase the
             // temporary file automatically; /check must keep mutation blocked.
