@@ -63,8 +63,19 @@ WRITE 공유를 추가하거나 lease를 풀지 않는다. ProgramFiles 기록·
 [한 번의 진단 명령과 짧은 결과 판독](guides/PPT_READER.md#ppt-요청-저장과-충돌-진단)은
 기존 대조군과 실제 제품 저장, 필수 ACL·stdout 수명 시험을 구분해서 보고한다.
 미확인 native 반환은 성공 처리하지 않고 helper·버퍼·lease·mutex를 유지하며 보류한다.
-Linux 회귀·Mono 컴파일은 Windows 저장 성공의 근거가 아니다. 실제 Windows writer/lease,
-다른 사용자, 같은/다른 관리자 UAC, 32/64비트 Office 시험은 **미실행**이다.
+사내에서는 writer 56 PASS / 4 FAIL / 2 UNEXECUTED, 필수 ACL 시험 PASS가 보고됐다.
+실패 4건은 hardlink fixture 생성 2건과 junction 정리 단계 2건이며, 제품 저장 결함으로 확정하지
+않았다. stdout 시험은 release 후 5초 안에 실제 종료가 확인되지 않았다. 원본 전체 로그는 미제공이다.
+
+후속 시험은 링크를 lease 전 준비하고 실제 오류 코드를 기록한다. 정리는 시험 소유 ID를 확인한
+임시 폴더만 대상으로 하며 reparse를 따라가지 않고 최초 오류와 정리 오류를 함께 보존한다.
+stdout은 쓰기 전후·종료 직전 단계를 기록하고 retained process handle로 실제 종료와 마지막-close
+삭제를 확인한다. 시험 자식의 실패 정리가 성공해도 본시험 실패를 통과로 바꾸지 않는다.
+pytest가 줄 앞에 시험 이름을 붙여 ACL PASS 요약을 누락하는 문제는 재현했으며, 최종 결과를
+사용해 정리 단계 실패까지 포함해 판정한다. 명령 한 번과 상세 로그 하나·앞뒤 짧은 요약은 유지한다.
+
+Linux 회귀·Mono 컴파일은 Windows 저장 성공의 근거가 아니다. 후속 Windows 시험·PowerShell·
+회사 DRM과 다른 사용자·같은/다른 관리자 UAC·32/64비트 Office 검증은 **미실행**이다.
 기존 orphan temp만 남은 상태의 명시 복구는 별도 과제이며 자동 삭제·재권한 부여로 우회하지 않는다.
 
 ### COM poison 복구 일관성 (2026-10-15)

@@ -15,7 +15,8 @@ internal static class RequestWriterHarness
 {
     private static readonly Stopwatch Clock = Stopwatch.StartNew();
     internal static string Mode, Child, Target, Source, SourceId, SourceAcl;
-    private static string stage = "preflight", failureStage;
+    private static string stage = "preflight";
+    internal static int CommitCount { get { return commits; } }
     private static bool armed, targetClosed;
     private static IntPtr pendingSource, pendingIo, pendingRename;
     private static int commits, nativeCalls;
@@ -93,77 +94,16 @@ internal static class RequestWriterHarness
     private static extern SafeFileHandle OpenFile(string path, uint access, uint share, IntPtr security,
         uint disposition, uint flags, IntPtr template);
     [DllImport("kernel32.dll", SetLastError = true)] private static extern uint GetFileType(IntPtr handle);
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern bool CreateHardLink(string name, string existing, IntPtr reserved);
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.I1)]
-    private static extern bool CreateSymbolicLink(string name, string existing, uint flags);
     private static void Require(bool value, string code)
     { if (!value) throw new RenameProbeNative.ProbeFailure(code); }
     private static string Security(string path)
     { return File.GetAccessControl(path).GetSecurityDescriptorSddlForm(AccessControlSections.Owner | AccessControlSections.Access); }
     private static void WriteTarget(Dictionary<string, object> values)
     { File.WriteAllText(Target, Contract.Json.Serialize(values)); }
-    private static void Cleanup(string anchor)
-    {
-        if (!Directory.Exists(anchor)) return;
-        foreach (string file in Directory.GetFiles(anchor, "*", SearchOption.AllDirectories))
-            File.SetAttributes(file, FileAttributes.Normal);
-        foreach (string directory in Directory.GetDirectories(anchor, "*", SearchOption.AllDirectories))
-        {
-            DirectorySecurity acl = Directory.GetAccessControl(directory);
-            acl.AddAccessRule(new FileSystemAccessRule(WindowsIdentity.GetCurrent().User,
-                FileSystemRights.FullControl, AccessControlType.Allow));
-            Directory.SetAccessControl(directory, acl);
-        }
-        Directory.Delete(anchor, true);
-    }
-    private static void ReparseDirectory(string anchor, int count)
-    {
-        Directory.CreateDirectory(anchor);
-        string child = Path.Combine(Path.Combine(anchor, "AegisDesk"), "PptReaderRequests");
-        Directory.CreateDirectory(child);
-        string external = Path.Combine(anchor, "junction-target"); Directory.CreateDirectory(external);
-        string sentinel = Path.Combine(external, "sentinel.fixture"); File.WriteAllText(sentinel, "sentinel");
-        string id = Guid.NewGuid().ToString("D"), target = Path.Combine(child, id + ".json");
-        var info = new ProcessStartInfo(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "cmd.exe"),
-            "/d /c mklink /J \"" + target + "\" \"" + external + "\"")
-            { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
-        using (Process process = Process.Start(info))
-        {
-            process.BeginOutputReadLine(); process.BeginErrorReadLine();
-            if (!process.WaitForExit(10000)) { process.Kill(); process.WaitForExit(2000); throw new IOException("junction_fixture_timeout"); }
-            Require(process.ExitCode == 0, "junction_fixture_failed");
-        }
-        Directory.SetAccessControl(child, RequestDirectory.Expected(false));
-        try
-        {
-            using (var mutex = new MachineLock())
-            using (var first = RequestDirectoryLease.AcquireAt(anchor))
-            using (var second = count == 2 ? RequestDirectoryLease.AcquireAt(anchor) : null)
-            using (Process process = Process.GetCurrentProcess())
-            using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
-            {
-                Child = first.ChildPath;
-                var values = new Dictionary<string, object> { { "schema", 1 }, { "request_id", id },
-                    { "required_version", Contract.Version }, { "helper_sid", identity.User.Value },
-                    { "helper_pid", process.Id }, { "helper_creation_ticks", process.StartTime.ToUniversalTime().Ticks.ToString() },
-                    { "child_pid", null }, { "child_creation_ticks", null }, { "state", "complete" } };
-                bool rejected = false;
-                try { RequestWriter.Write(first, values, RequestWriteMode.ReplaceExisting); }
-                catch (IOException) { rejected = true; }
-                catch (UnauthorizedAccessException) { rejected = true; }
-                Require(rejected && File.ReadAllText(sentinel) == "sentinel" && Directory.Exists(target), "junction_not_preserved");
-                first.Recheck(); if (second != null) second.Recheck();
-                Console.WriteLine("PPT_WRITER_EXPECT expected=reject actual=reject verified=1");
-            }
-        }
-        finally { if (Directory.Exists(target)) Directory.Delete(target); }
-    }
-
     private static void Run(string anchor, int count)
     {
-        if (Mode == "reparse-directory") { ReparseDirectory(anchor, count); return; }
+        if (Mode == "hardlink" || Mode == "reparse" || Mode == "reparse-directory")
+        { WriterLinkFixture.Run(anchor, count, Mode); return; }
         Directory.CreateDirectory(anchor);
         // Preserve the inherited legacy parent used by the actual reported failure.
         Directory.CreateDirectory(Path.Combine(anchor, "AegisDesk"));
@@ -208,14 +148,6 @@ internal static class RequestWriterHarness
                         FileSecurity unsafeAcl = File.GetAccessControl(Target);
                         unsafeAcl.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null),
                             FileSystemRights.Write, AccessControlType.Allow)); File.SetAccessControl(Target, unsafeAcl);
-                    }
-                    string alias = Path.Combine(Child, "alias.fixture");
-                    if (Mode == "hardlink") Require(CreateHardLink(alias, Target, IntPtr.Zero), "hardlink_fixture_failed");
-                    if (Mode == "reparse")
-                    {
-                        File.Delete(Target);
-                        if (!CreateSymbolicLink(Target, decoy, 2))
-                        { Console.WriteLine("PPT_WRITER_UNEXECUTED gate=reparse reason=symlink_privilege winerror=" + Marshal.GetLastWin32Error()); return; }
                     }
                     string expectedText = File.Exists(Target) ? File.ReadAllText(Target) : null;
                     string expectedSecurity = File.Exists(Target) ? Security(Target) : null;
@@ -306,50 +238,113 @@ internal static class RequestWriterHarness
             finally { armed = false; Environment.CurrentDirectory = previous; }
         }
     }
-    public static int Main(string[] args)
+    internal static void RecordRejection(SetupFailure error)
     {
-        Console.WriteLine("PPT_WRITER_ARCH bits=" + IntPtr.Size * 8);
-        string anchor = null;
-        int result = 0;
+        Console.WriteLine("PPT_WRITER_REJECT stage=" + error.Stage + " error_type=" + error.ErrorType
+            + " winerror=" + (error.WinError.HasValue ? error.WinError.Value.ToString() : "none"));
+    }
+    private static string ErrorType(Exception error)
+    {
+        var setup = error as SetupFailure;
+        if (setup != null) return setup.ErrorType;
+        if (error is WriterFixtureUnavailable || error is Win32Exception) return "Win32Exception";
+        if (error is RenameProbeNative.ProbeFailure) return "contract";
+        if (error is UnauthorizedAccessException) return "access";
+        return error is IOException ? "IOException" : "other";
+    }
+    private static string Evidence(Exception error, string at)
+    {
+        var setup = error as SetupFailure; var native = error as Win32Exception;
+        var unavailable = error as WriterFixtureUnavailable; var failure = error as RenameProbeNative.ProbeFailure;
+        string code = unavailable != null ? "fixture_creation_failed" : failure == null ? "exception" : failure.Code;
+        string winerror = unavailable != null ? unavailable.WinError.ToString() : native != null ? native.NativeErrorCode.ToString()
+            : setup != null && setup.WinError.HasValue ? setup.WinError.Value.ToString() : "none";
+        return "stage=" + at + " error_type=" + ErrorType(error) + " code=" + code + " winerror=" + winerror
+            + " ntstatus=" + (setup == null ? "none" : setup.NtStatus ?? "none")
+            + " io_status=" + (setup == null ? "none" : setup.IoStatus ?? "none");
+    }
+    private static bool Cleanup(WriterFixtureRoot root)
+    {
         try
         {
-            Require(args.Length == 3, "argument_count"); Mode = args[1];
-            using (WindowsIdentity user = WindowsIdentity.GetCurrent())
-                if (new WindowsPrincipal(user).IsInRole(WindowsBuiltInRole.Administrator))
-                { Console.WriteLine("PPT_WRITER_RESULT SKIP reason=elevated"); return 77; }
-            anchor = Path.GetFullPath(args[0]); Guid guid;
-            string leaf = Path.GetFileName(anchor);
-            Require(leaf.StartsWith("ppt-writer-", StringComparison.Ordinal) && Guid.TryParseExact(leaf.Substring(11), "N", out guid)
-                && (Mode == "cleanup" || !Directory.Exists(anchor)) && !File.Exists(anchor)
-                && !anchor.StartsWith(@"\\", StringComparison.Ordinal), "fixture_invalid");
-            string programData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData).TrimEnd('\\') + "\\";
-            Require(!anchor.StartsWith(programData, StringComparison.OrdinalIgnoreCase), "programdata_fixture_forbidden");
-            DriveInfo drive = new DriveInfo(Path.GetPathRoot(anchor));
-            if (drive.DriveType != DriveType.Fixed || drive.DriveFormat != "NTFS")
-            { Console.WriteLine("PPT_WRITER_RESULT SKIP reason=nonlocal_ntfs"); return 77; }
-            int count = Int32.Parse(args[2]); Require(count == 1 || count == 2, "lease_count_invalid");
-            Machine.NoLinks(Path.GetDirectoryName(anchor));
-            if (Mode == "cleanup") { Cleanup(anchor); Console.WriteLine("PPT_WRITER_CLEANUP PASS"); return 0; }
-            Run(anchor, count);
+            if (root != null) root.Cleanup();
+            WriterLinkFixture.VerifyExternal();
+            if (WriterLinkFixture.External != null) WriterLinkFixture.External.Cleanup();
+            if (WriterFixtureRoot.UnconfirmedCreation)
+                throw new RenameProbeNative.ProbeFailure("cleanup_identity_missing");
+            Console.WriteLine("PPT_WRITER_CLEANUP result=PASS stage=cleanup_verify error_type=none code=none winerror=none ntstatus=none io_status=none");
+            return true;
         }
         catch (Exception error)
         {
-            failureStage = stage;
-            var setup = error as SetupFailure;
+            string evidence = Evidence(error, WriterFixtureRoot.Stage);
+            Console.WriteLine("PPT_WRITER_DIAGNOSTIC phase=cleanup " + evidence);
             var failure = error as RenameProbeNative.ProbeFailure;
-            Console.WriteLine("PPT_WRITER_ERROR stage=" + failureStage + " kind=" + (setup == null ? "contract" : "setup")
+            Console.WriteLine("PPT_WRITER_CLEANUP result=" + (failure != null && failure.Code == "cleanup_identity_missing"
+                ? "INCOMPLETE" : "FAIL") + " " + evidence);
+            return false;
+        }
+    }
+    public static int Main(string[] args)
+    {
+        Console.WriteLine("PPT_WRITER_ARCH bits=" + IntPtr.Size * 8);
+        WriterFixtureRoot root = null; int result = 0; string terminal = "PASS"; bool cleanupOnly = false;
+        try
+        {
+            Require(args.Length == 3 || args.Length == 6, "argument_count"); Mode = args[1]; cleanupOnly = Mode == "cleanup";
+            Require(cleanupOnly || args.Length == 3, "argument_count");
+            using (WindowsIdentity user = WindowsIdentity.GetCurrent())
+                if (new WindowsPrincipal(user).IsInRole(WindowsBuiltInRole.Administrator))
+                { terminal = "SKIP reason=elevated"; result = 77; }
+            if (result == 0)
+            {
+                string anchor = Path.GetFullPath(args[0]); Guid guid; string leaf = Path.GetFileName(anchor);
+                Require(leaf.StartsWith("ppt-writer-", StringComparison.Ordinal) && Guid.TryParseExact(leaf.Substring(11), "N", out guid)
+                    && (cleanupOnly || !Directory.Exists(anchor)) && !File.Exists(anchor)
+                    && !anchor.StartsWith(@"\\", StringComparison.Ordinal), "fixture_invalid");
+                string programData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData).TrimEnd('\\') + "\\";
+                Require(!anchor.StartsWith(programData, StringComparison.OrdinalIgnoreCase), "programdata_fixture_forbidden");
+                DriveInfo drive = new DriveInfo(Path.GetPathRoot(anchor));
+                if (drive.DriveType != DriveType.Fixed || drive.DriveFormat != "NTFS")
+                { terminal = "SKIP reason=nonlocal_ntfs"; result = 77; }
+                else
+                {
+                    int count = Int32.Parse(args[2]); Require(count == 1 || count == 2, "lease_count_invalid");
+                    Machine.NoLinks(Path.GetDirectoryName(anchor));
+                    root = cleanupOnly ? WriterFixtureRoot.Handoff(anchor, args) : WriterFixtureRoot.Create(anchor, true);
+                    if (!cleanupOnly) Run(anchor, count);
+                }
+            }
+        }
+        catch (Exception error)
+        {
+            string phase = error is WriterFixtureUnavailable ? "fixture" : "primary";
+            Console.WriteLine("PPT_WRITER_DIAGNOSTIC phase=" + phase + " " + Evidence(error, stage));
+            var setup = error as SetupFailure; var failure = error as RenameProbeNative.ProbeFailure;
+            Console.WriteLine("PPT_WRITER_ERROR stage=" + stage + " kind=" + (setup == null ? "contract" : "setup")
                 + " code=" + (failure == null ? "exception" : failure.Code));
             if (setup != null)
             {
-                Console.WriteLine("PPT_WRITER_REJECT stage=" + setup.Stage + " error_type=" + setup.ErrorType
-                    + " winerror=" + (setup.WinError.HasValue ? setup.WinError.Value.ToString() : "none"));
+                RecordRejection(setup);
                 if (setup.NativeStage != null) Console.WriteLine("PPT_WRITER_NATIVE stage=" + setup.NativeStage
                     + " ntstatus=" + setup.NtStatus + " io_status=" + (setup.IoStatus ?? "none"));
             }
+            var unavailable = error as WriterFixtureUnavailable;
+            if (unavailable != null) Console.WriteLine("PPT_WRITER_UNEXECUTED gate=" + Mode
+                + " reason=fixture_creation_failed winerror=" + unavailable.WinError);
+            result = 1;
+            if (cleanupOnly && root == null)
+                Console.WriteLine("PPT_WRITER_CLEANUP result=INCOMPLETE " + Evidence(error, "cleanup_validate"));
+        }
+        // Body and cleanup evidence have separate lifetimes. Exactly one terminal follows both.
+        if (root != null && !Cleanup(root)) result = 1;
+        else if (root == null && WriterFixtureRoot.UnconfirmedCreation)
+        {
+            Console.WriteLine("PPT_WRITER_CLEANUP result=INCOMPLETE stage=cleanup_validate error_type=contract code=cleanup_identity_missing winerror=none ntstatus=none io_status=none");
             result = 1;
         }
-        finally { if (anchor != null && Directory.Exists(anchor)) { Stage("cleanup"); Cleanup(anchor); } }
-        Stage("complete"); Console.WriteLine("PPT_WRITER_RESULT " + (result == 0 ? "PASS" : "FAIL")); return result;
+        if (result == 1) terminal = "FAIL";
+        Stage("complete"); Console.WriteLine("PPT_WRITER_RESULT " + terminal); Console.Out.Flush(); return result;
     }
 }
 namespace AegisDesk.PptSetup
