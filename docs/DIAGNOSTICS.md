@@ -42,6 +42,11 @@ Office는 **미실행**이며, 하네스 소스나 모형 통과를 설치 성�
 [기존 폴더 검증 절차](guides/PPT_READER.md#기존-설치-준비-폴더와-native-lease-검증)를 통과한 뒤
 같은/다른 관리자 UAC, A(owner)/B(예약 owner)/C(비소유 사용자), 실제 ProgramData 업데이트를 확인한다.
 
+Windows 시험에서 CRT 파일 열기는 native `winerror` 없이 `errno=EACCES`만 반환할 수 있다.
+거절 판정은 이 표현을 수용하고 무관한 오류는 거절한다. 실제 helper 종료와 삭제 확인은 별도 유지한다.
+native 하네스의 30초 시간초과는 컴파일/실행 phase와 flush된 마지막 고정 stage를 표시한다.
+멈춘 단계가 확인되기 전에는 원인을 특정하거나 설치 성공으로 간주하지 않는다.
+
 ### COM poison 복구 일관성 (2026-10-15)
 
 실제 종료·소유 기록 제거 후 2초 목록이 남는 문제, 진행 중인 열거/guard가 옛 결과를 사용하는

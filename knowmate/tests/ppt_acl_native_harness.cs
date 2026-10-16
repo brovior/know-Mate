@@ -10,6 +10,17 @@ using AegisDesk.PptSetup;
 
 internal static class NativeAclHarness
 {
+    private static readonly Stopwatch Clock = Stopwatch.StartNew();
+
+    private static void Stage(string stage)
+    {
+        Console.WriteLine("PPT_ACL_STAGE " + stage + " elapsed_ms=" + Clock.ElapsedMilliseconds);
+        Console.Out.Flush();
+    }
+
+    private static RequestDirectoryLease Acquire(string anchor, string stage)
+    { Stage(stage); return RequestDirectoryLease.AcquireAt(anchor); }
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern SafeFileHandle CreateFile(string path, uint access, uint share,
         IntPtr security, uint disposition, uint flags, IntPtr template);
@@ -59,6 +70,7 @@ internal static class NativeAclHarness
 
     public static int Main(string[] args)
     {
+        Stage("account_check");
         using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
         {
             if (new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator))
@@ -67,47 +79,67 @@ internal static class NativeAclHarness
                 return 77;
             }
         }
+        Stage("filesystem_check");
         string anchor = Path.GetFullPath(args[0]);
         if (new DriveInfo(Path.GetPathRoot(anchor)).DriveFormat != "NTFS")
         {
             Console.WriteLine("SKIP native fixture requires local NTFS");
             return 77;
         }
+        Stage("fixture_create");
         Require(!Directory.Exists(anchor), "fixture_must_be_new");
         Directory.CreateDirectory(anchor);
         string parent = Path.Combine(anchor, "AegisDesk");
         string child = Path.Combine(parent, "PptReaderRequests");
         try
         {
+            Stage("parent_file_rejection");
             File.WriteAllText(parent, "fixture-parent-file");
             Denied(delegate { using (RequestDirectoryLease lease = RequestDirectoryLease.AcquireAt(anchor)) { } }, "parent_file_accepted");
             Require(File.ReadAllText(parent) == "fixture-parent-file", "rejected_parent_file_changed");
             File.Delete(parent);
             Directory.CreateDirectory(parent);
+            Stage("child_file_rejection");
             File.WriteAllText(child, "fixture-child-file");
             string rejectedParentSecurity = Security(parent);
             Denied(delegate { using (RequestDirectoryLease lease = RequestDirectoryLease.AcquireAt(anchor)) { } }, "child_file_accepted");
             Require(File.ReadAllText(child) == "fixture-child-file" && Security(parent) == rejectedParentSecurity, "rejected_child_file_changed");
             File.Delete(child);
+            Stage("junction_create");
             string external = Path.Combine(anchor, "junction-target"); Directory.CreateDirectory(external);
             File.WriteAllText(Path.Combine(external, "sentinel"), "fixture-target");
             var junction = new ProcessStartInfo(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System), "cmd.exe"),
                 "/d /c mklink /J \"" + child + "\" \"" + external + "\"")
                 { UseShellExecute = false, CreateNoWindow = true, RedirectStandardOutput = true, RedirectStandardError = true };
             using (Process process = Process.Start(junction))
-            { process.StandardOutput.ReadToEnd(); process.StandardError.ReadToEnd(); process.WaitForExit(); Require(process.ExitCode == 0, "junction_fixture_unavailable"); }
+            {
+                // Drain both streams while waiting; only this test-owned cmd
+                // process may be killed, never a production setup helper.
+                process.BeginOutputReadLine(); process.BeginErrorReadLine();
+                if (!process.WaitForExit(10000))
+                {
+                    process.Kill();
+                    process.WaitForExit(2000);
+                    throw new InvalidOperationException("junction_fixture_timeout");
+                }
+                Require(process.ExitCode == 0, "junction_fixture_unavailable");
+            }
+            Stage("junction_rejection");
             Denied(delegate { using (RequestDirectoryLease lease = RequestDirectoryLease.AcquireAt(anchor)) { } }, "child_junction_accepted");
             Require(File.ReadAllText(Path.Combine(external, "sentinel")) == "fixture-target" && Security(parent) == rejectedParentSecurity, "rejected_junction_changed");
             Directory.Delete(child); Directory.Delete(external, true); Directory.Delete(parent);
-            using (RequestDirectoryLease fresh = RequestDirectoryLease.AcquireAt(anchor))
+            using (RequestDirectoryLease fresh = Acquire(anchor, "fresh_acquire"))
             {
+                Stage("fresh_verify");
                 Require(Directory.GetAccessControl(parent).AreAccessRulesProtected, "fresh_parent_not_protected");
                 Require(Directory.GetAccessControl(child).AreAccessRulesProtected, "fresh_child_not_protected");
                 fresh.Recheck();
             }
+            Stage("fixture_reset");
             Cleanup(anchor);
             Directory.CreateDirectory(anchor);
             // Reproduce the old install's inherited parent, then atomically create the strict child.
+            Stage("legacy_create");
             Directory.CreateDirectory(parent);
             Require(!Directory.GetAccessControl(parent).AreAccessRulesProtected, "legacy_parent_not_inherited");
             Require(RequestDirectory.Create(child, RequestDirectory.Expected(false)), "child_atomic_create");
@@ -115,33 +147,42 @@ internal static class NativeAclHarness
             Require(RequestDirectory.Compatible(Directory.GetAccessControl(parent), true), "legacy_parent_policy");
             Require(RequestDirectory.Compatible(Directory.GetAccessControl(child), false), "strict_child_policy");
             string parentBefore = Security(parent), childBefore = Security(child);
-            using (RequestDirectoryLease first = RequestDirectoryLease.AcquireAt(anchor))
-            using (RequestDirectoryLease second = RequestDirectoryLease.AcquireAt(anchor))
+            using (RequestDirectoryLease first = Acquire(anchor, "legacy_first_acquire"))
+            using (RequestDirectoryLease second = Acquire(anchor, "legacy_second_acquire"))
             {
+                Stage("legacy_recheck");
                 first.Recheck(); second.Recheck();
+                Stage("rename_denial");
                 Denied(delegate { Directory.Move(anchor, anchor + ".renamed"); }, "anchor_rename_allowed");
                 Denied(delegate { Directory.Move(parent, parent + ".renamed"); }, "parent_rename_allowed");
                 Denied(delegate { Directory.Move(child, child + ".renamed"); }, "child_rename_allowed");
                 Denied(delegate { Directory.Delete(child); }, "empty_child_delete_allowed");
                 string request = Path.Combine(child, Guid.NewGuid().ToString("D") + ".json");
                 FileSecurity acl = RequestSecurity();
+                Stage("atomic_create");
                 Contract.AtomicWrite(request, new Dictionary<string, object> { { "fixture", 1 } }, acl);
+                Stage("atomic_replace");
                 Contract.AtomicWrite(request, new Dictionary<string, object> { { "fixture", 2 } }, acl);
+                Stage("atomic_verify");
                 Require(Convert.ToInt32(Contract.Read(request)["fixture"]) == 2, "atomic_replace_failed");
                 Require(Security(parent) == parentBefore && Security(child) == childBefore, "directory_security_changed");
                 first.Recheck(); second.Recheck();
                 File.Delete(request);
+                Stage("lease_release");
             }
             // A prior handle requesting DELETE must conflict with the later read-only-sharing lease.
+            Stage("sharing_conflict_open");
             using (SafeFileHandle conflict = CreateFile(parent, 0x00010000, 7, IntPtr.Zero, 3,
                 0x02000000 | 0x00200000, IntPtr.Zero))
             {
                 Require(!conflict.IsInvalid, "conflict_fixture_open_failed");
+                Stage("sharing_conflict_acquire");
                 Denied(delegate { using (RequestDirectoryLease lease = RequestDirectoryLease.AcquireAt(anchor)) { } },
                     "delete_handle_conflict_accepted");
             }
-            using (RequestDirectoryLease lease = RequestDirectoryLease.AcquireAt(anchor)) { lease.Recheck(); }
+            using (RequestDirectoryLease lease = Acquire(anchor, "reopen_after_conflict")) { lease.Recheck(); }
             // Confirm the earlier rename denial was caused by the live leases rather than absent caller rights.
+            Stage("rename_after_release");
             Directory.Move(child, child + ".renamed");
             Directory.Move(child + ".renamed", child);
             Directory.Move(parent, parent + ".renamed");
@@ -154,6 +195,7 @@ internal static class NativeAclHarness
         finally
         {
             // Test-owned roots only. Production ProgramData is never passed to this harness.
+            Stage("cleanup");
             Cleanup(anchor);
         }
     }
