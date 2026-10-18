@@ -3,6 +3,140 @@
 현재 원인 분석과 다음 검증의 정본이다. 작업 상태는 [ROADMAP.md](ROADMAP.md), 구현 계약은
 [DESIGN.md](design/DESIGN.md), 완료 이력은 [UPDATE_NOTES.md](UPDATE_NOTES.md)를 따른다.
 
+## PPT 종료·identity 관측 검토 (2026-10-18)
+
+**설치와 합성 PPT 읽기는 성공했으나, 원래 in-host Quit 미종료 원인은 미확정이다.**
+121에서는 선택 getter를 필수 host 관측 앞에 둔 진단 순서 결함을 확인했다.
+순서 개선은 **미구현·미검증 제안**이며 이번 작업은 분석·offline 검증에서 종료한다.
+현재 설치는 candidate121(`1.0.21.0`), recovery122(`1.0.22.0`)는 빌드만 했고 설치하지 않았다.
+추가 설치·실제 Office 시험·live 재실행은 하지 않는다.
+
+### 소스·환경과 실제 증거
+
+분석 기준은 브랜치 `fix/ppt-deferred-diagnostic`, HEAD
+`67c23cd6a9e851a0aeffd2ac7394579c03165353`와 미커밋 변경을 포함한 동결 소스
+fingerprint `4d71bac5`이다. 따라서 HEAD만으로 candidate121을 재현할 수 없다.
+이 문서 커밋에는 기존 제품 코드·테스트·다른 문서 변경을 포함하지 않는다.
+Windows 집 PC, 64-bit PowerPoint, 일반 사용자 controller에서 실행했으며 설치 UAC는 사용자가 승인했다.
+
+| 실제 시험 | 관측 결과 | 해석의 한계 |
+|---|---|---|
+| 113 지연 관측 | 합성 읽기 65자·해시 일치, in-host 요청 `quit_requested`; native Quit 반환·Unadvise 성공 기록 뒤 600초에도 원 PID 생존 | Quit 반환은 OS 종료가 아니다. 후속 callback 전체를 포착한 trace가 아니다 |
+| 113 순차 비교 | guard 이후 60초 생존; 외부 Quit 후 약 2.30초에 OS 종료 | 동일 세션의 순차 비교라 원인 분리는 안 됨 |
+| 113 외부 Quit | Application·reader service 참조를 유지한 채 약 2.38초 후 OS 종료 | Python service 참조 보유만으로 미종료를 설명할 수 없음; host 호출 문맥·sink 영향은 남음 |
+| 115 deferred | owner 측 deferred 경로에서 Quit 반환, 약 174.59초 후에도 생존 | 단순히 Python 호출 반환을 기다리는 문제라는 설명은 부족함 |
+| 115 외부 flags=3 | DISPID 2021, flags 3 외부 호출 후 약 2.45초에 OS 종료 | flags=3만으로 내부 경로 실패를 설명할 수 없음 |
+| 117 | 설치·loader·읽기 성공; Prepare `external_refused`, identity 획득/해제 2/2, START/ACK/Quit 0 | 당시 비교 결과와 guard 사유 미계측; 2/2는 동일 identity 증명이 아님 |
+| 119 | Prepare `Identity.Different` / `IdentityMismatch`; guard `NotReached`, trace 33개·drop 0, START/ACK/Quit 0 | controller에서 재구성한 ROT 비교와 host가 받은 원 인자의 동일성을 혼동하면 안 됨 |
+| 121 | 설치 후 `check=ready`, 보호 loader·DLL 두 개 해시 일치, 읽기 65자·해시 일치; Bind `bound`; controller unknown | host 관측 4개와 Prepare·START·ACK·Quit·Completion 모두 미실행. 종료 경로 성공 증거 없음 |
+
+121 core SHA-256은 `b3ecd7de549510ecfc56b441730ae0d599232abd7521770b4bdad2c3f5302af8`,
+events는 `1203cdfc432833112fbfe06036733e125003c40085940ad9150e9301892d142c`이다.
+설치 `prepare`는 1회 실행했고 후속 `check`도 `ready`였다.
+합성 출력 SHA-256은 `1d766c6794d7e50eba5a37b5850debc6f5309db02458793a941e3e614f9dd10e`이며 원문은 기록하지 않았다.
+
+### 121 진단 순서 결함과 확보된 범위
+
+실제 순서는 Bind → controller `collect` → 조건부 host `ObserveExternalIdentity` →
+primitive JSON export → 조건부 Prepare다. controller는 다음 순서로 수집한다.
+JSON 행 배열은 ROT가 먼저지만 실행은 candidate부터다.
+
+1. 정확히 제출할 candidate의 로컬 VARIANT unwrap·canonical IUnknown·형식 정보.
+2. ROT app, raw `_oleobj_`, candidate 및 ROT의 QI `_Application` self-control.
+3. `candidate.Application` → `COMAddIns` → `COMAddIns.Item` → `COMAddIns.Item.Application`.
+
+마지막 네 항목은 비교 보조용 선택 경로다. 그러나 `collect.usable`은 어느 행에서든
+unknown/fatal이 생기면 false가 되고, `observe_export_prepare`는 9개 행을 포함한
+controller usable을 host 호출의 선행 조건으로 사용한다. 따라서 알려진 선택 경로 오류가
+무관한 핵심 host 증거까지 가렸다. 별도 선택 항목 완결성과 핵심 증거 완결성 구분이 없다.
+안전 중단 규칙 자체를 완화할 사유는 아니다.
+
+121은 앞의 5개 controller identity 행에서 group 0과 self-control을 확보했다.
+`candidate.Application`은 `0x80020006`(명시적 이름 부재)로 unavailable,
+COMAddIns와 Item은 각각 group 1·2로 관측됐다. 마지막 getter는 outer
+`0x80020009`(DISP_E_EXCEPTION), EXCEPINFO scode `0x80004005`(E_FAIL)로 unknown이다.
+121은 scode만 보존하므로 EXCEPINFO 나머지 필드를 추측하지 않는다.
+119의 같은 선택 경로 시도에도 outer/inner가 같았고 EXCEPINFO는
+`(0, None, None, None, 0, -2147467259)`였다. underlying Office getter 실패 원인은 미확정이다.
+Python backend는 GetIDsOfNames와 Invoke를 하나의 `Application` 단계로 기록하므로
+121 기록만으로 두 세부 경계를 독립 판정할 수 없다.
+
+121 controller는 7 observed / 1 unavailable / 1 unknown, 소유 wrapper hold는
+9 acquired / 9 drop attempts / 9 dropped, cleanup 오류 0이다.
+이는 Python wrapper 정리 장부이며 서버의 모든 native 참조 해제 증명은 아니다.
+이전 관측값은 유효한 과거 증거지만 오류 이후 서버 건전성·host captured identity·
+COM 전달 후 candidate identity·Prepare 허용 여부·Quit 동작은 알 수 없다.
+`host-report.json`은 terminal frame 미복구로 불완전하다. native trace에서 행이 안 보인다는
+이유로 미도달을 단정하지 않는다. Prepare 0회는 controller 제어 흐름·저장 결과로 확인했다.
+
+host 구현은 `Describe(host)` → `Describe(candidate)` → `host.Application` →
+`candidate.Application` 순서다. COMAddIn.Application 경로는 없다.
+선택 Application getter 이전에 핵심 두 행을 얻지만, 각 Describe의 형식 메타데이터 조회는
+그 행의 QI와 결합돼 있어 host 메타데이터 unknown이 candidate 행까지 막을 수 있다.
+host.Application unknown은 이미 확보한 핵심 행을 남기고 다음 선택 행을 중단한다.
+이 경우 전체 report는 unusable이며 process fence UNKNOWN·Prepare 차단은 유지된다.
+121 실제 실행에서는 host probe가 호출되지 않았으므로 이 내부 순서의 결과는 미측정이다.
+
+### Offline 결과와 다음 조사 순서
+
+동결 candidate121 전체 fake 회귀는 **1973 PASS / 1 FAIL / 5 SKIP**다.
+실패는 production request writer 필수 gate 미완료이며 내부 결과는 **60 PASS / 0 FAIL /
+2 UNEXECUTED**, reparse leases=1·2의 WinError 1314다. 권한 부족 미실행을 제품 승인으로 바꾸지 않는다.
+이전 PR의 15 skipped는 총계만 알려져 있어 원 실행 목록을 추측하지 않는다.
+별도 controller 14 PASS와 synthetic guard/CP/sink 시험은 실제 Office 종료 증명이 아니다.
+회사 DRM·다른 계정·전체 UAC 행렬·실제 Office 배포는 이 집 PC 결과로 대체할 수 없다.
+
+이번 offline 검증은 기존 controller의 정확한 마지막 getter 오류 재현과 필수 canonical
+identity 실패 시 host 차단을 포함한다. 순서 개선 구현의 통과 결과가 아니다.
+최종 **35 PASS**(정확한 마지막 getter 오류 재현·필수 canonical 실패 차단 2건 포함)를 확인했다.
+첫 실행은 기존 pytest 임시 폴더 접근 거부로 25 PASS / 10 setup errors였고, 기존 폴더를
+변경하지 않은 새 고유 임시 경로에서 같은 35개를 재실행해 통과했다. 실행 로그는 아래 경로에 보존한다.
+
+1. controller-only 변경안: 필수 identity/wire 정보 → 기존 host observation 1회 → 즉시 primitive
+   결과 저장. 알려진 COMAddIn.Application은 이번 실행 미실행으로 표시하고 119·121 과거 오류를
+   별도 첨부한다. 모든 선택 항목 수집 여부와 핵심 증거 완결성을 분리한다.
+2. 기존 `complete_host`, ownership/cleanup·generation·same identity·export 성공·Prepare 안전
+   검사를 유지한다. 선택 getter를 별도 조사하더라도 첫 unknown/fatal 이후 추가 host 호출과
+   Prepare를 금지한다. 필수 단계 실패는 host probe 자체를 막아야 한다.
+3. 구현 후 offline에서 host 증거가 선택 오류 이전 저장됨, 오류 이후 host/Prepare 0회,
+   export·cleanup·필수 실패 차단을 검증하고 별도 검토를 거친다. controller 순서만 바꾸는 데는
+   설치121 재빌드·재설치가 필요 없다. host 내부 메타데이터 순서를 바꾸려면 별도 DLL 변경이 필요하다.
+   새 소유 세션의 live 시험은 이후 별도 승인 범위이며 기존 PID 재시도는 금지한다.
+
+### 시험 프로세스 정리와 증거 경로
+
+121 시험은 직접 생성한 PowerPoint를 생성시각·상속 capability·marker 창·독립 OS handle로
+연결했다. 합성 문서를 닫은 뒤 Presentations/ProtectedViewWindows/SlideShowWindows가 모두 0임을
+확인했다. 이는 당시 증거이며 나중의 문서 상태를 보증하지 않는다.
+180초 독립 관측 종료 시 원 프로세스는 생존했다.
+
+이후 승인된 정상 정리에서 EXE 경로·PID·생성시각·정확한 HWND·스레드·단일 활성 주창과
+다른 visible 창/대화상자 부재를 OS API로 재확인했다. COM 호출 없이 WM_CLOSE **1회**,
+강제 종료·대화상자 자동 응답 없이 원 handle의 종료와 창 소멸을 확인했다.
+시험 프로세스는 종료됐으며 이 정리는 진단 Prepare/Quit 성공에 포함하지 않는다.
+최초 정리 스크립트 실행은 문법 오류로 동작 전 중단됐고, 수정 후 실행에서만 WM_CLOSE를 보냈다.
+
+아래는 모두 저장소 루트의 `.aegisdesk_build/` 아래 상대 경로다.
+원 로그는 Git 추적 대상이 아니며 이 문서 커밋에 포함하지 않는다. 재현에 필요한 동결 소스·패키지·
+원 로그는 이 PC에 보존해야 한다.
+
+| 내용 | 정확한 상대 경로 |
+|---|---|
+| 113 내부·외부 비교 | `delayed-guard-quit113/RESULT.json`, `compare-guard-external113/RESULT.json`, `external-service-held113/RESULT.json` |
+| 115 deferred·외부 flags | `live-deferred115/RESULT.json`, `external-flags3-115/RESULT.json`, `quit-dispatch115/python-spy.json` |
+| 117 거절 분석 | `live-external117/RESULT.json`, `live-external117/refusal-analysis.json` |
+| 119 identity·기존 getter 오류 | `live-external119/live-result.json`, `live-external119/identity-and-close-v2.json`, `live-external119/identity-final-and-close.json` |
+| 121 설치 | `ppt-pair-121-122-ready/installation-trial-121/prepare.stdout.log`, `ppt-pair-121-122-ready/installation-trial-121/validation-result.json` |
+| 121 관측·OS·정리 | `live-external121/identity-controller-result.json`, `live-external121/identity-observation.json`, `live-external121/control.jsonl`, `live-external121/process-events.jsonl`, `live-external121/host-report.json`, `live-external121/analysis-evidence.json`, `live-external121/normal-close-os-only.json` |
+| 소스·설치 pin | `live-external121/package-pins.json`, `live-external121/controller-manifest.json`, `ppt-pair-121-122-ready/source-candidate121/` |
+| 전체 fake·writer·controller | `trace-release121/FINAL_REPORT.json`, `trace-release121/full.log`, `trace-release121/full.xml`, `trace-release121/writer-summary.json`, `trace-release121/controller-final.xml` |
+| 이번 offline·변경 전 기록 | `identity-order-review121/offline-final.log`, `identity-order-review121/offline-final.xml`, `identity-order-review121/test_order_reproduction.py`, `identity-order-review121/baseline-status.txt`, `identity-order-review121/baseline-diff.patch`, `identity-order-review121/baseline-hashes.json` |
+
+실제 실행 명령은 후보 패키지 `PptReaderSetup.exe prepare`(1회), `PptReaderSetup.exe check`,
+`.venv/Scripts/python.exe -X utf8 .aegisdesk_build/validate_install121.py`,
+`.venv/Scripts/python.exe -X utf8 .aegisdesk_build/live-external121/run.py --live`였다.
+이 목록은 과거 실행 기록이며 재실행 지시가 아니다.
+
 ## 현재 판단 (2026-10-13)
 
 PowerPoint 내부 추가 기능은 VDI와 사내 PC의 소수 문서에서 내용 일치·속도 개선이 보고됐다.
