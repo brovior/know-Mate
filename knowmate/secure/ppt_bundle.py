@@ -10,7 +10,7 @@ from typing import Any, Mapping
 
 from knowmate.secure.ppt_policy import REQUIRED_VERSION, AUTO_INSTALL_MODES, auto_install_mode
 
-PAYLOAD_FILES = ("AegisDesk.PptReader.dll", "PptReaderSetup.exe")
+PAYLOAD_FILES = ("AegisDesk.PptReader.dll", "AegisDesk.PptReader.Events.dll", "PptReaderSetup.exe")
 
 
 def payload_directory() -> Path:
@@ -27,7 +27,7 @@ def validate_manifest(
     if not isinstance(manifest, dict):
         raise ValueError("ppt_manifest_schema")
     expected = {
-        "schema": 1, "reader_version": REQUIRED_VERSION, "protocol": 3, "payload_schema": 1,
+        "schema": 1, "reader_version": REQUIRED_VERSION, "protocol": 3, "payload_schema": 2,
         "prog_id": "AegisDesk.PptReader", "reader_class": "AegisDesk.PptReader.Connect",
         "reader_clsid": "287A80D2-804A-46D3-A0E9-CA31C6FC3D09",
         "reader_iid": "9A20F4A6-6364-4BA7-930B-3E8857BEAF60",

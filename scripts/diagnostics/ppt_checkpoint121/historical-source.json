@@ -1,0 +1,13 @@
+{
+  "historical_source_commit": "67c23cd6a9e851a0aeffd2ac7394579c03165353",
+  "historical_fingerprint": "4d71bac5",
+  "historical_candidate_version": "1.0.21.0",
+  "historical_files_sha256": {
+    "run.py": "3c576d34777fb3d3d096f9e25d071481d83859fc6b10f86a3c0c9a51b7411bdc",
+    "controller_support.py": "5ddb8edf2590213944def8e4c3c89e2b37b94da10dcc9d8692ce86af40814cba",
+    "observe_processes.py": "2bb0ffed2aa549c801b04b0b35e27138066f8060897c7151eceae813f2cd19a0",
+    "verify_pins.py": "59a04eebe9f835e50db00f940bdc99a38f2b67a655120d3e72d4c20ddc87d153",
+    "test_controller.py": "d60d4fa29fc828fb3520db0ca53032990a391d62758e415d972e5e5fc4653935"
+  },
+  "status": "portable preservation; not byte-identical to historical scripts; live entry locked"
+}

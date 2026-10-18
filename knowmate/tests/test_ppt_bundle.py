@@ -19,13 +19,13 @@ def payload(tmp_path):
     for name in PAYLOAD_FILES:
         (tmp_path / name).write_bytes(b"synthetic payload")
     manifest = {
-        "schema": 1, "reader_version": "1.0.4.0", "protocol": 3, "payload_schema": 1,
+        "schema": 1, "reader_version": "1.0.5.0", "protocol": 3, "payload_schema": 2,
         "prog_id": "AegisDesk.PptReader", "reader_class": "AegisDesk.PptReader.Connect",
         "reader_clsid": "287A80D2-804A-46D3-A0E9-CA31C6FC3D09",
         "reader_iid": "9A20F4A6-6364-4BA7-930B-3E8857BEAF60",
         "auto_install_validated": False, "auto_install_mode": "disabled",
         "auto_install_enabled": False, "auto_shutdown_enabled": False, "build": build,
-        "assembly_versions": {name: "1.0.4.0" for name in PAYLOAD_FILES},
+        "assembly_versions": {name: "1.0.5.0" for name in PAYLOAD_FILES},
         "files": {name: hashlib.sha256(b"synthetic payload").hexdigest() for name in PAYLOAD_FILES},
     }
     (tmp_path / "manifest.json").write_text(json.dumps(manifest))
@@ -40,7 +40,7 @@ def test_payload_hash_bound_to_app_build(payload):
         verify_payload(path, other)
 
 
-@pytest.mark.parametrize("change", ["missing", "changed", "version", "gate", "boolean", "files"])
+@pytest.mark.parametrize("change", ["missing", "changed", "version", "gate", "boolean", "files", "events_missing", "events_changed", "old_payload_schema"])
 def test_payload_rejects_missing_changed_or_unverified_metadata(payload, change):
     path, original, build = payload
     manifest = copy.deepcopy(original)
@@ -56,6 +56,12 @@ def test_payload_rejects_missing_changed_or_unverified_metadata(payload, change)
         manifest["schema"] = True
     elif change == "files":
         manifest["files"]["foreign.dll"] = "a" * 64
+    elif change == "events_missing":
+        (path / "AegisDesk.PptReader.Events.dll").unlink()
+    elif change == "events_changed":
+        (path / "AegisDesk.PptReader.Events.dll").write_bytes(b"changed events")
+    elif change == "old_payload_schema":
+        manifest["payload_schema"] = 1
     with pytest.raises(ValueError):
         validate_manifest(manifest, path, build)
 
@@ -71,7 +77,7 @@ def test_frozen_selftest_payload_missing_fails_without_launch(monkeypatch, tmp_p
 
 
 def test_production_managed_harness_on_windows(tmp_path):
-    """Actual compiler and managed contracts require no Office or registry access."""
+    """Managed-host contracts use the Count fixture; native product integration is tested separately."""
     compiler = Path(os.environ.get("WINDIR", "")) / "Microsoft.NET/Framework/v4.0.30319/csc.exe"
     if os.name != "nt" or not compiler.is_file():
         pytest.skip("Windows .NET Framework compiler needed")
@@ -82,16 +88,18 @@ def test_production_managed_harness_on_windows(tmp_path):
     commands = [[str(compiler), "/nologo", "/target:library", f"/out:{dll}",
                  "/reference:Microsoft.CSharp.dll", "/reference:System.Core.dll", "/reference:System.Web.Extensions.dll",
                  str(root / "scripts/ppt_reader/PptReader.cs"), str(root / "scripts/ppt_shared/PptExtractionCore.cs"),
-                 str(root / "scripts/ppt_reader/PptShutdownEvents.cs"),
-                 str(root / "scripts/ppt_reader/PptShutdownGuard.cs"), str(policy)]]
+                 str(root / "scripts/ppt_reader/PptShutdownEvents.cs"), str(root / "scripts/ppt_reader/PptOwnedMetadata.cs"),
+                 str(root / "scripts/ppt_reader/PptShutdownGuard.cs"),
+                 str(root / "knowmate/tests/ppt_managed_count_fixture.cs"),
+                 *[str(root / "scripts/ppt_reader" / name) for name in ("PptShutdownState.cs", "PptSinkLoader.cs", "PptPackageIdentity.cs", "PptEventSignatures.cs", "PptEventValidator.cs")], str(policy)]]
     for name, args in (("ppt_reader_harness.cs", []),
                        ("ppt_probe_harness.cs", ["AegisDesk.PptReader.Connect"]),
                        ("ppt_probe_connection_harness.cs", ["--production"])):
         exe = tmp_path / (name + ".exe")
-        commands.extend([[str(compiler), "/nologo", "/reference:Microsoft.CSharp.dll", "/reference:System.Core.dll", f"/out:{exe}", str(root / "knowmate/tests" / name)],
+        commands.extend([[str(compiler), "/nologo", "/reference:Microsoft.CSharp.dll", "/reference:System.Core.dll", f"/out:{exe}", f"/reference:{dll}", str(root / "knowmate/tests" / name)],
                          [str(exe), str(dll), *args]])
     for command in commands:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=30,
+        result = subprocess.run(command, capture_output=True, text=True, errors="replace", timeout=30,
                                 creationflags=subprocess.CREATE_NO_WINDOW)
         assert result.returncode == 0, result.stdout + result.stderr
         assert "SECRET" not in result.stdout + result.stderr

@@ -322,6 +322,7 @@ def _make_worker(tmp_path: Path, watch_folder: str):
     config = _make_config(watch_folder)
     state_file = tmp_path / "state.json"
     worker = CollectorWorker(
+        get_idle_seconds=lambda: 0.0,
         config=config, indexer=indexer, extractor=extractor, state_file=state_file,
         purge_meta_file=tmp_path / "purge_meta.json", failure_file=tmp_path / "index_failure.json",
     )
@@ -753,7 +754,7 @@ class TestCollectorWorker:
         indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
         config = _make_config(str(folder))
         state_file = tmp_path / "state.json"
-        worker = CollectorWorker(config=config, indexer=indexer, extractor=FailingExtractor(), state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json", failure_file=tmp_path / "index_failure_5.json")
+        worker = CollectorWorker(get_idle_seconds=lambda: 0.0, config=config, indexer=indexer, extractor=FailingExtractor(), state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json", failure_file=tmp_path / "index_failure_5.json")
 
         finished_msgs = []
         worker.finished.connect(finished_msgs.append)
@@ -806,6 +807,7 @@ class TestComRestart:
         state_file = tmp_path / "state.json"
         spy = MagicMock()
         worker = CollectorWorker(
+            get_idle_seconds=lambda: 0.0,
             config=config, indexer=indexer, extractor=extractor, state_file=state_file,
             com_restart_fn=spy,
         )
@@ -850,6 +852,7 @@ class TestComRestart:
         }
         spy = MagicMock()
         worker = CollectorWorker(
+            get_idle_seconds=lambda: 0.0,
             config=config, indexer=indexer, extractor=FakeReader(),
             state_file=tmp_path / "state.json", com_restart_fn=spy,
         )
@@ -988,6 +991,7 @@ class TestComRestart:
             raise RuntimeError("재기동 실패")
 
         worker = CollectorWorker(
+            get_idle_seconds=lambda: 0.0,
             config=config, indexer=indexer, extractor=FakeReader(), state_file=state_file,
             com_restart_fn=failing_restart,
         )
@@ -1027,6 +1031,7 @@ class TestComRestart:
         periodic_restart = MagicMock()
         poison_recovery = MagicMock(return_value=True)
         worker = CollectorWorker(
+            get_idle_seconds=lambda: 0.0,
             config={
                 "collector": {
                     "watch_folders": [str(folder)],
@@ -1894,6 +1899,7 @@ class TestFailureStateIntegration:
         config = _make_config(str(folder))
 
         worker = CollectorWorker(
+            get_idle_seconds=lambda: 0.0,
             config=config, indexer=indexer, extractor=self._AlwaysFailingReader(),
             state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json",
             failure_file=failure_file,
@@ -1931,6 +1937,7 @@ class TestFailureStateIntegration:
         config = _make_config(str(folder))
 
         worker = CollectorWorker(
+            get_idle_seconds=lambda: 0.0,
             config=config, indexer=indexer, extractor=self._FailingInOpenStageReader(),
             state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json",
             failure_file=failure_file,
@@ -1962,6 +1969,7 @@ class TestFailureStateIntegration:
 
         for _ in range(3):
             worker = CollectorWorker(
+                get_idle_seconds=lambda: 0.0,
                 config=config, indexer=indexer, extractor=self._AlwaysFailingReader(),
                 state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json",
                 failure_file=failure_file, get_now=clock,
@@ -2036,6 +2044,7 @@ class TestFailureStateIntegration:
         clock = _MutableClock()
 
         worker = CollectorWorker(
+            get_idle_seconds=lambda: 0.0,
             config=config, indexer=indexer, extractor=self._AlwaysFailingReader(),
             state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json",
             failure_file=failure_file, get_now=clock,
@@ -2083,6 +2092,7 @@ class TestFailureStateIntegration:
         config = _make_config(str(folder))
 
         worker = CollectorWorker(
+            get_idle_seconds=lambda: 0.0,
             config=config, indexer=indexer, extractor=self._AlwaysFailingReader(),
             state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json",
             failure_file=failure_file,
@@ -2113,6 +2123,7 @@ class TestFailureStateIntegration:
         config = _make_config(str(folder))
 
         worker = CollectorWorker(
+            get_idle_seconds=lambda: 0.0,
             config=config, indexer=indexer, extractor=self._AlwaysFailingReader(),
             state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json",
             failure_file=failure_file,
@@ -2122,6 +2133,7 @@ class TestFailureStateIntegration:
 
         target.unlink()  # 파일 자체가 사라짐 — 다음 사이클(빈 폴더 스캔)에 정리돼야 함
         worker2 = CollectorWorker(
+            get_idle_seconds=lambda: 0.0,
             config=config, indexer=indexer, extractor=FakeReader(),
             state_file=state_file, purge_meta_file=tmp_path / "purge_meta.json",
             failure_file=failure_file,
@@ -2171,6 +2183,7 @@ class TestFailureBackoffIntegration:
         extractor = self._AlwaysFailingReader()
 
         worker = CollectorWorker(
+            get_idle_seconds=lambda: 0.0,
             config=config, indexer=indexer, extractor=extractor, state_file=state_file,
             purge_meta_file=tmp_path / "purge_meta.json", failure_file=failure_file,
         )
@@ -2199,6 +2212,7 @@ class TestFailureBackoffIntegration:
         extractor = self._AlwaysFailingReader()
 
         worker = CollectorWorker(
+            get_idle_seconds=lambda: 0.0,
             config=config, indexer=indexer, extractor=extractor, state_file=state_file,
             purge_meta_file=tmp_path / "purge_meta.json", failure_file=failure_file,
         )
@@ -2229,6 +2243,7 @@ class TestFailureBackoffIntegration:
         clock = _MutableClock()
 
         worker = CollectorWorker(
+            get_idle_seconds=lambda: 0.0,
             config=config, indexer=indexer, extractor=extractor, state_file=state_file,
             purge_meta_file=tmp_path / "purge_meta.json", failure_file=failure_file,
             get_now=clock,
@@ -2260,6 +2275,7 @@ class TestFailureBackoffIntegration:
         clock = _MutableClock()
 
         worker = CollectorWorker(
+            get_idle_seconds=lambda: 0.0,
             config=config, indexer=indexer, extractor=extractor, state_file=state_file,
             purge_meta_file=tmp_path / "purge_meta.json", failure_file=failure_file,
             get_now=clock,
@@ -2297,6 +2313,7 @@ class TestFailureBackoffIntegration:
         extractor = self._AlwaysFailingReader()
 
         worker = CollectorWorker(
+            get_idle_seconds=lambda: 0.0,
             config=config, indexer=indexer, extractor=extractor, state_file=state_file,
             purge_meta_file=tmp_path / "purge_meta.json", failure_file=failure_file,
         )
@@ -2327,6 +2344,7 @@ class TestFailureBackoffIntegration:
         extractor = self._AlwaysFailingReader()
 
         worker = CollectorWorker(
+            get_idle_seconds=lambda: 0.0,
             config=config, indexer=indexer, extractor=extractor, state_file=state_file,
             purge_meta_file=tmp_path / "purge_meta.json", failure_file=failure_file,
         )

@@ -107,6 +107,14 @@ internal static class WriterLinkFixture
                 { rejected = true; Console.WriteLine("PPT_WRITER_REJECT stage=policy error_type=IOException winerror=none"); }
                 catch (UnauthorizedAccessException)
                 { rejected = true; Console.WriteLine("PPT_WRITER_REJECT stage=policy error_type=access winerror=none"); }
+                catch (Win32Exception error)
+                {
+                    // A directory reparse target can be denied by the native file open.
+                    // Other native failures must still fail the fixture.
+                    if (mode != "reparse-directory" || error.NativeErrorCode != 5) throw;
+                    rejected = true;
+                    Console.WriteLine("PPT_WRITER_REJECT stage=target_open error_type=access winerror=5");
+                }
                 Require(rejected, operation == 0 ? "fixture_read_accepted" : "fixture_write_accepted");
                 RequestWriterHarness.Stage("preservation_verify");
                 var after = WriterFixtureNative.Inspect(target);

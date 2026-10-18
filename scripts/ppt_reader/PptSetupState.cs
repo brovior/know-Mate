@@ -39,12 +39,15 @@ namespace AegisDesk.PptSetup
     {
         // No implementation in shipping builds: compiler removes every call.
         static partial void TraceAtomic(string stage);
-        public const string Version = "1.0.4.0";
+        public const string Version = "1.0.5.0";
         public const string ProgId = "AegisDesk.PptReader";
         public const string ClassId = "{287A80D2-804A-46D3-A0E9-CA31C6FC3D09}";
         public const string ReaderIid = "9A20F4A6-6364-4BA7-930B-3E8857BEAF60";
         public const string ReaderClass = "AegisDesk.PptReader.Connect";
         public const string Dll = "AegisDesk.PptReader.dll";
+        public const string EventsDll = "AegisDesk.PptReader.Events.dll";
+        public static readonly string[] InstalledFiles = { Dll, EventsDll };
+        public static readonly string[] PayloadFiles = { Dll, EventsDll, "PptReaderSetup.exe" };
         public const string MutexName = @"Global\AegisDesk.PptReader.Machine.v1";
         // Shipping automatic preparation requires the actual Windows prototype.
         // This cannot be enabled via the caller's manifest or user config.
@@ -69,22 +72,28 @@ namespace AegisDesk.PptSetup
         {
             try
             {
-                Dictionary<string, object> data = Read(Path.Combine(PayloadDirectory, "manifest.json"));
-                if (Convert.ToInt32(data["schema"]) != 1 || (string)data["reader_version"] != Version ||
+                string manifest = Path.Combine(PayloadDirectory, "manifest.json");
+                Machine.NoLinks(manifest);
+                Dictionary<string, object> data = Read(manifest);
+                if (!(data["schema"] is int) || (int)data["schema"] != 1 || (string)data["reader_version"] != Version ||
                     (string)data["auto_install_mode"] != AutoInstallMode ||
                     !(data["auto_install_enabled"] is bool) || (bool)data["auto_install_enabled"] != AutoInstallEnabled ||
                     !(data["auto_install_validated"] is bool) || (bool)data["auto_install_validated"] != AutoInstallValidated ||
                     !(data["auto_shutdown_enabled"] is bool) || (bool)data["auto_shutdown_enabled"] != AutoShutdownEnabled ||
                     !String.Equals((string)data["reader_iid"], ReaderIid, StringComparison.OrdinalIgnoreCase) ||
-                    Convert.ToInt32(data["protocol"]) != 3 || Convert.ToInt32(data["payload_schema"]) != 1 ||
+                    !(data["protocol"] is int) || (int)data["protocol"] != 3 || !(data["payload_schema"] is int) || (int)data["payload_schema"] != 2 ||
                     (string)data["reader_class"] != ReaderClass || (string)data["prog_id"] != ProgId ||
                     !String.Equals((string)data["reader_clsid"], ClassId.Trim('{', '}'), StringComparison.OrdinalIgnoreCase)) return false;
                 Dictionary<string, object> files = (Dictionary<string, object>)data["files"];
-                foreach (string name in new[] { Dll, "PptReaderSetup.exe" })
+                Dictionary<string, object> versions = (Dictionary<string, object>)data["assembly_versions"];
+                if (files.Count != PayloadFiles.Length || versions.Count != PayloadFiles.Length) return false;
+                foreach (string name in PayloadFiles)
                 {
                     string path = Path.Combine(PayloadDirectory, name);
                     Machine.NoLinks(path);
-                    if (Hash(path) != (string)files[name] || AssemblyName.GetAssemblyName(path).Version.ToString() != Version) return false;
+                    AssemblyName identity = AssemblyName.GetAssemblyName(path);
+                    if ((string)versions[name] != Version || Hash(path) != (string)files[name] || identity.Version.ToString() != Version ||
+                        identity.Name != Path.GetFileNameWithoutExtension(name)) return false;
                 }
                 AssemblyName assembly = AssemblyName.GetAssemblyName(Path.Combine(PayloadDirectory, Dll));
                 return assembly.Name == "AegisDesk.PptReader";

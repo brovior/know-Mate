@@ -103,9 +103,11 @@ def launch_and_bind(win32com: Any, bitness: int) -> tuple[Any, tuple[int, Any], 
     try:
         path = trusted_powerpoint_path(bitness)
     except (OSError, ValueError, ImportError):
+        logger.info("[ppt] launch decision: path=dispatch reason=untrusted_path")
         return None  # no process call was started; ordinary read-only dispatch remains valid
     baseline, _ = guard.prepare_powerpoint_dispatch()
     if baseline:
+        logger.info("[ppt] launch decision: path=dispatch reason=existing_host")
         return None  # an existing read proof never acquires direct-launch authority
     with _lock:
         if _ticket is not None:
@@ -122,6 +124,7 @@ def launch_and_bind(win32com: Any, bitness: int) -> tuple[Any, tuple[int, Any], 
             started_call = True
             launched = LaunchedPowerPoint(path)
         except PptLaunchNotStarted:
+            logger.info("[ppt] launch decision: path=dispatch reason=create_not_started")
             _set_ticket(ticket, state="launch_failed")
             with _lock:
                 if _ticket is not None and _ticket.generation == ticket.generation:
@@ -143,11 +146,24 @@ def launch_and_bind(win32com: Any, bitness: int) -> tuple[Any, tuple[int, Any], 
         with guard._ownership_window(_EXE, app) as read_hwnd:
             def exact_hwnd() -> int | None:
                 hwnd = read_hwnd()
-                if guard._pid_from_hwnd(hwnd) != ticket.pid:
+                bound_pid = guard._pid_from_hwnd(hwnd)
+                if bound_pid != ticket.pid:
+                    logger.info("[ppt] launch ownership: reason=%s expected_pid=%s observed_pid=%s",
+                                "hwnd_missing" if hwnd is None else "pid_mismatch", ticket.pid, bound_pid)
                     return None
                 procs = guard._enumerate_processes()
-                if (procs is None or guard._pids_for(_EXE, procs) != {ticket.pid}
-                        or guard._process_creation_identity(ticket.pid) != ticket.identity):
+                if procs is None:
+                    logger.info("[ppt] launch ownership: reason=process_enumeration_unavailable expected_pid=%s", ticket.pid)
+                    return None
+                live_pids = guard._pids_for(_EXE, procs)
+                if live_pids != {ticket.pid}:
+                    logger.info("[ppt] launch ownership: reason=process_set_mismatch expected_pid=%s expected_present=%s",
+                                ticket.pid, ticket.pid in live_pids)
+                    return None
+                identity = guard._process_creation_identity(ticket.pid)
+                if identity != ticket.identity:
+                    logger.info("[ppt] launch ownership: reason=identity_mismatch expected_pid=%s identity_available=%s",
+                                ticket.pid, identity is not None)
                     return None
                 return hwnd
             proof = guard._register_owned_window(_EXE, set(), exact_hwnd, {})
@@ -157,6 +173,8 @@ def launch_and_bind(win32com: Any, bitness: int) -> tuple[Any, tuple[int, Any], 
         ready = _set_ticket(ticket, state="ready", proof_generation=proof[1].generation)
         if ready is None:
             raise guard.OfficeCleanupPendingError(_EXE, "launch_ticket_changed")
+        logger.info("[ppt] launch decision: path=direct reason=ready pid=%d generation=%d owner_thread=%d",
+                    ready.pid, ready.generation, ready.owner_thread)
         return app, proof, ready
     except BaseException:
         with _lock:
@@ -194,17 +212,23 @@ def abandon(ticket: LaunchTicket | None) -> None:
 def request_quit(app: Any, proof: Any, ticket: LaunchTicket | None, cache: Any,
                  poisoned: bool = False) -> tuple[str, dict[int, Any]]:
     """Request one host-guarded Quit; return an OS-only observation snapshot."""
+    global _ticket
     from knowmate.secure import office_guard as guard
     from knowmate.secure.ppt_addin_reader import PptAddinUnavailable, select_service
     from knowmate.secure.ppt_installation import MachineReadGuard
     from knowmate.secure.ppt_policy import auto_shutdown_enabled
     if not _exact_origin(ticket, proof):
+        logger.info(
+            "[ppt] quit decision: reason=origin_mismatch ticket_present=%s proof_present=%s",
+            ticket is not None, proof is not None,
+        )
         return "not_supported", {}
     pid, record = proof
     if poisoned:
         abandon(ticket)
         return "pending", {pid: record}
     if not auto_shutdown_enabled():
+        logger.info("[ppt] quit decision: reason=policy_disabled")
         abandon(ticket)
         return "not_supported", {}
     processes = guard._enumerate_processes()
@@ -225,9 +249,9 @@ def request_quit(app: Any, proof: Any, ticket: LaunchTicket | None, cache: Any,
             try:
                 service = select_service(app, cache)
             except PptAddinUnavailable:
+                logger.info("[ppt] quit decision: reason=service_unavailable")
                 guard._remove_owned_if_matches(pid, record)
                 with _lock:
-                    global _ticket
                     if _ticket is ticket:
                         _ticket = None
                 return "not_supported", {}
@@ -241,10 +265,15 @@ def request_quit(app: Any, proof: Any, ticket: LaunchTicket | None, cache: Any,
                 return "pending", {pid: record}
             snapshot = {pid: snapshot_record}
             try:
+                logger.info("[ppt] quit decision: reason=service_call pid=%d generation=%d", pid, ticket.generation)
                 status = service.TryQuitIfIdle()
             except Exception as exc:  # noqa: BLE001 -- opaque COM/OS failures remain pending
                 logger.warning("[ppt] 정상 종료 RPC 결과 불명: error_type=%s", type(exc).__name__)
                 return "pending", snapshot
+            logger.info("[ppt] quit decision: reason=service_return status=%s",
+                        status if isinstance(status, str) and status in {
+                            "protected", "not_supported", "failed", "quit_requested"
+                        } else "unknown")
             if status in {"protected", "not_supported", "failed"}:
                 # Protected includes a safely cancelled Quit. Yield this host to
                 # the user; the OS busy guard protects it thereafter.

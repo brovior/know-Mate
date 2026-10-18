@@ -256,13 +256,18 @@ def test_dispatch_retries_ownership_on_same_app_and_baseline(monkeypatch):
 
     def register(exe, baseline, candidate, expected_owned=None):
         probes.append((baseline, candidate))
-        return len(probes) == 2
+        return (20, office_guard.OwnedOfficeProcess(exe, 2020, False, 1)) if len(probes) == 2 else None
 
     monkeypatch.setattr(office_guard, "register_owned_app", register)
+    monkeypatch.setattr(office_guard, "_register_owned_app_record", register)
+    admitted = []
+    monkeypatch.setattr(office_guard, "assert_registered_app_admitted", lambda *args: admitted.append(args))
     client = SimpleNamespace(Dispatch=lambda prog_id: dispatched.append(prog_id) or app)
     assert com_reader._dispatch_and_own(client, "PowerPoint.Application", "POWERPNT.EXE") is app
     assert dispatched == ["PowerPoint.Application"]
     assert probes == [({10}, app), ({10}, app)]
+    if sys.platform == "win32":
+        assert admitted == [("POWERPNT.EXE", 20, office_guard.OwnedOfficeProcess("POWERPNT.EXE", 2020, False, 1))]
 
 
 def test_register_owned_app_rejects_existing_or_wrong_exe_pid(monkeypatch):
@@ -351,6 +356,10 @@ def test_word_excel_use_dispatchex_and_ppt_uses_dispatch(monkeypatch):
     monkeypatch.setattr("knowmate.secure.office_resiliency.clear_resiliency_markers", lambda exe: None)
     monkeypatch.setattr(office_guard, "office_pids_live", lambda exe: set())
     monkeypatch.setattr(office_guard, "register_owned_app", lambda exe, baseline, app, expected_owned=None: True)
+    monkeypatch.setattr(office_guard, "prepare_powerpoint_dispatch", lambda: (set(), {}))
+    monkeypatch.setattr(office_guard, "_register_owned_app_record",
+                        lambda exe, *args: (20, office_guard.OwnedOfficeProcess(exe, 2020, exe != "POWERPNT.EXE", 1)))
+    monkeypatch.setattr(office_guard, "assert_registered_app_admitted", lambda *args: None)
     calls = []
 
     class _Client:

@@ -581,13 +581,48 @@ def _get_excel_app() -> Any:
     return _get_word_excel_app("excel", "EXCEL.EXE", "Excel.Application")
 
 
+def _ppt_lifecycle_trace_enabled() -> bool:
+    try:
+        import os
+        if os.environ.get("AEGIS_PPT_LIFECYCLE_TRACE") != "1":
+            return False
+        directory = os.environ.get("AEGIS_PPT_LIFECYCLE_DIR", "")
+        # Import-time convenience gate for the app logger, not the native writer's
+        # held-handle/NTFS security boundary. Never create or fall back to a profile.
+        if (len(directory) < 3 or directory[0] not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+                or directory[1:3] != ":\\"
+                or any(ord(char) < 32 or char in '<>"|?*:' for char in directory[2:])):
+            return False
+        return os.path.isdir(directory)
+    except Exception:
+        return False
+
+
+_PPT_LIFECYCLE_TRACE_ENABLED = _ppt_lifecycle_trace_enabled()
+
+
+def _trace_ppt_cache_slots(stage: str) -> None:
+    """Record local slot presence only; never inspect COM objects or claim destruction."""
+    if not _PPT_LIFECYCLE_TRACE_ENABLED:
+        return
+    try:
+        names = ("ppt", "ppt_proof", "ppt_service", "ppt_launch_ticket", "ppt_launch_ready")
+        mask = sum(1 << i for i, name in enumerate(names) if getattr(_tls, name, None) is not None)
+        logger.info("[ppt-lifecycle] stage=%s thread=%d slots_present_mask=%d",
+                    stage, threading.get_ident(), mask)
+    except Exception:
+        pass  # Diagnostic failure must not interrupt reference clearing.
+
+
 def _release_ppt_references(*, poisoned: bool = False) -> None:
     """Release worker-owned PPT references without creating any further RPC."""
     from knowmate.secure.ppt_shutdown import abandon
+    _trace_ppt_cache_slots("cache_clear_before")
     if poisoned:
         abandon(getattr(_tls, "ppt_launch_ticket", None))
     for name in ("ppt", "ppt_proof", "ppt_service", "ppt_launch_ticket", "ppt_launch_ready"):
         setattr(_tls, name, None)
+    _trace_ppt_cache_slots("cache_clear_after")
 
 
 def _get_ppt_app() -> Any:
@@ -610,6 +645,7 @@ def _get_ppt_app() -> Any:
     _ensure_com_initialized()
     client = _require_win32com()
     prepared = getattr(_tls, "ppt_launch_ready", None)
+    logger.info("[ppt] launch preparation: prepared=%s", prepared is not None)
     launched = ppt_shutdown.launch_and_bind(client, prepared[0].office_bitness) if prepared is not None else None
     if launched is None:
         dispatched = _dispatch_owned_app(client, "PowerPoint.Application", "POWERPNT.EXE")
@@ -984,12 +1020,17 @@ class PowerPointComReader:
             raise PptPreparationPending("preparation_pending")
         from knowmate.secure.ppt_policy import auto_shutdown_enabled
         _tls.ppt_launch_ready = None
-        if (auto_shutdown_enabled() and self.policy == "ready"
+        shutdown_enabled = auto_shutdown_enabled()
+        logger.info("[ppt] launch preparation: shutdown_enabled=%s policy_ready=%s app_cached=%s",
+                    shutdown_enabled, self.policy == "ready", getattr(_tls, "ppt", None) is not None)
+        if (shutdown_enabled and self.policy == "ready"
                 and getattr(_tls, "ppt", None) is None):
             from knowmate.secure.ppt_installation import check_installation
             from knowmate.secure.ppt_launch import installation_stamp
             before = installation_stamp()
             preparation = check_installation()  # helper uses the same machine mutex
+            logger.info("[ppt] launch preparation: stamp_present=%s installation_ready=%s",
+                        before is not None, preparation.status == "ready")
             if before is not None and preparation.status == "ready":
                 _tls.ppt_launch_ready = (preparation, before)
         timer = com_stage.StageTimer(path)
@@ -1005,8 +1046,11 @@ class PowerPointComReader:
                 if getattr(_tls, "ppt_launch_ready", None) is not None:
                     from knowmate.secure.ppt_installation import _validate_helper, setup_helper_path
                     from knowmate.secure.ppt_launch import installation_stamp
-                    if (not _validate_helper(setup_helper_path())
-                            or installation_stamp() != _tls.ppt_launch_ready[1]):
+                    helper_valid = _validate_helper(setup_helper_path())
+                    stamp_matches = helper_valid and installation_stamp() == _tls.ppt_launch_ready[1]
+                    logger.info("[ppt] launch preparation: helper_valid=%s stamp_matches=%s",
+                                helper_valid, stamp_matches)
+                    if not stamp_matches:
                         _tls.ppt_launch_ready = None
                 try:
                     self._check("dispatch")

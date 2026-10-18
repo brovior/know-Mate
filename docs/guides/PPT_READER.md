@@ -1,6 +1,12 @@
 # 운영 PPT Reader 개발 검증
 
-현재 요구 버전은 **1.0.4.0**이다. 기본 빌드는 자동 설치를 끈 `disabled`이며,
+다른 PC의 미완성 진단 소스 검토는 [checkpoint 이전 안내](PPT_CHECKPOINT_HANDOFF.md)를 먼저 따른다.
+아래 1.0.5.0 후보 안내는 현재 PC의 설치 버전을 뜻하지 않으며 설치 실행 승인이 아니다.
+
+현재 소스의 요구 버전은 **1.0.5.0**이다. 선택적 Events DLL 통합 후보이므로
+[오프라인 통합·복구 조건](../design/PPT_EVENT_ADAPTER.md)을 먼저 확인한다.
+실제 설치·Office 검증 승인이 나기 전에는 아래 설치 절차를 실행하지 않는다.
+기존 1.0.4.0 설치본은 그대로 유지한다. 기본 빌드는 자동 설치를 끈 `disabled`이며,
 개발 빌드의 `candidate`/`released`에서 앱 시작부터 자동 설치를 실행한다.
 시험 DLL의 내용 일치/속도 결과를 운영 DLL·자동 설치의 성공으로 간주하지 않는다.
 아래 명령은 Windows 개발 PC에서 실행한다. 문서 원문은 로그/파일로 기록하지 않는다.
@@ -299,3 +305,15 @@ Linux fake·C# 순수 하네스는 위 Windows/UAC/Office 시험을 대체하지
 기록하지 않으며 빌드 해시·Office 비트수/버전·PID·종료 상태·시험 결과만 남긴다.
 전체 fake 테스트 통과는 위 Windows·Office 시험 완료를 뜻하지 않는다. 정상종료의 배포 활성화는
 이 시험 결과를 확인한 별도 변경이며 현재 released 빌드는 자동종료를 제공하지 않는다.
+
+
+### 외부 종료 bootstrap 진단 빌드
+
+`build.ps1 -ExternalDiagnostic`는 명시적 시험 전용 옵션이며 기본값은 비활성이다. 이 옵션은
+기존 deferred 진단과 외부 bootstrap IDispatch를 함께 컴파일한다. 기본 빌드의 dual IID와
+정상 종료 경로는 유지한다. `AEGIS_PPT_EXTERNAL_DIAGNOSTIC=1`만으로 기본 빌드를 활성화할 수 없다.
+진단 빌드도 nonce/PID 생성 시각/MAINSTA/창 소유 스레드, native capability 및 COM identity
+검증을 거쳐야 한다. 프로세스 환경 fence는 협력적 재시도 차단이며 보안 경계가 아니다.
+오류 기록은 최근 16개 작업까지만 보존하고, mutable fault hook은 시험 define에서만 존재한다.
+시험은 합성 host와 실제 COM/native handle을 사용하며 Office 설치·DRM·다른 계정·UAC 검증을
+대체하지 않는다. cleanup 오류 주입은 실제 OS CloseHandle 실패를 검증한 것이 아니다.

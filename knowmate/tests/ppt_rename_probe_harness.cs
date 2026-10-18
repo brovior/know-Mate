@@ -224,14 +224,14 @@ internal static class RenameProbeHarness
     {
         Console.WriteLine("PPT_RENAME_ARCH bits=" + (IntPtr.Size * 8));
         string anchor = null, originalCwd = Environment.CurrentDirectory;
-        int result = 0;
+        int result = 0; bool unconfirmedCreation = false;
         try
         {
             Stage("preflight");
             RenameProbeNative.Require(args.Length == 3, "argument_count");
             string mode = args[1];
             RenameProbeNative.Require(mode == "managed-create" || mode == "managed-replace" || mode == "native-create"
-                || mode == "native-replace" || mode == "native-collision", "mode_invalid");
+                || mode == "native-replace" || mode == "native-collision" || mode == "fixture-readback-failure", "mode_invalid");
             int count;
             RenameProbeNative.Require(Int32.TryParse(args[2], out count) && count >= 0 && count <= 2, "lease_count_invalid");
             using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
@@ -251,7 +251,9 @@ internal static class RenameProbeHarness
             if (drive.DriveType != DriveType.Fixed || drive.DriveFormat != "NTFS")
             { Console.WriteLine("PPT_RENAME_RESULT SKIP reason=nonlocal_ntfs"); return 77; }
             Machine.NoLinks(Path.GetDirectoryName(candidate));
-            Stage("fixture_create"); Directory.CreateDirectory(candidate); anchor = candidate;
+            Stage("fixture_create"); PptFixtureAcl.Create(candidate); unconfirmedCreation = true;
+            PptFixtureAcl.Verify(candidate, mode == "fixture-readback-failure");
+            anchor = candidate; unconfirmedCreation = false;
             Run(anchor, mode, count);
         }
         catch (Exception error) { Error(error); result = 1; }
@@ -261,6 +263,11 @@ internal static class RenameProbeHarness
             try
             {
                 Environment.CurrentDirectory = originalCwd;
+                if (unconfirmedCreation)
+                {
+                    Console.WriteLine("PPT_RENAME_CLEANUP result=INCOMPLETE code=cleanup_identity_missing");
+                    result = 1;
+                }
                 if (anchor != null)
                 {
                     Stage("cleanup");

@@ -33,7 +33,7 @@ def create_manifest(payload_dir: Path, build_info_dir: Path) -> dict[str, object
     if (build_info_dir / "PptBuildPolicy.cs").read_text(encoding="utf-8") != expected_policy:
         raise ValueError("ppt_build_policy_changed")
     manifest: dict[str, object] = {
-        "schema": 1, "reader_version": REQUIRED_VERSION, "protocol": 3, "payload_schema": 1,
+        "schema": 1, "reader_version": REQUIRED_VERSION, "protocol": 3, "payload_schema": 2,
         "prog_id": "AegisDesk.PptReader", "reader_class": "AegisDesk.PptReader.Connect",
         "reader_clsid": "287A80D2-804A-46D3-A0E9-CA31C6FC3D09",
         "reader_iid": "9A20F4A6-6364-4BA7-930B-3E8857BEAF60",

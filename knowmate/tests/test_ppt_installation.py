@@ -18,7 +18,7 @@ from knowmate.secure import ppt_installation as installation
 
 def result_json(**changes):
     value = dict(schema=1, operation="check", status="ready", reason="registration_ok",
-                 required_version="1.0.4.0", installed_version="1.0.4.0", office_bitness=64,
+                 required_version="1.0.5.0", installed_version="1.0.5.0", office_bitness=64,
                  scope="Machine", machine_safe=True, auto_install_validated=False, auto_install_mode="disabled")
     value.update(changes)
     return json.dumps(value)
@@ -26,7 +26,7 @@ def result_json(**changes):
 
 def reservation(**changes):
     value = dict(schema=1, request_id="33e979c6-c5c4-40af-845a-64c80517d1ae",
-                 required_version="1.0.4.0", helper_sid="S-1-5-21-1-2-3-1001", helper_pid=123,
+                 required_version="1.0.5.0", helper_sid="S-1-5-21-1-2-3-1001", helper_pid=123,
                  helper_creation_ticks="638901000000000000", child_pid=None,
                  child_creation_ticks=None, state="complete")
     value.update(changes)
@@ -204,7 +204,12 @@ def test_pending_and_corrupt_records_never_expire(monkeypatch, tmp_path, kind):
     elif kind == "symlink":
         target = tmp_path / "target.json"
         target.write_text(json.dumps(reservation()))
-        record.symlink_to(target)
+        try:
+            record.symlink_to(target)
+        except OSError as error:
+            if getattr(error, "winerror", None) != 1314:
+                raise
+            pytest.skip("Required symlink rejection gate unexecuted: fixture privilege missing (WinError 1314)")
     elif kind == "corrupt":
         record.write_text(json.dumps({"schema": 1, "state": "complete"}))
     else:
@@ -553,7 +558,7 @@ def test_setup_csharp_contract_without_installation(tmp_path, mode):
                  "/reference:System.Core.dll", "/reference:System.Web.Extensions.dll", "/reference:System.Security.dll",
                  *(str(path) for path in sources)], [str(executable), str(tmp_path)]]
     for command in commands:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=30,
+        result = subprocess.run(command, capture_output=True, text=True, encoding="ascii", errors="replace", timeout=30,
                                 creationflags=subprocess.CREATE_NO_WINDOW)
         assert result.returncode == 0, result.stdout + result.stderr
 

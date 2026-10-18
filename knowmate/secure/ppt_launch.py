@@ -144,7 +144,8 @@ def installation_stamp() -> tuple[Any, ...] | None:
                 state.append(None)
                 continue
             dll = record.parent / REQUIRED_VERSION / "AegisDesk.PptReader.dll"
-            for part in (record, dll, *dll.parents):
+            events = dll.with_name("AegisDesk.PptReader.Events.dll")
+            for part in (record, dll, events, *dll.parents):
                 if part.is_symlink() or getattr(part.stat(), "st_file_attributes", 0) & 0x400:
                     raise ValueError("installation_link")
             if record.stat().st_size > 16384:
@@ -152,9 +153,12 @@ def installation_stamp() -> tuple[Any, ...] | None:
             contents = record.read_bytes()
             metadata = json.loads(contents)
             digest = hashlib.sha256(dll.read_bytes()).hexdigest()
-            if metadata.get("version") != REQUIRED_VERSION or metadata.get("sha256") != digest:
+            event_digest = hashlib.sha256(events.read_bytes()).hexdigest()
+            if (type(metadata.get("schema")) is not int or metadata["schema"] != 2
+                    or metadata.get("version") != REQUIRED_VERSION or metadata.get("sha256") != digest
+                    or metadata.get("files") != {dll.name: digest, events.name: event_digest}):
                 raise ValueError("installation_hash")
-            state.append((contents, digest))
+            state.append((contents, digest, event_digest))
         return tuple(state)
     except (OSError, ValueError, TypeError, KeyError):
         return None

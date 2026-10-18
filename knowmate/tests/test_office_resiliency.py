@@ -213,12 +213,14 @@ class TestComReaderWiring:
 
         app = object()
 
-        def register(exe, baseline, candidate):
+        def register(exe, baseline, candidate, expected_owned=None):
             assert exe == "EXCEL.EXE" and baseline == set() and candidate is app
             order.append(f"register:{exe}")
-            return True
+            return (20, og.OwnedOfficeProcess(exe, 2020, True, 1))
 
         monkeypatch.setattr(og, "register_owned_app", register)
+        monkeypatch.setattr(og, "_register_owned_app_record", register)
+        monkeypatch.setattr(og, "assert_registered_app_admitted", lambda *args: None)
 
         class _FakeWin32Com:
             def Dispatch(self, prog_id):
