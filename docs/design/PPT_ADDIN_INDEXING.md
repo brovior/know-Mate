@@ -38,7 +38,7 @@ PowerPoint가 열려 있으면 설치를 미루고 기존 방식으로 읽는다
 | 항목 | 결정 |
 |---|---|
 | 운영 추가 기능 | 표시 이름 `Aegis Desk PPT Reader`, ProgID `AegisDesk.PptReader` |
-| DLL | `AegisDesk.PptReader.dll`, 현재 요구 버전 `1.0.4.0` |
+| DLL | `AegisDesk.PptReader.dll`, 현재 요구 버전 `1.0.5.0` |
 | COM 계약 | 경로·슬라이드 번호 전달 규약 3, 추출 결과 JSON 스키마 1 |
 | 식별자 | 시험용과 다른 운영 CLSID·추출 인터페이스 IID를 구현 시 고정. Office 연결 IID는 기존 규약 유지 |
 | 설치 위치 | `%ProgramFiles%/AegisDesk/PptReader/<version>/`의 보호된 고정 경로 |
@@ -418,7 +418,7 @@ HKCU 충돌이나 시험용 등록을 함께 제거하지 않는다. 설치 기�
 
 ### 8-5. 운영 읽기 성공 조건
 
-운영 서비스는 `ProtocolVersion()=3`, `ReaderVersion()=1.0.4.0`, JSON schema 1을 최초에 확인한다.
+운영 서비스는 `ProtocolVersion()=3`, `ReaderVersion()=1.0.5.0`, JSON schema 1을 최초에 확인한다.
 첫 릴리스는 요구 운영 버전과 정확히 일치할 때만 선택한다. 향후 호환 범위를 넓히는 것은 별도 변경이다.
 경로는 원본을 연 Python의 절대 경로와 host Presentations의 FullName을 비교한다.
 UNC·대소문자·중복·상대경로는 기존 하네스 계약을 유지하고 경로 alias는 추측해서 동일시하지 않는다.
@@ -565,5 +565,8 @@ QThread의 MTA에서만 사용하며 UI·타이머·OS 종료 helper로 넘기�
 타임아웃만으로 취소됐다고 간주하지 않는다. 앱의 제한된 종료는 PowerPoint 강제종료를 허용하지 않는다.
 
 기존 dual 인터페이스는 유지하고 새 기본 인터페이스로 lifecycle을 노출한다. 요구 버전은
-reader/setup 모두 1.0.4.0, protocol 3이며 추출 JSON schema 1·청크·인덱스 형식은 바꾸지 않는다.
+reader/Events/setup 모두 1.0.5.0, protocol 3이며 추출 JSON schema 1·청크·인덱스 형식은 바꾸지 않는다.
 사전 검증과 사용자 문서 보호 시험은 [운영 검증 절차](../guides/PPT_READER.md#powerpoint-자동종료-후보-검증)를 따른다.
+
+
+선택적 이벤트 DLL의 로딩·패키지·복구 계약은 [PPT 이벤트 어댑터](PPT_EVENT_ADAPTER.md)를 따른다.

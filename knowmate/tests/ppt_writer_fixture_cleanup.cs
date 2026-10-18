@@ -12,9 +12,10 @@ internal sealed class WriterFixtureRoot
     internal static string Stage = "cleanup_validate";
     internal static bool UnconfirmedCreation;
     private WriterFixtureRoot(string path, string id) { PathName = path; Id = id; }
-    internal static WriterFixtureRoot Create(string path, bool emit)
+    internal static WriterFixtureRoot Create(string path, bool emit, bool failReadback = false)
     {
-        ValidatePath(path); WriterFixtureNative.NewDirectory(path); UnconfirmedCreation = true;
+        ValidatePath(path); PptFixtureAcl.Create(path); UnconfirmedCreation = true;
+        PptFixtureAcl.Verify(path, failReadback);
         using (SafeFileHandle handle = WriterFixtureNative.Pin(path))
         {
             var info = WriterFixtureNative.Inspect(handle);

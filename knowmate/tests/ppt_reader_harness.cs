@@ -56,22 +56,13 @@ public sealed class ReaderConnectionPoint : IConnectionPoint
 }
 public static class ReaderHarness
 {
-    [StructLayout(LayoutKind.Sequential)]
-    private struct DispatchParameters
-    {
-        public IntPtr Arguments, Named;
-        public uint Count, NamedCount;
-    }
-    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
-    private delegate int InvokeEvent(IntPtr self, int id, ref Guid iid, uint locale, ushort flags,
-        ref DispatchParameters parameters, IntPtr result, IntPtr exception, IntPtr argumentError);
-
     private static Type guardType;
     private static object Guard(ReaderHost host, ReaderConnectionPoint point)
     {
         Func<object, IConnectionPoint> resolver = delegate(object ignored) { return point; };
         return Activator.CreateInstance(guardType, BindingFlags.Instance | BindingFlags.NonPublic,
-            null, new object[] { host, Thread.CurrentThread.ManagedThreadId, resolver }, null);
+            null, new object[] { host, Thread.CurrentThread.ManagedThreadId, resolver,
+                new Func<AegisDesk.PptReader.PptShutdownState, object>(state => new ManagedSink(state)) }, null);
     }
     private static string Request(object guard, bool reading)
     {
@@ -79,12 +70,22 @@ public static class ReaderHarness
             .Invoke(guard, new object[] { reading });
     }
     private static void Expect(bool condition, string code) { if (!condition) throw new Exception(code); }
+    private static void ExpectUnknown(object guard, string message)
+    {
+        try { Request(guard, false); throw new Exception("unknown_hidden"); }
+        catch (TargetInvocationException exc)
+        {
+            var com = exc.InnerException as COMException;
+            Expect(com != null && com.ErrorCode == unchecked((int)0x80004005)
+                && com.Message == message, "unknown_contract");
+        }
+    }
 
     [STAThread]
     public static int Main(string[] args)
     {
         Assembly assembly = Assembly.LoadFrom(args[0]);
-        Expect(assembly.GetName().Version.ToString() == "1.0.4.0", "version_mismatch");
+        Expect(assembly.GetName().Version.ToString() == "1.0.5.0", "version_mismatch");
         Type type = assembly.GetType("AegisDesk.PptReader.Connect", true);
         Expect(type.GUID == new Guid("287A80D2-804A-46D3-A0E9-CA31C6FC3D09"), "clsid_mismatch");
         Expect(((ProgIdAttribute)Attribute.GetCustomAttribute(type, typeof(ProgIdAttribute))).Value == "AegisDesk.PptReader", "progid_mismatch");
@@ -109,60 +110,18 @@ public static class ReaderHarness
         type.GetMethod("OnConnection").Invoke(instance, new object[] { new ReaderHost(), 1, addin, null });
         Expect(Object.ReferenceEquals(instance, addin.Object)
             && (int)type.GetMethod("ProtocolVersion").Invoke(instance, null) == 3
-            && (string)type.GetMethod("ReaderVersion").Invoke(instance, null) == "1.0.4.0", "production_connection_mismatch");
+            && (string)type.GetMethod("ReaderVersion").Invoke(instance, null) == "1.0.5.0", "production_connection_mismatch");
         // A fake host has no native typelib: it must never reach Quit even in candidate builds.
         Expect((string)type.GetMethod("TryQuitIfIdle").Invoke(instance, null) == "not_supported", "unverified_host_accepted");
         type.GetMethod("OnDisconnection").Invoke(instance, new object[] { 1, null });
         guardType = assembly.GetType("AegisDesk.PptReader.PptShutdownGuard", true);
         TestGuard();
-        if (Environment.OSVersion.Platform == PlatformID.Win32NT) TestNativeEventSink(assembly);
+        foreach (AssemblyName reference in assembly.GetReferencedAssemblies())
+            Expect(reference.Name != "office" && reference.Name != "Microsoft.Office.Interop.PowerPoint"
+                && reference.Name != "AegisDesk.PptReader.Events", "core_optional_dependency");
+        // The real PIA sink is covered by run_product.py on x86 and x64.
         Console.WriteLine("PASS production ABI/version/managed guard; native Office not verified");
         return 0;
-    }
-
-    private static void TestNativeEventSink(Assembly assembly)
-    {
-        Type sinkType = assembly.GetType("AegisDesk.PptReader.PptCloseEventSink", true);
-        Type events = assembly.GetType("AegisDesk.PptReader.IPptCloseEvents", true);
-        Expect(events.GUID == new Guid("914934C2-5A91-11CF-8700-00AA0060263B"), "events_iid");
-        object sink = Activator.CreateInstance(sinkType, true);
-        FieldInfo active = sinkType.GetField("Active", BindingFlags.Instance | BindingFlags.NonPublic);
-        IntPtr pointer = Marshal.GetComInterfaceForObject(sink, events);
-        try
-        {
-            IntPtr table = Marshal.ReadIntPtr(pointer);
-            var invoke = (InvokeEvent)Marshal.GetDelegateForFunctionPointer(Marshal.ReadIntPtr(table, 6 * IntPtr.Size), typeof(InvokeEvent));
-            foreach (int id in new int[] { 2025, 2028 })
-            foreach (bool enabled in new bool[] { false, true })
-            foreach (bool initial in new bool[] { false, true })
-            {
-                active.SetValue(sink, enabled);
-                int count = id == 2025 ? 2 : 3;
-                int variantSize = IntPtr.Size == 8 ? 24 : 16;
-                IntPtr arguments = Marshal.AllocCoTaskMem(variantSize * count);
-                IntPtr cancel = Marshal.AllocCoTaskMem(2);
-                try
-                {
-                    for (int i = 0; i < variantSize * count; i++) Marshal.WriteByte(arguments, i, 0);
-                    Marshal.WriteInt16(cancel, initial ? (short)-1 : (short)0);
-                    // IDispatch reverses argument order: Cancel, reason?, document.
-                    Marshal.WriteInt16(arguments, (short)(0x4000 | 11)); // VT_BYREF|VT_BOOL
-                    Marshal.WriteIntPtr(arguments, 8, cancel);
-                    if (id == 2028)
-                    {
-                        Marshal.WriteInt16(arguments, variantSize, (short)3); // VT_I4
-                        Marshal.WriteInt32(arguments, variantSize + 8, 0);
-                    }
-                    Marshal.WriteInt16(arguments, variantSize * (count - 1), (short)9); // VT_DISPATCH null
-                    var parameters = new DispatchParameters { Arguments = arguments, Count = (uint)count };
-                    Guid empty = Guid.Empty;
-                    int result = invoke(pointer, id, ref empty, 0, 1, ref parameters, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
-                    Expect(result == 0 && (Marshal.ReadInt16(cancel) != 0) == (enabled || initial), "native_cancel_marshalling_" + id);
-                }
-                finally { Marshal.FreeCoTaskMem(cancel); Marshal.FreeCoTaskMem(arguments); }
-            }
-        }
-        finally { Marshal.Release(pointer); GC.KeepAlive(sink); }
     }
 
     private static void TestGuard()
@@ -200,7 +159,10 @@ public static class ReaderHarness
         }
         {
             var host = new ReaderHost(); var point = new ReaderConnectionPoint { FailAdvise = true };
-            Expect(Request(Guard(host, point), false) == "not_supported" && host.QuitCount == 0, "advise_failure_quit");
+            object guard = Guard(host, point);
+            ExpectUnknown(guard, "ppt_shutdown_outcome_unknown");
+            Expect(host.QuitCount == 0 && point.Unadvised == 0
+                && Request(guard, false) == "not_supported", "advise_failure_quit");
         }
         {
             var host = new ReaderHost { FailAlerts = true }; var point = new ReaderConnectionPoint();
@@ -224,7 +186,8 @@ public static class ReaderHarness
         {
             var host = new ReaderHost(); var point = new ReaderConnectionPoint { FailUnadvise = true };
             object guard = Guard(host, point);
-            Expect(Request(guard, false) == "quit_requested" && Request(guard, false) == "not_supported"
+            ExpectUnknown(guard, "ppt_quit_outcome_unknown");
+            Expect(Request(guard, false) == "not_supported" && host.QuitCount == 1 && point.Unadvised == 1
                 && !point.Cancel("PresentationBeforeClose", false), "unadvise_failure_guard_active");
         }
         {
@@ -234,7 +197,16 @@ public static class ReaderHarness
             catch (TargetInvocationException exc)
             { Expect(exc.InnerException is COMException && exc.InnerException.Message == "ppt_quit_outcome_unknown", "quit_exception_type"); }
             Expect(point.Unadvised == 0 && !point.Cancel("PresentationBeforeClose", false)
-                && Request(guard, false) == "protected" && host.QuitCount == 1, "failed_quit_retried");
+                && Request(guard, false) == "not_supported" && host.QuitCount == 1, "failed_quit_retried");
         }
     }
+}
+
+// PIA-free managed guard fixture. It makes no claim about the native event ABI.
+public sealed class ManagedSink
+{
+    private readonly AegisDesk.PptReader.PptShutdownState state;
+    public ManagedSink(AegisDesk.PptReader.PptShutdownState value) { state=value; }
+    public void PresentationBeforeClose(object value,ref bool cancel) { if(state.Active) { cancel=true; state.Cancelled=true; } }
+    public void ProtectedViewWindowBeforeClose(object value,int reason,ref bool cancel) { PresentationBeforeClose(value,ref cancel); }
 }

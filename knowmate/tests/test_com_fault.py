@@ -191,6 +191,7 @@ def test_scheduler_throwing_primary_attribute_recovers_and_releases_attempt_befo
     embed = EmbeddingClient(base_url="http://localhost", host_header="e", fake=True)
     indexer = Indexer(db_path=tmp_path / "db", embed_client=embed)
     worker = CollectorWorker(
+        get_idle_seconds=lambda: 0.0,
         config={"collector": {"watch_folders": [str(folder)], "idle_seconds": 60,
                               "com_restart_every_n_files": 1, "com_timeout_base_sec": 0},
                 "cleanup": {"dry_run": True, "max_delete_ratio": 0.3},

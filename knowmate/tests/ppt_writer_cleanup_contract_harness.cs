@@ -29,7 +29,7 @@ internal static class WriterCleanupContractHarness
     {
         try
         {
-            if (args.Length != 1) throw new RenameProbeNative.ProbeFailure("argument_count");
+            if (args.Length != 1 && !(args.Length == 2 && args[1] == "readback-failure")) throw new RenameProbeNative.ProbeFailure("argument_count");
             using (WindowsIdentity identity = WindowsIdentity.GetCurrent())
                 if (new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator)) return 77;
             var drive = new DriveInfo(Path.GetPathRoot(Path.GetFullPath(args[0])));
@@ -42,7 +42,7 @@ internal static class WriterCleanupContractHarness
         {
             string path = Path.Combine(args[0], "ppt-writer-" + Guid.NewGuid().ToString("N"));
             stage = "fixture_create";
-            root = WriterFixtureRoot.Create(path, true); rootPresent = true;
+            root = WriterFixtureRoot.Create(path, true, args.Length == 2); rootPresent = true;
             string file = Path.Combine(path, "sentinel.fixture"); File.WriteAllText(file, "sentinel");
             string id = WriterFixtureNative.Inspect(file).Id, security = WriterFixtureNative.Security(file);
             stage = "refusal_missing_id";

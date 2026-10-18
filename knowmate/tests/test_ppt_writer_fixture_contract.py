@@ -25,6 +25,18 @@ _CLEAN_FAIL = ("PPT_WRITER_CLEANUP result=FAIL stage=cleanup_delete error_type=W
                "code=exception winerror=5 ntstatus=none io_status=none\n")
 
 
+@pytest.mark.parametrize("missing", [None, "fixture_read", "fixture_write", "preservation_verify"])
+def test_link_rejection_requires_both_operations_and_preservation(monkeypatch, tmp_path, missing):
+    stages = ["fixture_read", "preservation_verify", "fixture_write", "preservation_verify"]
+    if missing:
+        stages.remove(missing)
+    output = _ARCH + _ID + "".join(f"PPT_WRITER_STAGE {stage} elapsed_ms=1\n" for stage in stages)
+    output += _EXPECT + _CLEAN + _END
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, output, ""))
+    command = ["fixture.exe", str(tmp_path / ("ppt-writer-" + uuid.uuid4().hex)), "reparse-directory", "1"]
+    assert _writer_run(command).result == ("PASS" if missing is None else "FAIL")
+
+
 def test_primary_and_cleanup_failures_preserve_independent_evidence():
     """Cleanup never replaces the body's native status or stage."""
     output = _ARCH + _ID + _PRIMARY + _CLEAN_FAIL + _END.replace("RESULT PASS", "RESULT FAIL")

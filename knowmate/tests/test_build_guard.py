@@ -139,13 +139,13 @@ def test_prepare_generates_matching_python_and_csharp_policy(monkeypatch, tmp_pa
     assert info["ppt_auto_install_mode"] == mode
     policy = (tmp_path / "PptBuildPolicy.cs").read_text()
     assert f'AutoInstallMode = "{mode}";' in policy
-    script = (REPO_ROOT / "scripts/ppt_reader/build.ps1").read_text()
+    script = (REPO_ROOT / "scripts/ppt_reader/build.ps1").read_text(encoding="utf-8-sig")
     assert "$policySource @setupSources" in script
     assert "$out = Join-Path $BuildInfoDir 'ppt_reader'" in script
 
 
 def test_candidate_build_output_isolated_from_other_profiles():
-    script = (REPO_ROOT / "scripts/build_impl.bat").read_text()
+    script = (REPO_ROOT / "scripts/build_impl.bat").read_text(encoding="utf-8")
     assert 'set "BUILD_DIST_DIR=dist\\!PPT_INSTALL_MODE!"' in script
     assert 'set "BUILD_WORK_DIR=build\\!PPT_INSTALL_MODE!"' in script
     assert 'if exist "dist" rmdir' not in script

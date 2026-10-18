@@ -241,7 +241,7 @@ def _cleanup_writer(command: list[str], outcome: _WriterOutcome, *, root_absent:
                        events=outcome.events + ("PPT_WRITER_FIXTURE_CLEANUP result=INCOMPLETE",))
     try:
         result = subprocess.run([command[0], command[1], "cleanup", command[3], *outcome.fixture_id], check=False,
-                                capture_output=True, text=True, timeout=30,
+                                capture_output=True, text=True, encoding="ascii", errors="replace", timeout=30,
                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         cleanup = _writer_outcome(result.stdout, result.returncode, cleanup_only=True)
         success = cleanup.result == "PASS"
@@ -264,7 +264,7 @@ def _writer_run(command: list[str], *, isolation: bool = False) -> _WriterOutcom
                    and re.fullmatch(r"ppt-writer-[a-f0-9]{32}", Path(command[1]).name) is not None
                    and not os.path.lexists(command[1]))
     try:
-        result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=30,
+        result = subprocess.run(command, check=False, capture_output=True, text=True, encoding="ascii", errors="replace", timeout=30,
                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except subprocess.TimeoutExpired as error:
         outcome = _writer_outcome(error.stdout, None, timed_out=True, isolation=isolation)
@@ -295,7 +295,14 @@ def _writer_run(command: list[str], *, isolation: bool = False) -> _WriterOutcom
         return _WriterOutcome("FAIL", "process_start", winerror=_os_code(error, "winerror"), errno=_os_code(error, "errno"),
                               primary_stage="process_start", primary_error_type="other", primary_code="exception",
                               primary_winerror=_os_code(error, "winerror"))
-    return _writer_outcome(result.stdout, result.returncode, isolation=isolation)
+    outcome = _writer_outcome(result.stdout, result.returncode, isolation=isolation)
+    if len(command) == 4 and command[2] in {"hardlink", "reparse", "reparse-directory"} and outcome.result == "PASS":
+        checks = [event.split()[1] for event in outcome.events
+                  if event.startswith("PPT_WRITER_STAGE ") and event.split()[1] in {
+                      "fixture_read", "fixture_write", "preservation_verify"}]
+        if checks != ["fixture_read", "preservation_verify", "fixture_write", "preservation_verify"]:
+            outcome = replace(outcome, result="FAIL", error_code="fixture_preservation")
+    return outcome
 
 
 def _collect_writer(executable: Path, tmp_path: Path) -> list[_WriterOutcome]:
@@ -327,6 +334,7 @@ def test_ppt_production_request_writer_matrix(tmp_path: Path) -> None:
     policy.write_text('namespace AegisDesk.PptSetup { internal static class BuildPolicy { '
                       'public const string AutoInstallMode = "candidate"; } }', encoding="utf-8")
     sources = [root / "scripts/ppt_reader/PptReaderSetup.cs",
+               root / "knowmate/tests/ppt_fixture_acl.cs",
                *sorted((root / "scripts/ppt_reader").glob("PptSetup*.cs")),
                root / "knowmate/tests/ppt_rename_probe_native.cs",
                root / "knowmate/tests/ppt_request_writer_harness.cs",
@@ -393,7 +401,7 @@ def test_writer_interruption_requires_complete_expected_target_json(monkeypatch,
     anchor = tmp_path / ("ppt-writer-" + uuid.uuid4().hex)
     child = anchor / "AegisDesk" / "PptReaderRequests"
     request_id = str(uuid.uuid4())
-    record = {"schema": 1, "request_id": request_id, "required_version": "1.0.4.0", "helper_sid": "S-1-5-21-1001",
+    record = {"schema": 1, "request_id": request_id, "required_version": "1.0.5.0", "helper_sid": "S-1-5-21-1001",
               "helper_pid": 123, "helper_creation_ticks": "123456", "child_pid": None, "child_creation_ticks": None, "state": state}
     def run(command, **kwargs):
         if command[2] == "cleanup":
@@ -467,6 +475,7 @@ def test_ppt_writer_cleanup_native_contract(tmp_path: Path) -> None:
     policy.write_text('namespace AegisDesk.PptSetup { internal static class BuildPolicy { '
                       'public const string AutoInstallMode = "candidate"; } }', encoding="utf-8")
     sources = [root / "scripts/ppt_reader/PptReaderSetup.cs",
+               root / "knowmate/tests/ppt_fixture_acl.cs",
                *sorted((root / "scripts/ppt_reader").glob("PptSetup*.cs")),
                root / "knowmate/tests/ppt_rename_probe_native.cs",
                root / "knowmate/tests/ppt_request_writer_harness.cs",
@@ -480,7 +489,7 @@ def test_ppt_writer_cleanup_native_contract(tmp_path: Path) -> None:
         print("PPT_CLEANUP_SUMMARY result=FAIL", flush=True)
     assert compiled, "Cleanup contract harness compile failed"
     try:
-        result = subprocess.run([str(executable), str(tmp_path)], capture_output=True, text=True, timeout=30, check=False,
+        result = subprocess.run([str(executable), str(tmp_path)], capture_output=True, text=True, encoding="ascii", errors="replace", timeout=30, check=False,
                                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.TimeoutExpired) as error:
         winerror = _os_code(error, "winerror")
@@ -495,3 +504,13 @@ def test_ppt_writer_cleanup_native_contract(tmp_path: Path) -> None:
     passed = result.returncode == 0 and result.stdout.splitlines()[-1:] == ["PPT_WRITER_CLEANUP_CONTRACT PASS"]
     print("PPT_CLEANUP_SUMMARY result=" + ("PASS" if passed else "FAIL"), flush=True)
     assert passed, "Cleanup no-follow contract failed; inspect PPT_CLEANUP_DIAGNOSTIC"
+    failed_base = tmp_path / "readback-failure"
+    failed_base.mkdir()
+    failed = subprocess.run([str(executable), str(failed_base), "readback-failure"],
+                            capture_output=True, text=True, encoding="ascii", errors="replace",
+                            timeout=30, check=False, creationflags=subprocess.CREATE_NO_WINDOW)
+    assert failed.returncode == 1
+    assert "phase=cleanup stage=cleanup_root error_type=contract code=cleanup_identity_missing" in failed.stdout
+    assert "PPT_WRITER_CLEANUP_CONTRACT FAIL" in failed.stdout
+    assert "PPT_WRITER_CLEANUP_CONTRACT PASS" not in failed.stdout
+    assert len(list(failed_base.glob("ppt-writer-*"))) == 1

@@ -133,6 +133,11 @@ def test_unsafe_registered_executable_is_rejected(registry, scenario, tmp_path):
     else:
         original = root / "original.exe"
         executable.rename(original)
-        executable.symlink_to(original)
+        try:
+            executable.symlink_to(original)
+        except OSError as error:
+            if getattr(error, "winerror", None) != 1314:
+                raise
+            pytest.skip("Required symlink rejection gate unexecuted: fixture privilege missing (WinError 1314)")
     with pytest.raises((ValueError, OSError)):
         ppt_launch.trusted_powerpoint_path(64)

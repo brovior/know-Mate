@@ -1,0 +1,534 @@
+{
+  "provenance": "2026-10-17 live host EApplication metadata + offline registered typelib reference resolution; independent of generated sink",
+  "iid": "{914934C2-5A91-11CF-8700-00AA0060263B}",
+  "events": [
+    {
+      "index": 0,
+      "name": "WindowSelectionChange",
+      "dispid": 2001,
+      "slot": 7,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "Selection",
+          "iid": "{91493454-5A91-11CF-8700-00AA0060263B}"
+        }
+      ]
+    },
+    {
+      "index": 1,
+      "name": "WindowBeforeRightClick",
+      "dispid": 2002,
+      "slot": 8,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "Selection",
+          "iid": "{91493454-5A91-11CF-8700-00AA0060263B}"
+        },
+        {
+          "kind": "boolptr",
+          "flags": 3
+        }
+      ]
+    },
+    {
+      "index": 2,
+      "name": "WindowBeforeDoubleClick",
+      "dispid": 2003,
+      "slot": 9,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "Selection",
+          "iid": "{91493454-5A91-11CF-8700-00AA0060263B}"
+        },
+        {
+          "kind": "boolptr",
+          "flags": 3
+        }
+      ]
+    },
+    {
+      "index": 3,
+      "name": "PresentationClose",
+      "dispid": 2004,
+      "slot": 10,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "Presentation",
+          "iid": "{9149349D-5A91-11CF-8700-00AA0060263B}"
+        }
+      ]
+    },
+    {
+      "index": 4,
+      "name": "PresentationSave",
+      "dispid": 2005,
+      "slot": 11,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "Presentation",
+          "iid": "{9149349D-5A91-11CF-8700-00AA0060263B}"
+        }
+      ]
+    },
+    {
+      "index": 5,
+      "name": "PresentationOpen",
+      "dispid": 2006,
+      "slot": 12,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "Presentation",
+          "iid": "{9149349D-5A91-11CF-8700-00AA0060263B}"
+        }
+      ]
+    },
+    {
+      "index": 6,
+      "name": "NewPresentation",
+      "dispid": 2007,
+      "slot": 13,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "Presentation",
+          "iid": "{9149349D-5A91-11CF-8700-00AA0060263B}"
+        }
+      ]
+    },
+    {
+      "index": 7,
+      "name": "PresentationNewSlide",
+      "dispid": 2008,
+      "slot": 14,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "Slide",
+          "iid": "{9149346A-5A91-11CF-8700-00AA0060263B}"
+        }
+      ]
+    },
+    {
+      "index": 8,
+      "name": "WindowActivate",
+      "dispid": 2009,
+      "slot": 15,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "Presentation",
+          "iid": "{9149349D-5A91-11CF-8700-00AA0060263B}"
+        },
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "DocumentWindow",
+          "iid": "{91493457-5A91-11CF-8700-00AA0060263B}"
+        }
+      ]
+    },
+    {
+      "index": 9,
+      "name": "WindowDeactivate",
+      "dispid": 2010,
+      "slot": 16,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "Presentation",
+          "iid": "{9149349D-5A91-11CF-8700-00AA0060263B}"
+        },
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "DocumentWindow",
+          "iid": "{91493457-5A91-11CF-8700-00AA0060263B}"
+        }
+      ]
+    },
+    {
+      "index": 10,
+      "name": "SlideShowBegin",
+      "dispid": 2011,
+      "slot": 17,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "SlideShowWindow",
+          "iid": "{91493453-5A91-11CF-8700-00AA0060263B}"
+        }
+      ]
+    },
+    {
+      "index": 11,
+      "name": "SlideShowNextBuild",
+      "dispid": 2012,
+      "slot": 18,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "SlideShowWindow",
+          "iid": "{91493453-5A91-11CF-8700-00AA0060263B}"
+        }
+      ]
+    },
+    {
+      "index": 12,
+      "name": "SlideShowNextSlide",
+      "dispid": 2013,
+      "slot": 19,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "SlideShowWindow",
+          "iid": "{91493453-5A91-11CF-8700-00AA0060263B}"
+        }
+      ]
+    },
+    {
+      "index": 13,
+      "name": "SlideShowEnd",
+      "dispid": 2014,
+      "slot": 20,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "Presentation",
+          "iid": "{9149349D-5A91-11CF-8700-00AA0060263B}"
+        }
+      ]
+    },
+    {
+      "index": 14,
+      "name": "PresentationPrint",
+      "dispid": 2015,
+      "slot": 21,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "Presentation",
+          "iid": "{9149349D-5A91-11CF-8700-00AA0060263B}"
+        }
+      ]
+    },
+    {
+      "index": 15,
+      "name": "SlideSelectionChanged",
+      "dispid": 2016,
+      "slot": 22,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "SlideRange",
+          "iid": "{9149346B-5A91-11CF-8700-00AA0060263B}"
+        }
+      ]
+    },
+    {
+      "index": 16,
+      "name": "ColorSchemeChanged",
+      "dispid": 2017,
+      "slot": 23,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "SlideRange",
+          "iid": "{9149346B-5A91-11CF-8700-00AA0060263B}"
+        }
+      ]
+    },
+    {
+      "index": 17,
+      "name": "PresentationBeforeSave",
+      "dispid": 2018,
+      "slot": 24,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "Presentation",
+          "iid": "{9149349D-5A91-11CF-8700-00AA0060263B}"
+        },
+        {
+          "kind": "boolptr",
+          "flags": 3
+        }
+      ]
+    },
+    {
+      "index": 18,
+      "name": "SlideShowNextClick",
+      "dispid": 2019,
+      "slot": 25,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "SlideShowWindow",
+          "iid": "{91493453-5A91-11CF-8700-00AA0060263B}"
+        },
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "Effect",
+          "iid": "{914934DF-5A91-11CF-8700-00AA0060263B}"
+        }
+      ]
+    },
+    {
+      "index": 19,
+      "name": "AfterNewPresentation",
+      "dispid": 2020,
+      "slot": 26,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "Presentation",
+          "iid": "{9149349D-5A91-11CF-8700-00AA0060263B}"
+        }
+      ]
+    },
+    {
+      "index": 20,
+      "name": "AfterPresentationOpen",
+      "dispid": 2021,
+      "slot": 27,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "Presentation",
+          "iid": "{9149349D-5A91-11CF-8700-00AA0060263B}"
+        }
+      ]
+    },
+    {
+      "index": 21,
+      "name": "PresentationSync",
+      "dispid": 2022,
+      "slot": 28,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "Presentation",
+          "iid": "{9149349D-5A91-11CF-8700-00AA0060263B}"
+        },
+        {
+          "kind": "i4",
+          "flags": 1,
+          "name": "MsoSyncEventType",
+          "type_iid": "{00000000-0000-0000-0000-000000000000}",
+          "library_iid": "{2DF8D04C-5BFA-101B-BDE5-00AA0044DE52}",
+          "bytes": 4
+        }
+      ]
+    },
+    {
+      "index": 22,
+      "name": "SlideShowOnNext",
+      "dispid": 2023,
+      "slot": 29,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "SlideShowWindow",
+          "iid": "{91493453-5A91-11CF-8700-00AA0060263B}"
+        }
+      ]
+    },
+    {
+      "index": 23,
+      "name": "SlideShowOnPrevious",
+      "dispid": 2024,
+      "slot": 30,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "SlideShowWindow",
+          "iid": "{91493453-5A91-11CF-8700-00AA0060263B}"
+        }
+      ]
+    },
+    {
+      "index": 24,
+      "name": "PresentationBeforeClose",
+      "dispid": 2025,
+      "slot": 31,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "Presentation",
+          "iid": "{9149349D-5A91-11CF-8700-00AA0060263B}"
+        },
+        {
+          "kind": "boolptr",
+          "flags": 3
+        }
+      ]
+    },
+    {
+      "index": 25,
+      "name": "ProtectedViewWindowOpen",
+      "dispid": 2026,
+      "slot": 32,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "ProtectedViewWindow",
+          "iid": "{BA72E55A-4FF5-48F4-8215-5505F990966F}"
+        }
+      ]
+    },
+    {
+      "index": 26,
+      "name": "ProtectedViewWindowBeforeEdit",
+      "dispid": 2027,
+      "slot": 33,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "ProtectedViewWindow",
+          "iid": "{BA72E55A-4FF5-48F4-8215-5505F990966F}"
+        },
+        {
+          "kind": "boolptr",
+          "flags": 3
+        }
+      ]
+    },
+    {
+      "index": 27,
+      "name": "ProtectedViewWindowBeforeClose",
+      "dispid": 2028,
+      "slot": 34,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "ProtectedViewWindow",
+          "iid": "{BA72E55A-4FF5-48F4-8215-5505F990966F}"
+        },
+        {
+          "kind": "i4",
+          "flags": 1,
+          "name": "PpProtectedViewCloseReason",
+          "type_iid": "{7F9B36C7-48CC-335E-B058-49658FD8CECE}",
+          "library_iid": "{91493440-5A91-11CF-8700-00AA0060263B}",
+          "bytes": 4
+        },
+        {
+          "kind": "boolptr",
+          "flags": 3
+        }
+      ]
+    },
+    {
+      "index": 28,
+      "name": "ProtectedViewWindowActivate",
+      "dispid": 2029,
+      "slot": 35,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "ProtectedViewWindow",
+          "iid": "{BA72E55A-4FF5-48F4-8215-5505F990966F}"
+        }
+      ]
+    },
+    {
+      "index": 29,
+      "name": "ProtectedViewWindowDeactivate",
+      "dispid": 2030,
+      "slot": 36,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "ProtectedViewWindow",
+          "iid": "{BA72E55A-4FF5-48F4-8215-5505F990966F}"
+        }
+      ]
+    },
+    {
+      "index": 30,
+      "name": "PresentationCloseFinal",
+      "dispid": 2031,
+      "slot": 37,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "Presentation",
+          "iid": "{9149349D-5A91-11CF-8700-00AA0060263B}"
+        }
+      ]
+    },
+    {
+      "index": 31,
+      "name": "AfterDragDropOnSlide",
+      "dispid": 2032,
+      "slot": 38,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "Slide",
+          "iid": "{9149346A-5A91-11CF-8700-00AA0060263B}"
+        },
+        {
+          "kind": "r4",
+          "flags": 1
+        },
+        {
+          "kind": "r4",
+          "flags": 1
+        }
+      ]
+    },
+    {
+      "index": 32,
+      "name": "AfterShapeSizeChange",
+      "dispid": 2033,
+      "slot": 39,
+      "args": [
+        {
+          "kind": "interface",
+          "flags": 1,
+          "name": "Shape",
+          "iid": "{91493479-5A91-11CF-8700-00AA0060263B}"
+        }
+      ]
+    }
+  ]
+}

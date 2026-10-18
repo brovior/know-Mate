@@ -135,7 +135,7 @@ def test_untrusted_office_path_never_calls_createprocess_or_dispatch(launch, mon
 def origin(launch, monkeypatch):
     app, client, _ = launch
     app, proof, ticket = shutdown.launch_and_bind(client, 64)
-    service = SimpleNamespace(ProtocolVersion=lambda: 3, ReaderVersion=lambda: "1.0.4.0",
+    service = SimpleNamespace(ProtocolVersion=lambda: 3, ReaderVersion=lambda: "1.0.5.0",
                               TryQuitIfIdle=Mock(return_value="quit_requested"))
     app.COMAddIns = SimpleNamespace(Item=Mock(return_value=SimpleNamespace(Connect=True, Object=service)))
     monkeypatch.setattr(ppt_policy, "auto_shutdown_enabled", lambda: True)
@@ -243,6 +243,50 @@ def test_existing_worker_cleanup_releases_every_ppt_reference_before_os_wait(ori
     service.TryQuitIfIdle.assert_called_once()
 
 
+@pytest.mark.parametrize("scenario,reason", [
+    ("origin", "origin_mismatch"), ("policy", "policy_disabled"),
+    ("service", "service_unavailable"), ("host", "service_return"),
+])
+def test_not_supported_diagnostics_distinguish_authority_from_host(origin, monkeypatch, caplog, scenario, reason):
+    app, proof, ticket, cache, service = origin
+    caplog.set_level("INFO", logger=shutdown.__name__)
+    if scenario == "origin":
+        ticket = None
+    elif scenario == "policy":
+        monkeypatch.setattr(ppt_policy, "auto_shutdown_enabled", lambda: False)
+    elif scenario == "service":
+        app.COMAddIns.Item.side_effect = RuntimeError("private-document-marker")
+    else:
+        service.TryQuitIfIdle.return_value = "not_supported"
+    assert shutdown.request_quit(app, proof, ticket, cache) == ("not_supported", {})
+    assert f"reason={reason}" in caplog.text
+    assert "private-document-marker" not in caplog.text
+    assert service.TryQuitIfIdle.call_count == (1 if scenario == "host" else 0)
+
+
+def test_unknown_service_status_is_not_logged_or_retried(origin, caplog):
+    app, proof, ticket, cache, service = origin
+    caplog.set_level("INFO", logger=shutdown.__name__)
+    service.TryQuitIfIdle.return_value = "private-document-marker"
+    status, snapshot = shutdown.request_quit(app, proof, ticket, cache)
+    assert status == "pending" and snapshot
+    assert "reason=service_return status=unknown" in caplog.text
+    assert "private-document-marker" not in caplog.text
+    assert shutdown.request_quit(app, proof, ticket, cache) == ("not_supported", {})
+    service.TryQuitIfIdle.assert_called_once()
+
+
+def test_foreign_worker_diagnostics_do_not_grant_quit_authority(origin, caplog):
+    app, proof, ticket, cache, service = origin
+    caplog.set_level("INFO", logger=shutdown.__name__)
+    result = []
+    worker = threading.Thread(target=lambda: result.append(shutdown.request_quit(app, proof, ticket, cache)))
+    worker.start(); worker.join(5)
+    assert result == [("not_supported", {})]
+    assert "reason=origin_mismatch" in caplog.text
+    service.TryQuitIfIdle.assert_not_called()
+
+
 def test_poison_releases_all_worker_capabilities_without_more_com(origin, monkeypatch):
     from knowmate.secure import com_reader
     app, proof, ticket, _cache, service = origin
@@ -329,12 +373,16 @@ def test_installation_stamp_detects_registry_dll_and_record_mutations(monkeypatc
     monkeypatch.setitem(sys.modules, "winreg", module)
     monkeypatch.setattr(ppt_installation, "_known_folder", lambda identifier: tmp_path)
     directory = tmp_path / "AegisDesk/PptReader"
-    versioned = directory / "1.0.4.0"
+    versioned = directory / "1.0.5.0"
     versioned.mkdir(parents=True)
     dll = versioned / "AegisDesk.PptReader.dll"
     dll.write_bytes(b"compiled candidate")
+    events = versioned / "AegisDesk.PptReader.Events.dll"
+    events.write_bytes(b"compiled events")
     record = directory / "installation.json"
-    metadata = {"version": "1.0.4.0", "sha256": hashlib.sha256(dll.read_bytes()).hexdigest()}
+    digest = hashlib.sha256(dll.read_bytes()).hexdigest()
+    metadata = {"schema": 2, "version": "1.0.5.0", "sha256": digest,
+                "files": {dll.name: digest, events.name: hashlib.sha256(events.read_bytes()).hexdigest()}}
     record.write_text(json.dumps(metadata))
     first = ppt_launch.installation_stamp()
     assert first is not None
@@ -344,6 +392,14 @@ def test_installation_stamp_detects_registry_dll_and_record_mutations(monkeypatc
     dll.write_bytes(b"different candidate")
     assert ppt_launch.installation_stamp() is None
     dll.write_bytes(b"compiled candidate")
+    events.write_bytes(b"different events")
+    assert ppt_launch.installation_stamp() is None
+    events.write_bytes(b"compiled events")
+    incomplete = dict(metadata, files={dll.name: digest})
+    record.write_text(json.dumps(incomplete))
+    assert ppt_launch.installation_stamp() is None
+    record.write_text(json.dumps(metadata))
+    assert ppt_launch.installation_stamp() == first
     record.unlink()
     assert ppt_launch.installation_stamp() != first
 
@@ -415,3 +471,90 @@ def test_uncertain_launch_without_pid_keeps_cleanup_incomplete_until_os_absence(
     assert first.ownership_pending == frozenset({"POWERPNT.EXE"})
     monkeypatch.setattr(guard, "_enumerate_processes", list)
     assert com_reader.quit_com_apps(grace_sec=0).successful
+
+
+@pytest.mark.parametrize("record", [object(), None])
+def test_stale_ticket_diagnostics_preserve_rejection_of_unusable_record(origin, monkeypatch, record):
+    app, _proof, ticket, cache, service = origin
+    monkeypatch.setattr(shutdown, "_ticket", None)
+    proof = (123, record)
+    assert shutdown._exact_origin(ticket, proof) is False
+    assert shutdown.request_quit(app, proof, ticket, cache) == ("not_supported", {})
+    app.COMAddIns.Item.assert_not_called()
+    service.TryQuitIfIdle.assert_not_called()
+
+
+def test_stale_ticket_diagnostics_never_inspect_record_or_log_under_lock(origin, monkeypatch):
+    app, _proof, ticket, cache, service = origin
+    monkeypatch.setattr(shutdown, "_ticket", None)
+    class UnreadableRecord:
+        def __getattribute__(self, name):
+            raise AssertionError("rejected record must not be inspected")
+    class ObservedLock:
+        held = False
+        def __enter__(self):
+            self.held = True
+        def __exit__(self, *args):
+            self.held = False
+    lock = ObservedLock()
+    monkeypatch.setattr(shutdown, "_lock", lock)
+    calls = []
+    def log(*args):
+        assert not lock.held
+        calls.append(args)
+    monkeypatch.setattr(shutdown.logger, "info", log)
+    assert shutdown.request_quit(app, (123, UnreadableRecord()), ticket, cache) == ("not_supported", {})
+    assert len(calls) == 1
+    app.COMAddIns.Item.assert_not_called()
+    service.TryQuitIfIdle.assert_not_called()
+
+
+@pytest.mark.parametrize("reason,hwnd,bound_pid,processes,identity", [
+    ("hwnd_missing", None, None, None, None),
+    ("pid_mismatch", 50, 20, None, None),
+    ("process_enumeration_unavailable", 50, 10, None, None),
+    ("process_set_mismatch", 50, 10, [("POWERPNT.EXE", 10), ("POWERPNT.EXE", 20)], None),
+    ("identity_mismatch", 50, 10, [("POWERPNT.EXE", 10)], 200),
+    ("identity_mismatch", 50, 10, [("POWERPNT.EXE", 10)], None),
+])
+def test_exact_hwnd_rejection_logs_preserve_probe_short_circuit(
+        launch, monkeypatch, caplog, reason, hwnd, bound_pid, processes, identity):
+    _app, client, handles = launch
+    caplog.set_level("INFO", logger=shutdown.__name__)
+    read = Mock(return_value=hwnd)
+    @contextmanager
+    def window(*args):
+        yield read
+    enumeration = Mock(side_effect=[[("POWERPNT.EXE", 10)], processes])
+    pid_probe = Mock(return_value=bound_pid)
+    identity_probe = Mock(return_value=identity)
+    monkeypatch.setattr(guard, "_ownership_window", window)
+    monkeypatch.setattr(guard, "_enumerate_processes", enumeration)
+    monkeypatch.setattr(guard, "_pid_from_hwnd", pid_probe)
+    monkeypatch.setattr(guard, "_process_creation_identity", identity_probe)
+    def register(exe, baseline, exact_hwnd, records):
+        assert exact_hwnd() is None
+        return None
+    monkeypatch.setattr(guard, "_register_owned_window", register)
+    with pytest.raises(guard.OfficeCleanupPendingError):
+        shutdown.launch_and_bind(client, 64)
+    assert f"reason={reason}" in caplog.text
+    read.assert_called_once_with()
+    pid_probe.assert_called_once_with(hwnd)
+    assert enumeration.call_count == (1 if reason in {"hwnd_missing", "pid_mismatch"} else 2)
+    assert identity_probe.call_count == (1 if reason == "identity_mismatch" else 0)
+    handles[0].close.assert_called_once()
+    assert shutdown._ticket.state == "pending"
+
+
+@pytest.mark.parametrize("live_pid,expected_remaining", [(10, frozenset({10})), (20, frozenset())])
+def test_pending_cleanup_observes_launch_ticket_not_unowned_replacement(monkeypatch, live_pid, expected_remaining):
+    ticket = shutdown.LaunchTicket(1, threading.get_ident(), state="pending", pid=10, identity=100)
+    monkeypatch.setattr(shutdown, "_ticket", ticket)
+    monkeypatch.setattr(guard, "_enumerate_processes", lambda: [("POWERPNT.EXE", live_pid)])
+    monkeypatch.setattr(guard, "_process_creation_identity", lambda pid: 100)
+    result = shutdown.pending_cleanup_result()
+    assert result.remaining == expected_remaining
+    assert result.successful == (live_pid != 10)
+    assert result.confirmed_exited == frozenset()
+    assert (shutdown._ticket is None) == (live_pid != 10)

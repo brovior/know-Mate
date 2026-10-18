@@ -9,7 +9,7 @@ using Microsoft.Win32;
 
 namespace AegisDesk.PptSetup
 {
-    internal static class Mutation
+    internal static partial class Mutation
     {
         /// <summary>Return the unescaped file URL expected by .NET COM registration.</summary>
         public static string RegistrationCodeBase(string path)
@@ -47,23 +47,6 @@ namespace AegisDesk.PptSetup
                         FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership)) != 0) throw new IOException("acl_unavailable");
             }
         }
-        public static bool Owned()
-        {
-            try
-            {
-                Machine.NoLinks(Machine.Record);
-                if (!Protected(Machine.Record)) return false;
-                var data = Contract.Read(Machine.Record);
-                int bitness = Convert.ToInt32(data["bitness"]);
-                Version parsed;
-                if (!Version.TryParse((string)data["version"], out parsed) || parsed.ToString() != (string)data["version"] || parsed.Revision < 0) return false;
-                return Convert.ToInt32(data["schema"]) == 1 && (string)data["prog_id"] == Contract.ProgId &&
-                    (string)data["class_id"] == Contract.ClassId && (string)data["scope"] == "Machine" &&
-                    (bitness == 32 || bitness == 64) &&
-                    String.Equals((string)data["path"], Machine.InstalledDll((string)data["version"]), StringComparison.OrdinalIgnoreCase);
-            }
-            catch { return false; }
-        }
         public static bool RegistrationValid(RegistryKey root, string version)
         {
             string path = Machine.InstalledDll(version);
@@ -71,6 +54,19 @@ namespace AegisDesk.PptSetup
             if (!File.Exists(path) || !Protected(path) || AssemblyName.GetAssemblyName(path).Version.ToString() != version) return false;
             var record = Contract.Read(Machine.Record);
             if (Contract.Hash(path) != (string)record["sha256"]) return false;
+            if (new Version(version) > new Version("1.0.4.0"))
+            {
+                if (!Owned()) return false;
+                var files = (Dictionary<string, object>)record["files"];
+                foreach (string name in Contract.InstalledFiles)
+                {
+                    string installed = Path.Combine(Path.GetDirectoryName(path), name);
+                    Machine.NoLinks(installed);
+                    if (!File.Exists(installed) || !Protected(installed) || Contract.Hash(installed) != (string)files[name]) return false;
+                    AssemblyName identity = AssemblyName.GetAssemblyName(installed);
+                    if (identity.Name != Path.GetFileNameWithoutExtension(name) || identity.Version.ToString() != version) return false;
+                }
+            }
             using (RegistryKey server = root.OpenSubKey(Contract.Keys[0] + @"\InprocServer32"))
             using (RegistryKey versionKey = root.OpenSubKey(Contract.Keys[0] + @"\InprocServer32\" + version))
             using (RegistryKey prog = root.OpenSubKey(Contract.Keys[1] + @"\CLSID"))
@@ -153,15 +149,13 @@ namespace AegisDesk.PptSetup
         }
         public static void Recover()
         {
+            VersionBoundary();
             Machine.NoLinks(Machine.Journal);
             if (!File.Exists(Machine.Journal)) return;
             if (!Protected(Machine.Journal)) throw new IOException("journal_unresolved");
-            var data = Contract.Read(Machine.Journal);
-            if (Convert.ToInt32(data["schema"]) != 1 || (string)data["prog_id"] != Contract.ProgId) throw new IOException("journal_unresolved");
-            int bitness = Convert.ToInt32(data["bitness"]);
-            if (bitness != 32 && bitness != 64) throw new IOException("journal_unresolved");
+            var data = ReadRecoveryJournal();
+            int bitness = (int)data["bitness"];
             var snapshots = (Dictionary<string, object>)data["keys"];
-            if (snapshots.Count != Contract.Keys.Length) throw new IOException("journal_unresolved");
             using (RegistryKey root = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, Machine.View(bitness)))
                 foreach (string path in Contract.Keys) RestoreKey(root, path, snapshots[path]);
             if (data["record"] == null) { if (File.Exists(Machine.Record)) File.Delete(Machine.Record); }
@@ -173,7 +167,7 @@ namespace AegisDesk.PptSetup
             var keys = new Dictionary<string, object>();
             foreach (string path in Contract.Keys) using (RegistryKey key = root.OpenSubKey(path)) keys[path] = Snapshot(key);
             Contract.AtomicWrite(Machine.Journal, new Dictionary<string, object> {
-                { "schema", 1 }, { "prog_id", Contract.ProgId }, { "bitness", bitness }, { "keys", keys },
+                { "schema", 2 }, { "target_version", Contract.Version }, { "prog_id", Contract.ProgId }, { "bitness", bitness }, { "keys", keys },
                 { "record", File.Exists(Machine.Record) ? Contract.Read(Machine.Record) : null }
             }, FileAcl());
         }
@@ -185,13 +179,14 @@ namespace AegisDesk.PptSetup
             if (!Machine.OfficeClosed()) throw new IOException("office_busy");
             if (!Machine.Admin || !Machine.ReservationsSafe(own)) throw new IOException("mutation_blocked");
             lease.Recheck();
-            Protect(Machine.Root);
-            lease.Recheck();
+            VersionBoundary();
             Recover();
             Result state = Machine.Check("check", true, false, own);
             if (!state.machine_safe || state.office_bitness == null || state.status == "conflict" || (!remove && state.status == "disabled")) throw new IOException("mutation_blocked");
             if (remove && !Owned()) throw new IOException("installation_unknown");
             if (Owned() && Convert.ToInt32(Contract.Read(Machine.Record)["bitness"]) != state.office_bitness.Value) throw new IOException("installation_view_changed");
+            Protect(Machine.Root);
+            lease.Recheck();
             using (RegistryKey root = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, Machine.View(state.office_bitness.Value)))
             {
                 // Expose the journal before any own registry mutation; every
@@ -212,11 +207,21 @@ namespace AegisDesk.PptSetup
                         if (!Contract.PayloadValid()) throw new IOException("payload_invalid");
                         string path = Machine.InstalledDll(Contract.Version);
                         Protect(Path.GetDirectoryName(path));
-                        string source = Path.Combine(Contract.PayloadDirectory, Contract.Dll);
-                        if (File.Exists(path)) { if (Contract.Hash(path) != Contract.Hash(source)) throw new IOException("same_version_changed"); }
-                        else File.Copy(source, path, false);
-                        File.SetAccessControl(path, FileAcl());
-                        if (Contract.Hash(path) != Contract.Hash(source)) throw new IOException("copy_invalid");
+                        var hashes = new Dictionary<string, object>();
+                        foreach (string name in Contract.InstalledFiles)
+                        {
+                            string source = Path.Combine(Contract.PayloadDirectory, name);
+                            string target = Path.Combine(Path.GetDirectoryName(path), name);
+                            Machine.NoLinks(source); Machine.NoLinks(target);
+                            string hash = Contract.Hash(source);
+                            if (File.Exists(target)) { if (Contract.Hash(target) != hash) throw new IOException("same_version_changed"); }
+                            else File.Copy(source, target, false);
+                            File.SetAccessControl(target, FileAcl());
+                            AssemblyName identity = AssemblyName.GetAssemblyName(target);
+                            if (Contract.Hash(target) != hash || identity.Name != Path.GetFileNameWithoutExtension(name) ||
+                                identity.Version.ToString() != Contract.Version) throw new IOException("copy_invalid");
+                            hashes[name] = hash;
+                        }
                         string server = Contract.Keys[0] + @"\InprocServer32";
                         string assembly = AssemblyName.GetAssemblyName(path).FullName;
                         Set(root, Contract.Keys[0], "", "Aegis Desk PPT Reader");
@@ -231,9 +236,9 @@ namespace AegisDesk.PptSetup
                         Set(root, Contract.Keys[2], "FriendlyName", "Aegis Desk PPT Reader");
                         Set(root, Contract.Keys[2], "Description", "In-process PowerPoint reader");
                         Set(root, Contract.Keys[2], "LoadBehavior", 3, RegistryValueKind.DWord);
-                        Contract.AtomicWrite(Machine.Record, new Dictionary<string, object> { { "schema", 1 }, { "prog_id", Contract.ProgId },
+                        Contract.AtomicWrite(Machine.Record, new Dictionary<string, object> { { "schema", 2 }, { "prog_id", Contract.ProgId },
                             { "class_id", Contract.ClassId }, { "scope", "Machine" }, { "bitness", state.office_bitness.Value },
-                            { "version", Contract.Version }, { "path", path }, { "sha256", Contract.Hash(path) } }, FileAcl());
+                            { "version", Contract.Version }, { "path", path }, { "sha256", hashes[Contract.Dll] }, { "files", hashes } }, FileAcl());
                         if (!RegistrationValid(root, Contract.Version)) throw new IOException("registration_invalid");
                     }
                     File.Delete(Machine.Journal);

@@ -86,13 +86,17 @@ internal static class NativeAclHarness
             Console.WriteLine("SKIP native fixture requires local NTFS");
             return 77;
         }
+        PptFixtureAcl.VerifyOwnerRightsRejected();
         Stage("fixture_create");
         Require(!Directory.Exists(anchor), "fixture_must_be_new");
-        Directory.CreateDirectory(anchor);
+        bool unconfirmedCreation = false, verifiedCreation = false;
         string parent = Path.Combine(anchor, "AegisDesk");
         string child = Path.Combine(parent, "PptReaderRequests");
         try
         {
+            PptFixtureAcl.Create(anchor); unconfirmedCreation = true;
+            PptFixtureAcl.Verify(anchor, args.Length == 2 && args[1] == "readback-failure");
+            unconfirmedCreation = false; verifiedCreation = true;
             if (args.Length == 2 && args[1] == "atomic-control")
             {
                 Directory.CreateDirectory(parent);
@@ -150,8 +154,9 @@ internal static class NativeAclHarness
                 fresh.Recheck();
             }
             Stage("fixture_reset");
-            Cleanup(anchor);
-            Directory.CreateDirectory(anchor);
+            Cleanup(anchor); verifiedCreation = false;
+            PptFixtureAcl.Create(anchor); unconfirmedCreation = true;
+            PptFixtureAcl.Verify(anchor); unconfirmedCreation = false; verifiedCreation = true;
             // Reproduce the old install's inherited parent, then atomically create the strict child.
             Stage("legacy_create");
             Directory.CreateDirectory(parent);
@@ -219,11 +224,19 @@ internal static class NativeAclHarness
             Console.WriteLine("UNEXECUTED actual ProgramData, UAC, Office and distinct A-owner/B-request-owner/C-nonowner accounts");
             return 0;
         }
+        catch (InvalidOperationException)
+        {
+            if (args.Length != 2 || args[1] != "readback-failure") throw;
+            Console.WriteLine("PPT_ACL_RESULT FAIL");
+            return 1;
+        }
         finally
         {
             // Test-owned roots only. Production ProgramData is never passed to this harness.
             Stage("cleanup");
-            Cleanup(anchor);
+            if (unconfirmedCreation)
+                Console.WriteLine("PPT_ACL_CLEANUP result=INCOMPLETE code=cleanup_identity_missing");
+            else if (verifiedCreation) Cleanup(anchor);
         }
     }
 }

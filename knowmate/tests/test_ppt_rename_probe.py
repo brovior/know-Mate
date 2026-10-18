@@ -128,7 +128,7 @@ def _os_code(error: OSError, name: str) -> str:
 
 def _run(command: list[str]) -> _Outcome:
     try:
-        result = subprocess.run(command, check=False, capture_output=True, text=True,
+        result = subprocess.run(command, check=False, capture_output=True, text=True, encoding="ascii", errors="replace",
                                 timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except subprocess.TimeoutExpired as error:
         return _outcome(error.stdout, None, timed_out=True)
@@ -180,7 +180,7 @@ def _compiler_diagnostics(output: str | bytes | None, sources: list[Path]) -> tu
 
 def _compile(command: list[str], sources: list[Path]) -> bool:
     try:
-        result = subprocess.run(command, check=False, capture_output=True, text=True,
+        result = subprocess.run(command, check=False, capture_output=True, text=True, encoding="ascii", errors="replace",
                                 timeout=30, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except subprocess.TimeoutExpired as error:
         for event in _compiler_diagnostics(error.stdout, sources):
@@ -207,6 +207,7 @@ def test_ppt_native_rename_comparison(tmp_path: Path) -> None:
     policy.write_text('namespace AegisDesk.PptSetup { internal static class BuildPolicy { '
                       'public const string AutoInstallMode = "candidate"; } }', encoding="utf-8")
     sources = [root / "scripts/ppt_reader/PptReaderSetup.cs",
+               root / "knowmate/tests/ppt_fixture_acl.cs",
                *sorted((root / "scripts/ppt_reader").glob("PptSetup*.cs")),
                root / "knowmate/tests/ppt_rename_probe_native.cs",
                root / "knowmate/tests/ppt_rename_probe_harness.cs", policy]
@@ -227,6 +228,15 @@ def test_ppt_native_rename_comparison(tmp_path: Path) -> None:
     # comparison regressions fail this diagnostic test. Product gates are separate.
     assert all(outcome.result == "PASS" for outcome in native), (
         "Native comparison incomplete; inspect PPT_RENAME_CASE. This does not substitute for production writer gates.")
+    failed_anchor = tmp_path / ("ppt-rename-probe-" + uuid.uuid4().hex)
+    failed = subprocess.run([str(executable), str(failed_anchor), "fixture-readback-failure", "0"],
+                            capture_output=True, text=True, encoding="ascii", errors="replace",
+                            timeout=30, check=False, creationflags=subprocess.CREATE_NO_WINDOW)
+    assert failed.returncode == 1
+    assert "PPT_RENAME_CLEANUP result=INCOMPLETE code=cleanup_identity_missing" in failed.stdout
+    assert failed.stdout.splitlines()[-1] == "PPT_RENAME_RESULT FAIL"
+    assert failed_anchor.is_dir()
+
 
 
 @pytest.mark.parametrize("output", [None, "PPT_RENAME_STAGE native_rename_call elapsed_ms=1900\n",
