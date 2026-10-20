@@ -153,9 +153,13 @@ namespace AegisDesk.PptReader
         /// <summary>Office 연결이 끝나면 보유 참조만 해제한다.</summary>
         public void OnDisconnection(int removeMode, ref Array custom)
         {
+#if AEGIS_PPT_EXTERNAL_DIAGNOSTIC
+            externalTrace.LifecycleBoundary(1,true,removeMode);
+#endif
             lifecycle.Record(1, HostFlags(), 0);
             try { DisconnectHost(); } finally {
 #if AEGIS_PPT_EXTERNAL_DIAGNOSTIC
+                externalTrace.LifecycleBoundary(1,false,removeMode);
                 ExportLifecycleBoundary();
 #endif
             }
@@ -167,9 +171,13 @@ namespace AegisDesk.PptReader
         /// <summary>Office 종료에는 보유 참조만 해제한다.</summary>
         public void OnBeginShutdown(ref Array custom)
         {
+#if AEGIS_PPT_EXTERNAL_DIAGNOSTIC
+            externalTrace.LifecycleBoundary(2,true,0);
+#endif
             lifecycle.Record(2, HostFlags(), 0);
             try { DisconnectHost(); } finally {
 #if AEGIS_PPT_EXTERNAL_DIAGNOSTIC
+                externalTrace.LifecycleBoundary(2,false,0);
                 ExportLifecycleBoundary();
 #endif
             }
@@ -223,8 +231,16 @@ namespace AegisDesk.PptReader
         public string TryQuitIfIdle()
         {
             object scope = EnterDeferredService();
+#if AEGIS_PPT_EXTERNAL_DIAGNOSTIC
+            externalTrace.ServiceBoundary(true);
+#endif
             try { return InvokeExistingShutdown(); }
-            finally { LeaveDeferredService(scope); }
+            finally {
+#if AEGIS_PPT_EXTERNAL_DIAGNOSTIC
+                externalTrace.ServiceBoundary(false);
+#endif
+                LeaveDeferredService(scope);
+            }
         }
 
         private string InvokeExistingShutdown()

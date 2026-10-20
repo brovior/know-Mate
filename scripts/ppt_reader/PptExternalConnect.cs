@@ -25,6 +25,7 @@ public sealed partial class Connect {
   catch{reason="diagnostic_fence_unavailable";return false;}
  }
  bool ClaimDiagnostic(ExternalDiagnosticServices services,int generation,PptShutdownGuard guard,out string reason){
+  reason="capture_transport_unavailable";if(!externalTrace.CaptureHealthy)return false;
   reason="diagnostic_binding_missing";
   if(services==null)return false;
   // Only the success of this call authorizes its continuation; no Claimed field/token lookup.
@@ -73,7 +74,7 @@ public sealed partial class Connect {
   RequireHostThread();var session=external;if(session!=null){session.Poll(start,completion,controllerAlive,externalGeneration);ReaderFence.Resolve(session);}
  }
  void InvalidateExternalSession(){
-  externalGeneration++;
+  externalGeneration++;externalTrace.Generation(externalGeneration);
   var session=external;var services=diagnostic;var guard=shutdown;
   var timer=bootstrapTimer;
   external=null;diagnostic=null;shutdown=null;application=null;mainThread=0;bootstrapTimer=null;

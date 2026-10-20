@@ -95,6 +95,7 @@ docs/
 |---|---|
 | `docs/design/DESIGN.md` | **설계 결정 상세 (정본)** — 스키마·파서·워치독·실패 백오프 등 |
 | [docs/design/PPT_ADDIN_INDEXING.md](design/PPT_ADDIN_INDEXING.md) | PPT 추가 기능 운영 적용·별도 설치/업데이트 설계(구현 전) |
+| [docs/guides/PPT_CAPTURE.md](guides/PPT_CAPTURE.md) | 기본 잠금 상태의 PPT 종료 진단 빌드·offline 판독·Windows gate |
 | `docs/design/EMAIL_DESIGN.md` | 메일 인덱싱 (Knox `.mysingle` · `.eml`) |
 | `docs/design/ISSUE_B_query_async.md` | 질문 비동기 실행·읽기/종료 보호 계약 |
 | `knowmate/secure/README.md` | Windows·보안 의존 코드 운영 및 사내 검증 안내 |

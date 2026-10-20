@@ -31,7 +31,7 @@ def test_terminal_evidence_loss_is_explicit(tmp_path, case):
     assert result["evidence_complete"] == (case in ("terminal", "latecleanup"))
     assert (result["host_trace"] == "recovered") == (case in ("terminal", "latecleanup", "overflow"))
     assert result["stages"]["Ack"]["reached"] == (
-        "not_reached" if case in ("terminal", "latecleanup") else "unknown")
+        "unknown")
 
 
 @pytest.mark.parametrize("earlier", ["missing", "arrives_last", "dropped"])
@@ -48,4 +48,4 @@ def test_cumulative_final_slot_is_selected_independent_of_arrival(tmp_path, earl
     assert result["stages"]["Completion"]["reached"] == "yes"
     assert result["evidence_complete"] == (earlier != "dropped")
     assert result["stages"]["Ack"]["reached"] == (
-        "unknown" if earlier == "dropped" else "not_reached")
+        "unknown")

@@ -29,7 +29,8 @@ public sealed partial class Connect {
   int generation=externalGeneration;var guard=shutdown;
   bool complete=false;
   try{
-   var report=IdentityObservation.Capture(application,candidate,(int)observationOwner,generation,()=>ObservationFence.Active?externalGeneration:-1);
+   var previous=ExternalTrace.Current;ExternalTrace.Current=externalTrace;
+   IdentityObservation.Report report;try{report=IdentityObservation.Capture(application,candidate,(int)observationOwner,generation,()=>ObservationFence.Active?externalGeneration:-1);}finally{ExternalTrace.Current=previous;}
    if(!report.usable||report.outcome!="complete"||generation!=externalGeneration||!Object.ReferenceEquals(guard,shutdown))return new JavaScriptSerializer().Serialize(report);
    string json=new JavaScriptSerializer().Serialize(report);
    complete=ObservationFence.Complete();

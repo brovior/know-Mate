@@ -1,7 +1,13 @@
 <# Precompile only. This script never starts Office or registers COM. #>
 [CmdletBinding()]
-param([Parameter(Mandatory=$true)][string]$BuildInfoDir, [switch]$DeferredDiagnostic, [switch]$ExternalDiagnostic)
+param([Parameter(Mandatory=$true)][string]$BuildInfoDir, [switch]$DeferredDiagnostic, [switch]$ExternalDiagnostic, [switch]$CaptureDiagnostic)
 $ErrorActionPreference = 'Stop'
+if ($CaptureDiagnostic) {
+    $capturePython = Join-Path $PSScriptRoot '..\..\.venv\Scripts\python.exe'
+    & $capturePython (Join-Path $PSScriptRoot 'build_capture.py') --build-info-dir $BuildInfoDir
+    if ($LASTEXITCODE -ne 0) { throw 'ppt_capture_build_failed' }
+    return
+}
 $compiler = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe'
 if (!(Test-Path $compiler)) { throw 'ppt_compiler_missing' }
 $infoModule = Join-Path $BuildInfoDir 'aegisdesk_build_info.py'

@@ -19,6 +19,12 @@ namespace AegisDesk.PptReader
             if(Telemetry!=null)Telemetry.Record(ExternalTrace.Stage.Cancel,ExternalTrace.Result.Success,kind,Active?1:0,Cancelled?1:0);
 #endif
         }
+        /// <summary>Record callback input/output without reading a presentation object.</summary>
+        public void EventBoundary(int kind,bool enter,bool incoming,bool outgoing,bool setByAegis) {
+#if AEGIS_PPT_EXTERNAL_DIAGNOSTIC
+            if(Telemetry!=null)Telemetry.EventBoundary(kind,enter,(incoming?1:0)|(outgoing?2:0)|(setByAegis?4:0)|(Active?8:0)|(Cancelled?16:0)|(Broken?32:0));
+#endif
+        }
         private bool broken;
         /// <summary>Failure cannot be cleared by a callback or a later RPC.</summary>
         public bool Broken { get { return broken; } }
@@ -39,6 +45,9 @@ namespace AegisDesk.PptReader
         private readonly string outputDirectory;
         internal PptLifecycleTrace()
         {
+#if AEGIS_PPT_CAPTURE_DIAGNOSTIC
+            if(System.Environment.GetEnvironmentVariable("AEGIS_PPT_CAPTURE_DIAGNOSTIC")=="1")return;
+#endif
             // Object construction, not an Office lifecycle callback.
             try
             {

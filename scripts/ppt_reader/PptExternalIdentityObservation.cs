@@ -8,7 +8,7 @@ namespace AegisDesk.PptReader {
 // Review-stage read-only probe. No bootstrap/guard integration or permission decision.
 // Every result is primitive; native addresses live only in this synchronous owner scope.
 internal sealed class IdentityObservation {
- internal sealed class Step {public string row,operation,outcome;public int hr,inner;}
+ internal sealed class Step {public string row,operation,outcome;public int hr,inner,wCode,argError;public bool sourcePresent,descriptionPresent;}
  internal sealed class Ownership {public int id;public string row,kind;public bool acquired=true,attempted,released,blocked;}
  internal sealed class Row {
   public string name,managedType,kind,typeGuid,typeName,status="not_run",reason;
@@ -52,7 +52,11 @@ internal sealed class IdentityObservation {
 #if AEGIS_IDENTITY_TEST
   if(StepLimitOverride>0)limit=StepLimitOverride;
 #endif
-  if(report.steps.Count>=limit){report.dropped++;Fail(row,op,"trace_overflow");return;}report.steps.Add(new Step{row=row,operation=op,outcome=outcome,hr=hr,inner=inner});}
+  if(report.steps.Count>=limit){report.dropped++;Fail(row,op,"trace_overflow");return;}report.steps.Add(new Step{row=row,operation=op,outcome=outcome,hr=hr,inner=inner});
+  var trace=ExternalTrace.Current;if(trace!=null)trace.Record(ExternalTrace.Stage.IdentityObservation,outcome=="begin"?ExternalTrace.Result.Entered:outcome=="ok"?ExternalTrace.Result.Success:ExternalTrace.Result.Unknown,RowCode(row),OperationCode(op),hr);
+ }
+ static int RowCode(string row){return Array.IndexOf(new[]{"host","candidate","host.Application","candidate.Application","probe"},row);}
+ static int OperationCode(string operation){unchecked{uint hash=2166136261;foreach(char value in operation)hash=(hash^value)*16777619;return (int)hash;}}
  static int CurrentThread(){
 #if AEGIS_IDENTITY_TEST
   if(ThreadOverride!=null)return ThreadOverride();
@@ -120,21 +124,21 @@ internal sealed class IdentityObservation {
   finally{try{name=Marshal.ReadIntPtr(output);if(name!=IntPtr.Zero){IntPtr owned=name;cleanup.Add(()=>DoCleanup(row.name,"FreeBSTR_typeinfo_name",()=>Marshal.FreeBSTR(owned)));}}finally{DoCleanup(row.name,"FreeHGlobal_typeinfo_name",()=>Marshal.FreeHGlobal(output));}}
   if(End(row.name,"GetDocumentation_name",hr,true)&&name!=IntPtr.Zero){string n=Marshal.PtrToStringBSTR(name);row.typeName=n.Length<=128?n:n.Substring(0,128);}
  }
- IntPtr Describe(object value,Row row){
+ IntPtr Describe(object value,Row row,bool metadata=true){
   row.kind="managed_argument";row.managedType=value==null?"null":value.GetType().FullName;
   if(value==null){row.status="unavailable";return IntPtr.Zero;}
   row.isComObject=Marshal.IsComObject(value);
   Begin(row.name,"GetIUnknownForObject");IntPtr u=Own(Marshal.GetIUnknownForObject(value),row.name,"managed_unknown");End(row.name,"GetIUnknownForObject",0);row.group=Group(u);
   Begin(row.name,"GetIDispatchForObject");IntPtr d=Own(Marshal.GetIDispatchForObject(value),row.name,"managed_dispatch");End(row.name,"GetIDispatchForObject",0);
   IntPtr self=Query(d,Unknown,row.name,"dispatch_to_unknown",false);SelfControl(row,self,u);
-  DescribeNative(u,d,row);return d;
+  DescribeNative(u,d,row,metadata);return d;
  }
- void DescribeNative(IntPtr u,IntPtr dispatch,Row row){
+ void DescribeNative(IntPtr u,IntPtr dispatch,Row row,bool metadata=true){
   row.group=Group(u);IntPtr d=Query(u,Dispatch,row.name,"QI_IDispatch",true);row.dispatchSupport=d==IntPtr.Zero?0:1;
   if(d!=IntPtr.Zero)SelfControl(row,Query(d,Unknown,row.name,"QI_dispatch_self_control",false),u);
   IntPtr app=Query(u,Application,row.name,"QI_Application",true);row.applicationSupport=app==IntPtr.Zero?0:1;
   if(app!=IntPtr.Zero)SelfControl(row,Query(app,Unknown,row.name,"QI_application_self_control",false),u);
-  if(dispatch!=IntPtr.Zero)Metadata(dispatch,row);Check();row.status="observed";
+  if(metadata&&dispatch!=IntPtr.Zero)Metadata(dispatch,row);Check();row.status="observed";
  }
  IntPtr Property(IntPtr dispatch,Row row){
   row.kind="native_property";if(dispatch==IntPtr.Zero){row.status="not_run";return IntPtr.Zero;}
@@ -146,6 +150,8 @@ internal sealed class IdentityObservation {
    Guid empty=Guid.Empty;int id;Begin(row.name,"GetIDsOfNames_Application");int hr=Slot<GetNames>(dispatch,5)(dispatch,ref empty,names,1,0,out id);
    if(!End(row.name,"GetIDsOfNames_Application",hr,true)){row.status="unavailable";return IntPtr.Zero;}
    var args=new Parameters();uint argError;Begin(row.name,"Invoke_Application");hr=Slot<Invoke>(dispatch,6)(dispatch,id,ref empty,0,2,ref args,value,ref error,out argError);
+   if(report.steps.Count<256)report.steps.Add(new Step{row=row.name,operation="Invoke_Application_diagnostics",outcome="numeric",hr=hr,inner=error.scode,wCode=error.code,argError=unchecked((int)argError),sourcePresent=error.source!=IntPtr.Zero,descriptionPresent=error.description!=IntPtr.Zero});else report.dropped++;
+   var telemetry=ExternalTrace.Current;if(telemetry!=null){telemetry.Record(ExternalTrace.Stage.ErrorDetail,hr<0?ExternalTrace.Result.Failed:ExternalTrace.Result.Success,hr,error.scode,error.code);telemetry.Record(ExternalTrace.Stage.ErrorDetail,ExternalTrace.Result.Success,unchecked((int)argError),error.source!=IntPtr.Zero?1:0,error.description!=IntPtr.Zero?1:0);}
    if(error.deferredFill!=IntPtr.Zero){Fail(row.name,"deferred_error_not_invoked","unknown",hr,error.scode);throw new Halt();}
    if(!End(row.name,"Invoke_Application",hr,true,error.scode)){row.status="unavailable";return IntPtr.Zero;}
    int vt=(ushort)Marshal.ReadInt16(value);Note(row.name,"returned_variant","ok",vt);
@@ -174,7 +180,7 @@ internal sealed class IdentityObservation {
   if(active!=null){r.reentrant=true;probe.Fail("probe","entry","reentrant");active.report.reentrant=true;active.Fail(active.currentRow,active.currentOperation,"reentrant");probe.Finish();return r;}
   probe.expectedThread=expectedOwner;probe.generation=currentGeneration;active=probe;
   try{int hr=Apartment(out r.apartment,out r.qualifier);if(hr!=0||r.nativeThread!=expectedOwner||(r.apartment!=3&&r.apartment!=0)){probe.Fail("probe","entry","owner_apartment",hr);throw new Halt();}
-   probe.Check();if(host==null||candidate==null){probe.Fail(host==null?"host":"candidate","null_argument","invalid");throw new Halt();}IntPtr h=probe.Describe(host,r.rows[0]),c=probe.Describe(candidate,r.rows[1]);probe.Property(h,r.rows[2]);probe.Check();probe.Property(c,r.rows[3]);
+   probe.Check();if(host==null||candidate==null){probe.Fail(host==null?"host":"candidate","null_argument","invalid");throw new Halt();}IntPtr h=probe.Describe(host,r.rows[0],false),c=probe.Describe(candidate,r.rows[1],false);probe.Metadata(h,r.rows[0]);probe.Check();probe.Metadata(c,r.rows[1]);probe.Check();probe.Property(h,r.rows[2]);probe.Check();probe.Property(c,r.rows[3]);
   }catch(Halt){}catch(Exception e){probe.Fail(probe.currentRow,probe.currentOperation,Fatal(e.HResult)?"fatal":"unknown",e.HResult);foreach(Row row in r.rows)if(row.name==probe.currentRow)row.status=r.stopReason;probe.Note(probe.currentRow,probe.currentOperation,r.stopReason,e.HResult);}
   finally{for(int i=probe.cleanup.Count-1;i>=0;i--)probe.DoCleanupEntry(probe.cleanup[i]);probe.cleanup.Clear();probe.groups.Clear();active=null;probe.Finish();}
   return r;
