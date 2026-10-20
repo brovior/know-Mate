@@ -54,12 +54,12 @@ def read_terminal_trace(directory: Path, run_id: str, pid: int, creation: int) -
     records = frames[-1]["records"] if frames else []
     stage_status = {
         stage: {"reached": "yes" if any(r["stage"] == stage for r in records)
-                else "not_reached" if intact else "unknown",
+                else "unknown",
                 "observations": [r for r in records if r["stage"] == stage]}
         for stage in STAGES
     }
     return dict(run_id=run_id, pid=pid, creation=creation, frames=frames, issues=issues,
                 host_trace="recovered" if complete else "unrecovered",
-                evidence_complete=intact, stages=stage_status,
+                evidence_complete=intact, evidence_scope="request_boundary", request_complete=intact, capture_closed=None, os_exit=None, stages=stage_status,
                 missing_reason=None if complete else "no_terminal_frame_write_failure_or_process_loss",
-                absent_stage_interpretation="not_reached_only_if_complete_untruncated_else_unknown")
+                absent_stage_interpretation="legacy_request_frame_cannot_prove_later_lifecycle_absence")

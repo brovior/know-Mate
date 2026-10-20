@@ -3,6 +3,18 @@
 현재 원인 분석과 다음 검증의 정본이다. 작업 상태는 [ROADMAP.md](ROADMAP.md), 구현 계약은
 [DESIGN.md](design/DESIGN.md), 완료 이력은 [UPDATE_NOTES.md](UPDATE_NOTES.md)를 따른다.
 
+## PPT 한 번 수집 진단 구현 후보 (2026-10-20)
+
+**핵심 identity 우선 관측·단회 internal/external adapter·공유 buffer/외부 collector·독립 OS 감시·schema3 판독을
+구현하고 소스 리뷰·fake 회귀를 확인했다. 실제 Windows 빌드/native/Office 검증은 미실행이다.** 새 live 진입은 잠겨 있고 일반 배포
+자동종료는 계속 비활성이다. 요청 반환·관측 종료·원 handle의 OS 종료·증거 유실을 서로 구분한다.
+이 변경은 기존 in-host Quit 미종료 원인의 해결 증거가 아니다.
+
+새 코드·분리 진단 패키지·offline 판독 및 필수 gate는 [실행·판독 안내](guides/PPT_CAPTURE.md)를 따른다.
+작성자와 분리한 지적·수정·116 PASS/6 SKIP 및 기존 환경 오류는 [구현 리뷰](archive/ppt-shutdown-capture-review/implementation-review.md)에 남겼다.
+Bind 이전 lifecycle은 unknown으로 남기고 이후 slot도 누락 counter/최종 drain을 확인한다.
+아래 10월18일 기록은 당시 checkpoint121 분석이며 현재 설치 상태를 새로 확인한 기록이 아니다.
+
 ## PPT 종료·identity 관측 검토 (2026-10-18)
 
 **설치와 합성 PPT 읽기는 성공했으나, 원래 in-host Quit 미종료 원인은 미확정이다.**

@@ -1,0 +1,188 @@
+# PPT 종료 진단을 한 번에 수집하는 개발 계획
+
+계획 revision: **r2 / 2026-10-20**. 상태: **계획, 검증 판정은 리뷰 기록 참조**. 현행 구현 계약이나 실행 승인이 아니다.
+목표는 한 번의 진단 실행에서 종료 미실행·거절·취소·정리 실패·OS 생존·증거 유실을 구별하는 것이다.
+한 실행으로 모든 원인을 확정하거나 내부/외부 Quit의 인과관계를 증명한다고 약속하지 않는다.
+
+## 1. 범위와 기준
+
+- 기준 소스: GitHub `brovior/know-Mate` main `b75c98511cea3ddb7d842c7204dd11b4f9767ea3`.
+  현재 workspace는 관련 파일의 부분 스냅샷이며 Git checkout·Windows 설치본·과거 원 로그는 없다.
+- 근거 정본: [진단](../DIAGNOSTICS.md), [checkpoint 이전 조건](../guides/PPT_CHECKPOINT_HANDOFF.md),
+  [운영 설계](PPT_ADDIN_INDEXING.md), [공통 계약](../../CLAUDE.md).
+- 이번 작업 산출물은 계획과 독립 리뷰 기록뿐이다. 제품 코드·설치·등록·live 실행·GitHub 쓰기는 수행하지 않는다.
+- 후속 구현은 명시적으로 선택한 진단 빌드와 새 합성 입력만 대상으로 한다. 기본·released 자동종료는 계속 비활성이다.
+  보존된 checkpoint121 runner의 잠금을 해제하거나 candidate121/recovery122를 재사용하지 않는다.
+- 인덱싱·검색·암호화·DB 포맷·사용자 문서·Word/Excel 종료 정책·DRM 정책은 변경하지 않는다.
+  별도 OS 수집기는 COM이나 DB를 사용하지 않으며 수집기의 QThread 계약을 대체하지 않는다.
+
+## 2. 확인된 문제와 가설
+
+| 구분 | 근거와 설계상 결과 |
+|---|---|
+| 확인 | controller의 선택 getter가 host 관측 선행 조건이다. `GetIDsOfNames`와 `Invoke` 오류 경계도 합쳐져 있다 |
+| 확인 | host `Describe(host)`의 형식 정보 실패가 candidate 핵심 identity 조사까지 막는다 |
+| 확인 | `ExportTerminal(false)`의 정상 frame 이후 export가 잠긴다. 현재 판독기의 frame 완결은 이후 lifecycle 완결을 보장하지 않는다 |
+| 확인 | 현 writer는 PPT 내부 ThreadPool이다. OS observer는 관측 대상 중 하나가 끝나면 감시를 멈춘다 |
+| 확인 | 우리 event sink도 Active일 때 Cancel을 true로 설정한다. 그 값만으로 다른 추가 기능의 취소를 판단할 수 없다 |
+| 미확정 | in-host Quit 반환 뒤 생존 원인: 호출 문맥/재진입, 객체·marshaling 차이, 이벤트/추가 기능, 정리·Windows 대기 등 |
+
+113의 내부 Quit 반환 후 생존과 119의 identity 거절은 별개 결과로 다룬다.
+121의 합성 읽기 성공은 종료 성공의 증거가 아니며 현재 runner가 실행하는 Quit은 외부 호출이다.
+
+## 3. 한 번의 실행과 상태 전이
+
+새 도구의 한 실행은 **새 target 하나, 선택 경로 하나, Quit 최대 1회, 결과 디렉터리 하나**다.
+기본 경로는 원래 문제인 `internal`이다. `external`은 별도로 선택한 새 실행에서만 비교한다.
+한 PID에서 내부 실패 뒤 외부 Quit을 보내거나, timeout 뒤 새 PPT를 자동 시작하지 않는다.
+
+`CREATED → PREFLIGHT → OBSERVERS_READY → OWNED → OBSERVED → REQUESTED → OS_OBSERVE → CAPTURE_END`
+모든 단계에서 `BLOCKED` 또는 `UNKNOWN`으로 이동할 수 있다. 이후 신규 COM 호출·재시도·새 target 생성은 금지하고
+외부 수집과 기존 소유 리소스 해제만 계속한다. 해제도 begin/return/failure를 남기며 성공을 추측하지 않는다.
+
+| 단계 | 진행 조건과 실패 동작 |
+|---|---|
+| PREFLIGHT | 일반 사용자, AegisDesk/PPT 부재, 배타적 진단 run lock, 새 로컬 NTFS 결과 디렉터리, 새 source/package/helper/fixture pin 확인. 실패 시 Office 시작 전 종료 |
+| OBSERVERS_READY | COM 없는 외부 수집기와 OS observer를 먼저 준비하고 출력 가능·시간 기준·공유 버퍼 자체 검사를 확인. 실패 시 시작 금지 |
+| OWNED | `/EMBEDDING` 직접 실행의 원 handle·PID·생성시각·실제 자식에 상속된 capability 동일성·정확한 HWND/native owner thread를 기존 방식으로 검증. 단순 프로세스 발견은 소유 증명이 아님 |
+| OBSERVED | exact candidate의 필수 controller 관측 → host 관측 1회 → primitive 증거 파일 저장 성공. canonical 비교는 각 apartment 안에서만 하며 프로세스 간 포인터 숫자를 비교하지 않음 |
+| REQUESTED | 아래 경로별 기존 gate를 모두 통과할 때만 한 번 요청. 거절·unknown·저장 실패면 요청 금지 |
+| OS_OBSERVE | 요청 시작부터 controller가 멈춰도 독립 감시. 정확한 retained target handle의 signal 또는 180초의 상한까지 관측 |
+| CAPTURE_END | target exit 또는 deadline/user cancel/수집 오류 사유, 마지막 확보 순번·누락 여부·각 process 생존과 출력 상태를 기록. 관측 종료는 PPT 종료를 뜻하지 않음 |
+
+합성 읽기·marker probe·문서 닫기는 기존 소유 절차와 실패 중단 조건을 재사용한다.
+새 사용자 문서·보호된 보기·슬라이드쇼가 생기면 기존 보호 guard를 유지하고 자동 저장·응답·close를 추가하지 않는다.
+합성 읽기 검증은 길이/허용된 해시만 기록하고 본문은 메모리에서만 비교한다.
+
+### 경로별 one-shot 계약
+
+- 공통: 새 runner는 관측/저장과 실제 요청을 분리한다. 기존 `observe_export_prepare`를 그대로 internal 경로에 쓰지 않는다.
+  `complete_host`, 동일 identity, ownership/cleanup, generation, export 성공과 기존 안전 검사를 그대로 적용한다.
+- internal: Bind → Observe/export → 기존 `TryQuitIfIdle` 1회. `PrepareExternalBootstrap`·START/ACK/COMPLETE를 호출하지 않는다.
+  `AllowNormalShutdown/ProcessFence.TryClaim`과 기존 guard만 정상종료 권한을 결정한다.
+- external: Bind → Observe/export → 기존 Prepare 1회 → 기존 Ready/status 계약 1회 → START 1회/ACK → 기존 Quit 1회 → 정상 반환일 때만 COMPLETE.
+  presignaled/timeout/거절/unknown 뒤 status·getter·Prepare·Quit 추가 호출을 하지 않는다.
+- 환경변수·run ID·공유 메모리·진단 관측 결과는 종료 권한을 부여하지 않는다. 기존 process-wide retry fence를 리셋하지 않는다.
+
+## 4. 핵심 증거와 오류 경계
+
+controller는 local VARIANT unwrap과 기존 필수 canonical/self-control/wire 정보를 먼저 확보한다.
+선택 `COMAddIns.Item.Application`은 이번 기본 실행에서 `omitted_by_plan`으로 남기고 119/121의 과거 오류를 별도 근거로 연결한다.
+이 선택 항목을 건너뛰는 것과 실제 unknown 이후 계속 호출하는 것을 구별한다.
+
+host는 host/candidate 각각의 canonical·IDispatch·기존 QI self-control을 먼저 기록하고 그 후 형식 정보와 기존 Application 행을 조사한다.
+첫 unknown/fatal 이후에는 나머지 COM 조사를 중단한다. 양쪽 핵심 관측 완료는 앞선 필수 호출이 성공한 경우에만 가능하다.
+기존 4개 host 행과 `complete_host` 기준을 완화하지 않는다. 핵심을 먼저 기록해도 전체 host 보고서가 unusable이면 요청하지 않는다.
+
+각 COM 경계는 begin → return 또는 fail을 독립 기록한다. GetIDsOfNames와 Invoke를 나누고 호출 경로·DISPID·flags·HRESULT의
+부호값/hex·EXCEPINFO의 wCode/scode·argErr와 필드 존재 여부를 남긴다. 자유 문자열 EXCEPINFO 설명·본문은 남기지 않는다.
+native Win32 오류는 해당 API 실패 직후에만 저장하며 stale GetLastError를 COM 오류 원인으로 사용하지 않는다.
+primary 오류와 cleanup 오류를 별도 보존하고 최초 unknown을 뒤의 해제 성공으로 지우지 않는다.
+
+## 5. PPT 밖에서 보존하는 trace
+
+PPT 내부 기록은 고정 크기의 primitive 전용 append buffer에만 쓴다. callback에서 파일 I/O·수집기 응답 대기·COM 추가 조회·GC 강제 실행을 하지 않는다.
+외부 수집기가 버퍼를 읽어 디스크에 보존한다. 현재 ThreadPool export를 외부 수집기로 잘못 부르지 않는다.
+
+- 새 진단 전용 전송은 시작 전에 만든 **익명 pagefile-backed shared mapping**과 명시적 handle 상속을 사용한다.
+  기존 상속 capability 검증과 같이 실제 자식의 mapping handle이 원 kernel object와 같은지 부모가 검증한다.
+  host는 handle type/접근/고정 header 크기·schema·run binding을 검증한 후 채택한다. 검증 안 된 handle 숫자는 닫거나 재해석하지 않는다.
+- mapping은 익명이고 현재 일반 사용자/Admin/System 범위로 제한한다. 이 경계가 같은 사용자 내부의 적대 코드까지 격리한다고 주장하지 않는다.
+  전송은 진단 데이터만 담고 프로세스 종료 권한과 분리한다. 기존 START/ACK/COMPLETE handle과 혼용하지 않는다.
+- 레이아웃 v1: 고정 header와 4096개 고정 128-byte slot. header에는 layout/schema, run UUID, PID/creation,
+  QPC frequency, published_count, saturated dropped_count, offthread_count를 둔다. 임의 문자열·COM 객체·native 주소는 넣지 않는다.
+- producer는 기존 owner STA 하나다. Quit 안에서 정상 중첩 진입하는 Cancel/lifecycle callback은 entry/exit와 각 depth를 담은 정상 record로 보존한다.
+  COM callback 중첩과 slot append 함수가 쓰는 도중의 append 자체 재진입을 구별한다. append 안에는 COM·callback·메시지 pump를 넣지 않는다.
+  append 자체 재진입이나 off-thread 기록을 안전하게 보존할 수 없으면 guard 상태를 변경하지 않고 종류별 saturating 누락 counter를 올린다.
+  counter가 정확한 수인지 하한인지 header에 명시한다. counter 비영·조회 불가·불일치이면 해당 범위는 evidence_loss/unknown이며 미실행으로 판정하지 않는다.
+  slot 전체 기록 → release publish 순번, collector의 acquire read → 완성 slot 복사를 적용한다. x86/x64의 부분 기록·가시성을 native 시험한다.
+  append-only로 재사용하지 않는다. 포화 시 덮어쓰지 않고 누락 표시를 남긴다. overflow이면 수집 완전 판정은 실패한다.
+- mapping은 수집기가 계속 보유하므로 PPT가 끝나도 마지막 published slot을 회수한다. 수집기는 매 50ms 이하 주기로 가져오고
+  최대 1초 간격·최종 drain에서 파일 flush를 수행한다. 마지막 published_seq와 persisted_seq를 구별한다.
+  수집기/디스크 실패면 콜백을 기다리게 하거나 재시도하지 않는다. 다음 요청 전 실패를 알면 요청 금지, 요청 후면 판정을 unknown으로 남긴다.
+- retained target signal 후 final drain하거나 deadline/cancel 시 그 시점의 마지막 순번까지만 drain한다.
+  host가 살아 있으면 이후 이벤트가 계속 발생할 수 있으므로 `capture_closed`가 host 종료나 이후 이벤트 부재를 뜻하지 않는다.
+  깨진/빠진 slot·tail 불일치·수집기 실패는 evidence_loss이며 종료 성공으로 대체하지 않는다.
+
+## 6. 수집 항목과 판독
+
+| 수집 위치 | 기록할 최소 정보 | 해석 제한 |
+|---|---|---|
+| 실행 환경 | Windows/Office/Python/pywin32/CLR 버전·bitness, 권한/세션, 실제 EXE/DLL/source/helper/fixture pin, 등록 addon·실제 loaded module의 허용된 이름/버전 | 무거운 hash는 Quit 구간 밖에서 수행. 등록과 실제 로드를 구별 |
+| host/controller | run_id/target PID·creation/seq/QPC, 경로 internal/external, native/managed thread·apartment, generation, service/guard/event depth, 호출 begin/return/fail | QPC frequency로 같은 기준 ns로 환산하고 UTC는 보조. 서로 다른 프로세스의 seq 순서를 시간순으로 추측하지 않음 |
+| 이벤트 | 이벤트 종류, entry/exit, Active/Broken/Cancelled, cancel_in/cancel_out/set_by_aegis, 종료 lifecycle의 removeMode 및 정리 begin/return | 이벤트 인수의 문서 속성 접근 금지. 우리 callback 출력이 다른 subscriber까지 거친 최종 Cancel을 뜻하지 않음 |
+| 정리 | 자기가 획득한 참조 ID·종류·획득/해제 시도/결과, Advise/Unadvise, timer/capability 정리, OnBeginShutdown/OnDisconnection | 전체 native refcount나 외부 addon 정리 완료 증명으로 쓰지 않음. borrowed host RCW 강제 Release·GC 추가 금지 |
+| OS observer | exact handle wait, creation/exit time·exit code, owner TID·CPU/스레드 수, 해당 PID 창의 class/owner/visible/enabled, bounded WCT | 창 제목·본문·dump·registry 전체 export 제외. WCT 빈 결과/접근거부는 원인 해소 증명 아님 |
+
+OS 상세 snapshot은 요청 직전과 요청 시작 후 1/5/15/30/60/180초에 수집한다. controller가 반환하지 않아도 시작 시각 기준으로 작동한다.
+WCT는 별도 COM 없는 worker에서 비동기·최대 2초 관측으로 격리하고, 실패/미반환이면 해당 probe를 unavailable로 남기고 더 만들지 않는다.
+기본 handle 감시는 이 worker를 기다리지 않는다. module·registry 정보 조회도 상한을 두고 실패를 그대로 기록한다.
+다른 PID 종료는 target 감시를 멈추는 조건이 아니다. PID 재사용·HWND 변경은 기존 대상과 혼동하지 않고 unknown으로 분리한다.
+
+최종 summary에는 `request_complete`, `capture_closed`와 사유/시간/관측 범위, `os_exit`, `evidence_loss`,
+실제 호출 횟수·마지막 단계·primary/cleanup 오류·미실행 사유, overflow/append 재진입/offthread 누락과 그 하한 여부를 각각 둔다.
+미관측 동작은 기본 unknown이다. 미실행은 controller의 확정 분기나 유실 없는 해당 호출 범위의 명시적 기록으로만 판정한다.
+legacy schema2 frame은 request 범위의 과거 자료로 읽고 그것만으로 이후 lifecycle 미도달을 확정하지 않는다.
+
+산출물은 `summary.json`, `manifest.json`, `controller.jsonl`, `host.jsonl`, `os.jsonl`, `coverage.json`과 허용목록 파일의 hash 목록이다.
+수집기는 이 파일만 같은 run 디렉터리에 CREATE_NEW로 만든다. symlink/reparse 경로·기존 파일 덮어쓰기는 거절한다.
+부분 실패여도 이미 저장된 파일과 incomplete 요약을 남긴다. 무관한 AppData 로그·문서·덤프를 자동 첨부하지 않는다.
+
+## 7. 중단·취소·복구
+
+기본 controller는 요청의 normal return/거절/확정 실패 직후 의도적인 참조 보유 대기 없이 정리한다.
+external 정상 반환에서 기존 COMPLETE 신호를 보낸 뒤 추가 COM 관측 없이 다음 순서를 따르고, internal에는 COMPLETE를 추가하지 않는다.
+오류도 primitive outcome으로 변환해 활성 예외 처리 범위를 벗어난 뒤 같은 정리 경로로 간다.
+
+1. `request_return` 또는 fail을 저장한다. helper의 소유 apartment에서 app/service·중간 wrapper·candidate·prepared_args·closure/cache·예외/traceback의 COM 보유를 놓으며 `controller_refs_drop_begin/end`를 기록한다.
+2. 성공한 CoInitializeEx에 대해서만 같은 apartment에서 균형 잡힌 CoUninitialize를 1회 시도하고 `CoUninitialize_begin/end`를 기록한다.
+3. caller exit는 독립 process handle로 확인한다. 정상 wrapper drop을 서버 전체 native 참조 소멸로 판정하지 않는다.
+
+기존 runner의 service/app 30초 보유와 강제 GC는 기본 도구에 옮기지 않는다. borrowed RCW나 caller app에 명시적 Release/FinalRelease를 추가하지 않는다.
+외부 감시는 요청 시작부터 계속하며 `controller_refs_drop_end`와 `CoUninitialize_end`가 모두 확인된 때부터
+target exit 또는 capture deadline까지 실제 관측한 `post_cleanup_observed_ms`를 따로 기록한다.
+COM 미반환·정리/CoUninitialize 미반환이면 이 시간은 unavailable과 사유로 남긴다. deadline 직전 정리됐으면 짧은 실제 시간만 보고하고 180초 상한을 연장하지 않는다.
+
+취소는 새로운 COM 단계와 새 snapshot 예약을 중단하고 이미 모인 버퍼를 외부에서 drain한다. 진행 중 COM/RPC·WCT를 thread kill로 중단하지 않는다.
+observer deadline은 요청 시작부터 최대 180초이며 시작 전 단계별 hang도 외부 supervisor의 180초 상한으로 보고한다.
+PPT·controller가 남으면 identity·생존·마지막 단계를 기록하고 결과 묶음을 만든다. observer timeout을 process exit로 표시하지 않는다.
+정상 wrapper 해제/CoUninitialize도 실패하거나 멈출 수 있으므로 별도 begin/return을 기록하고 수집기 완료를 막지 않도록 한다.
+강제 종료·WM_CLOSE·대화상자 자동응답·등록/ACL 복구·소유권 재획득은 자동 수행하지 않는다.
+사용자가 이후 정상 정리를 하더라도 별도 기록이며 진단 Quit 성공으로 합산하지 않는다.
+다음 실행은 원 target과 caller가 모두 종료했고 기존 run lock·설치 상태가 안전함을 확인한 새 실행만 허용한다.
+
+## 8. 구현 순서·호환성·커밋 경계
+
+| 순서 | 변경 모듈과 경계 |
+|---|---|
+| 1 | `scripts/ppt_reader/ppt_trace_report.py`: 범위/완결/OS 종료를 분리한 schema3 판독과 legacy 제한. 순수 fake 회귀와 함께 한 커밋 |
+| 2 | `scripts/ppt_reader/ppt_identity_observation.py`, `ppt_identity_controller.py`, `ppt_identity_live.py`, `PptExternalIdentityObservation.cs`: 핵심 우선·오류 분리·관측과 실행 adapter 분리. 기존 gate 유지 회귀와 한 커밋 |
+| 3 | 새 진단 전용 shared-buffer 모듈 및 `PptExternalTrace.cs`, `PptShutdownState.cs`, `PptEventSink.cs`, `PptReader.cs`·guard 경계: 외부 보존과 이벤트/lifecycle 계측. native transport 시험과 한 커밋 |
+| 4 | `scripts/diagnostics/ppt_capture/` 새 supervisor/collector/report와 COM bootstrap adapter. Win32/win32com 코드는 `knowmate/secure/`에 격리하고 CLI/보고서는 primitive만 받음. checkpoint121은 변경하지 않음 |
+| 5 | build.ps1/manifest의 새 진단 패키지·schema/pin·default-off 검사, 실제 실행 guide 및 DIAGNOSTICS/ROADMAP/UPDATE_NOTES 동기화 |
+
+실제 reader/setup/core/events 버전은 구현 시 기존 설치와 충돌하지 않는 새 버전으로 함께 고정하고 실제 빌드 hash를 기록한다.
+reader protocol3와 기존 공개 COM method의 의미·DISPID를 바꾸지 않는다. 새 telemetry schema3/layout1은 명시적 진단 빌드에서만 사용한다.
+구버전 package와 새 runner를 섞으면 Office 시작 전 거절한다. 사용자 설정·DB·기존 raw log는 마이그레이션하거나 삭제하지 않는다.
+
+## 9. 검증과 실패 시 행동
+
+| 검증 단계 | 필수 기준 | 실패 시 행동 |
+|---|---|---|
+| 순수 fake | 선택 getter 오류가 핵심 앞에 오지 않음; 필수 실패·cleanup/export 실패 뒤 후속 COM 0; internal/external 횟수·일회 latch·generation·기존 complete_host 거절; Quit 안의 정상 Cancel/lifecycle callback의 순서/depth/귀속 보존; append 재진입/offthread/포화 누락의 evidence_loss·coverage unknown 전파; 늦은 lifecycle와 legacy unknown; 참조 해제→CoUninitialize 순서·보유 대기 없음·정리 멈춤/직전 완료 시 실제 post-cleanup 시간 | 설계/코드 보완 전 다음 단계 금지 |
+| Windows native, Office 없음 | x86/x64 mapping 검증·타입/크기/handle 재사용/타인 run 거절; publish 도중 append 재진입·counter 가시성·producer/collector 급종료·포화·디스크 실패·최종 drain·잘못된 seq; 콜백 비차단; 대상 외 PID 종료·WCT 미반환/접근거부·cancel 상한 | native 증명 전 새 live 도구 잠금 유지. 권한 부족은 UNEXECUTED로 기록 |
+| 전체 회귀/빌드 | `pytest knowmate/tests -v` 및 새 도구 회귀·default-off·기존 cleanup/ABI/ACL 필수 gate; 새 frozen package/pin 검증 | 기존 writer 1314 미실행 등을 통과로 바꾸지 않음. 미통과 산출물로 live/배포하지 않음 |
+| 별도 Windows/Office 합성 승인 시험 | 일반 사용자·정확한 소유 target·실제 event ABI, source 불변·본문 비출력, 요청 반환/실제 exit의 구분·hang 시 외부 수집·overflow 거절; 사용자가 문서를 여는 보호 경합 | 새 live 실행은 해당 구체적 패키지·절차 검토 후 별도 승인 범위. 실패 시 활성화 중단·unknown 보존 |
+| 사내 Office/DRM·UAC·배포 | 설치/운영 정본의 독립 gate와 실제 최종 배포 파일 승인 | 집 PC 합성·계획 승인으로 대체하지 않음. 자동종료 출시 계속 비활성 |
+
+진단 오버헤드는 transport native 부하시 지연/누락, 별도 합성 Office 시험의 계측 전후 시간 분포로 기록한다.
+계측 때문에 없어진 현상을 해결로 판정하지 않는다. blocking·guard 의미 변경·미관측 손실이면 진단 구현을 재설계한다.
+
+현재 미실행: 위 구현 및 자동/native/실제 Windows·Office·DRM 시험 전체. 현재 환경에는 Windows·Office와 완전 checkout이 없고 pytest도 없다.
+계획 완료 기준: 최종 revision에 대한 독립 검토의 미해결 Critical/High/Medium 0건이며, 이는 구현·테스트·live·배포 승인이 아니다.
+
+## 10. 리뷰 기록
+
+리뷰와 revision별 계획은 [검증 기록 디렉터리](../archive/ppt-shutdown-capture-review/)에 보존한다.
+`plan-review-loop` 스킬 본문을 적용했다. 부속 `references/review-contract.md`는 provider에서 읽을 수 없어
+본문의 필수 계획 항목·심각도별 finding/조건/근거/조치/재검증 기준과 종료 조건으로 기록 양식을 구성했다.
