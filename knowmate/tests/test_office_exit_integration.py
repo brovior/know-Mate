@@ -10,16 +10,14 @@ from knowmate.collector.scheduler import CollectorWorker
 from knowmate.secure import office_exit, office_guard
 
 
-def test_owned_excel_exit_releases_collector_and_runs_com_finally(tmp_path, monkeypatch):
+def test_owned_excel_exit_releases_collector_and_runs_com_finally(tmp_path, monkeypatch, native_com_backend):
     office_guard.clear_owned_pids()
     entered, release = threading.Event(), threading.Event()
     events = []
     controller_thread = threading.get_ident()
-    monkeypatch.setitem(sys.modules, "pythoncom", SimpleNamespace(
-        COINIT_MULTITHREADED=0,
-        CoInitializeEx=lambda _mode: events.append(("com_init", threading.get_ident())),
-        CoUninitialize=lambda: events.append(("com_uninit", threading.get_ident())),
-    ))
+    from knowmate.secure.com_scope import acquire_current_scope
+    native_com_backend.initialize = lambda: (events.append(("com_init", threading.get_ident())), 0)[1]
+    native_com_backend.uninitialize = lambda: events.append(("com_uninit", threading.get_ident()))
     monkeypatch.setattr(lifecycle, "_WAIT_GRACEFUL_MS", 10)
 
     def com_cleanup(**_kwargs):
@@ -33,6 +31,7 @@ def test_owned_excel_exit_releases_collector_and_runs_com_finally(tmp_path, monk
     )
 
     def blocked_cycle():
+        acquire_current_scope()
         worker._work_phase = "com_cell_read"
         entered.set()
         assert release.wait(3), "fake Office read was not released"

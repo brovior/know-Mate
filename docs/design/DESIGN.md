@@ -514,6 +514,25 @@ hard_exit 주입) 사외 단위 테스트가 가능하다.
 근거 있게 설계한다. 위 dirty-shutdown 표식은 "언제 그 복구가 필요할지"에 대한 최소한의 신호일
 뿐, 자동 격리·재구축은 여전히 하지 않는다.
 
+## COM 초기화와 PowerPoint 원 프로세스 관측
+
+수집기 워커는 lazy `ComScope` 하나를 소유한다. 실제 COM 진입 전에 native MTA 초기화와
+실제 apartment 확인을 끝내고, pywin32 import와 getter는 그 뒤에 수행한다. 중첩 scope는
+빌려 쓰며 native 초기화를 추가하지 않는다. 자기 native 성공분만 같은 스레드에서 해제한다.
+환경 확인 실패는 COM 파일을 연기하고 일반 파일·메일 처리를 막지 않는다.
+
+파일·generator·ownership·예외 프레임이 끝난 뒤 복구한다. 오류 분류에 필요한 원예외는 그
+경계 안에서 사용하고, 바깥에는 고정 단계·숫자 코드만 전달한다. 추출 본문의 기존 메모리·암호화
+DB 흐름, Word·Excel의 DispatchEx/Quit/watchdog 정책은 유지한다.
+
+직접 실행한 PowerPoint의 원 handle은 COM host의 PID·생성 identity·generation 일치 후
+COM 없는 관측 객체로 이전한다. Quit snapshot과 독립하여 보존하고 wait/close는 단일 소유자가
+직렬화한다. 신호·시간초과·관측 실패·대상 미확인을 구분하며, OS 종료 신호로 사용자 문서 종료
+권한이나 정상종료 원인을 추정하지 않는다. 새 워커에는 COM 객체·Quit 권한을 이전하지 않는다.
+
+별도 합성 진단과 배포 보류 조건은 [진단 안내](../guides/PPT_CAPTURE.md#별도-참조-수명-비교-후보-1070)를
+따른다. 기존 제품 종료 정책과 설치 계약은 변경하지 않는다.
+
 ## COM 오류 증거와 복구 진단
 
 `secure/com_fault.py`는 부호 있는/없는 32비트 정수 HRESULT, 표준 6항목 excepinfo의

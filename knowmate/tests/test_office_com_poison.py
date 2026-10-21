@@ -381,7 +381,7 @@ def test_word_excel_use_dispatchex_and_ppt_uses_dispatch(monkeypatch):
     ]
 
 
-def test_xls_dynamic_fallback_reports_actual_com_and_hooks(monkeypatch):
+def test_xls_dynamic_fallback_reports_actual_com_and_hooks(monkeypatch, native_com_scope):
     """xlrd 실패 뒤에만 워치독용 훅을 감싸고 실제 COM 사용을 보고한다."""
     from knowmate.secure import AutoReader
 

@@ -3,6 +3,43 @@
 현재 원인 분석과 다음 검증의 정본이다. 작업 상태는 [ROADMAP.md](ROADMAP.md), 구현 계약은
 [DESIGN.md](design/DESIGN.md), 완료 이력은 [UPDATE_NOTES.md](UPDATE_NOTES.md)를 따른다.
 
+## PPT 참조 수명·원 프로세스 관측 후보 (2026-10-20)
+
+워커의 첫 실제 COM 사용 전에 native MTA를 확보하고 자기 성공분만 해제하는 후보와,
+직접 실행한 PowerPoint의 원 handle을 보존하는 관측을 추가했다. 문서·예외 프레임이 끝난 뒤
+정리하며, 빈 정리 결과를 실제 프로세스 종료나 재기동 성공으로 집계하지 않는다.
+자기 초기화 해제·apartment 전체 종료·OS 프로세스 종료는 서로 다른 결과다.
+
+별도 `ppt_lifetime` 진단은 Reader 로드 상태의 새 프로세스에서 참조 해제와 외부 Quit을 비교한다.
+현재는 mock/replay만 사용하며 live/private 진입은 잠겨 있다. 기존 capture·checkpoint121·제품 설치
+계약은 유지한다. 새 1.0.7 진단 DLL은 build-only 소스이며 실제 빌드·설치·등록은 하지 않았다.
+명령과 결과 해석은 [진단 안내](guides/PPT_CAPTURE.md#별도-참조-수명-비교-후보-1070)를 따른다.
+
+새 진단은 직접 생성한 합성 파일의 모든 OPC member 이름·내용을 비교한다. 기존 capture의
+슬라이드·관계 검사만으로는 notes/customXml 등 전체 내용의 합성 출처를 보장하지 못하므로
+기존 검증기를 새 경로의 합성 인증으로 사용하지 않는다.
+
+### 구현 리뷰·실행 결과 (2026-10-21)
+
+개발 Agent의 구현 뒤 root 소스 리뷰에서 다음을 보완했다.
+
+- native apartment 조회 실패는 파일 손상으로 집계하지 않고 COM 환경 대기로 처리한다.
+- 진단 로그 쓰기·drop 실패에도 자기 참조를 정리한 뒤 native pair를 끝낸다.
+- OS 종료 사실과 실험 완료를 분리한다. 읽기·Close·참조 정리·호출자 완료가 빠지면 CLI 성공이 아니다.
+- 외부에 보존된 예외도 끝난 COM 프레임을 붙잡지 않도록 숫자 코드 추출 후 traceback 연결을 정리한다.
+- 초기화 직후 로그가 중단돼도 자기 성공분을 해제하고, apartment 검증 전 재진입은 차단한다.
+
+`python -m unittest knowmate.tests.test_ppt_lifetime -v`: **23 PASS**.
+별도 표준라이브러리 기반 native/handle 모형 검사 **12 PASS**, 변경 Python 34개 구문 검사와
+`git diff --check` 통과. 모형 검사는 실제 Windows native 시험이 아니다.
+필수 `python -m pytest knowmate/tests -v`는 `No module named pytest`로 실행하지 못했다.
+pytest 미설치로 전체 회귀는 **UNEXECUTED**다.
+전체 회귀 통과나 배포 가능 판정으로 해석하지 않는다.
+
+Windows x86/x64 native·첫 import·frozen·Office/DRM·Reader 속도/정확도·실제 원 PID 종료·설치/복구는
+**UNEXECUTED**다. 공유 host의 사용자 보호·실제 종료·배포·COM 수명·관측·성능 기준에 관한 기존
+미해결 Critical 1 / High 4 / Medium 1은 유지하며, 후보 구현이나 모형 시험으로 닫지 않는다.
+
 ## PPT 한 번 수집 진단 구현 후보 (2026-10-20)
 
 **핵심 identity 우선 관측·단회 internal/external adapter·공유 buffer/외부 collector·독립 OS 감시·schema3 판독을

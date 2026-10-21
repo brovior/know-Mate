@@ -23,6 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from knowmate.secure import com_reader
+from knowmate.secure.com_scope import ComScope
 from knowmate.secure.ppt_diagnostics import probe_error_details
 from scripts.ppt_probe.readers import (
     PROG_ID, ProbeCloseFailure, ProbeFailure, Snapshot, compare, convert_synthetic, decode_slide,
@@ -170,6 +171,18 @@ def main(argv: list[str] | None = None) -> int:
     if args.self_test:
         return self_test()
     try:
+        with ComScope() as scope:
+            scope.acquire()
+            return _run_probe(args)
+    except Exception as exc:
+        _emit({"status": "error", "error_type": type(exc).__name__,
+               "hresult": com_reader.hresult_of(exc)})
+        return 1
+
+
+def _run_probe(args: argparse.Namespace) -> int:
+    app = None
+    try:
         dispatch = time.perf_counter()
         app = com_reader._get_ppt_app()
         _emit({"environment": "synthetic" if args.synthetic else "real_read_only",
@@ -195,7 +208,8 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     finally:
         # PowerPoint에 Quit·강제 종료·추가 Close를 요청하지 않는다.
-        com_reader._tls.ppt = None
+        app = None
+        com_reader._release_ppt_references()
         gc.collect()
 
 

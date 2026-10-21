@@ -72,6 +72,7 @@ Phase 1~4 완료(RAG 지식검색), 5a 완료(Knox `.mysingle` + 표준 `.eml` �
 | PowerPoint 추가 기능 운영 적용 | 1.0.4.0 요청 전용 native 저장 후보, 사내 ACL PASS·writer 일부 통과 보고. 링크 fixture·정리·stdout·최종 결과 요약 보완, 기본 disabled 유지 | [저장 검증](guides/PPT_READER.md#ppt-요청-저장과-충돌-진단)과 다른 관리자 UAC 후 원래 helper 완료 저장을 우선 확인. [운영 설계](design/PPT_ADDIN_INDEXING.md)·[검증 절차](guides/PPT_READER.md)의 최종 released 파일 승인 시험 후 동일 파일 배포. 기존 orphan-only 임시파일 복구는 별도 과제 |
 | PowerPoint 인덱싱 후 자동종료 #116 | 직접 실행 증명·호스트 정상종료·사용자 문서 보호 후보 구현, candidate만 시험 | [자동종료 검증](guides/PPT_READER.md#powerpoint-자동종료-후보-검증)의 실제 Windows·Office 시험 후 별도 배포 활성화 |
 | PowerPoint 종료 진단 한 번 수집 | core 우선 관측·단회 요청·외부 보존·schema3 판독 및 별도1.0.6 진단 빌드 후보 구현. live 잠금 유지 | [새 진단 안내](guides/PPT_CAPTURE.md)의 x86/x64 native·정확한 패키지 pin·Office 합성 gate 대기. 기존 checkpoint121 잠금·일반 배포 기본값 유지 |
+| PowerPoint 참조 수명·원 handle 비교 | native MTA scope·예외 프레임 정리·원 handle 관측과 별도1.0.7 진단 후보. mock/replay만 허용 | [진단 안내](guides/PPT_CAPTURE.md#별도-참조-수명-비교-후보-1070)의 Windows·Office·사용자 보호 증거 대기. live·빌드·설치·등록·일반 배포 활성화 미실행 |
 | 질문 비동기화 | 요청별 QThread·기존 인덱스 읽기·대화 ACK/오래된 응답 차단·종료 보호 구현 | [상세 설계](design/ISSUE_B_query_async.md)의 사내 Windows·Office·DPAPI·실제 UI/장시간 질문 검증 대기 |
 | 실패 원인 판별 6b | 보류 | 오류 코드 실측, 워치독 밖 probe I/O의 행오버 위험 해소 |
 | 공용 인덱스 5b | 예정 | 로컬 캐시 복사 배포 설계·검증 |

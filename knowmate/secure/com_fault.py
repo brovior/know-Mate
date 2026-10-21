@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import traceback
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -117,6 +118,38 @@ def make_fault(exc: BaseException, stage: str, *, app_exe: str | None = None,
                phase: str | None = None) -> ComFault:
     """Capture an explicit operation fault using exception-first call syntax."""
     return make_com_fault(stage, exc, app_exe=app_exe, phase=phase)
+
+
+def clear_com_error_frames(exc: BaseException) -> None:
+    """Drop finished parser frames after scalar classification, before recovery."""
+    from knowmate.secure.office_guard import OfficeOwnershipProbeError, OfficeOwnershipCleanupError
+    pending = [exc]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        evidence = _attribute(current, "evidence")
+        if isinstance(evidence, ComFailureEvidence):
+            faults = (evidence.primary, *evidence.cleanup, evidence.poison_fault)
+            pending.extend(fault.original for fault in faults if fault is not None)
+        if isinstance(current, OfficeOwnershipProbeError):
+            current.document = None
+            if isinstance(current, OfficeOwnershipCleanupError):
+                for name in ("probe_error", "close_error", "restore_error"):
+                    original = getattr(current, name)
+                    if isinstance(original, BaseException):
+                        pending.append(original)
+                    setattr(current, name, None)
+        pending.extend(link for link in (current.__cause__, current.__context__)
+                       if isinstance(link, BaseException))
+        if current.__traceback__ is not None:
+            # clear_frames skips executing frames; it never mutates live COM work.
+            traceback.clear_frames(current.__traceback__)
+        current.__traceback__ = None
+        current.__cause__ = None
+        current.__context__ = None
 
 
 def fault_fatal_hresult(fault: ComFault, *, app_exe: str | None = None) -> int | None:

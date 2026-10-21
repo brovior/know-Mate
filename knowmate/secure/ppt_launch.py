@@ -4,7 +4,10 @@ from __future__ import annotations
 import ctypes
 import subprocess
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from knowmate.secure.ppt_process_observation import RetainedProcess
 
 
 def trusted_powerpoint_path(bitness: int) -> Path:
@@ -103,6 +106,16 @@ class LaunchedPowerPoint:
         handle, self._handle = self._handle, None
         if handle is not None:
             self._kernel.CloseHandle(handle)
+
+    def detach_observation(self) -> RetainedProcess:
+        """Transfer the original process handle after the caller proves its COM host."""
+        from knowmate.secure.ppt_process_observation import RetainedProcess
+
+        if self._handle is None or self.identity is None:
+            raise ValueError("powerpoint_observation_unavailable")
+        observer = RetainedProcess(self.pid, self.identity, self._handle, self._kernel)
+        self._handle = None
+        return observer
 
 
 def installation_stamp() -> tuple[Any, ...] | None:

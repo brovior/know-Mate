@@ -55,7 +55,9 @@ namespace AegisDesk.PptReader
     /// <summary>PowerPoint 주 STA에서 슬라이드를 읽는 운영 추가 기능.</summary>
     [ComVisible(true), Guid("287A80D2-804A-46D3-A0E9-CA31C6FC3D09")]
     [ProgId("AegisDesk.PptReader"), ClassInterface(ClassInterfaceType.None)]
-#if AEGIS_PPT_EXTERNAL_DIAGNOSTIC
+#if AEGIS_PPT_LIFETIME_DIAGNOSTIC
+    [ComDefaultInterface(typeof(IPptReaderLifetimeDiagnostic))]
+#elif AEGIS_PPT_EXTERNAL_DIAGNOSTIC
     [ComDefaultInterface(typeof(IPptExternalBootstrap))]
 #elif AEGIS_PPT_DEFERRED_DIAGNOSTIC
     [ComDefaultInterface(typeof(IPptReaderDeferredDiagnostic))]
@@ -63,6 +65,9 @@ namespace AegisDesk.PptReader
     [ComDefaultInterface(typeof(IPptReaderLifecycle))]
 #endif
     public sealed partial class Connect : StandardOleMarshalObject, IDTExtensibility2, IPptReader, IPptReaderLifecycle
+#if AEGIS_PPT_LIFETIME_DIAGNOSTIC
+        , IPptReaderLifetimeDiagnostic
+#endif
 #if AEGIS_PPT_DEFERRED_DIAGNOSTIC
         , IPptReaderDeferredDiagnostic
 #if AEGIS_PPT_EXTERNAL_DIAGNOSTIC
@@ -73,17 +78,23 @@ namespace AegisDesk.PptReader
         private object application;
         private int mainThread;
         private bool reading;
+#if !AEGIS_PPT_LIFETIME_DIAGNOSTIC
         private PptShutdownGuard shutdown;
+#endif
 #if AEGIS_PPT_DEFERRED_DIAGNOSTIC
         private PptDeferredDiagnostic deferred;
         private int connectionGeneration;
 #endif
+#if !AEGIS_PPT_LIFETIME_DIAGNOSTIC
         private readonly PptLifecycleTrace lifecycle = new PptLifecycleTrace();
+#endif
 
         /// <summary>Office가 로드할 때 주 STA와 자동화 객체를 연결한다.</summary>
         public void OnConnection(object app, int connectMode, object addin, ref Array custom)
         {
-#if AEGIS_PPT_EXTERNAL_DIAGNOSTIC
+#if AEGIS_PPT_LIFETIME_DIAGNOSTIC
+            ConnectLifetimeHost(app, addin);
+#elif AEGIS_PPT_EXTERNAL_DIAGNOSTIC
 
             ObservationFence.Require();
             InvalidateExternalSession();
@@ -153,6 +164,9 @@ namespace AegisDesk.PptReader
         /// <summary>Office 연결이 끝나면 보유 참조만 해제한다.</summary>
         public void OnDisconnection(int removeMode, ref Array custom)
         {
+#if AEGIS_PPT_LIFETIME_DIAGNOSTIC
+            DisconnectHost();
+#else
 #if AEGIS_PPT_EXTERNAL_DIAGNOSTIC
             externalTrace.LifecycleBoundary(1,true,removeMode);
 #endif
@@ -163,6 +177,7 @@ namespace AegisDesk.PptReader
                 ExportLifecycleBoundary();
 #endif
             }
+#endif
         }
         /// <summary>추가 기능 목록 변경에는 작업하지 않는다.</summary>
         public void OnAddInsUpdate(ref Array custom) { }
@@ -171,6 +186,9 @@ namespace AegisDesk.PptReader
         /// <summary>Office 종료에는 보유 참조만 해제한다.</summary>
         public void OnBeginShutdown(ref Array custom)
         {
+#if AEGIS_PPT_LIFETIME_DIAGNOSTIC
+            DisconnectHost();
+#else
 #if AEGIS_PPT_EXTERNAL_DIAGNOSTIC
             externalTrace.LifecycleBoundary(2,true,0);
 #endif
@@ -181,14 +199,20 @@ namespace AegisDesk.PptReader
                 ExportLifecycleBoundary();
 #endif
             }
+#endif
         }
 
+#if !AEGIS_PPT_LIFETIME_DIAGNOSTIC
         private int HostFlags()
         { return (application != null ? 1 : 0) | (shutdown != null ? 2 : 0); }
+#endif
 
         private void DisconnectHost()
         {
-#if AEGIS_PPT_EXTERNAL_DIAGNOSTIC
+#if AEGIS_PPT_LIFETIME_DIAGNOSTIC
+            application = null;
+            mainThread = 0;
+#elif AEGIS_PPT_EXTERNAL_DIAGNOSTIC
 
             InvalidateExternalSession();
             lifecycle.Record(3, HostFlags(), 0);
@@ -230,6 +254,9 @@ namespace AegisDesk.PptReader
         /// <summary>Candidate-only request; OS process exit is observed by the caller.</summary>
         public string TryQuitIfIdle()
         {
+#if AEGIS_PPT_LIFETIME_DIAGNOSTIC
+            return "not_supported";
+#else
             object scope = EnterDeferredService();
 #if AEGIS_PPT_EXTERNAL_DIAGNOSTIC
             externalTrace.ServiceBoundary(true);
@@ -241,8 +268,10 @@ namespace AegisDesk.PptReader
 #endif
                 LeaveDeferredService(scope);
             }
+#endif
         }
 
+#if !AEGIS_PPT_LIFETIME_DIAGNOSTIC
         private string InvokeExistingShutdown()
         {
 #if AEGIS_PPT_EXTERNAL_DIAGNOSTIC
@@ -281,6 +310,7 @@ namespace AegisDesk.PptReader
 
 #endif
 }
+#endif
 
         /// <summary>Already opened host document only; shared core preserves trial output.</summary>
         public string ExtractSlide(string presentationPath, int slide)
@@ -302,7 +332,11 @@ namespace AegisDesk.PptReader
             object scope = EnterDeferredService();
             try {
             RequireHostThread();
+#if AEGIS_PPT_LIFETIME_DIAGNOSTIC
+            if (reading) throw new COMException("probe_reentrant_request");
+#else
             if (reading || (shutdown != null && shutdown.Entered)) throw new COMException("probe_reentrant_request");
+#endif
             reading = true;
             try { return AegisDesk.PptShared.PptExtractionCore.ExtractSlide(application, presentationPath, slide); }
             finally { reading = false; }

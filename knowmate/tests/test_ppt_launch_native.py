@@ -29,6 +29,7 @@ def kernel(monkeypatch, *, started=True, identity=777, identity_error=False):
         return started
 
     native = SimpleNamespace(CreateProcessW=Function(create),
+                             WaitForSingleObject=Function(lambda *_: 258),
                              CloseHandle=Function(lambda handle: calls.append(("close", handle)) or True))
     import ctypes
     monkeypatch.setattr(ctypes, "WinDLL", lambda *_a, **_k: native, raising=False)
@@ -73,6 +74,21 @@ def test_post_create_error_releases_both_handles_and_is_not_not_started(monkeypa
         ppt_launch.LaunchedPowerPoint(Path("/Office/POWERPNT.EXE"))
     assert not isinstance(error.value, ppt_launch.PptLaunchNotStarted)
     assert sorted(call[1] for call in calls if call[0] == "close") == [101, 102]
+
+
+def test_detach_transfers_original_handle_without_duplicate_or_early_close(monkeypatch):
+    calls = kernel(monkeypatch)
+    child = ppt_launch.LaunchedPowerPoint(Path("/Office/POWERPNT.EXE"))
+    observer = child.detach_observation()
+    child.close()
+    assert observer.pid == 123 and observer.identity == 777
+    assert observer.poll().status == "timeout"
+    assert calls[1:] == [("close", 102)]
+    with pytest.raises(ValueError, match="observation_unavailable"):
+        child.detach_observation()
+    observer.close()
+    observer.close()
+    assert calls[1:] == [("close", 102), ("close", 101)]
 
 
 @pytest.fixture

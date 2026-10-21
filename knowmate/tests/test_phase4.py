@@ -187,6 +187,16 @@ class TestRetrieverWithCrypto:
         assert len(decrypt_log) == len(results)
 
 
+@pytest.fixture
+def reader_com_scope(native_com_backend):
+    """Give direct reader routing tests an explicit modeled native apartment."""
+    from knowmate.secure.com_scope import ComScope
+    with ComScope() as scope:
+        scope.acquire()
+        yield scope
+
+
+@pytest.mark.usefixtures("reader_com_scope")
 class TestComReader:
     def test_com_reader_unavailable_without_win32com(self):
         """win32com 없는 환경에서 ComReader.extract() 시 ComUnavailableError."""
@@ -207,6 +217,7 @@ class TestComReader:
             reader.extract("C:/dummy/file.docx")
 
 
+@pytest.mark.usefixtures("reader_com_scope")
 class TestAutoReader:
     def test_auto_reader_docx_uses_plain(self, tmp_path: Path):
         """AutoReader.extract()로 .docx 경로를 주면 PlainReader 경로로 간다."""
@@ -596,6 +607,7 @@ class TestSignature:
 
 # ── AutoReader OLE2/DRM 폴백 라우팅 ──────────────────────────────
 
+@pytest.mark.usefixtures("reader_com_scope")
 class TestAutoReaderOle2Fallback:
     @pytest.fixture(autouse=True)
     def _isolate_office_guard(self, monkeypatch):

@@ -16,6 +16,8 @@ from knowmate.collector.memory_diagnostics import MemoryDiagnostics
 from knowmate.collector.scanner import get_scope, iter_scan_folder, normalize_path_key
 from knowmate.collector.state import load_state, save_state
 from knowmate.secure import com_stage
+from knowmate.secure.com_fault import clear_com_error_frames
+from knowmate.secure.com_scope import ComScopeUnavailable
 from knowmate.secure.office_guard import OfficeBusyError, OfficeCleanupPendingError
 from knowmate.secure.signature import UnreadableFormatError, is_ole2, is_zip
 
@@ -327,7 +329,9 @@ class CollectorWorker(QThread):
         self._embedding_cancel = EmbeddingCancellation()
         start = time.time()
         self._memory_diagnostics = None
-        _com_initialized = False
+        from knowmate.secure.com_scope import ComScope
+        com_scope = ComScope()
+        com_scope.__enter__()
         try:
             try:
                 from knowmate.config import memory_diagnostics_settings
@@ -338,15 +342,6 @@ class CollectorWorker(QThread):
             except Exception as exc:
                 self._memory_failure("initialize", exc)
 
-            # QThread에서는 메시지 펌프 없이 Office를 호출할 수 있도록 MTA를 사용한다.
-            try:
-                import pythoncom  # type: ignore
-                pythoncom.CoInitializeEx(pythoncom.COINIT_MULTITHREADED)
-                _com_initialized = True
-            except ImportError:
-                pass
-            except Exception as exc:
-                logger.warning("COM 초기화 경고: %s", exc)
             with embedding_cancellation_scope(self._embedding_cancel):
                 self._run_cycle()
         except EmbeddingCancelledError:
@@ -357,8 +352,8 @@ class CollectorWorker(QThread):
         finally:
             self._memory_call("log", "before_com_cleanup")
             try:
-                if _com_initialized:
-                    # COM 앱 Quit은 반드시 생성 스레드(여기)에서 수행해야 한다(STA)
+                if com_scope.active:
+                    # Cleanup runs on the owning worker before its native pair ends.
                     try:
                         self._cleanup_com_apps("cycle_end")
                     except Exception:
@@ -370,9 +365,7 @@ class CollectorWorker(QThread):
                     finally:
                         release_verified_pending_com_refs()
                 finally:
-                    if _com_initialized:
-                        import pythoncom  # type: ignore
-                        pythoncom.CoUninitialize()
+                    com_scope.close()
             finally:
                 try:
                     self._memory_call("log", "after_com_cleanup")
@@ -1156,6 +1149,7 @@ class CollectorWorker(QThread):
             com_stage.take_last_failed_stage()
             _wd_fired_stage = None
             _wd_exe = None
+            poison_exe = None
             try:
                 logger.debug("[단계1] 텍스트 추출 시작: %s", task.path)
                 _extract_t0 = time.perf_counter()
@@ -1372,6 +1366,7 @@ class CollectorWorker(QThread):
                         changed_during.append(task.path)
                     failure_state.note_failure(failures, task.path, kind, stage, None,
                                                task.mtime, task.size, self._get_now())
+                clear_com_error_frames(exc)
             except EmbeddingCancelledError:
                 self._cancelled = True
                 deferred.append(task.path)
@@ -1396,22 +1391,8 @@ class CollectorWorker(QThread):
                     task.mtime, task.size, self._get_now(),
                 )
                 _log_com_poison(exc, attempt_id=attempt_id)
-                try:
-                    recovered = self._com_poison_recovery_fn(exc.exe_name)
-                except Exception as recovery_exc:
-                    recovered = False
-                    logger.warning("[collector] COM poison 즉시 복구 실패: attempt_id=%s exe=%s error_type=%s",
-                                   attempt_id, exc.exe_name, type(recovery_exc).__name__)
-                last_recovery_by_exe[exc.exe_name] = (attempt_id, bool(recovered), _og.guard_epoch())
-                if recovered:
-                    poison_recovery_count += 1
-                    com_since_restart = 0
-                    logger.warning("[collector] COM poison 즉시 복구 후 계속 진행: %s attempt_id=%s epoch=%s",
-                                   exc.exe_name, attempt_id, last_recovery_by_exe[exc.exe_name][2])
-                else:
-                    poison_recovery_failed += 1
-                    poisoned_exes.add(exc.exe_name)
-                    logger.warning("[collector] COM poison 복구 미확인 — %s만 이번 사이클 연기", exc.exe_name)
+                poison_exe = exc.exe_name
+                clear_com_error_frames(exc)
             except OfficeCleanupPendingError as exc:
                 cleanup_pending_count += 1
                 com_stage.take_last_failed_stage()
@@ -1425,6 +1406,17 @@ class CollectorWorker(QThread):
                                       previous_recovery=last_recovery_by_exe.get(exc.exe), path=task.path)
                     cleanup_pending_logged_exes.add(exc.exe)
                 deferred.append(task.path)
+                clear_com_error_frames(exc)
+            except ComScopeUnavailable as exc:
+                com_stage.take_last_failed_stage()
+                actual_com = getattr(self._extractor, "take_actual_com_used", None)
+                if callable(actual_com):
+                    actual_com()
+                com_used = False
+                deferred.append(task.path)
+                logger.warning("[collector] COM 환경 확인 불가로 연기: reason=%s attempt_id=%s <%s>",
+                               exc.reason, attempt_id, task.path)
+                clear_com_error_frames(exc)
             except OfficeBusyError as exc:
                 # 사용자가 Office를 열어둔 상태 → 이번 사이클만 연기(실패 아님).
                 # state를 갱신하지 않으므로 다음 유휴 사이클에서 자동 재시도된다.
@@ -1441,6 +1433,7 @@ class CollectorWorker(QThread):
                     failures, task.path, kind, _wd_fired_stage or _failed_stage, error_code,
                     task.mtime, task.size, self._get_now(),
                 )
+                clear_com_error_frames(exc)
             except UnreadableFormatError as exc:
                 # OOXML 확장자이나 zip 아님(DRM 래핑·손상 등)에 COM도 불가한 경우.
                 # 일반 실패와 구분해 로그·요약에 표시 — "버그"가 아니라 DRM/손상임을 알림.
@@ -1457,6 +1450,7 @@ class CollectorWorker(QThread):
                     failures, task.path, kind, _wd_fired_stage or _failed_stage, error_code,
                     task.mtime, task.size, self._get_now(),
                 )
+                clear_com_error_frames(exc)
             except Exception as exc:
                 if is_com or _wd_exe or task_exe is not None:
                     from knowmate.secure.com_fault import outer_hresult
@@ -1475,6 +1469,7 @@ class CollectorWorker(QThread):
                     failures, task.path, kind, _wd_fired_stage or _failed_stage, error_code,
                     task.mtime, task.size, self._get_now(),
                 )
+                clear_com_error_frames(exc)
 
             finally:
                 try:
@@ -1490,6 +1485,34 @@ class CollectorWorker(QThread):
                         com_stage.set_attempt_context(previous_attempt_context.cycle_id,
                                                       previous_attempt_context.attempt_id,
                                                       previous_attempt_context.app_exe)
+
+            if poison_exe is not None:
+                # The exception suite and parser frames have ended before recovery.
+                recovery_context = com_stage.get_attempt_context()
+                com_stage.set_attempt_context(cycle_id, attempt_id, poison_exe)
+                try:
+                    try:
+                        recovered = self._com_poison_recovery_fn(poison_exe)
+                    except Exception as recovery_exc:
+                        recovered = False
+                        logger.warning("[collector] COM poison 즉시 복구 실패: attempt_id=%s exe=%s error_type=%s",
+                                       attempt_id, poison_exe, type(recovery_exc).__name__)
+                    last_recovery_by_exe[poison_exe] = (attempt_id, bool(recovered), _og.guard_epoch())
+                    if recovered:
+                        poison_recovery_count += 1
+                        com_since_restart = 0
+                        logger.warning("[collector] COM poison 즉시 복구 후 계속 진행: %s attempt_id=%s epoch=%s",
+                                       poison_exe, attempt_id, last_recovery_by_exe[poison_exe][2])
+                    else:
+                        poison_recovery_failed += 1
+                        poisoned_exes.add(poison_exe)
+                        logger.warning("[collector] COM poison 복구 미확인 — %s만 이번 사이클 연기", poison_exe)
+                finally:
+                    if recovery_context is None:
+                        com_stage.clear_attempt_context()
+                    else:
+                        com_stage.set_attempt_context(recovery_context.cycle_id, recovery_context.attempt_id,
+                                                      recovery_context.app_exe)
 
             run_hard = getattr(self._indexer, "run_hard_limit_maintenance", None)
             if callable(run_hard) and not self._cancelled:
@@ -1513,12 +1536,14 @@ class CollectorWorker(QThread):
                         if result is None:  # legacy test/custom callback contract
                             restart_count += 1
                             logger.info("[collector] COM Office 주기 재기동 callback 완료: %d개 COM 파일 이후", com_since_restart)
-                        elif result.successful:
+                        elif result.successful and (result.confirmed_exited or result.forced_exited):
                             restart_count += 1
                             logger.info(
                                 "[collector] COM Office 주기 재기동 종료 확인: files=%d actual_exit=%s",
                                 com_since_restart, sorted(result.confirmed_exited),
                             )
+                        elif result.successful:
+                            logger.info("[collector] COM Office 주기 정리 완료: files=%d actual_exit=[]", com_since_restart)
                         else:
                             logger.warning(
                                 "[collector] COM Office 주기 재기동 미확인: files=%d remaining=%s identity_unknown=%s failed=%s",

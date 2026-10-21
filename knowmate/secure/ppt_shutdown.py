@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from dataclasses import dataclass, replace
 from typing import Any
 
@@ -30,6 +31,52 @@ class LaunchTicket:
 _ticket: LaunchTicket | None = None
 
 
+@dataclass
+class _ObservationTarget:
+    observer: Any
+    record: Any
+    yielded: bool = False
+
+
+_observations: dict[int, _ObservationTarget] = {}
+
+
+def _yield_observation(ticket: LaunchTicket) -> None:
+    with _lock:
+        target = _observations.get(ticket.generation)
+        if target is not None:
+            target.yielded = True
+
+
+def close_observations() -> None:
+    """Release retained OS handles on application exit without claiming process exit."""
+    with _lock:
+        targets = tuple(_observations.items())
+        _observations.clear()
+    for generation, target in targets:
+        result = target.observer.poll()
+        target.observer.close()
+        logger.info("[ppt] observation released: generation=%s pid=%s status=%s yielded=%s",
+                    generation, target.observer.pid, result.status, target.yielded)
+
+
+def _finish_observation(generation: int, target: _ObservationTarget) -> None:
+    from knowmate.secure import office_guard as guard
+    global _ticket
+    with _lock:
+        if _observations.get(generation) is not target:
+            return
+        _observations.pop(generation)
+        if _ticket is not None and _ticket.generation == generation:
+            _ticket = None
+    if not target.yielded:
+        with guard._owned_lock:
+            current = guard._owned_pids.get(target.observer.pid)
+        if (current is not None and current.generation == target.record.generation
+                and current.creation_identity == target.record.creation_identity):
+            guard._remove_owned_if_matches(target.observer.pid, current)
+
+
 def admission_reason() -> str | None:
     """Block new dispatch while launch or a single quit outcome is unresolved."""
     with _lock:
@@ -51,10 +98,14 @@ def _set_ticket(expected: LaunchTicket, **changes: Any) -> LaunchTicket | None:
 
 
 def reset_for_tests() -> None:
-    """Reset scalar admission only, without inspecting or touching Office."""
+    """Reset admission and release retained handles without touching Office."""
     global _ticket
     with _lock:
         _ticket = None
+        targets = tuple(_observations.values())
+        _observations.clear()
+    for target in targets:
+        target.observer.close()
 
 
 def observe_pending() -> None:
@@ -65,6 +116,15 @@ def observe_pending() -> None:
         current = _ticket
     if current is None or current.state in {"ready", "launching"}:
         return  # an in-flight CreateProcess is never resolved by a vacant OS list
+    with _lock:
+        target = _observations.get(current.generation)
+    if target is not None:
+        result = target.observer.poll()
+        if result.status == "exited":
+            _finish_observation(current.generation, target)
+            return
+        if result.status == "timeout":
+            return
     processes = guard._enumerate_processes()
     if processes is None:
         return
@@ -77,6 +137,11 @@ def observe_pending() -> None:
         with _lock:
             if _ticket is current:
                 _ticket = None
+                discarded = _observations.pop(current.generation, None)
+            else:
+                discarded = None
+        if discarded is not None:
+            discarded.observer.close()
         guard.prune_released_nonterminable_processes()
 
 
@@ -173,6 +238,14 @@ def launch_and_bind(win32com: Any, bitness: int) -> tuple[Any, tuple[int, Any], 
         ready = _set_ticket(ticket, state="ready", proof_generation=proof[1].generation)
         if ready is None:
             raise guard.OfficeCleanupPendingError(_EXE, "launch_ticket_changed")
+        observer = launched.detach_observation()
+        with _lock:
+            attached = _ticket is ready
+            if attached:
+                _observations[ready.generation] = _ObservationTarget(observer, proof[1])
+        if not attached:
+            observer.close()
+            raise guard.OfficeCleanupPendingError(_EXE, "launch_ticket_changed")
         logger.info("[ppt] launch decision: path=direct reason=ready pid=%d generation=%d owner_thread=%d",
                     ready.pid, ready.generation, ready.owner_thread)
         return app, proof, ready
@@ -251,6 +324,7 @@ def request_quit(app: Any, proof: Any, ticket: LaunchTicket | None, cache: Any,
             except PptAddinUnavailable:
                 logger.info("[ppt] quit decision: reason=service_unavailable")
                 guard._remove_owned_if_matches(pid, record)
+                _yield_observation(ticket)
                 with _lock:
                     if _ticket is ticket:
                         _ticket = None
@@ -278,6 +352,7 @@ def request_quit(app: Any, proof: Any, ticket: LaunchTicket | None, cache: Any,
                 # Protected includes a safely cancelled Quit. Yield this host to
                 # the user; the OS busy guard protects it thereafter.
                 guard._remove_owned_if_matches(pid, snapshot_record)
+                _yield_observation(ticket)
                 with _lock:
                     if _ticket is pending:
                         _ticket = None
@@ -292,17 +367,47 @@ def request_quit(app: Any, proof: Any, ticket: LaunchTicket | None, cache: Any,
 def observe_exit(snapshot: dict[int, Any], timeout: float, wait_fn: Any = None) -> Any:
     """Confirm actual exit after worker references are released; never kill."""
     from knowmate.secure import office_guard as guard
-    if not snapshot:
-        return guard.OfficeCleanupResult()
+    deadline = time.monotonic() + max(0.0, timeout)
+    with _lock:
+        targets = tuple(_observations.items())
+    confirmed: set[int] = set()
+    remaining: set[int] = set()
+    failed: set[int] = set()
+    unknown: set[int] = set()
+    covered: set[int] = set()
+    for generation, target in targets:
+        pid = target.observer.pid
+        covered.add(pid)
+        result = target.observer.poll() if target.yielded else target.observer.wait_until(deadline)
+        logger.info("[ppt] process observation: generation=%s pid=%s status=%s error_code=%s yielded=%s",
+                    generation, pid, result.status, result.error_code, target.yielded)
+        if result.status == "exited":
+            _finish_observation(generation, target)
+            if not target.yielded:
+                confirmed.add(pid)
+        elif not target.yielded:
+            if result.status == "timeout":
+                remaining.add(pid)
+            elif result.status == "target_unconfirmed":
+                unknown.add(pid)
+            else:
+                failed.add(pid)
+    legacy = {pid: record for pid, record in snapshot.items() if pid not in covered}
     try:
-        remaining, _ = (wait_fn or guard.wait_for_owned_exit)(snapshot, max(0, timeout))
-        guard.finish_owned_cleanup(snapshot, set(remaining))
+        if legacy:
+            unresolved, _ = (wait_fn or guard.wait_for_owned_exit)(legacy, max(0.0, deadline - time.monotonic()))
+            guard.finish_owned_cleanup(legacy, set(unresolved))
+            confirmed.update(set(legacy) - set(unresolved))
+            remaining.update(unresolved)
         observe_pending()
-        return guard.OfficeCleanupResult(confirmed_exited=frozenset(set(snapshot) - set(remaining)),
-                                        remaining=frozenset(remaining))
+        return guard.OfficeCleanupResult(confirmed_exited=frozenset(confirmed),
+                                        remaining=frozenset(remaining), failed=frozenset(failed),
+                                        identity_unknown=frozenset(unknown))
     except Exception as exc:  # noqa: BLE001 -- opaque COM/OS failures remain pending
         logger.warning("[ppt] 실제 종료 관찰 실패: error_type=%s", type(exc).__name__)
-        return guard.OfficeCleanupResult(identity_unknown=frozenset(snapshot))
+        return guard.OfficeCleanupResult(confirmed_exited=frozenset(confirmed),
+                                        remaining=frozenset(remaining), failed=frozenset(failed),
+                                        identity_unknown=frozenset(set(legacy) | unknown))
 
 
 def pending_cleanup_result() -> Any:
@@ -315,6 +420,18 @@ def pending_cleanup_result() -> Any:
         return guard.OfficeCleanupResult()
     if current.pid is None or current.state == "launching":
         return guard.OfficeCleanupResult(ownership_pending=frozenset({_EXE}))
+    with _lock:
+        target = _observations.get(current.generation)
+    if target is not None:
+        result = target.observer.poll()
+        if result.status == "exited":
+            _finish_observation(current.generation, target)
+            return guard.OfficeCleanupResult(confirmed_exited=frozenset({current.pid}))
+        if result.status == "observation_failed":
+            return guard.OfficeCleanupResult(failed=frozenset({current.pid}))
+        if result.status == "target_unconfirmed":
+            return guard.OfficeCleanupResult(identity_unknown=frozenset({current.pid}))
+        return guard.OfficeCleanupResult(remaining=frozenset({current.pid}))
     processes = guard._enumerate_processes()
     identity = guard._process_creation_identity(current.pid)
     if processes is None or identity is None or current.identity is None:
