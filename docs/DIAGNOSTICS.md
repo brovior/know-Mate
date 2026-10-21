@@ -3,6 +3,23 @@
 현재 원인 분석과 다음 검증의 정본이다. 작업 상태는 [ROADMAP.md](ROADMAP.md), 구현 계약은
 [DESIGN.md](design/DESIGN.md), 완료 이력은 [UPDATE_NOTES.md](UPDATE_NOTES.md)를 따른다.
 
+## PowerPoint 단축 경로로 직접 실행이 생략되는 결함 (2026-10-21)
+
+설치·helper·stamp 검사가 모두 통과해도 App Paths가 `PROGRA~1` 같은 Windows 8.3 단축명을
+반환하면 문자열 기반 Program Files 포함 검사가 실패했다. 이때 `untrusted_path`로 일반 COM
+연결로 전환되고 직접 실행 ticket이 없어 문서 완료 시 `origin_mismatch`로 Quit을 요청하지 않는다.
+29건 처리 뒤 `documents_complete` 정리가 실행된 사례이므로 30건 주기 미도달이 원인은 아니다.
+
+단축명을 Windows native API로 긴 경로로 확장한 뒤 허용 루트와 비교하도록 수정했다. 원래 경로와
+확장 경로의 링크·reparse 거절 및 실행 파일·PE 비트수 검사는 유지했다. 경로 거절에는 고정된
+세부 사유·오류 종류·숫자 코드를 남겨 `untrusted_path` 한 가지로 뭉뚱그리지 않는다.
+이 수정은 직접 실행 진입 조건을 바로잡으며, 실제 Quit 반환·원 PID 종료·사용자 문서 보호의
+Windows/Office 검증을 대체하지 않는다.
+
+오프라인 회귀는 `python -m unittest knowmate.tests.test_ppt_short_path knowmate.tests.test_ppt_lifetime -v`로
+37 PASS / Windows native 1 SKIP을 확인했다. 전체 pytest는 pytest 미설치로 **UNEXECUTED**이며,
+Windows 실제 단축명 API·Office 실행·Quit·원 PID 종료·사용자 문서 보호는 **UNEXECUTED**다.
+
 ## PPT 참조 수명·원 프로세스 관측 후보 (2026-10-20)
 
 워커의 첫 실제 COM 사용 전에 native MTA를 확보하고 자기 성공분만 해제하는 후보와,
