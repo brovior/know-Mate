@@ -1,10 +1,8 @@
 """구형 바이너리 포맷(doc/xls/ppt) COM 싱글톤 파서 (CLAUDE.md 6-6).
 
-win32com 없는 환경에서 import 시 ComUnavailableError를 발생시킨다.
-fake 모드에서는 이 모듈을 import하지 않아야 한다.
-
-COM STA 주의: COM 객체는 생성한 스레드에서만 사용 가능하다.
-_ThreadLocalComApps를 통해 스레드별로 독립적인 COM 앱 인스턴스를 관리한다.
+호출자는 ComScope로 native MTA를 확보한 뒤 COM 리더에 진입한다.
+getter는 초기화를 반복하지 않으며 COM 객체는 생성한 스레드에서만 사용한다.
+win32com은 실제 앱 연결 직전에 지연 import한다.
 """
 from __future__ import annotations
 
@@ -18,6 +16,7 @@ from types import ModuleType
 from typing import Any, TYPE_CHECKING
 
 from knowmate.secure import com_stage
+from knowmate.secure.com_scope import ComScopeUnavailable as ComUnavailableError, require_current_scope
 from knowmate.secure.com_fault import (
     ComFailureEvidence, ComFault, make_fault, outer_hresult, fatal_hresult,
     FATAL_HRESULTS,
@@ -32,10 +31,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _MSO_GROUP = 6  # msoGroup — 그룹 도형 Type 값
-
-
-class ComUnavailableError(RuntimeError):
-    """win32com.client를 사용할 수 없는 환경에서 발생한다."""
 
 
 # Office가 이미 죽었거나 RPC 연결이 끊겼음을 뜻하는 HRESULT만 여기에 둔다.
@@ -94,20 +89,9 @@ def _require_win32com():
         ) from exc
 
 
-def _ensure_com_initialized() -> bool:
-    """현재 스레드에 COM을 MTA로 초기화한다.
-
-    워커 스레드(메시지 펌프 없음)에서 Office STA 서버를 호출하려면
-    MTA가 필요하다. STA로 초기화하면 펌프 부재로 Open()이 무한 대기한다.
-    """
-    try:
-        import pythoncom  # type: ignore
-        # COINIT_MULTITHREADED — 메시지 펌프 불필요, COM이 RPC로 마샬링
-        pythoncom.CoInitializeEx(pythoncom.COINIT_MULTITHREADED)
-        return True
-    except Exception:
-        # 이미 다른 모드로 초기화됨(RPC_E_CHANGED_MODE) 등 → 그대로 진행
-        return False
+def _ensure_com_initialized() -> None:
+    """Require the caller's verified native MTA scope without another init call."""
+    require_current_scope()
 
 
 # 스레드별 COM 앱 인스턴스를 저장한다 (STA 요구사항 준수)
@@ -552,12 +536,12 @@ def _configure_word_options(app: Any) -> None:
 
 def _get_word_excel_app(slot: str, exe: str, prog_id: str) -> Any:
     from knowmate.secure.office_guard import ensure_office_available
-    release_verified_pending_com_refs(exe)
     ensure_office_available(exe)
+    _ensure_com_initialized()
+    release_verified_pending_com_refs(exe)
     app = _consume_word_excel_app(slot)
     if app is not None:
         return app
-    _ensure_com_initialized()
     dispatched = _dispatch_owned_app(_require_win32com(), prog_id, exe)
     app = dispatched.app
     assignments = ((app, "Visible", False), (app, "DisplayAlerts", _WD_ALERTS_NONE if slot == "word" else _XL_ALERTS_OFF),
@@ -630,6 +614,7 @@ def _get_ppt_app() -> Any:
     from knowmate.secure import office_guard, ppt_shutdown
     office_guard.ensure_application_open("POWERPNT.EXE")
     ppt_shutdown.ensure_admitted()
+    _ensure_com_initialized()
     app = getattr(_tls, "ppt", None)
     if app is not None:
         proof = getattr(_tls, "ppt_proof", None)
@@ -642,7 +627,6 @@ def _get_ppt_app() -> Any:
                 _release_ppt_references(poisoned=True)
                 raise
         return app
-    _ensure_com_initialized()
     client = _require_win32com()
     prepared = getattr(_tls, "ppt_launch_ready", None)
     logger.info("[ppt] launch preparation: prepared=%s", prepared is not None)
@@ -1236,11 +1220,10 @@ def quit_com_apps(
                 _release_ppt_references()
             app = None
     gc.collect()
-    if ppt_snapshot:
-        from knowmate.secure.ppt_shutdown import observe_exit
-        ppt_result = observe_exit(ppt_snapshot, min(max(0, grace_sec), quit_timeout_sec), wait_fn)
-        results.append(ppt_result)
-        office_guard._log_cleanup_result("POWERPNT.EXE", ppt_result, "graceful_observation")
+    from knowmate.secure.ppt_shutdown import observe_exit
+    ppt_result = observe_exit(ppt_snapshot, min(max(0, grace_sec), quit_timeout_sec), wait_fn)
+    results.append(ppt_result)
+    office_guard._log_cleanup_result("POWERPNT.EXE", ppt_result, "graceful_observation")
     office_guard.prune_released_nonterminable_processes()
     terminable = {
         pid: record for pid, record in owned.items()
@@ -1316,6 +1299,9 @@ class ComReader:
         라우팅한다. COM 앱은 확장자와 무관하게 실제 포맷을 열기 때문이다.
         """
         ext = Path(path).suffix.lower()
+        if ext in (".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"):
+            from knowmate.secure.com_scope import acquire_current_scope
+            acquire_current_scope()
         if ext in (".doc", ".docx"):
             return self._word.parse(path)
         if ext in (".xls", ".xlsx"):

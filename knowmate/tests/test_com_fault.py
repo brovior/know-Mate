@@ -184,6 +184,7 @@ def test_scheduler_throwing_primary_attribute_recovers_and_releases_attempt_befo
     recovery_contexts = []
 
     def recover(exe):
+        assert sys.exception() is None  # No raw parser exception is live during recovery.
         assert exe == "WINWORD.EXE"
         recovery_contexts.append(com_stage.get_attempt_context())
         return True
@@ -223,18 +224,15 @@ def test_scheduler_throwing_primary_attribute_recovers_and_releases_attempt_befo
 @pytest.mark.parametrize("initialized", [False, True])
 @pytest.mark.parametrize("unverified_release_fails", [False, True])
 def test_worker_finally_releases_verified_refs_despite_apartment_or_release_error(
-    monkeypatch, tmp_path, initialized, unverified_release_fails,
+    monkeypatch, tmp_path, initialized, unverified_release_fails, native_com_backend,
 ):
     from knowmate.collector.scheduler import CollectorWorker
     from knowmate.secure import com_reader, office_guard
 
-    def initialize(mode):
-        if not initialized:
-            raise RuntimeError("RPC_E_CHANGED_MODE")
-
+    from knowmate.secure.com_scope import acquire_current_scope, ComScopeUnavailable
     uninitialize = MagicMock()
-    monkeypatch.setitem(sys.modules, "pythoncom", SimpleNamespace(
-        CoInitializeEx=initialize, COINIT_MULTITHREADED=0, CoUninitialize=uninitialize))
+    native_com_backend.initialize = lambda: 0 if initialized else -2147417850
+    native_com_backend.uninitialize = uninitialize
     com_reader.release_verified_pending_com_refs()
     worker = CollectorWorker(config={"collector": {}}, indexer=MagicMock(), extractor=MagicMock(),
                              state_file=tmp_path / "state.json", com_cleanup_fn=MagicMock())
@@ -242,6 +240,10 @@ def test_worker_finally_releases_verified_refs_despite_apartment_or_release_erro
     def cycle():
         record = office_guard.OwnedOfficeProcess("EXCEL.EXE", 123, generation=2)
         com_reader._retain_verified_pending_app("EXCEL.EXE", object(), 20, record)
+        try:
+            acquire_current_scope()
+        except ComScopeUnavailable:
+            pass  # A failed native init must still release existing reference slots.
 
     monkeypatch.setattr(worker, "_run_cycle", cycle)
     if unverified_release_fails:

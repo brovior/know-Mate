@@ -28,8 +28,22 @@ def launch(monkeypatch):
     class Process:
         pid, identity = 10, 100
         def __init__(self, path):
+            from knowmate.secure.ppt_process_observation import RetainedProcess
+            def poll(handle, timeout):
+                processes = guard._enumerate_processes()
+                if processes is None:
+                    return 258
+                identity = guard._process_creation_identity(10)
+                return 0 if (10 not in guard._pids_for("POWERPNT.EXE", processes)
+                             or identity is not None and identity != 100) else 258
+            self.kernel = SimpleNamespace(WaitForSingleObject=Mock(side_effect=poll),
+                                          CloseHandle=Mock(return_value=True))
+            self.observer = RetainedProcess(10, 100, 500, self.kernel)
             self.close = Mock()
             handles.append(self)
+
+        def detach_observation(self):
+            return self.observer
 
     @contextmanager
     def window(exe, app):
@@ -44,7 +58,7 @@ def launch(monkeypatch):
     return app, client, handles
 
 
-def test_exact_direct_launch_authority_and_handle_release(launch):
+def test_exact_direct_launch_authority_and_handle_handoff(launch):
     app, client, handles = launch
     result = shutdown.launch_and_bind(client, 64)
     assert result[0] is app and result[1][0] == 10
@@ -52,6 +66,8 @@ def test_exact_direct_launch_authority_and_handle_release(launch):
     assert shutdown._exact_origin(result[2], result[1])
     assert app.DisplayAlerts == 2
     handles[0].close.assert_called_once()
+    assert shutdown._observations[result[2].generation].observer is handles[0].observer
+    handles[0].kernel.CloseHandle.assert_not_called()
     client.Dispatch.assert_called_once_with("PowerPoint.Application")
 
 
@@ -558,3 +574,89 @@ def test_pending_cleanup_observes_launch_ticket_not_unowned_replacement(monkeypa
     assert result.successful == (live_pid != 10)
     assert result.confirmed_exited == frozenset()
     assert (shutdown._ticket is None) == (live_pid != 10)
+
+
+def test_policy_disabled_empty_request_still_observes_original_handle(origin, launch, monkeypatch):
+    app, proof, ticket, cache, service = origin
+    monkeypatch.setattr(ppt_policy, "auto_shutdown_enabled", lambda: False)
+    assert shutdown.request_quit(app, proof, ticket, cache) == ("not_supported", {})
+    assert shutdown.observe_exit({}, 0).remaining == frozenset({10})
+    launch[2][0].kernel.WaitForSingleObject.side_effect = None
+    launch[2][0].kernel.WaitForSingleObject.return_value = 0
+    result = shutdown.observe_exit({}, 0)
+    assert result.confirmed_exited == frozenset({10})
+    assert shutdown._ticket is None and not shutdown._observations
+    service.TryQuitIfIdle.assert_not_called()
+    launch[2][0].kernel.CloseHandle.assert_called_once()
+
+
+def test_yielded_host_keeps_observation_but_is_not_automatic_exit_success(origin, launch):
+    app, proof, ticket, cache, service = origin
+    service.TryQuitIfIdle.return_value = "protected"
+    assert shutdown.request_quit(app, proof, ticket, cache) == ("protected", {})
+    assert shutdown._ticket is None and shutdown._observations[ticket.generation].yielded
+    native = launch[2][0].kernel
+    native.WaitForSingleObject.side_effect = None
+    native.WaitForSingleObject.return_value = 0
+    result = shutdown.observe_exit({}, 0)
+    assert not result.confirmed_exited and not shutdown._observations
+    native.CloseHandle.assert_called_once()
+
+
+def test_original_handle_failure_is_not_silently_reclassified_as_remaining(origin, launch, monkeypatch):
+    import ctypes
+    app, proof, ticket, cache, _service = origin
+    shutdown.request_quit(app, proof, ticket, cache)
+    native = launch[2][0].kernel
+    native.WaitForSingleObject.side_effect = None
+    native.WaitForSingleObject.return_value = 0xFFFFFFFF
+    monkeypatch.setattr(ctypes, "get_last_error", lambda: 6, raising=False)
+    result = shutdown.observe_exit({}, 0)
+    assert result.failed == frozenset({10}) and not result.confirmed_exited
+    assert shutdown.pending_cleanup_result().failed == frozenset({10})
+    native.CloseHandle.assert_called_once()
+
+
+def test_app_exit_observes_and_closes_ppt_even_without_worker_com_cleanup(origin, launch, monkeypatch):
+    from knowmate.secure import office_exit
+    monkeypatch.setattr(guard, "begin_owned_cleanup", dict)
+    assert not office_exit.cleanup_before_worker_termination(None, budget_sec=.5)
+    assert not shutdown._observations
+    launch[2][0].kernel.WaitForSingleObject.assert_called()
+    launch[2][0].kernel.CloseHandle.assert_called_once()
+    assert shutdown._ticket is not None  # releasing a handle is not process exit
+
+
+def test_stale_original_handle_exit_does_not_clear_new_ticket_generation(origin, launch, monkeypatch):
+    app, proof, ticket, cache, _service = origin
+    shutdown.request_quit(app, proof, ticket, cache)
+    replacement = guard.OwnedOfficeProcess("POWERPNT.EXE", 200, False, proof[1].generation + 1)
+    guard._owned_pids[10] = replacement
+    newer = shutdown.LaunchTicket(ticket.generation + 1, threading.get_ident(), "pending", 10, 200,
+                                 replacement.generation)
+    monkeypatch.setattr(shutdown, "_ticket", newer)
+    monkeypatch.setattr(guard, "_process_creation_identity", lambda _pid: 200)
+    native = launch[2][0].kernel
+    native.WaitForSingleObject.side_effect = None
+    native.WaitForSingleObject.return_value = 0
+    result = shutdown.observe_exit({}, 0)
+    assert result.confirmed_exited == frozenset({10})
+    assert shutdown._ticket is newer
+    assert guard.take_owned_processes()[10] is replacement
+
+
+def test_observation_wait_runs_after_worker_ppt_references_are_released(origin, launch, monkeypatch):
+    from knowmate.secure import com_reader
+    app, proof, ticket, _cache, _service = origin
+    for name in ("word", "excel"):
+        monkeypatch.setattr(com_reader._tls, name, None, raising=False)
+    for name, value in (("ppt", app), ("ppt_proof", proof), ("ppt_launch_ticket", ticket),
+                        ("ppt_service", None)):
+        monkeypatch.setattr(com_reader._tls, name, value, raising=False)
+    def poll(_handle, _timeout):
+        for name in ("ppt", "ppt_proof", "ppt_launch_ticket", "ppt_service"):
+            assert getattr(com_reader._tls, name) is None
+        return 258
+    launch[2][0].kernel.WaitForSingleObject.side_effect = poll
+    result = com_reader.quit_com_apps(grace_sec=0)
+    assert result.remaining == frozenset({10})

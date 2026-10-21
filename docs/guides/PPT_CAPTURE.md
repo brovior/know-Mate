@@ -8,6 +8,39 @@
 내부 실패 뒤 외부 Quit으로 이어서 시험하지 않는다. 검토한 범위는
 [r2 계획](../design/PPT_SHUTDOWN_CAPTURE_PLAN.md), 과거 실측은 [진단](../DIAGNOSTICS.md)에 있다.
 
+## 별도 참조 수명 비교 후보 (1.0.7.0)
+
+`ppt_lifetime`은 기존 schema3 capture와 별도 도구다. 현재 가능한 것은 Office 없는 mock과
+한 arm의 offline 재판독뿐이다. 저장소 루트에서 서로 다른 새 출력 폴더를 지정한다.
+
+```powershell
+python -m scripts.diagnostics.ppt_lifetime --mock --output C:\capture\lifetime-mock001
+python -m scripts.diagnostics.ppt_lifetime --replay C:\capture\lifetime-mock001\natural_drop --output C:\capture\lifetime-replay001
+```
+
+mock은 두 arm의 모형 증거를 만들며 `actual_os_exit_verified=false`다. replay도 실제 OS 종료를
+새로 인증하지 않는다. `--live`와 private caller는 파일 읽기·native import·Office 실행 전에 차단한다.
+이 잠금은 CLI·환경변수·JSON으로 해제하지 않는다.
+
+향후 비교 조건은 Reader가 로드된 각각의 새 host에서 `natural_drop`과 `exact_app_external_quit`
+한 번씩이다. 후자만 원래 연결한 Application에 Quit을 한 번 요청하며, 이전 PID에 구조 요청을
+이어 보내지 않는다. 문서 Close·참조 범위·자기 native pair·Quit 요청/반환·OS 신호를 구분한다.
+Add-in 미로드 대조군은 아직 구현하지 않았다.
+
+새 합성 파일은 감독자가 직접 생성하며 모든 OPC member 이름·내용 bytes를 기준과 비교한다.
+업무 파일 입력은 받지 않고 notes/customXml·문서 속성 변조, 미지 member와 링크도 거부한다.
+문서 본문·창 제목·임의 예외 문구는 증거 묶음에 저장하지 않는다.
+
+`scripts/ppt_reader/build_lifetime.py`는 생성 사본의 Reader DLL 1.0.7.0과 별도 manifest만 만드는
+개발용 빌드 코드다. 이번에는 실행하지 않았다. 기존 제품 1.0.5/capture 1.0.6과 IID·설치 계약은
+유지하며 새 variant의 내부 Quit·guard·이벤트 종료 경로는 compile 단계에서 제외한다.
+정상 helper manifest·Setup EXE·자동 등록은 만들지 않는다. 일반 사용자에게 compiler/PIA를
+추가 수동 설치하도록 요구하지 않으며 필요한 DLL은 향후 개발/CI에서 사전 빌드한다.
+
+실제 실행에는 별도 disposable Windows VM의 사전 등록과 정확한 package/source/template/
+설치 DLL pin이 필요하다. VM 준비는 미구현, native x86/x64·Office·DRM·실제 종료·사용자 보호·배포
+시험은 **UNEXECUTED**다. 후보 코드와 mock 성공을 live-ready 또는 제품 활성화 승인으로 해석하지 않는다.
+
 ## 현재 사용할 수 있는 기능
 
 저장소 루트에서 기존 **새 도구 schema3 묶음**을 다시 판독한다. 원본을 덮어쓰지 않으며 새 폴더가 필요하다.
@@ -28,7 +61,8 @@ python -m scripts.diagnostics.ppt_capture --make-fixture --output C:\capture\new
 
 고정 title/body 한 슬라이드의 `capture-<새 UUID>.pptx`와 `fixture.json`을 만든다. 실제 읽기 결과는
 메모리에서 길이·SHA256만 비교한다. provenance 해시, 생성기 식별, 고정 XML 내용, 슬라이드 수 및
-외부 관계 부재를 검증하므로 임의 업무 파일을 fixture pin으로 지정하는 경로로 사용하지 않는다.
+외부 관계 부재를 검사한다. notes/customXml 등 전체 member의 고정 내용을 인증하는 검사는 아니므로
+임의 업무 파일을 fixture pin으로 지정하지 않는다. 새 lifetime 경로는 위의 전체 member 검사를 사용한다.
 
 ## 진단 전용 패키지 빌드
 

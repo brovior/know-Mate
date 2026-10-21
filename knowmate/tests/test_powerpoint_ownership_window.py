@@ -244,7 +244,7 @@ def test_native_marker_lookup_requires_complete_unique_result(monkeypatch, title
 
 
 @pytest.fixture
-def ppt_flow(monkeypatch):
+def ppt_flow(monkeypatch, native_com_scope):
     """AutoReader부터 실제 소유 가드와 문서 Open/Close까지 가짜 OS/COM으로 연결한다."""
     from knowmate.secure import AutoReader
 

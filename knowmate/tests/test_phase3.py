@@ -329,6 +329,54 @@ def _make_worker(tmp_path: Path, watch_folder: str):
     return worker, indexer, state_file
 
 
+def test_unconfirmed_native_apartment_defers_com_but_indexes_plain(tmp_path, native_com_backend):
+    """An environment-level COM failure must not become a file failure or stop plain work."""
+    from knowmate.secure import AutoReader
+    from knowmate.collector.state import load_state
+    from knowmate.collector.failure_state import load_failures
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    (folder / "unavailable.doc").write_bytes(b"synthetic")
+    (folder / "plain.txt").write_text("synthetic plain text", encoding="utf-8")
+    native_com_backend.apartment = lambda: (0, 0)
+    worker, _indexer, state_file = _make_worker(tmp_path, str(folder))
+    worker._extractor = AutoReader()
+    errors = []
+    worker.error.connect(errors.append)
+    worker.run()
+    assert not errors
+    assert {Path(path).name for path in load_state(state_file)} == {"plain.txt"}
+    assert not load_failures(tmp_path / "index_failure.json")
+
+
+def test_worker_direct_com_reader_acquires_only_when_extracting(tmp_path, monkeypatch, native_com_backend):
+    """A real ComReader injected into a worker acquires the same lazy root."""
+    from knowmate.secure.com_reader import ComReader
+    from knowmate.secure.com_scope import require_current_scope
+    folder = tmp_path / "docs"
+    folder.mkdir()
+    (folder / "fixture.doc").write_bytes(b"synthetic")
+    reader = ComReader()
+    calls = []
+
+    def parse(path):
+        assert require_current_scope().active
+        calls.append("parse")
+        return "synthetic text"
+
+    native_com_backend.initialize = lambda: calls.append("initialize") or 0
+    native_com_backend.uninitialize = lambda: calls.append("uninitialize")
+    monkeypatch.setattr(reader._word, "parse", parse)
+    worker, _indexer, state_file = _make_worker(tmp_path, str(folder))
+    worker._extractor = reader
+    errors = []
+    worker.error.connect(errors.append)
+    worker.run()
+    assert not errors
+    assert calls == ["initialize", "parse", "uninitialize"]
+    assert {Path(path).name for path in load_state(state_file)} == {"fixture.doc"}
+
+
 def _make_worker_for_indexer(tmp_path: Path, watch_folder: str, indexer):
     """기존 Indexer와 state 파일을 재사용하는 CollectorWorker를 반환한다."""
     from knowmate.collector.scheduler import CollectorWorker
@@ -3314,7 +3362,7 @@ class TestMailFailureMigration:
 @pytest.mark.parametrize("mode", ["off", "basic", "detailed"])
 @pytest.mark.parametrize("outcome", ["success", "failure", "cancel"])
 @pytest.mark.parametrize("broken_operation", [None, "initialize", "start", "log", "collect_and_log", "stop"])
-def test_memory_diagnostic_errors_preserve_cycle_cleanup_and_restart(tmp_path, monkeypatch, mode, outcome, broken_operation):
+def test_memory_diagnostic_errors_preserve_cycle_cleanup_and_restart(tmp_path, monkeypatch, mode, outcome, broken_operation, native_com_backend):
     """Normal/error/cancel runs still clean COM, release diagnostics and become idle."""
     import sys
     from types import SimpleNamespace
@@ -3355,16 +3403,15 @@ def test_memory_diagnostic_errors_preserve_cycle_cleanup_and_restart(tmp_path, m
     errors = []
     worker.error.connect(errors.append)
     monkeypatch.setattr(scheduler, "MemoryDiagnostics", Diagnostic)
-    monkeypatch.setitem(sys.modules, "pythoncom", SimpleNamespace(
-        COINIT_MULTITHREADED=0,
-        CoInitializeEx=lambda _: events.append("com_initialize"),
-        CoUninitialize=lambda: events.append("com_uninitialize"),
-    ))
+    from knowmate.secure.com_scope import acquire_current_scope
+    native_com_backend.initialize = lambda: (events.append("com_initialize"), 0)[1]
+    native_com_backend.uninitialize = lambda: events.append("com_uninitialize")
     monkeypatch.setattr(worker, "_cleanup_com_apps", lambda _: events.append("com_cleanup"))
     monkeypatch.setattr(com_reader, "release_unverified_com_refs", lambda: events.append("unverified_refs"))
     monkeypatch.setattr(com_reader, "release_verified_pending_com_refs", lambda: events.append("verified_refs"))
 
     def cycle():
+        acquire_current_scope()
         events.append("cycle_work")
         worker._work_phase = "indexing"
         if outcome == "failure":

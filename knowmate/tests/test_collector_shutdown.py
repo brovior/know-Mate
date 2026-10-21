@@ -316,9 +316,10 @@ def test_tray_shutdown_during_mail_embedding_finishes_worker_cleanup(tmp_path, m
             assert stop_worker(worker, hard_exit=lambda _code: pytest.fail("unexpected hard exit")) is False
             assert time.monotonic() - start < 5
             assert not worker.isRunning()
-            assert len(events) == 2  # 정상 종료의 최종 정리도 생성 워커에서 실행됐다.
-            assert events[0][1] == events[1][1] != threading.get_ident()
-            assert com_events == [("init", events[0][1]), ("uninit", events[0][1])]
+            # Fake extraction and mail never acquired COM, so there is no native pair or final Quit.
+            assert len(events) == 1
+            assert events[0][1] != threading.get_ident()
+            assert com_events == []
             assert worker.work_stage == "idle"
             assert mail_indexer.table.count_rows() == 0
         finally:

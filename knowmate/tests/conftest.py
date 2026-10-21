@@ -10,6 +10,7 @@ has already been destroyed"로 실패한다). exec()는 호출하지 않는다 �
 PyQt6가 없는 환경(사외)에서는 조용히 아무것도 하지 않는다.
 """
 import pytest
+from types import SimpleNamespace
 
 try:
     from PyQt6.QtWidgets import QApplication
@@ -29,3 +30,20 @@ def _qapp_session():
         app = QApplication([])
     yield app
     # 세션 종료까지 app을 명시적으로 destroy하지 않는다(프로세스 종료 시 자연 정리).
+
+
+@pytest.fixture
+def native_com_backend(monkeypatch):
+    """Inject explicit native-call models only in COM lifetime regression tests."""
+    from knowmate.secure import com_scope
+    backend = SimpleNamespace(initialize=lambda: 0, apartment=lambda: (0, 1), uninitialize=lambda: None)
+    monkeypatch.setattr(com_scope, "_NativeCom", lambda: backend)
+    return backend
+
+
+@pytest.fixture
+def native_com_scope(native_com_backend):
+    """Provide a caller-owned lazy apartment for direct COM routing models."""
+    from knowmate.secure.com_scope import ComScope
+    with ComScope() as scope:
+        yield scope

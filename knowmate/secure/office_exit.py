@@ -33,9 +33,17 @@ def cleanup_before_worker_termination(worker: Any, *, budget_sec: float = _EXIT_
         forced: set[int] = set()
         unresolved: dict[int, str] = {}
         try:
+            from knowmate.secure import ppt_shutdown
             stage = getattr(worker, "work_stage", "idle") if worker is not None else "idle"
             logger.info("[com] Office 정리 시작: phase=app_exit stage=%s budget=%.1f", stage, budget_sec)
             while time.monotonic() < deadline:
+                ppt_result = ppt_shutdown.observe_exit({}, 0)
+                confirmed.update(ppt_result.confirmed_exited)
+                targets.update(ppt_result.confirmed_exited | ppt_result.remaining | ppt_result.failed | ppt_result.identity_unknown)
+                for pid in ppt_result.confirmed_exited:
+                    unresolved.pop(pid, None)
+                for state in ("remaining", "identity_unknown", "failed"):
+                    unresolved.update((pid, state) for pid in getattr(ppt_result, state))
                 running = worker is not None and worker.isRunning()
                 snapshot = office_guard.begin_owned_cleanup()
                 # A Dispatch already in flight may register its verified PID late.
@@ -87,7 +95,11 @@ def cleanup_before_worker_termination(worker: Any, *, budget_sec: float = _EXIT_
             unsafe[0] = True
             logger.warning("[com] Office 앱 종료 정리 실패: phase=app_exit error_type=%s", type(exc).__name__)
         finally:
-            done.set()
+            try:
+                from knowmate.secure.ppt_shutdown import close_observations
+                close_observations()
+            finally:
+                done.set()
 
     helper = threading.Thread(target=run, name="office-app-exit", daemon=True)
     helper.start()

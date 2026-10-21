@@ -85,6 +85,8 @@ class AutoReader:
             # 게시된 COM 작업 컨텍스트는 반드시 on_end로 해제해야 한다.
             if self._on_com_begin is not None and exe is not None:
                 self._on_com_begin(exe)
+            from knowmate.secure.com_scope import acquire_current_scope
+            acquire_current_scope()
             self._last_com_used = True
             from knowmate.secure.com_reader import ComReader
             return ComReader(xlsx_block_rows=self._xlsx_block_rows,
