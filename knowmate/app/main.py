@@ -7,6 +7,15 @@ import sys
 from collections.abc import Callable
 from pathlib import Path
 
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+# Diagnostic callers must not create a UI, collector or another COM apartment.
+if __name__ == "__main__" and sys.argv[1:2] == ["--ppt-quit-compare"]:
+    from knowmate.secure.ppt_quit_compare import main as quit_compare_main
+    raise SystemExit(quit_compare_main(sys.argv[2:]))
+
 # PyTorch/sentence-transformers가 import되기 전에 설정해야 효과 있음
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 os.environ.setdefault("OMP_NUM_THREADS", "1")
@@ -15,10 +24,6 @@ os.environ.setdefault("MKL_NUM_THREADS", "1")
 from PyQt6.QtCore import QEventLoop, QFile, QIODevice, QTimer, QUrl, Qt
 from PyQt6.QtGui import QIcon, QAction
 from PyQt6.QtWidgets import QApplication, QMainWindow, QSizeGrip, QSystemTrayIcon, QMenu
-
-ROOT = Path(__file__).resolve().parents[2]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
 
 
 def _shutdown_warning(message: str, error: Exception) -> None:

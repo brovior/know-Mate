@@ -3,6 +3,24 @@
 현재 원인 분석과 다음 검증의 정본이다. 작업 상태는 [ROADMAP.md](ROADMAP.md), 구현 계약은
 [DESIGN.md](design/DESIGN.md), 완료 이력은 [UPDATE_NOTES.md](UPDATE_NOTES.md)를 따른다.
 
+## 설치된 Reader의 종료 3방식 비교 (2026-10-21)
+
+단축 경로 수정 후 직접 실행과 `TryQuitIfIdle()`의 `quit_requested` 반환은 확인됐으나,
+원 프로세스 관측은 `timeout`이며 앱 종료 후에도 PowerPoint가 남았다는 보고가 있다.
+실행 경로 거절과 내부 Quit 후 미종료는 별개 문제이며, 후자의 원인은 미확정이다.
+
+격리된 시험 세션 전용 `--ppt-quit-compare`로 외부 Quit·내부 Quit·참조 해제를 새 프로세스에서
+비교한다. 부모는 원 프로세스 핸들과 호출 프로세스 종료를 독립 관측하고, 잔류·불명확·증거 누락 시
+후속 시험을 실행하지 않는다. Reader 설치·등록과 일반 자동종료 정책은 바꾸지 않는다.
+실행 방법과 격리 조건은 [비교 진단 안내](guides/PPT_READER.md#powerpoint-종료-3방식-비교-진단)를 따른다.
+
+이 진단은 명시적으로 격리를 확인한 사용자가 통제된 환경에서 실행하는 별도 도구다.
+기존 capture/lifetime runner의 실행 잠금을 해제하지 않으며, 외부 Quit의 공유 인스턴스 경쟁 안전성이나
+일반 배포 승인 증거를 제공하지 않는다. 실제 Windows x86/x64·Office·frozen·DRM 검증은 **UNEXECUTED**다.
+
+개발 agent 구현 후 주 agent가 리뷰하고, 진단·진입점·기존 단축 경로·수명 unittest를 함께 실행해
+59 PASS / Windows native 1 SKIP을 확인했다. 전체 pytest는 pytest 미설치로 **UNEXECUTED**다.
+
 ## PowerPoint 단축 경로로 직접 실행이 생략되는 결함 (2026-10-21)
 
 설치·helper·stamp 검사가 모두 통과해도 App Paths가 `PROGRA~1` 같은 Windows 8.3 단축명을

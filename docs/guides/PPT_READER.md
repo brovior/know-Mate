@@ -307,6 +307,56 @@ Linux fake·C# 순수 하네스는 위 Windows/UAC/Office 시험을 대체하지
 이 시험 결과를 확인한 별도 변경이며 현재 released 빌드는 자동종료를 제공하지 않는다.
 
 
+### PowerPoint 종료 3방식 비교 진단
+
+`--ppt-quit-compare`는 설치된 candidate Reader를 그대로 사용해 외부 Quit, 내부 Quit,
+참조 해제만 수행하는 시험을 각각 새 PowerPoint·호출 프로세스에서 실행한다. 일반 앱의
+자동종료 정책을 바꾸거나 DLL을 설치·등록하지 않는다. Python·컴파일러·PIA 추가 설치는 필요 없다.
+
+**업무용 세션에서 실행하지 않는다.** 폐기 가능한 시험 VDI/VM 세션에서 다른 앱과 AegisDesk를
+완전히 종료하고 PowerPoint가 없는지 확인한다. 실행 중에는 사용자와 다른 프로그램이 Office를
+열지 않아야 한다. `--confirm-isolated-session`은 이 전제의 명시적 확인이다. 문서 수 검사와 PID
+일치는 외부 Quit 직전 사용자 문서가 열리는 경쟁 상황의 안전성을 보장하지 않는다.
+
+먼저 `build.bat clean candidate`로 빌드하고 candidate 앱을 한 번 실행해 Reader 자동 설치가
+완료됐는지 확인한 뒤 앱을 완전히 종료한다. 빌드 PC에서 만든 `dist\candidate\AegisDesk` 폴더
+전체를 시험 VDI로 옮긴다. 이번 기능이 포함된 새 EXE가 필요하며 Reader를 수동 재설치하지 않는다.
+
+PowerShell에서 저장소 루트를 기준으로 실행한다. VDI에서는 `$exe`를 옮긴 EXE 경로로 바꾼다.
+
+```powershell
+$exe = (Resolve-Path '.\dist\candidate\AegisDesk\AegisDesk.exe').Path
+$out = Join-Path $env:TEMP ('AegisPptQuit-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+$p = Start-Process -FilePath $exe -ArgumentList @(
+  '--ppt-quit-compare', '--live', '--confirm-isolated-session',
+  '--output', ('"{0}"' -f $out), '--timeout', '30'
+) -PassThru
+$p.WaitForExit()
+Get-Content (Join-Path $out 'summary.log')
+```
+
+개발 소스에서는 같은 옵션으로 `python -m knowmate.secure.ppt_quit_compare`를 실행한다.
+`Start-Process -Wait`는 잔류한 자식 PowerPoint까지 기다릴 수 있으므로 위처럼 부모의
+`WaitForExit()`만 사용한다.
+32비트 Office는 `--office-bitness 32`를 추가한다(기본 64). 느린 환경에서는 `--timeout 120`처럼
+시험별 제한 시간을 5~300초 범위에서 지정할 수 있다.
+도구가 생성한 합성 PPT만 열고 Reader 추출 결과를 고정 해시와 비교한다. 본문·창 제목·임의 예외
+문자열은 기록하지 않는다. 종료 요청과 반환, 참조 정리, 자기 COM 초기화 해제, 호출 프로세스 종료,
+원 PowerPoint 프로세스의 실제 종료를 구분한다. 실제 종료는 부모가 보관한 원 프로세스 핸들로 확인한다.
+
+어느 시험에서든 PowerPoint·호출 프로세스가 남거나 상태가 불명확하면 다음 시험은
+**UNEXECUTED**로 남긴다. 남은 프로세스를 강제 종료하거나 동일 프로세스로 후속 시험하지 않는다.
+제한 시간이 지나 부모가 끝나도 호출 프로세스는 COM 호출 중일 수 있다. 요약의 호출 PID까지
+완전히 종료됐는지 확인할 때까지 세션을 격리한 채 유지한다. 확인이 어려우면 시험 VDI를 폐기한다.
+참조 해제만 하는 시험은 PowerPoint가 남는 것도 유효한 관측이므로 마지막에 실행한다.
+남은 시험은 합성 시험 프로세스임을 확인해 수동으로 닫은 뒤 새 출력 폴더와
+`--arm internal_quit`, `--arm reference_drop` 또는 `--arm external_quit`로 별도 실행한다.
+
+결과를 공유할 때는 우선 `$out\summary.log` 하나를 전달한다. 실제 종료가 확인돼도 해당 조건의
+관측일 뿐, 사용자 문서 보호·일반 배포 승인·모든 Office 환경의 종료 성공 증거가 아니다.
+전체 pytest와 실제 Windows x86/x64·Office·frozen EXE·DRM 검증 상태는
+[DIAGNOSTICS.md](../DIAGNOSTICS.md)를 따른다.
+
 ### 외부 종료 bootstrap 진단 빌드
 
 `build.ps1 -ExternalDiagnostic`는 명시적 시험 전용 옵션이며 기본값은 비활성이다. 이 옵션은

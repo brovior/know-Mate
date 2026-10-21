@@ -7,11 +7,14 @@ onefile은 시동이 느리고 폐쇄망 백신 오탐이 잦다.
 """
 import os
 
-from PyInstaller.utils.hooks import collect_all
+from PyInstaller.utils.hooks import collect_all, collect_data_files
 
 datas = []
 binaries = []
 hiddenimports = []
+
+# Fixed synthetic diagnostics use python-pptx's bundled blank template offline.
+datas += collect_data_files("pptx", includes=["templates/default.pptx"])
 
 build_info_dir = os.environ.get("AEGIS_BUILD_INFO_DIR")
 if not build_info_dir or not os.path.isfile(os.path.join(build_info_dir, "aegisdesk_build_info.py")):
