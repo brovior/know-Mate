@@ -10,6 +10,31 @@ if TYPE_CHECKING:
     from knowmate.secure.ppt_process_observation import RetainedProcess
 
 
+def _expand_short_path(path: Path) -> Path:
+    """Expand filesystem 8.3 aliases without resolving reparse points."""
+    if "~" not in str(path):
+        return path
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    expand = kernel.GetLongPathNameW
+    expand.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+    expand.restype = wintypes.DWORD
+    capacity = 260
+    for _ in range(2):
+        buffer = ctypes.create_unicode_buffer(capacity)
+        length = expand(str(path), buffer, capacity)
+        if not 0 < length < 32768:
+            raise ValueError("office_path_expansion")
+        if length >= capacity:
+            capacity = length
+            continue
+        if len(buffer.value.encode("utf-16-le")) // 2 != length:
+            raise ValueError("office_path_expansion")
+        return Path(buffer.value)
+    raise ValueError("office_path_expansion")
+
+
 def trusted_powerpoint_path(bitness: int) -> Path:
     """Resolve the machine Office registration within an OS-known install root."""
     import winreg
@@ -27,12 +52,20 @@ def trusted_powerpoint_path(bitness: int) -> Path:
     path = Path(raw.strip('"'))
     roots = {_known_folder("905e63b6-c1bf-494e-b29c-65b732d3d21a"),
              _known_folder("7c5a40ef-a0fb-4bfc-874a-c0f2e0b9fa8e")}
-    if (not path.is_absolute() or path.name.upper() != "POWERPNT.EXE" or not path.is_file()
-            or not any(path.is_relative_to(root) for root in roots)):
+    if (not path.is_absolute() or ".." in path.parts
+            or path.name.upper() != "POWERPNT.EXE" or not path.is_file()):
         raise ValueError("office_path")
     for part in (path, *path.parents):
-        if part.is_symlink() or getattr(part.stat(), "st_file_attributes", 0) & 0x400:
+        if part.is_symlink() or getattr(part.lstat(), "st_file_attributes", 0) & 0x400:
             raise ValueError("office_path_link")
+    expanded = _expand_short_path(path)
+    if (not expanded.is_absolute() or ".." in expanded.parts or expanded.name.upper() != "POWERPNT.EXE"
+            or not expanded.is_file() or not any(expanded.is_relative_to(root) for root in roots)):
+        raise ValueError("office_path")
+    if expanded != path:
+        for part in (expanded, *expanded.parents):
+            if part.is_symlink() or getattr(part.lstat(), "st_file_attributes", 0) & 0x400:
+                raise ValueError("office_path_link")
     # Match the PE machine to the registration view, never infer from Python.
     with path.open("rb") as stream:
         if stream.read(2) != b"MZ":
@@ -46,7 +79,7 @@ def trusted_powerpoint_path(bitness: int) -> Path:
             raise ValueError("office_image")
         if int.from_bytes(stream.read(2), "little") != (0x8664 if bitness == 64 else 0x14C):
             raise ValueError("office_bitness")
-    return path
+    return expanded
 
 
 class PptLaunchNotStarted(OSError):

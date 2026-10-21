@@ -167,8 +167,23 @@ def launch_and_bind(win32com: Any, bitness: int) -> tuple[Any, tuple[int, Any], 
     ensure_admitted()
     try:
         path = trusted_powerpoint_path(bitness)
-    except (OSError, ValueError, ImportError):
-        logger.info("[ppt] launch decision: path=dispatch reason=untrusted_path")
+    except (OSError, ValueError, ImportError) as exc:
+        # Only fixed validation codes and scalar OS errors belong in this log.
+        # Exception text can contain environment paths or other private data.
+        detail = "validation_failed"
+        error_type = "ValueError"
+        if isinstance(exc, OSError):
+            detail, error_type = "os_error", "OSError"
+        elif isinstance(exc, ImportError):
+            detail, error_type = "dependency_unavailable", "ImportError"
+        elif len(exc.args) == 1 and isinstance(exc.args[0], str) and exc.args[0] in {
+                "office_bitness", "office_path", "office_path_link", "office_image",
+                "office_path_expansion"}:
+            detail = exc.args[0]
+        winerror = getattr(exc, "winerror", None)
+        logger.info("[ppt] launch decision: path=dispatch reason=untrusted_path "
+                    "detail=%s error_type=%s winerror=%s", detail, error_type,
+                    winerror if type(winerror) is int else None)
         return None  # no process call was started; ordinary read-only dispatch remains valid
     baseline, _ = guard.prepare_powerpoint_dispatch()
     if baseline:
