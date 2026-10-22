@@ -16,7 +16,8 @@ from uuid import uuid4
 ARMS = ("external_quit", "internal_quit", "reference_drop")
 EVENTS = {"native_scope_acquired", "host_bound", "synthetic_read", "document_closed",
           "quit_requested", "quit_returned", "references_dropped", "native_pair_completed",
-          "caller_complete", "operation_failed"}
+          "caller_complete", "operation_failed", "launch_created", "handle_transferred",
+          "dispatch_entered", "dispatch_returned"}
 STATUSES = {"returned", "quit_requested", "protected", "not_supported", "failed", "unknown"}
 _MAX_EVIDENCE = 65536
 
@@ -60,8 +61,17 @@ def validate_row(row: dict[str, Any], config: dict[str, Any]) -> None:
     if (type(row) is not dict or not {"event", "qpc_ns", "run_id", "pid", "creation"} <= set(row)
             or not set(row) <= {"event", "qpc_ns", "run_id", "pid", "creation", "status", "stage", "pythoncom_preimported", "error_type", "hresult", "winerror", "reason", "bind_step", "cause_error_type", "cause_hresult"}
             or type(row["event"]) is not str or row["event"] not in EVENTS or type(row["qpc_ns"]) is not int or row["qpc_ns"] <= 0
-            or any(type(row[key]) is not type(config[key]) or row[key] != config[key]
-                   for key in ("run_id", "pid", "creation"))):
+            or type(row["run_id"]) is not str or row["run_id"] != config["run_id"]):
+        raise ValueError("evidence_record")
+    identity = (row["pid"], row["creation"])
+    if identity == (None, None):
+        if config.get("kind") != "ppt_quit_compare_bootstrap" or row["event"] not in {"native_scope_acquired", "operation_failed", "references_dropped",
+                                "native_pair_completed", "caller_complete"}:
+            raise ValueError("evidence_record")
+    elif (type(row["pid"]) is not int or not 0 < row["pid"] <= 0xffffffff
+          or type(row["creation"]) is not int or not 0 < row["creation"] <= 0xffffffffffffffff):
+        raise ValueError("evidence_record")
+    elif config.get("pid") is not None and identity != (config["pid"], config["creation"]):
         raise ValueError("evidence_record")
     if "status" in row and (row["event"] != "quit_returned" or type(row["status"]) is not str or row["status"] not in STATUSES):
         raise ValueError("evidence_status")
@@ -74,6 +84,7 @@ def validate_row(row: dict[str, Any], config: dict[str, Any]) -> None:
     if "bind_step" in row and (row["event"] != "operation_failed" or row.get("stage") != "bind"
                                or type(row["bind_step"]) is not str or row["bind_step"] not in {
                                    "target_check", "client_import", "dispatch", "app_hwnd", "probe_precheck",
+                                   "launch", "handoff",
                                    "caption_probe", "probe_owner", "probe_cleanup", "hwnd_owner", "idle_check",
                                    "service_select", "service_idle_check"}):
         raise ValueError("evidence_stage")
@@ -124,27 +135,21 @@ class WindowsBackend:
                 raise RuntimeError("baseline_not_empty")
 
     def start(self, arm: str) -> dict[str, Any]:
-        """Generate only synthetic data and retain the exact CreateProcess handle."""
-        from .ppt_launch import LaunchedPowerPoint, trusted_powerpoint_path
+        """Start the prepared caller before it creates its own PowerPoint process."""
         from .ppt_quit_compare_fixture import create_fixture
         from .ppt_capture_native import start_child
+        from .ppt_quit_compare_handoff import KIND, VERSION, validate_bootstrap
         self.baseline()
         fixture = create_fixture(self.directory / "fixture")
-        launched = LaunchedPowerPoint(trusted_powerpoint_path(self.bitness))
-        try:
-            if type(launched.identity) is not int or launched.identity <= 0:
-                raise RuntimeError("launch_identity_unknown")
-            self.target = launched.detach_observation()
-        finally:
-            launched.close()
         token = uuid4().hex + uuid4().hex
-        self.config = dict(arm=arm, pid=self.target.pid, creation=self.target.identity,
+        self.config = dict(kind=KIND, version=VERSION, arm=arm,
                            run_id=uuid4().hex, token=token, parent_pid=os.getpid(),
                            parent_creation=self.native.creation(self.native.k.GetCurrentProcess()),
                            fixture_path=str(fixture.path), fixture_sha256=fixture.sha256,
                            evidence=str(self.directory / "caller.jsonl"), timeout=self.timeout,
-                           allowed_pids=[os.getpid()])
-        validate_binding(self.config)
+                           allowed_pids=[os.getpid()], office_bitness=self.bitness,
+                           handoff=str(self.directory / "launch-handoff.json"))
+        validate_bootstrap(self.config)
         config_path = self.directory / "caller-config.json"
         config_path.write_text(json.dumps(self.config), encoding="utf-8")
         environment = dict(os.environ)
@@ -155,11 +160,21 @@ class WindowsBackend:
         environment["AEGIS_PPT_COMPARE_TOKEN"] = token
         self.caller = start_child(caller_command(), [], stdin=subprocess.DEVNULL,
                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=environment)
-        return dict(**{key: self.config[key] for key in ("run_id", "pid", "creation", "arm")},
-                    caller_pid=self.caller.pid, supervisor_pid=os.getpid())
+        self.binding = dict(**{key: self.config[key] for key in ("run_id", "arm")}, pid=None, creation=None,
+                            caller_pid=self.caller.pid, supervisor_pid=os.getpid(), launch_handoff_required=True)
+        return self.binding
 
     def poll(self) -> tuple[str, bool | None, list[dict[str, Any]]]:
         """Observe the exact original process and bounded complete helper records."""
+        if self.target is None and self.caller is not None and "handoff" in self.config:
+            from .ppt_quit_compare_handoff import receive_launch
+            try:
+                self.target = receive_launch(self.native, Path(self.config["handoff"]), self.config, self.caller.pid)
+            except Exception as error:
+                from .ppt_quit_compare_com import error_fields
+                self.handoff_failure = error_fields(error)
+            if self.target is not None:
+                self.binding.update(pid=self.target.pid, creation=self.target.identity)
         observation = self.target.poll() if self.target is not None else None
         self.last_observation_error = None if observation is None else observation.error_code
         state = "target_unconfirmed" if observation is None else observation.status
@@ -179,7 +194,7 @@ class WindowsBackend:
                 if not line.endswith(b"\n"):
                     continue
                 row = json.loads(line)
-                validate_row(row, self.config)
+                validate_row(row, dict(self.config, **getattr(self, "binding", {})))
                 rows.append(row)
             if len(rows) > 64:
                 raise ValueError("evidence_rows")
@@ -199,7 +214,7 @@ def summarize_arm(binding: dict[str, Any], state: str, alive: bool | None,
     if state not in {"exited", "timeout", "target_unconfirmed", "observation_failed"} or (alive is not None and type(alive) is not bool):
         raise ValueError("evidence_record")
     bound = "host_bound" in events
-    verified = state == "exited" and bound
+    verified = state == "exited" and bound and type(binding.get("pid")) is int and type(binding.get("creation")) is int
     if len(events) != len(set(events)) or any(rows[i]["qpc_ns"] >= rows[i + 1]["qpc_ns"] for i in range(len(rows) - 1)):
         raise ValueError("evidence_order")
     failed = "operation_failed" in events
@@ -210,6 +225,10 @@ def summarize_arm(binding: dict[str, Any], state: str, alive: bool | None,
     if binding.get("arm") != "reference_drop":
         expected += ["quit_requested", "quit_returned"]
     expected += ["references_dropped", "native_pair_completed", "caller_complete"]
+    startup_events = {"launch_created", "handle_transferred", "dispatch_entered", "dispatch_returned"}
+    startup = [event for event in events if event in startup_events]
+    if startup or binding.get("launch_handoff_required"):
+        expected = expected[:1] + ["launch_created", "handle_transferred", "dispatch_entered", "dispatch_returned"] + expected[1:]
     completed = completed and events == expected
     quit_status = next((row.get("status") for row in rows if row["event"] == "quit_returned"), None)
     if binding.get("arm") == "internal_quit" and quit_status != "quit_requested":
@@ -223,6 +242,9 @@ def summarize_arm(binding: dict[str, Any], state: str, alive: bool | None,
     return dict(binding, os_status=state, actual_os_exit_verified=verified,
                 caller_exited=alive is False, experiment_complete=completed and alive is False,
                 native_pair_scope="caller_owned_only", pythoncom_initialization="implicit_import_possible",
+                handoff_verified=type(binding.get("pid")) is int and type(binding.get("creation")) is int,
+                caller_reported_pid=next((row["pid"] for row in rows if type(row["pid"]) is int), None),
+                caller_reported_creation=next((row["creation"] for row in rows if type(row["creation"]) is int), None),
                 outcome="exited" if verified else "remaining" if state == "timeout" else "unknown",
                 events=events, stage_elapsed_ms=timings, failures=failures,
                 pythoncom_preimported=next((row.get("pythoncom_preimported") for row in rows
@@ -278,6 +300,9 @@ def run_compare(output: Path, bitness: int = 64, timeout: float = 30,
                     result.update(observed_times, observation_elapsed_ms=elapsed,
                                   observation_origin="caller_started")
                     result["os_error_code"] = getattr(backend, "last_observation_error", None)
+                    if getattr(backend, "handoff_failure", None) is not None:
+                        result["handoff_failure"] = backend.handoff_failure
+                        result["experiment_complete"] = False
                     if getattr(backend, "caller", None) is not None:
                         code = backend.caller.poll()
                         result["caller_exit_code"] = code
@@ -325,7 +350,8 @@ def caller_entry() -> int:
     if not config_path.is_absolute() or config_path.name != "caller-config.json" or config_path.stat().st_size > 16384:
         return 2
     config = json.loads(config_path.read_bytes())
-    validate_binding(config)
+    from .ppt_quit_compare_handoff import validate_bootstrap
+    validate_bootstrap(config)
     if (config["token"] != os.environ.pop("AEGIS_PPT_COMPARE_TOKEN", "")
             or config_path.parent != Path(config["evidence"]).parent):
         return 2
@@ -333,7 +359,7 @@ def caller_entry() -> int:
     from .ppt_quit_compare_com import Session, run_caller
     native = Native()
     try:
-        parent = native.keep(native.k.OpenProcess(0x100000 | 0x1000, False, config["parent_pid"]))
+        parent = native.keep(native.k.OpenProcess(0x100000 | 0x1000 | 0x40, False, config["parent_pid"]))
         if native.wait(parent) or native.creation(parent) != config["parent_creation"]:
             return 2
         config["allowed_pids"].append(os.getpid())
@@ -343,17 +369,21 @@ def caller_entry() -> int:
         with evidence.open("xb", buffering=0) as stream:
             def emit(event: str, **fields: Any) -> None:
                 row = dict(event=event, qpc_ns=time.perf_counter_ns(),
-                           **{key: config[key] for key in ("run_id", "pid", "creation")}, **fields)
+                           run_id=config["run_id"], pid=config.get("pid"), creation=config.get("creation"), **fields)
                 validate_row(row, config)
                 stream.write((json.dumps(row, separators=(",", ":")) + "\n").encode())
             try:
-                session = Session(config, native)
+                session = Session(config, native, parent)
             except Exception as error:
                 from .ppt_quit_compare_com import error_fields
                 emit("operation_failed", stage="bind", **error_fields(error))
                 emit("caller_complete")
                 return 2
-            return run_caller(session, config["arm"], emit)
+            try:
+                return run_caller(session, config["arm"], emit)
+            finally:
+                if session.observer is not None:
+                    session.observer.close()
     finally:
         native.close()
 

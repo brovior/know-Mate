@@ -3,6 +3,25 @@
 현재 원인 분석과 다음 검증의 정본이다. 작업 상태는 [ROADMAP.md](ROADMAP.md), 구현 계약은
 [DESIGN.md](design/DESIGN.md), 완료 이력은 [UPDATE_NOTES.md](UPDATE_NOTES.md)를 따른다.
 
+## 진단의 호출 준비와 PowerPoint 직접 실행 순서 (2026-10-22)
+
+후속 VDI 시험은 `bind_step=probe_precheck`, `reason=target_changed`, 원 핸들 `os_status=exited`이며
+명령 종료 후 PowerPoint 프로세스가 없다는 보고다. `host_bound`·합성 읽기·Quit에는 도달하지 않았다.
+이 관측은 인덱싱 후 내부 Quit의 잔류 원인을 설명하거나 외부 Quit의 성공을 입증하지 않는다.
+
+기존 진단은 부모가 PowerPoint를 먼저 실행한 뒤 별도 frozen 호출 프로그램을 시작했다.
+제품은 같은 워커에서 실행 직후 COM에 연결한다. 호출 프로그램 시작·COM 준비 지연 동안
+빈 COM 서버가 종료됐을 가능성은 있으나 Windows 실측으로 원인을 확정하지는 않았다.
+비교 조건을 맞추기 위해 호출 프로그램의 COM·Python 준비를 먼저 끝내고 그 안에서
+PowerPoint 실행과 연결을 연속 수행한다. 부모는 원 CreateProcess 핸들의 관측 권한만 복제받아
+PID·생성 시각을 검증하고 종료를 독립 관측한다. 다른 PID를 찾아 종료 권한을 얻지 않는다.
+인계 누락·불명확·PID 불일치·조기 종료는 계속 보류하고 후속 시험을 막는다.
+실행·핸들 인계·Dispatch 진입/반환 시간을 따로 남기며 `target_exited`, `process_set_changed`,
+`identity_mismatch`로 거절 원인을 구분한다. 원 프로세스 핸들 인계 회귀를 포함한 오프라인 시험은
+74 PASS / Windows native 1 SKIP이다. 실제 Windows x86/x64 핸들 전달·Office·frozen·DRM과
+전체 pytest(pytest 미설치)는 **UNEXECUTED**다. 이 변경으로 조기 종료나 인덱싱 후 잔류가
+실제로 해결됐다고 판정하지 않는다.
+
 ## 종료 비교의 연결 호환성과 오류 분류 보완 (2026-10-22)
 
 첫 비교에서 `host_bound`·Quit 이벤트 없이 `bind/unknown`으로 중단된 보고가 있다.
