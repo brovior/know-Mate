@@ -15,7 +15,8 @@ from .ppt_quit_compare_fixture import SyntheticFixture, verify_fixture
 ERROR_TYPES = frozenset({"ValueError", "OSError", "RuntimeError", "ImportError", "ModuleNotFoundError",
                          "com_error", "PermissionError", "FileNotFoundError", "ComScopeUnavailable",
                          "PptAddinUnavailable", "TimeoutError", "AttributeError", "TypeError", "OverflowError",
-                         "OfficeOwnershipProbeError", "OfficeOwnershipCleanupError"})
+                         "OfficeOwnershipProbeError", "OfficeOwnershipCleanupError", "PptLaunchNotStarted",
+                         "ArgumentError", "error"})
 
 
 def error_fields(error: BaseException) -> dict[str, Any]:
@@ -30,6 +31,8 @@ def error_fields(error: BaseException) -> dict[str, Any]:
                "service_disabled", "service_unavailable", "service_incompatible", "windows_required",
                "evidence_bound", "evidence_rows", "evidence_partial", "evidence_order", "evidence_record",
                "evidence_status", "evidence_stage", "evidence_import_state"}
+    reasons |= {"handoff_parent_changed", "handoff_record", "handoff_binding", "handoff_identity",
+                "target_exited", "process_set_changed", "identity_mismatch", "launch_not_prepared"}
     code = outer_hresult(error)
     winerror = getattr(error, "winerror", None)
     reason = error.args[0] if len(error.args) == 1 and type(error.args[0]) is str and error.args[0] in reasons else "unspecified"
@@ -47,14 +50,46 @@ def error_fields(error: BaseException) -> dict[str, Any]:
 class Session:
     """Keep every caller-owned COM reference in one disposable helper process."""
 
-    def __init__(self, config: dict[str, Any], native: Any) -> None:
-        """Retain an independently checked observation of the supervisor's target."""
+    def __init__(self, config: dict[str, Any], native: Any, parent: int | None = None) -> None:
+        """Prepare a launch caller without opening any target process by PID."""
         self.config, self.native = config, native
         self.holds: dict[str, Any] = {}
         self.cache = SimpleNamespace(ppt_service=None)
         self.fixture = SyntheticFixture(Path(config["fixture_path"]), config["fixture_sha256"])
-        self.target = native.keep(native.k.OpenProcess(0x100000 | 0x1000, False, config["pid"]))
+        self.target = None
+        self.observer: Any = None
+        self.bootstrap = True
+        self.parent = parent
+        self.emit: Callable[..., None] | None = None
         self.requested = False
+
+    def launch_and_handoff(self) -> None:
+        """Launch next to activation and transfer only its original observation capability."""
+        from .ppt_capture_observer import processes
+        from .ppt_launch import LaunchedPowerPoint, trusted_powerpoint_path
+        from .ppt_quit_compare_handoff import publish_launch
+        if self.parent is None or self.emit is None:
+            raise RuntimeError("launch_not_prepared")
+        rows = processes(self.native)
+        if any(row["name"] == "powerpnt.exe" or (row["name"] == "aegisdesk.exe"
+                and row["pid"] not in self.config["allowed_pids"]) for row in rows):
+            raise RuntimeError("baseline_not_empty")
+        path = trusted_powerpoint_path(self.config["office_bitness"])
+        self.bind_step = "launch"
+        launched = LaunchedPowerPoint(path)
+        try:
+            if (type(launched.identity) is not int or not 0 < launched.identity <= 0xffffffffffffffff
+                    or type(launched.pid) is not int or not 0 < launched.pid <= 0xffffffff):
+                raise RuntimeError("launch_identity_unknown")
+            self.config.update(pid=launched.pid, creation=launched.identity)
+            self.emit("launch_created")
+            self.bind_step = "handoff"
+            publish_launch(self.native, self.parent, launched, self.config)
+            self.observer = launched.detach_observation()
+            self.target = self.observer._handle
+            self.emit("handle_transferred")
+        finally:
+            launched.close()
 
     def target_check(self) -> None:
         """Require the original live process and an otherwise empty PowerPoint baseline."""
@@ -63,9 +98,12 @@ class Session:
         candidates = [row["pid"] for row in rows if row["name"] == "powerpnt.exe"]
         if any(row["name"] == "aegisdesk.exe" and row["pid"] not in self.config["allowed_pids"] for row in rows):
             raise RuntimeError("concurrent_application")
-        if (candidates != [self.config["pid"]] or self.native.wait(self.target)
-                or self.native.creation(self.target) != self.config["creation"]):
-            raise RuntimeError("target_changed")
+        if self.native.wait(self.target):
+            raise RuntimeError("target_exited")
+        if self.native.creation(self.target) != self.config["creation"]:
+            raise RuntimeError("identity_mismatch")
+        if candidates != [self.config["pid"]]:
+            raise RuntimeError("process_set_changed")
 
     def counts(self, expected: int) -> None:
         """Reject visible windows or foreign documents; snapshots do not prove race safety."""
@@ -98,14 +136,21 @@ class Session:
 
     def bind(self) -> None:
         """Match production startup activation, then prove the original host before use."""
-        self.bind_step = "target_check"
-        self.target_check()
+        if not getattr(self, "bootstrap", False):
+            self.bind_step = "target_check"
+            self.target_check()
         self.bind_step = "client_import"
         import win32com.client as client
+        if getattr(self, "bootstrap", False):
+            self.launch_and_handoff()
         # An /EMBEDDING server may expose its class factory before entering ROT.
         # Activation can hand off: a different host is never opened or quit.
         self.bind_step = "dispatch"
+        if getattr(self, "emit", None) is not None:
+            self.emit("dispatch_entered")
         self.holds["app"] = client.Dispatch("PowerPoint.Application")
+        if getattr(self, "emit", None) is not None:
+            self.emit("dispatch_returned")
         from .office_guard import _app_hwnd, _ppt_ownership_window
         self.bind_step = "app_hwnd"
         hwnd = _app_hwnd(self.holds["app"], "POWERPNT.EXE")
@@ -191,6 +236,8 @@ def operate(session: Any, arm: str, emit: Callable[..., None]) -> bool:
     """Unwind operation frames and opaque COM exceptions before releasing references."""
     stage = "bind"
     try:
+        if getattr(session, "bootstrap", False):
+            session.emit = emit
         session.bind()
         emit("host_bound")
         stage = "read"
