@@ -58,7 +58,7 @@ def validate_binding(config: dict[str, Any]) -> None:
 def validate_row(row: dict[str, Any], config: dict[str, Any]) -> None:
     """Accept only fixed metadata; arbitrary text and document fields are forbidden."""
     if (type(row) is not dict or not {"event", "qpc_ns", "run_id", "pid", "creation"} <= set(row)
-            or not set(row) <= {"event", "qpc_ns", "run_id", "pid", "creation", "status", "stage", "pythoncom_preimported", "error_type", "hresult", "winerror", "reason"}
+            or not set(row) <= {"event", "qpc_ns", "run_id", "pid", "creation", "status", "stage", "pythoncom_preimported", "error_type", "hresult", "winerror", "reason", "bind_step", "cause_error_type", "cause_hresult"}
             or type(row["event"]) is not str or row["event"] not in EVENTS or type(row["qpc_ns"]) is not int or row["qpc_ns"] <= 0
             or any(type(row[key]) is not type(config[key]) or row[key] != config[key]
                    for key in ("run_id", "pid", "creation"))):
@@ -71,19 +71,31 @@ def validate_row(row: dict[str, Any], config: dict[str, Any]) -> None:
     if "pythoncom_preimported" in row and (row["event"] != "native_scope_acquired"
                                            or type(row["pythoncom_preimported"]) is not bool):
         raise ValueError("evidence_import_state")
+    if "bind_step" in row and (row["event"] != "operation_failed" or row.get("stage") != "bind"
+                               or type(row["bind_step"]) is not str or row["bind_step"] not in {
+                                   "target_check", "client_import", "dispatch", "app_hwnd", "probe_precheck",
+                                   "caption_probe", "probe_owner", "probe_cleanup", "hwnd_owner", "idle_check",
+                                   "service_select", "service_idle_check"}):
+        raise ValueError("evidence_stage")
     errors = {"error_type", "hresult", "winerror", "reason"} & set(row)
     if errors:
         if row["event"] != "operation_failed" or errors != {"error_type", "hresult", "winerror", "reason"}:
             raise ValueError("evidence_record")
         # Match the encoder's fixed vocabulary without trusting arbitrary strings.
-        from .ppt_quit_compare_com import error_fields
+        from .ppt_quit_compare_com import ERROR_TYPES, error_fields
         allowed = error_fields(RuntimeError(row["reason"]))["reason"]
-        if allowed != row["reason"] or type(row["error_type"]) is not str or row["error_type"] not in {
-                "ValueError", "OSError", "RuntimeError", "ImportError", "ModuleNotFoundError",
-                "com_error", "PermissionError", "FileNotFoundError", "ComScopeUnavailable",
-                "PptAddinUnavailable", "TimeoutError", "unknown"}:
+        if allowed != row["reason"] or type(row["error_type"]) is not str or row["error_type"] not in ERROR_TYPES | {"unknown"}:
             raise ValueError("evidence_record")
         if any(row[key] is not None and type(row[key]) is not int for key in ("hresult", "winerror")):
+            raise ValueError("evidence_record")
+    if "cause_error_type" in row or "cause_hresult" in row:
+        if not errors or not {"cause_error_type", "cause_hresult"} <= set(row):
+            raise ValueError("evidence_record")
+        from .ppt_quit_compare_com import ERROR_TYPES
+        allowed_types = ERROR_TYPES | {"unknown", None}
+        if (row["cause_error_type"] is not None and type(row["cause_error_type"]) is not str
+                or row["cause_error_type"] not in allowed_types
+                or row["cause_hresult"] is not None and type(row["cause_hresult"]) is not int):
             raise ValueError("evidence_record")
 
 
@@ -205,7 +217,8 @@ def summarize_arm(binding: dict[str, Any], state: str, alive: bool | None,
     if binding.get("arm") == "external_quit" and quit_status != "returned":
         completed = False
     timings = {row["event"]: round((row["qpc_ns"] - rows[0]["qpc_ns"]) / 1000000, 3) for row in rows} if rows else {}
-    failures = [{key: row.get(key) for key in ("stage", "reason", "error_type", "hresult", "winerror")}
+    failures = [{key: row.get(key) for key in ("stage", "bind_step", "reason", "error_type", "hresult", "winerror",
+                                              "cause_error_type", "cause_hresult")}
                 for row in rows if row["event"] == "operation_failed"]
     return dict(binding, os_status=state, actual_os_exit_verified=verified,
                 caller_exited=alive is False, experiment_complete=completed and alive is False,
