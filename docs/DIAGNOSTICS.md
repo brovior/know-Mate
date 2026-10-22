@@ -3,6 +3,20 @@
 현재 원인 분석과 다음 검증의 정본이다. 작업 상태는 [ROADMAP.md](ROADMAP.md), 구현 계약은
 [DESIGN.md](design/DESIGN.md), 완료 이력은 [UPDATE_NOTES.md](UPDATE_NOTES.md)를 따른다.
 
+## 종료 비교의 연결 호환성과 오류 분류 보완 (2026-10-22)
+
+첫 비교에서 `host_bound`·Quit 이벤트 없이 `bind/unknown`으로 중단된 보고가 있다.
+`os_status=exited`는 실행한 원 프로세스의 종료 관측이며, COM 호스트 연결을 확인하지 못했으므로
+`actual_os_exit_verified=false`와 후속 시험 UNEXECUTED 처리는 유지한다. 이 결과는 외부 Quit 시험 결과가 아니다.
+
+진단이 `Application.HWND`만 직접 읽고 제품의 미지원 속성 대체 경로를 누락한 결함을 보완했다.
+HWND 미지원은 유력 원인이지만 이전 로그가 AttributeError 등을 unknown으로 축약했으므로 실제 원인은
+아직 미확정이다. 빈 호스트에서 제품의 임시 빈 문서·캡션 표식 검증을 재사용하고, PID·생성 identity·
+프로세스 집합이 다르면 Reader 선택·합성 파일 읽기·Quit을 하지 않는다. 확인 문서와 설정 복원 실패도 중단한다.
+고정 `bind_step`, AttributeError/TypeError 등 오류 종류와 원인 오류의 종류·숫자 HRESULT를 기록하며
+임의 메시지는 기록하지 않는다. 오프라인 회귀 64 PASS / Windows native 1 SKIP,
+실제 Windows·Office·frozen·DRM 및 전체 pytest(pytest 미설치)는 **UNEXECUTED**다.
+
 ## 설치된 Reader의 종료 3방식 비교 (2026-10-21)
 
 단축 경로 수정 후 직접 실행과 `TryQuitIfIdle()`의 `quit_requested` 반환은 확인됐으나,

@@ -12,13 +12,16 @@ from typing import Any, Callable
 from scripts.diagnostics.ppt_capture.fixture import TEXT, TEXT_SHA256
 from .ppt_quit_compare_fixture import SyntheticFixture, verify_fixture
 
+ERROR_TYPES = frozenset({"ValueError", "OSError", "RuntimeError", "ImportError", "ModuleNotFoundError",
+                         "com_error", "PermissionError", "FileNotFoundError", "ComScopeUnavailable",
+                         "PptAddinUnavailable", "TimeoutError", "AttributeError", "TypeError", "OverflowError",
+                         "OfficeOwnershipProbeError", "OfficeOwnershipCleanupError"})
+
 
 def error_fields(error: BaseException) -> dict[str, Any]:
     """Reduce errors to fixed reason/type codes and numeric HRESULT/Win32 metadata."""
     from .com_fault import clear_com_error_frames, outer_hresult
-    names = {"ValueError", "OSError", "RuntimeError", "ImportError", "ModuleNotFoundError",
-             "com_error", "PermissionError", "FileNotFoundError", "ComScopeUnavailable",
-             "PptAddinUnavailable", "TimeoutError"}
+    names = ERROR_TYPES
     reasons = {"baseline_not_empty", "capture_busy", "launch_identity_unknown", "target_changed",
                "concurrent_application", "user_document_or_unknown", "visible_window_or_unknown",
                "window_owner_mismatch", "synthetic_read_mismatch", "fixture_binding", "duplicate_quit",
@@ -30,9 +33,13 @@ def error_fields(error: BaseException) -> dict[str, Any]:
     code = outer_hresult(error)
     winerror = getattr(error, "winerror", None)
     reason = error.args[0] if len(error.args) == 1 and type(error.args[0]) is str and error.args[0] in reasons else "unspecified"
+    cause = error.__cause__
     result = dict(error_type=type(error).__name__ if type(error).__name__ in names else "unknown",
                   hresult=code if type(code) is int else None,
-                  winerror=winerror if type(winerror) is int else None, reason=reason)
+                  winerror=winerror if type(winerror) is int else None, reason=reason,
+                  cause_error_type=(type(cause).__name__ if type(cause).__name__ in names else "unknown")
+                  if cause is not None else None,
+                  cause_hresult=outer_hresult(cause) if cause is not None else None)
     clear_com_error_frames(error)
     return result
 
@@ -91,15 +98,36 @@ class Session:
 
     def bind(self) -> None:
         """Match production startup activation, then prove the original host before use."""
+        self.bind_step = "target_check"
         self.target_check()
+        self.bind_step = "client_import"
         import win32com.client as client
         # An /EMBEDDING server may expose its class factory before entering ROT.
         # Activation can hand off: a different host is never opened or quit.
+        self.bind_step = "dispatch"
         self.holds["app"] = client.Dispatch("PowerPoint.Application")
-        self.native.owner(int(self.holds["app"].HWND), self.config["pid"])
+        from .office_guard import _app_hwnd, _ppt_ownership_window
+        self.bind_step = "app_hwnd"
+        hwnd = _app_hwnd(self.holds["app"], "POWERPNT.EXE")
+        if hwnd is None:
+            # Match the production fallback only in an empty isolated host.
+            self.bind_step = "probe_precheck"
+            self.counts(0)
+            self.bind_step = "caption_probe"
+            with _ppt_ownership_window(self.holds["app"]) as read_hwnd:
+                self.bind_step = "probe_owner"
+                self.native.owner(read_hwnd(), self.config["pid"])
+                self.target_check()
+                self.bind_step = "probe_cleanup"
+        else:
+            self.bind_step = "hwnd_owner"
+            self.native.owner(hwnd, self.config["pid"])
+        self.bind_step = "idle_check"
         self.counts(0)
+        self.bind_step = "service_select"
         from .ppt_addin_reader import select_service
         self.holds["service"] = select_service(self.holds["app"], self.cache)
+        self.bind_step = "service_idle_check"
         self.counts(0)
 
     def read(self) -> None:
@@ -176,7 +204,10 @@ def operate(session: Any, arm: str, emit: Callable[..., None]) -> bool:
             emit("quit_returned", status=session.quit(arm, emit))
         return True
     except Exception as error:
-        emit("operation_failed", stage=stage, **error_fields(error))
+        details = error_fields(error)
+        if stage == "bind":
+            details["bind_step"] = getattr(session, "bind_step", "target_check")
+        emit("operation_failed", stage=stage, **details)
         return False
 
 
