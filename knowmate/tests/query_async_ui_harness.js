@@ -77,15 +77,141 @@ test('failed or malformed save preserves dirty question without dispatch',async(
  assert.equal(f.run('currentThread.messages.length'),1);
  }
 });
-test('navigation during pending initial save cancels dispatch',async()=>{
+test('navigation during user save dispatches the original question after its ACK',async()=>{
  const f=fixture();f.input('q');const send=f.run('sendMsg()');await tick();const nav=f.run('newThread()');
  f.calls.saved[0].resolve('{"ok":true}');await Promise.all([send,nav]);
- assert.equal(f.calls.sent.length,0);assert.equal(f.run('currentThread'),null);
+ assert.equal(f.calls.sent.length,1);assert.equal(f.run('currentThread'),null);
+ assert.equal(f.calls.sent[0].thread_id,f.calls.saved[0].thread.id);assert.equal(f.calls.cancelled.length,0);
 });
-test('mode switch resets thread and rejects old response',async()=>{
- const f=fixture();const req=await accepted(f);await f.run('switchMode("mes")');await response(f,req);
+
+test('mode switch while awaiting user save keeps the original request mode',async()=>{
+ const f=fixture();f.input('question');const send=f.run('sendMsg()');await tick();
+ const away=f.run('switchMode("mes")');await tick();assert.equal(f.calls.sent.length,0);
+ f.calls.saved[0].resolve('{"ok":true}');await Promise.all([send,away]);
+ assert.equal(f.run('currentMode'),'mes');assert.equal(f.calls.sent.length,1);
+ assert.equal(f.calls.sent[0].mode,'knowledge');assert.equal(f.run('waiting'),false);
+ const answer=response(f,f.calls.sent[0]);await tick();assert.equal(f.calls.saved[1].mode,'knowledge');
+ assert.equal(f.calls.blocks.length,0);f.calls.saved[1].resolve('{"ok":true}');await answer;
+});
+test('returning to a pending conversation keeps the request and receives its answer',async()=>{
+ const f=fixture();const req=await accepted(f);const original=f.run('JSON.stringify(currentThread)');
+ const away=f.run('restoreThread({id:"other",mode:"knowledge"})');await tick();
+ f.calls.restored[0].resolve('{"id":"other","mode":"knowledge","messages":[]}');await away;
+ assert.equal(f.calls.cancelled.length,0);assert.equal(f.run('waiting'),false);
+ f.context.origin={id:req.thread_id,mode:req.mode};
+ const back=f.run('restoreThread(origin)');await tick();f.calls.restored[1].resolve(original);await back;
+ assert.equal(f.run('waiting'),true);
+ const answer=response(f,req);await tick();assert.equal(f.calls.saved.length,2);
+ assert.equal(f.calls.saved[1].thread.id,req.thread_id);assert.equal(f.calls.saved[1].thread.messages.length,2);
+ f.calls.saved[1].resolve('{"ok":true}');await answer;
+ assert.equal(f.run('currentThread.messages.length'),2);assert.equal(f.calls.blocks.length,1);
+});
+
+test('background answer is saved only to its origin and appears on a later restore',async()=>{
+ const f=fixture();const req=await accepted(f);
+ const away=f.run('restoreThread({id:"other",mode:"knowledge"})');await tick();
+ f.calls.restored[0].resolve('{"id":"other","mode":"knowledge","messages":[]}');await away;
+ const answer=response(f,req);await tick();
+ assert.equal(f.calls.blocks.length,0);assert.equal(f.run('currentThread.messages.length'),0);
+ assert.equal(f.calls.saved[1].thread.id,req.thread_id);
+ const stored=JSON.stringify(f.calls.saved[1].thread);
+ f.calls.saved[1].resolve('{"ok":true}');await answer;
+ f.context.origin={id:req.thread_id,mode:req.mode};const back=f.run('restoreThread(origin)');await tick();
+ f.calls.restored[1].resolve(stored);await back;
+ assert.equal(f.run('currentThread.messages.length'),2);assert.equal(f.calls.blocks.length,1);
+ assert.equal(f.run('waiting'),false);assert.equal(f.calls.cancelled.length,0);
+});
+
+test('new conversation leaves a request running and still enforces single flight',async()=>{
+ const f=fixture();const req=await accepted(f);await f.run('newThread()');
+ f.input('next');await f.run('sendMsg()');assert.equal(f.calls.sent.length,1);
+ assert.equal(f.calls.cancelled.length,0);assert.equal(f.run('currentThread'),null);
+ const answer=response(f,req);await tick();assert.equal(f.calls.saved[1].thread.id,req.thread_id);
+ await response(f,req);assert.equal(f.calls.saved.length,2);assert.equal(f.calls.blocks.length,0);
+ f.calls.saved[1].resolve('{"ok":true}');await answer;
+ assert.equal(f.run('backendBusy'),true);f.state(false,'IDLE',req.request_id);
+ assert.equal(f.run('queryLocked()'),false);
+});
+
+test('answer arriving during origin restore cannot be replaced by its older stored snapshot',async()=>{
+ const f=fixture();const req=await accepted(f);const old=f.run('JSON.stringify(currentThread)');await f.run('newThread()');
+ f.context.origin={id:req.thread_id,mode:req.mode};const back=f.run('restoreThread(origin)');await tick();
+ const answer=response(f,req);await tick();f.calls.saved[1].resolve('{"ok":true}');await answer;
+ f.calls.restored[0].resolve(old);await back;
+ assert.equal(f.run('currentThread.id'),req.thread_id);assert.equal(f.run('currentThread.messages.length'),2);
+ assert.equal(f.calls.blocks.length,1);assert.equal(f.run('navigationPending'),false);
+});
+
+test('background persistence does not invalidate an unrelated conversation restore',async()=>{
+ const f=fixture();const req=await accepted(f);const away=f.run('restoreThread({id:"other",mode:"knowledge"})');await tick();
+ const answer=response(f,req);await tick();f.calls.saved[1].resolve('{"ok":true}');await answer;
+ f.calls.restored[0].resolve('{"id":"other","mode":"knowledge","messages":[]}');await away;
+ assert.equal(f.run('currentThread.id'),'other');assert.equal(f.run('currentThread.messages.length'),0);
+ assert.equal(f.run('waiting'),false);
+});
+
+test('failed background save survives a later request and is retried from its original conversation',async()=>{
+ const f=fixture();const req=await accepted(f);const old=f.run('JSON.stringify(currentThread)');await f.run('newThread()');
+ const answer=response(f,req);await tick();f.calls.saved[1].resolve('{"ok":false}');await answer;
+ f.state(false,'IDLE',req.request_id);f.input('second');const second=f.run('sendMsg()');await tick();
+ f.calls.saved[2].resolve('{"ok":true}');await second;
+ f.context.origin={id:req.thread_id,mode:req.mode};const back=f.run('restoreThread(origin)');await tick();
+ f.calls.restored[0].resolve(old);await back;
+ assert.equal(f.run('currentThread.messages.length'),2);assert.equal(f.run('waiting'),false);
+ const leave=f.run('newThread()');await tick();assert.equal(f.calls.saved[3].thread.id,req.thread_id);
+ assert.equal(f.calls.saved[3].thread.messages.length,2);f.calls.saved[3].resolve('{"ok":true}');await leave;
+ assert.equal(f.run('retainedThreads.has(origin.mode+":"+origin.id)'),false);
+});
+
+test('deleting the background request cancels only it and never saves its late answer',async()=>{
+ const f=fixture();const req=await accepted(f);await f.run('newThread()');
+ f.context.origin={id:req.thread_id,mode:req.mode};const deletion=f.run('deleteQuestion(origin)');await tick();
+ assert.deepEqual(f.calls.cancelled,[req.request_id]);await response(f,req);
+ assert.equal(f.calls.saved.length,1);f.calls.deleted[0].resolve('{"ok":true}');await deletion;
+ assert.equal(f.run('retainedThreads.has(origin.mode+":"+origin.id)'),false);
+});
+
+test('deletion waits for a dispatched background save so it cannot recreate the conversation',async()=>{
+ const f=fixture();const req=await accepted(f);await f.run('newThread()');
+ const answer=response(f,req);await tick();f.context.origin={id:req.thread_id,mode:req.mode};
+ const deletion=f.run('deleteQuestion(origin)');await tick();assert.equal(f.calls.deleted.length,0);
+ f.calls.saved[1].resolve('{"ok":true}');await answer;await tick();assert.equal(f.calls.deleted.length,1);
+ f.calls.deleted[0].resolve('{"ok":true}');await deletion;await response(f,req);
+ assert.equal(f.calls.saved.length,2);assert.equal(f.run('currentThread'),null);
+});
+
+test('deleting a restore target rejects its stale snapshot even after deletion completes',async()=>{
+ const f=fixture();const req=await accepted(f);const back=f.run('restoreThread({id:"other",mode:"knowledge"})');await tick();
+ const deletion=f.run('deleteQuestion({id:"other",mode:"knowledge"})');await tick();
+ f.calls.deleted[0].resolve('{"ok":true}');await deletion;
+ f.calls.restored[0].resolve('{"id":"other","mode":"knowledge","messages":[]}');await back;
+ assert.equal(f.run('currentThread.id'),req.thread_id);assert.equal(f.run('navigationPending'),false);
+ assert.equal(f.calls.cancelled.length,0);
+});
+
+test('returning across modes resumes the existing request without redispatch',async()=>{
+ const f=fixture();const req=await accepted(f);const old=f.run('JSON.stringify(currentThread)');
+ await f.run('switchMode("mes")');await f.run('switchMode("knowledge")');
+ f.context.origin={id:req.thread_id,mode:req.mode};const back=f.run('restoreThread(origin)');await tick();
+ f.calls.restored[0].resolve(old);await back;
+ assert.equal(f.run('waiting'),true);assert.equal(f.calls.sent.length,1);assert.equal(f.calls.cancelled.length,0);
+ const answer=response(f,req);await tick();f.calls.saved[1].resolve('{"ok":true}');await answer;
+ assert.equal(f.run('currentThread.messages.length'),2);
+});
+
+test('timeout still retires a background request without attaching content to the visible conversation',async()=>{
+ const f=fixture();const req=await accepted(f);await f.run('newThread()');
+ await response(f,req,'timeout');f.state(true,'RETIRED_PENDING_EXIT',req.request_id);
+ assert.equal(f.run('currentThread'),null);assert.equal(f.calls.saved.length,1);
+ assert.equal(f.run('retainedThreads.size'),0);assert.equal(f.run('queryLocked()'),true);
+});
+
+test('mode switch keeps the pending answer in its originating conversation',async()=>{
+ const f=fixture();const req=await accepted(f);await f.run('switchMode("mes")');const answer=response(f,req);await tick();
  assert.equal(f.run('currentMode'),'mes');assert.equal(f.run('currentThread'),null);
- assert.equal(f.calls.blocks.length,0);assert.equal(f.calls.saved.length,1);assert.deepEqual(f.calls.cancelled,[req.request_id]);
+ assert.equal(f.calls.blocks.length,0);assert.equal(f.calls.saved.length,2);assert.deepEqual(f.calls.cancelled,[]);
+ assert.equal(f.calls.saved[1].mode,'knowledge');assert.equal(f.calls.saved[1].thread.id,req.thread_id);
+ f.calls.saved[1].resolve('{"ok":true}');await answer;
  assert.equal(f.run('backendBusy'),true);
 });
 test('terminal and duplicate cannot release busy before actual IDLE',async()=>{
@@ -99,6 +225,10 @@ test('malformed and stale terminal or state do not affect current request',async
  const f=fixture();const req=await accepted(f);await f.run('onResponse("{")');
  await response(f,req,'success',{thread_id:'other'}); f.state(false,'IDLE','old');
  assert.equal(f.run('backendBusy'),true);assert.equal(f.run('waiting'),true);assert.equal(f.calls.saved.length,1);
+ const failed=f.run('restoreThread({id:"missing",mode:"knowledge"})');await tick();
+ f.calls.restored[0].resolve('null');await failed;
+ assert.equal(f.run('currentThread.id'),req.thread_id);assert.equal(f.run('waiting'),true);
+ assert.equal(f.calls.cancelled.length,0);
 });
 test('cancel timeout keeps send locked and preserves editable input',async()=>{
  const f=fixture();const req=await accepted(f);await response(f,req,'timeout');f.state(true,'RETIRED_PENDING_EXIT',req.request_id);

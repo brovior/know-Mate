@@ -74,7 +74,7 @@ Phase 1~4 완료(RAG 지식검색), 5a 완료(Knox `.mysingle` + 표준 `.eml` �
 | PowerPoint 종료 3방식 비교 | 설치된 Reader로 외부 Quit·내부 Quit·참조 해제를 새 프로세스에서 비교하는 명시적 진단 | [격리된 VDI 실행](guides/PPT_READER.md#powerpoint-종료-3방식-비교-진단)의 실제 Windows x86/x64·frozen·Office·DRM 검증. 일반 배포 종료 안전성 승인을 대신하지 않음 |
 | PowerPoint 종료 진단 한 번 수집 | core 우선 관측·단회 요청·외부 보존·schema3 판독 및 별도1.0.6 진단 빌드 후보 구현. live 잠금 유지 | [새 진단 안내](guides/PPT_CAPTURE.md)의 x86/x64 native·정확한 패키지 pin·Office 합성 gate 대기. 기존 checkpoint121 잠금·일반 배포 기본값 유지 |
 | PowerPoint 참조 수명·원 handle 비교 | native MTA scope·예외 프레임 정리·원 handle 관측과 별도1.0.7 진단 후보. mock/replay만 허용 | [진단 안내](guides/PPT_CAPTURE.md#별도-참조-수명-비교-후보-1070)의 Windows·Office·사용자 보호 증거 대기. live·빌드·설치·등록·일반 배포 활성화 미실행 |
-| 질문 비동기화 | 요청별 QThread·기존 인덱스 읽기·대화 ACK/오래된 응답 차단·종료 보호 구현 | [상세 설계](design/ISSUE_B_query_async.md)의 사내 Windows·Office·DPAPI·실제 UI/장시간 질문 검증 대기 |
+| 질문 비동기화 | 대화 탐색 시 요청 유지·원래 대화 응답 저장·복귀 시 로딩 복원 수정. JS 40사례·관련 pytest 41개·실제 Qt 합성 2사례 확인. 전체 2,175 PASS, 기존 링크 권한 3 FAIL | [대화 이동 응답 검증](DIAGNOSTICS.md#대화-이동-뒤-응답-중단-2026-10-24)의 사내 API·장시간 질문 검증 대기 |
 | 실패 원인 판별 6b | 보류 | 오류 코드 실측, 워치독 밖 probe I/O의 행오버 위험 해소 |
 | 공용 인덱스 5b | 예정 | 로컬 캐시 복사 배포 설계·검증 |
 | DRM 저장 정책 | 사내 확인 대기 | 코드 변경이 아닌 정책 확인. [DESIGN.md](design/DESIGN.md) 참고 |
