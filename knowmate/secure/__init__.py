@@ -29,7 +29,8 @@ __all__ = [
 class AutoReader:
     """확장자 기반으로 PlainReader 또는 ComReader를 자동 선택하는 TextExtractor 구현체."""
 
-    def __init__(self, xlsx_block_rows: int | None = None, *, ppt_reader_mode: str | None = None) -> None:
+    def __init__(self, xlsx_block_rows: int | None = None, *, ppt_reader_mode: str | None = None,
+                 ppt_registration_timeout_sec: float | None = None) -> None:
         """AutoReader를 초기화한다.
 
         xlsx_block_rows: COM 경로에서 Excel 범위를 한 번에 읽을 행 수
@@ -42,6 +43,7 @@ class AutoReader:
         """
         self._plain = PlainReader()
         self._xlsx_block_rows = xlsx_block_rows
+        self._ppt_registration_timeout_sec = ppt_registration_timeout_sec
         from knowmate.config import ppt_reader_mode as resolve_ppt_mode
         self._ppt_reader_mode = resolve_ppt_mode({} if ppt_reader_mode is None else {"ppt_reader_mode": ppt_reader_mode})
         self._ppt_policy = "ready"
@@ -91,7 +93,8 @@ class AutoReader:
             from knowmate.secure.com_reader import ComReader
             return ComReader(xlsx_block_rows=self._xlsx_block_rows,
                              ppt_reader_mode=self._ppt_reader_mode, ppt_policy=self._ppt_policy,
-                             ppt_operation=self._ppt_operation).extract(path)
+                             ppt_operation=self._ppt_operation,
+                             ppt_registration_timeout_sec=self._ppt_registration_timeout_sec).extract(path)
         finally:
             if self._on_com_end is not None and exe is not None:
                 self._on_com_end()
@@ -153,7 +156,8 @@ class AutoReader:
 
 
 def get_extractor(mode: str, xlsx_block_rows: int | None = None, *,
-                  ppt_reader_mode: str | None = None) -> TextExtractor:
+                  ppt_reader_mode: str | None = None,
+                  ppt_registration_timeout_sec: float | None = None) -> TextExtractor:
     """mode에 따라 적합한 TextExtractor 인스턴스를 반환한다.
 
     xlsx_block_rows: COM 경로에서 Excel 범위를 한 번에 읽을 행 수
@@ -165,5 +169,6 @@ def get_extractor(mode: str, xlsx_block_rows: int | None = None, *,
     if mode == "plain":
         return PlainReader()
     if mode == "auto":
-        return AutoReader(xlsx_block_rows=xlsx_block_rows, ppt_reader_mode=ppt_reader_mode)
+        return AutoReader(xlsx_block_rows=xlsx_block_rows, ppt_reader_mode=ppt_reader_mode,
+                          ppt_registration_timeout_sec=ppt_registration_timeout_sec)
     raise ValueError(f"알 수 없는 extractor 모드: {mode!r}")

@@ -10,6 +10,12 @@ namespace AegisDesk.PptReader
         public bool Active;
         /// <summary>Sticky cancellation observation for this guard invocation.</summary>
         public bool Cancelled;
+        /// <summary>True only after a close event has actually been cancelled.</summary>
+        public bool CloseCancelled;
+        /// <summary>Allows a later manual close after a deferred automatic close was cancelled.</summary>
+        public bool DeferredProtection;
+        /// <summary>Once a user arrives during shutdown, never reacquire this invocation.</summary>
+        public void ObserveUserActivity() { if (Active) Cancelled = true; }
 #if AEGIS_PPT_EXTERNAL_DIAGNOSTIC
         internal ExternalTrace Telemetry;
 #endif

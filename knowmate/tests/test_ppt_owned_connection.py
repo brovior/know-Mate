@@ -30,7 +30,7 @@ def test_owned_connection_product_path(tmp_path, arch):
     policy = tmp_path / "Policy.cs"
     policy.write_text("namespace AegisDesk.PptReader { internal static class ShutdownBuildPolicy { public const bool Enabled=true; } }")
     exe = tmp_path / "OwnedConnection.exe"
-    names = ("PptReader.cs", "PptShutdownGuard.cs", "PptShutdownEvents.cs", "PptOwnedMetadata.cs",
+    names = ("PptReader.cs", "PptCallerQuit.cs", "PptShutdownGuard.cs", "PptShutdownEvents.cs", "PptOwnedMetadata.cs",
              "PptShutdownState.cs", "PptRawCount.cs", "PptSinkLoader.cs", "PptPackageIdentity.cs",
              "PptEventSignatures.cs", "PptEventValidator.cs")
     fixtures = ("ppt_owned_connection_fixture.cs", "ppt_owned_metadata_fixture.cs", "ppt_owned_connection_harness.cs")

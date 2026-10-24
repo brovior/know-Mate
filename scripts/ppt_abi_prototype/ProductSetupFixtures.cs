@@ -43,7 +43,7 @@ internal static class ProductSetupFixtures
         if(new Version(version)<=new Version("1.0.4.0")) {
             Contract.Read(Machine.Record)["schema"]=1; Contract.Read(Machine.Record).Remove("files");
         }
-        Payload("1.0.5.0"); ResetCounts();
+        Payload("1.0.5.10"); ResetCounts();
     }
     private static void Journal(string target)
     {
@@ -80,20 +80,20 @@ internal static class ProductSetupFixtures
                 }
                 Denied("newer_"+shape,"conflict");
             }
-            Seed("1.0.5.0"); File.Trusted=false; Denied("untrusted_record","conflict");
-            Seed("1.0.5.0"); Contract.Read(Machine.Record)["path"]=@"C:\Foreign\Reader.dll"; Denied("inconsistent_identity","conflict");
-            Seed("1.0.5.0"); Contract.Read(Machine.Record)["version"]="01.0.5.0"; Denied("noncanonical_version","conflict");
+            Seed("1.0.5.10"); File.Trusted=false; Denied("untrusted_record","conflict");
+            Seed("1.0.5.10"); Contract.Read(Machine.Record)["path"]=@"C:\Foreign\Reader.dll"; Denied("inconsistent_identity","conflict");
+            Seed("1.0.5.10"); Contract.Read(Machine.Record)["version"]="01.0.5.10"; Denied("noncanonical_version","conflict");
             Seed("1.0.6.0"); Journal("1.0.6.0"); Denied("pending_journal_newer_current","conflict");
             bool directDenied=false; try { Mutation.Recover(); } catch(IOException) { directDenied=true; }
             Need(directDenied,"direct_recover_newer"); ZeroWrites();
             Seed("1.0.6.0"); Journal("1.0.6.0"); File.Delete(Machine.Record); Denied("pending_journal_newer_without_current","busy");
-            Seed("1.0.5.0"); Journal("1.0.5.0"); Contract.Read(Machine.Journal)["schema"]=1; Denied("legacy_ambiguous_journal","busy");
-            Seed("1.0.5.0"); Journal("1.0.5.0");
+            Seed("1.0.5.10"); Journal("1.0.5.10"); Contract.Read(Machine.Journal)["schema"]=1; Denied("legacy_ambiguous_journal","busy");
+            Seed("1.0.5.10"); Journal("1.0.5.10");
             ((Dictionary<string,object>)Contract.Read(Machine.Journal)["record"])["path"]=@"C:\Foreign\Reader.dll";
             Denied("journal_inconsistent_record","busy");
-            Seed("1.0.6.0"); Journal("1.0.5.0"); File.Delete(Machine.Record);
+            Seed("1.0.6.0"); Journal("1.0.5.10"); File.Delete(Machine.Record);
             Denied("journal_newer_snapshot_record","busy");
-            Seed("1.0.5.0"); Journal("1.0.5.0");
+            Seed("1.0.5.10"); Journal("1.0.5.10");
             var snapshots=(Dictionary<string,object>)Contract.Read(Machine.Journal)["keys"];
             var clsid=(Dictionary<string,object>)snapshots[Contract.Keys[0]];
             var children=(Dictionary<string,object>)clsid["children"];
@@ -101,16 +101,16 @@ internal static class ProductSetupFixtures
             var values=(Dictionary<string,object>)server["values"];
             ((Dictionary<string,object>)values["Assembly"])["value"]="AegisDesk.PptReader, Version=1.0.6.0, Culture=neutral, PublicKeyToken=null";
             Denied("journal_newer_registry_snapshot","busy");
-            foreach(string version in new[]{"1.0.5.0","1.0.4.0"}) {
+            foreach(string version in new[]{"1.0.5.10","1.0.4.0"}) {
                 Seed(version);
-                if(version=="1.0.5.0") using(var root=RegistryKey.OpenBaseKey(RegistryHive.LocalMachine,RegistryView.Registry64))
+                if(version=="1.0.5.10") using(var root=RegistryKey.OpenBaseKey(RegistryHive.LocalMachine,RegistryView.Registry64))
                     foreach(string key in Contract.Keys) root.DeleteSubKeyTree(key,false);
                 ResetCounts(); Result before=Machine.Check("check",true,false,"synthetic");
-                Need(before.status==(version=="1.0.5.0"?"repairable":"outdated"),"allowed_preflight"); ZeroWrites();
+                Need(before.status==(version=="1.0.5.10"?"repairable":"outdated"),"allowed_preflight"); ZeroWrites();
                 Mutation.Apply(false,"synthetic",new RequestDirectoryLease());
                 Need(Machine.Check("check",true,false,"synthetic").status=="ready","allowed_apply");
                 Need(Contract.JournalCreates==1 && Contract.RecordWrites==1,"allowed_transaction");
-                cases++; Console.WriteLine("SETUP PASS "+(version=="1.0.5.0"?"same_version_repair":"older_upgrade"));
+                cases++; Console.WriteLine("SETUP PASS "+(version=="1.0.5.10"?"same_version_repair":"older_upgrade"));
             }
             for(int boundary=1;boundary<=18;boundary++) {
                 Seed("1.0.4.0"); string before=RegistryKey.Dump();

@@ -2,8 +2,8 @@ using System;
 using System.IO;
 using System.Reflection;
 
-[assembly: AssemblyVersion("1.0.5.0")]
-[assembly: AssemblyFileVersion("1.0.5.0")]
+[assembly: AssemblyVersion("1.0.5.10")]
+[assembly: AssemblyFileVersion("1.0.5.10")]
 
 namespace AegisDesk.PptSetup
 {

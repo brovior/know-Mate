@@ -19,13 +19,13 @@ def payload(tmp_path):
     for name in PAYLOAD_FILES:
         (tmp_path / name).write_bytes(b"synthetic payload")
     manifest = {
-        "schema": 1, "reader_version": "1.0.5.0", "protocol": 3, "payload_schema": 2,
+        "schema": 1, "reader_version": "1.0.5.10", "protocol": 3, "payload_schema": 2,
         "prog_id": "AegisDesk.PptReader", "reader_class": "AegisDesk.PptReader.Connect",
         "reader_clsid": "287A80D2-804A-46D3-A0E9-CA31C6FC3D09",
         "reader_iid": "9A20F4A6-6364-4BA7-930B-3E8857BEAF60",
         "auto_install_validated": False, "auto_install_mode": "disabled",
         "auto_install_enabled": False, "auto_shutdown_enabled": False, "build": build,
-        "assembly_versions": {name: "1.0.5.0" for name in PAYLOAD_FILES},
+        "assembly_versions": {name: "1.0.5.10" for name in PAYLOAD_FILES},
         "files": {name: hashlib.sha256(b"synthetic payload").hexdigest() for name in PAYLOAD_FILES},
     }
     (tmp_path / "manifest.json").write_text(json.dumps(manifest))
@@ -87,7 +87,7 @@ def test_production_managed_harness_on_windows(tmp_path):
     policy.write_text('namespace AegisDesk.PptReader { internal static class ShutdownBuildPolicy { public const bool Enabled = true; } }')
     commands = [[str(compiler), "/nologo", "/target:library", f"/out:{dll}",
                  "/reference:Microsoft.CSharp.dll", "/reference:System.Core.dll", "/reference:System.Web.Extensions.dll",
-                 str(root / "scripts/ppt_reader/PptReader.cs"), str(root / "scripts/ppt_shared/PptExtractionCore.cs"),
+                 str(root / "scripts/ppt_reader/PptReader.cs"), str(root / "scripts/ppt_reader/PptCallerQuit.cs"), str(root / "scripts/ppt_shared/PptExtractionCore.cs"),
                  str(root / "scripts/ppt_reader/PptShutdownEvents.cs"), str(root / "scripts/ppt_reader/PptOwnedMetadata.cs"),
                  str(root / "scripts/ppt_reader/PptShutdownGuard.cs"),
                  str(root / "knowmate/tests/ppt_managed_count_fixture.cs"),

@@ -2,8 +2,8 @@ using System;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using AegisDesk.PptReader;
-[assembly: AssemblyVersion("1.0.5.0")]
-[assembly: AssemblyFileVersion("1.0.5.0")]
+[assembly: AssemblyVersion("1.0.5.10")]
+[assembly: AssemblyFileVersion("1.0.5.10")]
 [assembly: ComVisible(false)]
 namespace AegisDesk.PptEvents
 {
@@ -22,7 +22,9 @@ namespace AegisDesk.PptEvents
             state.EventBoundary(kind,true,incoming,incoming,false);
             try {
                 if(!state.Active){state.RecordCancellation(kind);return;}
-                cancel=true;set=true;state.Cancelled=true;state.RecordCancellation(kind);
+                cancel=true;set=true;state.Cancelled=true;state.CloseCancelled=true;
+                if(state.DeferredProtection)state.Active=false;
+                state.RecordCancellation(kind);
                 try { CancelCheckpoint(); } catch { state.MarkBroken(); }
             } finally { state.EventBoundary(kind,false,incoming,cancel,set); }
         }
@@ -37,13 +39,13 @@ namespace AegisDesk.PptEvents
         /// <summary>Preserve the imported PowerPoint event ABI.</summary>
         public void PresentationSave(Microsoft.Office.Interop.PowerPoint.Presentation p0){ state.EventBoundary(105,true,false,false,false); state.EventBoundary(105,false,false,false,false); }
         /// <summary>Preserve the imported PowerPoint event ABI.</summary>
-        public void PresentationOpen(Microsoft.Office.Interop.PowerPoint.Presentation p0){ state.EventBoundary(106,true,false,false,false); state.EventBoundary(106,false,false,false,false); }
+        public void PresentationOpen(Microsoft.Office.Interop.PowerPoint.Presentation p0){ state.ObserveUserActivity(); state.EventBoundary(106,true,false,false,false); state.EventBoundary(106,false,false,false,false); }
         /// <summary>Preserve the imported PowerPoint event ABI.</summary>
-        public void NewPresentation(Microsoft.Office.Interop.PowerPoint.Presentation p0){ state.EventBoundary(107,true,false,false,false); state.EventBoundary(107,false,false,false,false); }
+        public void NewPresentation(Microsoft.Office.Interop.PowerPoint.Presentation p0){ state.ObserveUserActivity(); state.EventBoundary(107,true,false,false,false); state.EventBoundary(107,false,false,false,false); }
         /// <summary>Preserve the imported PowerPoint event ABI.</summary>
         public void PresentationNewSlide(Microsoft.Office.Interop.PowerPoint.Slide p0){ state.EventBoundary(108,true,false,false,false); state.EventBoundary(108,false,false,false,false); }
         /// <summary>Preserve the imported PowerPoint event ABI.</summary>
-        public void WindowActivate(Microsoft.Office.Interop.PowerPoint.Presentation p0, Microsoft.Office.Interop.PowerPoint.DocumentWindow p1){ state.EventBoundary(109,true,false,false,false); state.EventBoundary(109,false,false,false,false); }
+        public void WindowActivate(Microsoft.Office.Interop.PowerPoint.Presentation p0, Microsoft.Office.Interop.PowerPoint.DocumentWindow p1){ state.ObserveUserActivity(); state.EventBoundary(109,true,false,false,false); state.EventBoundary(109,false,false,false,false); }
         /// <summary>Preserve the imported PowerPoint event ABI.</summary>
         public void WindowDeactivate(Microsoft.Office.Interop.PowerPoint.Presentation p0, Microsoft.Office.Interop.PowerPoint.DocumentWindow p1){ state.EventBoundary(110,true,false,false,false); state.EventBoundary(110,false,false,false,false); }
         /// <summary>Preserve the imported PowerPoint event ABI.</summary>
@@ -65,9 +67,9 @@ namespace AegisDesk.PptEvents
         /// <summary>Preserve the imported PowerPoint event ABI.</summary>
         public void SlideShowNextClick(Microsoft.Office.Interop.PowerPoint.SlideShowWindow p0, Microsoft.Office.Interop.PowerPoint.Effect p1){ state.EventBoundary(119,true,false,false,false); state.EventBoundary(119,false,false,false,false); }
         /// <summary>Preserve the imported PowerPoint event ABI.</summary>
-        public void AfterNewPresentation(Microsoft.Office.Interop.PowerPoint.Presentation p0){ state.EventBoundary(120,true,false,false,false); state.EventBoundary(120,false,false,false,false); }
+        public void AfterNewPresentation(Microsoft.Office.Interop.PowerPoint.Presentation p0){ state.ObserveUserActivity(); state.EventBoundary(120,true,false,false,false); state.EventBoundary(120,false,false,false,false); }
         /// <summary>Preserve the imported PowerPoint event ABI.</summary>
-        public void AfterPresentationOpen(Microsoft.Office.Interop.PowerPoint.Presentation p0){ state.EventBoundary(121,true,false,false,false); state.EventBoundary(121,false,false,false,false); }
+        public void AfterPresentationOpen(Microsoft.Office.Interop.PowerPoint.Presentation p0){ state.ObserveUserActivity(); state.EventBoundary(121,true,false,false,false); state.EventBoundary(121,false,false,false,false); }
         /// <summary>Preserve the imported PowerPoint event ABI.</summary>
         public void PresentationSync(Microsoft.Office.Interop.PowerPoint.Presentation p0, Microsoft.Office.Core.MsoSyncEventType p1){ state.EventBoundary(122,true,false,false,false); state.EventBoundary(122,false,false,false,false); }
         /// <summary>Preserve the imported PowerPoint event ABI.</summary>
@@ -77,13 +79,13 @@ namespace AegisDesk.PptEvents
         /// <summary>Preserve the imported PowerPoint event ABI.</summary>
         public void PresentationBeforeClose(Microsoft.Office.Interop.PowerPoint.Presentation p0, ref bool p1){ Cancel(ref p1,1); }
         /// <summary>Preserve the imported PowerPoint event ABI.</summary>
-        public void ProtectedViewWindowOpen(Microsoft.Office.Interop.PowerPoint.ProtectedViewWindow p0){ state.EventBoundary(125,true,false,false,false); state.EventBoundary(125,false,false,false,false); }
+        public void ProtectedViewWindowOpen(Microsoft.Office.Interop.PowerPoint.ProtectedViewWindow p0){ state.ObserveUserActivity(); state.EventBoundary(125,true,false,false,false); state.EventBoundary(125,false,false,false,false); }
         /// <summary>Preserve the imported PowerPoint event ABI.</summary>
         public void ProtectedViewWindowBeforeEdit(Microsoft.Office.Interop.PowerPoint.ProtectedViewWindow p0, ref bool p1){ state.EventBoundary(126,true,p1,p1,false); state.EventBoundary(126,false,p1,p1,false); }
         /// <summary>Preserve the imported PowerPoint event ABI.</summary>
         public void ProtectedViewWindowBeforeClose(Microsoft.Office.Interop.PowerPoint.ProtectedViewWindow p0, Microsoft.Office.Interop.PowerPoint.PpProtectedViewCloseReason p1, ref bool p2){ Cancel(ref p2,2); }
         /// <summary>Preserve the imported PowerPoint event ABI.</summary>
-        public void ProtectedViewWindowActivate(Microsoft.Office.Interop.PowerPoint.ProtectedViewWindow p0){ state.EventBoundary(127,true,false,false,false); state.EventBoundary(127,false,false,false,false); }
+        public void ProtectedViewWindowActivate(Microsoft.Office.Interop.PowerPoint.ProtectedViewWindow p0){ state.ObserveUserActivity(); state.EventBoundary(127,true,false,false,false); state.EventBoundary(127,false,false,false,false); }
         /// <summary>Preserve the imported PowerPoint event ABI.</summary>
         public void ProtectedViewWindowDeactivate(Microsoft.Office.Interop.PowerPoint.ProtectedViewWindow p0){ state.EventBoundary(128,true,false,false,false); state.EventBoundary(128,false,false,false,false); }
         /// <summary>Preserve the imported PowerPoint event ABI.</summary>

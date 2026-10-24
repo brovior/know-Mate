@@ -12,7 +12,7 @@ internal static class SetupHarness
     private static Dictionary<string, object> Record()
     {
         return new Dictionary<string, object> { { "schema", 1 }, { "request_id", "33e979c6-c5c4-40af-845a-64c80517d1ae" },
-            { "required_version", "1.0.5.0" }, { "helper_sid", "S-1-5-21-1-2-3-1001" }, { "helper_pid", 123 },
+            { "required_version", "1.0.5.10" }, { "helper_sid", "S-1-5-21-1-2-3-1001" }, { "helper_pid", 123 },
             { "helper_creation_ticks", "638901000000000000" }, { "child_pid", null }, { "child_creation_ticks", null }, { "state", "complete" } };
     }
     public static int Main(string[] args)
@@ -156,7 +156,7 @@ internal static class SetupHarness
         string safeJson = Contract.Json.Serialize(diag.Values());
         Require(!safeJson.Contains("SECRET-MARKER") && diag.winerror == null, "raw_exception_not_emitted");
         // These are Windows paths even when the pure harness runs under Mono.
-        string suffix = "/AegisDesk/PptReader/1.0.5.0/AegisDesk.PptReader.dll";
+        string suffix = "/AegisDesk/PptReader/1.0.5.10/AegisDesk.PptReader.dll";
         foreach (string directory in new[] { "Program Files", "Program Files (x86)", "프로그램 파일", "literal%20folder" })
         {
             string file = @"C:\" + directory + suffix.Replace('/', '\\');

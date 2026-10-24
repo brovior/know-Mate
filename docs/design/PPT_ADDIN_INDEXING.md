@@ -560,12 +560,29 @@ Quit 반환·연결 단절은 실제 종료 증거가 아니다. COM 참조를 �
 취급한다. PPT `terminable=False` 및 read/quit watchdog·poison·앱 종료의 강제종료 금지는 유지한다.
 poison 이후에는 Count·Quit을 포함한 새 RPC를 요청하지 않는다.
 
-설치 읽기 잠금 안에서 생성·호환 서비스 확인·정상종료 요청을 수행한다. COM 객체는 생성
+설치 읽기 잠금 안에서 생성·호환 서비스 확인·정상종료 요청을 수행한다. 읽기 COM 객체는 생성
 QThread의 MTA에서만 사용하며 UI·타이머·OS 종료 helper로 넘기지 않는다. 동기 RPC가 멈췄다고
 타임아웃만으로 취소됐다고 간주하지 않는다. 앱의 제한된 종료는 PowerPoint 강제종료를 허용하지 않는다.
 
+Reader 1.0.5.10 후보는 호스트 STA에서 빈 컬렉션 확인과 `CommandBars.ExecuteMso("FileExit")`를
+연속 실행한다. 확인 후 외부 클라이언트에 Quit을 맡기던 경로는 사용하지 않는다.
+이전 실험 메서드 `TryQuitIfIdleWithCaller`·`ConfirmCallerQuit`은 `not_supported`로 차단한다.
+문서 열림·새 문서·창 활성화를 관측하면 해당 종료 시도의 포기를 유지하며, 실제 종료 명령 전에
+감지한 경우에는 명령을 실행하지 않는다. 사용자 열기를 막거나 UI 입력에 잠금을 걸지 않는다.
+
+종료 명령 반환은 실제 닫힘 완료가 아니므로, 정상 요청 뒤에는 기존에 취득한 이벤트 보호와 native
+참조를 호스트가 보유한다. 이후 닫기 이벤트에서 취소를 설정한 경우에만 `CloseCancelled`를 기록하고
+보호 상태를 내린다. 다음 수동 닫기는 막지 않는다. `QueryQuitOutcome`은 확인된 취소를 `protected`로
+보고하며 종료 요청만 반환된 경우와 구분한다. 보호 취득·정리는 기존 STA에서만 수행한다.
+확인된 취소 뒤의 상태 조회 또는 호스트 연결 해제에서 기존 취득분을 한 번 정리한다.
+poison·정리 실패는 결과 불명으로 두고 새 RPC나 Quit 재시도로 보정하지 않는다.
+
+Python은 같은 수집 QThread에서 한 번만 요청하고, 짧은 상태 조회 뒤 COM 참조를 내려놓는다.
+실제 종료 판단은 계속 원 handle·PID·생성 identity 관측으로 한다. 외부 Application.Quit·타이머·
+강제종료와 새 패키지 의존성은 추가하지 않는다. 사용자 문서 보호·일반 배포 승인은 실제 검증 대상이다.
+
 기존 dual 인터페이스는 유지하고 새 기본 인터페이스로 lifecycle을 노출한다. 요구 버전은
-reader/Events/setup 모두 1.0.5.0, protocol 3이며 추출 JSON schema 1·청크·인덱스 형식은 바꾸지 않는다.
+reader/Events/setup 모두 1.0.5.10, protocol 3이며 추출 JSON schema 1·청크·인덱스 형식은 바꾸지 않는다.
 사전 검증과 사용자 문서 보호 시험은 [운영 검증 절차](../guides/PPT_READER.md#powerpoint-자동종료-후보-검증)를 따른다.
 
 

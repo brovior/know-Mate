@@ -29,7 +29,7 @@ def build(folder, arch, main, diagnostic=True, faults=False, actual_counts=False
     """Compile product source directly; only host/count/extraction are synthetic."""
     folder.mkdir(parents=True, exist_ok=True)
     exe = folder / 'Fixture.exe'
-    names = ['PptReader.cs','PptShutdownGuard.cs','PptShutdownEvents.cs','PptOwnedMetadata.cs',
+    names = ['PptReader.cs','PptCallerQuit.cs','PptShutdownGuard.cs','PptShutdownEvents.cs','PptOwnedMetadata.cs',
              'PptShutdownState.cs','PptEventSignatures.cs','PptEventValidator.cs','PptDeferredDiagnostic.cs']
     sources = [SOURCE / n for n in names] + list(SOURCE.glob('PptExternal*.cs'))
     fixtures = ['Fixtures.cs','CountFixture.cs']

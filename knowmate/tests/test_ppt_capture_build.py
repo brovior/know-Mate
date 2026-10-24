@@ -13,7 +13,7 @@ from knowmate.secure.ppt_policy import REQUIRED_VERSION
 def source_tree(tmp_path: Path) -> tuple[Path, Path, Path]:
     """Construct only controlled build inputs without compiling or starting Office."""
     root = tmp_path / "repo"
-    for relative in ("scripts/ppt_reader/PptReader.cs", "scripts/ppt_events/PptEventSink.cs",
+    for relative in ("scripts/ppt_reader/PptReader.cs", "scripts/ppt_reader/PptCallerQuit.cs", "scripts/ppt_events/PptEventSink.cs",
                      "scripts/ppt_shared/PptExtractionCore.cs", "scripts/diagnostics/ppt_capture/report.py",
                      "knowmate/secure/ppt_capture_native.py", "scripts/ppt_reader/build_capture.py",
                      "scripts/ppt_reader/build.ps1", "scripts/build_guard.py", "scripts/ppt_reader/manifest.py",
@@ -22,7 +22,7 @@ def source_tree(tmp_path: Path) -> tuple[Path, Path, Path]:
                      "knowmate/tests/ppt_capture_buffer_harness.cs", "knowmate/tests/test_ppt_capture_buffer_native.py"):
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text('version = "1.0.5.0"\n', encoding="utf-8")
+        path.write_text('version = "1.0.5.10"\n', encoding="utf-8")
     info = tmp_path / "info"
     info.mkdir()
     (info / "PptBuildPolicy.cs").write_text("candidate\n", encoding="utf-8")
@@ -36,8 +36,8 @@ def source_tree(tmp_path: Path) -> tuple[Path, Path, Path]:
 def test_generated_version_does_not_change_normal_product_sources(tmp_path: Path) -> None:
     root, info, output = source_tree(tmp_path)
     generated = build_capture.copy_sources(output / "generated", info, root)
-    assert REQUIRED_VERSION == "1.0.5.0"
-    assert '"1.0.5.0"' in (root / "scripts/ppt_reader/PptReader.cs").read_text()
+    assert REQUIRED_VERSION == "1.0.5.10"
+    assert '"1.0.5.10"' in (root / "scripts/ppt_reader/PptReader.cs").read_text()
     assert '"1.0.6.0"' in (output / "generated/scripts/ppt_reader/PptReader.cs").read_text()
     assert "CaptureAssemblyVersion.cs" in generated
     assert generated["scripts/ppt_reader/PptReader.cs"] != build_capture.digest(root / "scripts/ppt_reader/PptReader.cs")

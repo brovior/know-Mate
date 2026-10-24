@@ -22,7 +22,7 @@ def clean_state():
 @pytest.fixture
 def launch(monkeypatch):
     app = SimpleNamespace(DisplayAlerts=1)
-    client = SimpleNamespace(Dispatch=Mock(return_value=app))
+    client = SimpleNamespace(Dispatch=Mock(), GetActiveObject=Mock(return_value=app))
     handles = []
 
     class Process:
@@ -68,7 +68,8 @@ def test_exact_direct_launch_authority_and_handle_handoff(launch):
     handles[0].close.assert_called_once()
     assert shutdown._observations[result[2].generation].observer is handles[0].observer
     handles[0].kernel.CloseHandle.assert_not_called()
-    client.Dispatch.assert_called_once_with("PowerPoint.Application")
+    client.GetActiveObject.assert_called_once_with("PowerPoint.Application")
+    client.Dispatch.assert_not_called()
 
 
 @pytest.mark.parametrize("scenario", ["other_pid", "wrong_host", "unknown_identity", "closing"])
@@ -81,7 +82,7 @@ def test_ambiguous_created_host_never_acquires_quit_authority(launch, monkeypatc
     elif scenario == "unknown_identity":
         monkeypatch.setattr(guard, "_process_creation_identity", lambda pid: None)
     else:
-        client.Dispatch.side_effect = lambda _: (guard.begin_application_shutdown(), app)[1]
+        client.GetActiveObject.side_effect = lambda _: (guard.begin_application_shutdown(), app)[1]
     with pytest.raises(guard.OfficeCleanupPendingError):
         shutdown.launch_and_bind(client, 64)
     assert shutdown._ticket.state == "pending"
@@ -151,7 +152,12 @@ def test_untrusted_office_path_never_calls_createprocess_or_dispatch(launch, mon
 def origin(launch, monkeypatch):
     app, client, _ = launch
     app, proof, ticket = shutdown.launch_and_bind(client, 64)
-    service = SimpleNamespace(ProtocolVersion=lambda: 3, ReaderVersion=lambda: "1.0.5.0",
+    from knowmate.secure import ppt_caller_quit
+    def invoke(service, app, check_target):
+        check_target()
+        return service.TryQuitIfIdle()
+    monkeypatch.setattr(ppt_caller_quit, "request_guarded_quit", invoke)
+    service = SimpleNamespace(ProtocolVersion=lambda: 3, ReaderVersion=lambda: "1.0.5.10",
                               TryQuitIfIdle=Mock(return_value="quit_requested"))
     app.COMAddIns = SimpleNamespace(Item=Mock(return_value=SimpleNamespace(Connect=True, Object=service)))
     monkeypatch.setattr(ppt_policy, "auto_shutdown_enabled", lambda: True)
@@ -389,7 +395,7 @@ def test_installation_stamp_detects_registry_dll_and_record_mutations(monkeypatc
     monkeypatch.setitem(sys.modules, "winreg", module)
     monkeypatch.setattr(ppt_installation, "_known_folder", lambda identifier: tmp_path)
     directory = tmp_path / "AegisDesk/PptReader"
-    versioned = directory / "1.0.5.0"
+    versioned = directory / "1.0.5.10"
     versioned.mkdir(parents=True)
     dll = versioned / "AegisDesk.PptReader.dll"
     dll.write_bytes(b"compiled candidate")
@@ -397,7 +403,7 @@ def test_installation_stamp_detects_registry_dll_and_record_mutations(monkeypatc
     events.write_bytes(b"compiled events")
     record = directory / "installation.json"
     digest = hashlib.sha256(dll.read_bytes()).hexdigest()
-    metadata = {"schema": 2, "version": "1.0.5.0", "sha256": digest,
+    metadata = {"schema": 2, "version": "1.0.5.10", "sha256": digest,
                 "files": {dll.name: digest, events.name: hashlib.sha256(events.read_bytes()).hexdigest()}}
     record.write_text(json.dumps(metadata))
     first = ppt_launch.installation_stamp()
@@ -536,6 +542,11 @@ def test_stale_ticket_diagnostics_never_inspect_record_or_log_under_lock(origin,
 def test_exact_hwnd_rejection_logs_preserve_probe_short_circuit(
         launch, monkeypatch, caplog, reason, hwnd, bound_pid, processes, identity):
     _app, client, handles = launch
+    from knowmate.secure import ppt_active
+    def registered(*args):
+        guard._enumerate_processes()
+        return _app
+    monkeypatch.setattr(ppt_active, "wait_for_active_app", registered)
     caplog.set_level("INFO", logger=shutdown.__name__)
     read = Mock(return_value=hwnd)
     @contextmanager
@@ -654,6 +665,8 @@ def test_observation_wait_runs_after_worker_ppt_references_are_released(origin, 
                         ("ppt_service", None)):
         monkeypatch.setattr(com_reader._tls, name, value, raising=False)
     def poll(_handle, _timeout):
+        if getattr(com_reader._tls, "ppt") is app:
+            return 258  # fresh handle check inside the still-active guarded callback
         for name in ("ppt", "ppt_proof", "ppt_launch_ticket", "ppt_service"):
             assert getattr(com_reader._tls, name) is None
         return 258

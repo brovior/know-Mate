@@ -221,6 +221,22 @@ def mail_discovery_refresh_seconds(mail: dict[str, Any]) -> float:
     return float(bundled["mail"]["discovery_refresh_seconds"])
 
 
+def ppt_registration_timeout_seconds(collector: dict[str, Any]) -> float:
+    """Resolve a bounded ROT registration wait from runtime or bundled settings."""
+    with _bundled_config_source().open(encoding="utf-8") as handle:
+        default = float(yaml.safe_load(handle)["collector"]["ppt_registration_timeout_sec"])
+    value = collector.get("ppt_registration_timeout_sec", default)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            numeric = float(value)
+            if math.isfinite(numeric) and 0 < numeric <= 300:
+                return numeric
+        except (OverflowError, ValueError):
+            pass
+    logger.warning("잘못된 collector.ppt_registration_timeout_sec 설정을 배포 기본값으로 복구합니다")
+    return default
+
+
 def com_quit_call_timeout_seconds(collector: dict[str, Any]) -> float:
     """Return a finite positive Quit timeout, falling back to bundled config."""
     default = _bundled_com_quit_timeout_default()

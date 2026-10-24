@@ -269,7 +269,7 @@ class TestAutoReader:
 
         class _FakeCom:
             def __init__(self, xlsx_block_rows=None, *, ppt_reader_mode=None,
-                         ppt_policy="ready", ppt_operation=None):
+                         ppt_policy="ready", ppt_operation=None, ppt_registration_timeout_sec=None):
                 captured.update(xlsx_block_rows=xlsx_block_rows, ppt_reader_mode=ppt_reader_mode,
                                 ppt_policy=ppt_policy, ppt_operation=ppt_operation)
 
@@ -629,7 +629,7 @@ class TestAutoReaderOle2Fallback:
 
         class _FakeCom:
             def __init__(self, xlsx_block_rows=None, *, ppt_reader_mode=None,
-                         ppt_policy="ready", ppt_operation=None):
+                         ppt_policy="ready", ppt_operation=None, ppt_registration_timeout_sec=None):
                 captured.update(xlsx_block_rows=xlsx_block_rows, ppt_reader_mode=ppt_reader_mode,
                                 ppt_policy=ppt_policy, ppt_operation=ppt_operation)
 
@@ -661,7 +661,7 @@ class TestAutoReaderOle2Fallback:
 
         class _FakeCom:
             def __init__(self, xlsx_block_rows=None, *, ppt_reader_mode=None,
-                         ppt_policy="ready", ppt_operation=None):
+                         ppt_policy="ready", ppt_operation=None, ppt_registration_timeout_sec=None):
                 captured.update(xlsx_block_rows=xlsx_block_rows, ppt_reader_mode=ppt_reader_mode,
                                 ppt_policy=ppt_policy, ppt_operation=ppt_operation)
 
@@ -688,7 +688,7 @@ class TestAutoReaderOle2Fallback:
 
         class _FakeCom:
             def __init__(self, xlsx_block_rows=None, *, ppt_reader_mode=None,
-                         ppt_policy="ready", ppt_operation=None):
+                         ppt_policy="ready", ppt_operation=None, ppt_registration_timeout_sec=None):
                 captured.update(xlsx_block_rows=xlsx_block_rows, ppt_reader_mode=ppt_reader_mode,
                                 ppt_policy=ppt_policy, ppt_operation=ppt_operation)
 
