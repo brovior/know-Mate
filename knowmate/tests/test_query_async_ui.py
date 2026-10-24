@@ -18,4 +18,4 @@ def test_query_frontend_executable_contract() -> None:
         check=False, capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "28 frontend scenarios passed" in result.stdout
+    assert "40 frontend scenarios passed" in result.stdout

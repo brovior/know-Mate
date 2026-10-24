@@ -22,6 +22,7 @@ let queryTimeoutMs = 0;
 const threadVersions = new WeakMap();
 const savedThreadVersions = new WeakMap();
 const threadSaves = new Map();
+const retainedThreads = new Map(); // pending requests and answers awaiting a successful save
 const deletingThreads = new Set();
 const unsentUserMessages = new WeakMap();
 let currentThread = null;   // 현재 대화 스레드 {id, title, mode, created_at, messages}
@@ -221,10 +222,25 @@ function onQueryStateChanged(json, authoritative = false) {
   if (!backendBusy) renderFailuresPanel();
 }
 
-function touchHistory() {
+function touchHistory(invalidateRestore = false) {
   historyMutationEpoch++;
   recentListSeq++;
-  restoreSeq++;
+  if (invalidateRestore) restoreSeq++;
+}
+
+function threadKey(thread) {
+  return thread.mode + ":" + thread.id;
+}
+
+function releaseSavedThread(thread) {
+  if (!thread || (threadVersions.get(thread) || 0) !== (savedThreadVersions.get(thread) || 0)) return;
+  if (activeRequest && activeRequest.thread === thread && !activeRequest.terminalSeen && !activeRequest.invalidated) return;
+  if (retainedThreads.get(threadKey(thread)) === thread) retainedThreads.delete(threadKey(thread));
+}
+
+function requestIsVisible(request) {
+  return currentThread && currentMode === request.mode && currentThread.mode === request.mode &&
+    currentThread.id === request.thread_id;
 }
 
 function markThreadDirty(thread) {
@@ -234,6 +250,7 @@ function markThreadDirty(thread) {
 async function persistThread(thread = currentThread) {
   if (!thread || !bridge) return true;
   while (threadSaves.has(thread.id)) await threadSaves.get(thread.id);
+  if (deletingThreads.has(threadKey(thread))) return false;
   const version = threadVersions.get(thread) || 0;
   if ((savedThreadVersions.get(thread) || 0) === version) return true;
   touchHistory();
@@ -252,6 +269,7 @@ async function persistThread(thread = currentThread) {
   threadSaves.set(thread.id, pending);
   const ok = await pending;
   if (threadSaves.get(thread.id) === pending) threadSaves.delete(thread.id);
+  if (ok) releaseSavedThread(thread);
   return ok;
 }
 
@@ -261,14 +279,11 @@ async function prepareNavigation() {
   viewGeneration++;
   restoreSeq++;
   recentListSeq++;
-  if (activeRequest) {
-    activeRequest.invalidated = true;
-    if (bridge) bridge.cancelQuery(activeRequest.request_id);
-  }
   setWaiting(false);
   const saved = await persistThread();
   if (seq !== navigationSeq) return false;
   navigationPending = false;
+  if (!saved) syncWaitingToView();
   updateQueryControls();
   return saved;
 }
@@ -316,14 +331,18 @@ async function sendMsg() {
       appendUserMsg(text);
     }
     if (!await persistThread(thread)) return;
-    if (generation !== viewGeneration || currentThread !== thread || navigationPending) return;
-    const request = { request_id: _genId(), mode: currentMode, thread_id: thread.id,
-      view_generation: generation, terminalSeen: false, invalidated: false, timerArmed: false };
+    const request = { request_id: _genId(), mode: thread.mode, thread_id: thread.id,
+      view_generation: generation, thread, terminalSeen: false, invalidated: false, timerArmed: false };
+    if (activeRequest) {
+      activeRequest.invalidated = true;
+      releaseSavedThread(activeRequest.thread);
+    }
     activeRequest = request;
+    retainedThreads.set(threadKey(thread), thread);
     backendBusy = true;
     stateRequestId = request.request_id;
     queryState = "RUNNING";
-    setWaiting(true);
+    setWaiting(Boolean(requestIsVisible(request) && !navigationPending));
     // Reserve before calling: a fast Qt response may arrive during this invocation.
     await bridge.sendQuery(JSON.stringify({ query: text, scopes, request_id: request.request_id,
       mode: request.mode, thread_id: request.thread_id, view_generation: generation }));
@@ -350,6 +369,11 @@ function setWaiting(on) {
   updateQueryControls();
 }
 
+function syncWaitingToView() {
+  setWaiting(Boolean(activeRequest && !activeRequest.terminalSeen && !activeRequest.invalidated &&
+    backendBusy && requestIsVisible(activeRequest)));
+}
+
 /* -- Python 응답 수신: 실행권은 상태 신호의 실제 종료 확인으로만 해제 -- */
 async function onResponse(json) {
   let data;
@@ -365,18 +389,22 @@ async function onResponse(json) {
     return;
   }
   request.terminalSeen = true;
-  if (request.invalidated || request.view_generation !== viewGeneration ||
-      currentMode !== request.mode || !currentThread || currentThread.id !== request.thread_id) return;
-  setWaiting(false);
+  if (request.invalidated) return;
+  const thread = request.thread;
+  if (requestIsVisible(request)) setWaiting(false);
   const blocks = Array.isArray(data.blocks) ? data.blocks : [];
   if (data.status === "cancelled" || data.status === "timeout") {
+    releaseSavedThread(thread);
     showToast(data.status === "timeout" ? "응답 시간이 초과되었습니다. 이전 요청을 정리합니다." : "질문을 취소했습니다.");
     return;
   }
-  appendAiBlocks(blocks);
-  currentThread.messages.push({ role: "ai", blocks });
-  markThreadDirty(currentThread);
-  await persistThread();
+  thread.messages.push({ role: "ai", blocks });
+  markThreadDirty(thread);
+  if (requestIsVisible(request)) {
+    currentThread = thread;
+    appendAiBlocks(blocks);
+  }
+  await persistThread(thread);
 }
 
 /* -- 인덱싱 시그널 핸들러 -- */
@@ -787,18 +815,27 @@ async function deleteQuestion(thread) {
   const key = mode + ":" + thread.id;
   if (deletingThreads.has(key)) return;
   deletingThreads.add(key);
+  const retained = retainedThreads.get(key);
+  if (activeRequest && activeRequest.mode === mode && activeRequest.thread_id === thread.id) {
+    activeRequest.invalidated = true;
+    if (!activeRequest.terminalSeen) bridge.cancelQuery(activeRequest.request_id);
+    if (requestIsVisible(activeRequest)) setWaiting(false);
+  }
   updateQueryControls();
-  touchHistory();
+  touchHistory(true);
   try {
+    // Finish any already-dispatched save before deletion, so its ACK cannot recreate the thread.
+    while (threadSaves.has(thread.id)) await threadSaves.get(thread.id);
     const result = JSON.parse(await bridge.deleteThread(mode, thread.id));
     if (!result || result.ok !== true) throw new Error("delete failed");
+    retainedThreads.delete(key);
     if (currentThread && currentThread.id === thread.id && currentThread.mode === mode) {
       currentThread = null;
       renderEmptyState();
     }
     loadRecentQuestions();
   } catch { showToast("대화를 삭제하지 못했습니다."); }
-  finally { deletingThreads.delete(key); updateQueryControls(); }
+  finally { deletingThreads.delete(key); releaseSavedThread(retained); updateQueryControls(); }
 }
 
 async function restoreThread(thread) {
@@ -810,24 +847,25 @@ async function restoreThread(thread) {
   }
   if (!await prepareNavigation()) return;
   const seq = ++restoreSeq;
-  const epoch = historyMutationEpoch;
   const generation = viewGeneration;
+  const retained = retainedThreads.get(mode + ":" + thread.id);
   navigationPending = true;
   updateQueryControls();
   try {
     const restored = JSON.parse(await bridge.getThread(mode, thread.id));
-    if (seq !== restoreSeq || epoch !== historyMutationEpoch || generation !== viewGeneration || mode !== currentMode) return;
+    if (seq !== restoreSeq || generation !== viewGeneration || mode !== currentMode) return;
     if (!restored || restored.id !== thread.id || restored.mode !== mode) {
       showToast("대화를 찾을 수 없습니다.");
       return;
     }
-    currentThread = restored;
-    renderThreadMessages(restored);
+    currentThread = retained || retainedThreads.get(mode + ":" + thread.id) || restored;
+    renderThreadMessages(currentThread);
     loadRecentQuestions();
   } catch { showToast("대화를 불러오지 못했습니다."); }
   finally {
     if (generation === viewGeneration) {
       navigationPending = false;
+      syncWaitingToView();
       updateQueryControls();
     }
   }
@@ -839,6 +877,7 @@ function renderThreadMessages(thread) {
     if (msg.role === "user") appendUserMsg(msg.content);
     else if (msg.role === "ai") appendAiBlocks(msg.blocks || []);
   });
+  syncWaitingToView();
 }
 
 /* -- 유틸 -- */

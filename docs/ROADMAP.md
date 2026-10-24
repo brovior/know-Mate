@@ -64,7 +64,8 @@ Phase 1~4 완료(RAG 지식검색), 5a 완료(Knox `.mysingle` + 표준 `.eml` �
 | 항목 | 상태·다음 행동 | 시작 조건 |
 |---|---|---|
 | COM poison 복구 뒤 점유 오판·오류 혼합 | 2초 캐시 epoch·정확한 앱 증명·최초/닫기 오류 분리 및 fake 회귀 구현 | [진단 §COM poison](DIAGNOSTICS.md#com-poison-복구-일관성-2026-10-15)의 실제 Windows·Office·DRM 검증 대기 |
-| 메모리 진단 부하 분리 | OFF 유지·basic 수치 로그·명시적 detailed 추적과 진단 예외 격리 구현, 로컬 합성 비교 완료 | [진단 §1](DIAGNOSTICS.md#1-앱-크래시와-메모리-진단)의 실제 Windows OFF/basic 성능 비교·장시간/취소 시험 대기. 크래시 해결은 미확정 |
+| 메모리 진단 부하 분리 | Windows 소스 OFF/basic 각 3회에서 경과시간 증가 5% 이내·각 24사이클 및 취소/재시작 확인. detailed 약 30배 부하 재현 | [진단 §1](DIAGNOSTICS.md#windows-소스-비교-2026-10-24)의 frozen EXE 30분 이상·전체 앱 종료·사내 시험 대기. 기본 OFF, 크래시 해결은 미확정 |
+| 대량 메일 완료 후 메모리 잔류 | 합성 mysingle 2,000건·10,000청크에서 유휴 Private Bytes 1,092→515MiB, 저장 결과 확인. 전체 2,182 PASS·1 FAIL·6 skip; 실패한 시간 민감 정리 모듈은 별도 22 PASS | [잔류 진단](DIAGNOSTICS.md#대량-메일-완료-뒤-메모리-잔류-2026-10-24)의 사내 원본·frozen·장시간·직렬 성능 검증 |
 | 앱 크래시 | 사내 로그·Windows 오류 기록 확보 | 기존 기록이 부족하면 진단 보강을 먼저 설계 |
 | 메일 처리 중 종료 후 Office 잔류 | 문서 완료 시 Office 정리·임베딩 취소·단계별 종료 로그 구현, fake·localhost 회귀 통과 | [진단 §4](DIAGNOSTICS.md#4-office-종료-정리-확인)의 사내 종료·PID 확인 대기 |
 | 상태 JSON·유휴 스캔 | 단계별 실측 대기 | JSON 처리와 실제 파일 접근 비용을 구분한 뒤 개선 선택 |
@@ -74,7 +75,7 @@ Phase 1~4 완료(RAG 지식검색), 5a 완료(Knox `.mysingle` + 표준 `.eml` �
 | PowerPoint 종료 3방식 비교 | 설치된 Reader로 외부 Quit·내부 Quit·참조 해제를 새 프로세스에서 비교하는 명시적 진단 | [격리된 VDI 실행](guides/PPT_READER.md#powerpoint-종료-3방식-비교-진단)의 실제 Windows x86/x64·frozen·Office·DRM 검증. 일반 배포 종료 안전성 승인을 대신하지 않음 |
 | PowerPoint 종료 진단 한 번 수집 | core 우선 관측·단회 요청·외부 보존·schema3 판독 및 별도1.0.6 진단 빌드 후보 구현. live 잠금 유지 | [새 진단 안내](guides/PPT_CAPTURE.md)의 x86/x64 native·정확한 패키지 pin·Office 합성 gate 대기. 기존 checkpoint121 잠금·일반 배포 기본값 유지 |
 | PowerPoint 참조 수명·원 handle 비교 | native MTA scope·예외 프레임 정리·원 handle 관측과 별도1.0.7 진단 후보. mock/replay만 허용 | [진단 안내](guides/PPT_CAPTURE.md#별도-참조-수명-비교-후보-1070)의 Windows·Office·사용자 보호 증거 대기. live·빌드·설치·등록·일반 배포 활성화 미실행 |
-| 질문 비동기화 | 요청별 QThread·기존 인덱스 읽기·대화 ACK/오래된 응답 차단·종료 보호 구현 | [상세 설계](design/ISSUE_B_query_async.md)의 사내 Windows·Office·DPAPI·실제 UI/장시간 질문 검증 대기 |
+| 질문 비동기화 | 대화 탐색 시 요청 유지·원래 대화 응답 저장·복귀 시 로딩 복원 수정. JS 40사례·관련 pytest 41개·실제 Qt 합성 2사례 확인. 전체 2,175 PASS 이후 링크 권한 실패 3건은 권한 설정 후 별도 재실행 PASS | [대화 이동 응답 검증](DIAGNOSTICS.md#대화-이동-뒤-응답-중단-2026-10-24)의 사내 API·장시간 질문 검증 대기 |
 | 실패 원인 판별 6b | 보류 | 오류 코드 실측, 워치독 밖 probe I/O의 행오버 위험 해소 |
 | 공용 인덱스 5b | 예정 | 로컬 캐시 복사 배포 설계·검증 |
 | DRM 저장 정책 | 사내 확인 대기 | 코드 변경이 아닌 정책 확인. [DESIGN.md](design/DESIGN.md) 참고 |

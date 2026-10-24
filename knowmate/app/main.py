@@ -210,6 +210,8 @@ class MainWindow(QMainWindow):
             crypto = get_crypto_manager(cfg)
             self._pump_startup()
             self._cfg      = cfg
+            from knowmate.rag.lance_session import create_indexing_session
+            indexing_session = create_indexing_session(cfg.get("lancedb_cache"))
             self._indexer  = Indexer(
                 db_path=db_path,
                 embed_client=embed_client,
@@ -218,6 +220,7 @@ class MainWindow(QMainWindow):
                 batch_size=batch_size,
                 crypto=crypto,
                 maintenance_config=maintenance,
+                lance_session=indexing_session,
             )
             self._pump_startup()
             # 메일(.mysingle) 인덱서 — mail.enabled: true 일 때 워커가 사용
@@ -231,6 +234,7 @@ class MainWindow(QMainWindow):
                 batch_size=batch_size,
                 crypto=crypto,
                 maintenance_config=maintenance,
+                lance_session=indexing_session,
             )
             self._pump_startup()
             self._extractor = get_extractor(

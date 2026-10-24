@@ -339,6 +339,14 @@ chunks·emails 테이블 **전체**를 `to_arrow().to_pandas()`로 로드했고,
 
 앱 크래시 가설, 진단 로그의 한계와 추가 검증 순서는 [DIAGNOSTICS.md](../DIAGNOSTICS.md)를 따른다.
 
+**수집기 DB 캐시 한도**: `lancedb_cache.index_cache_mib`와 `metadata_cache_mib`의 기본값은
+각각 64MiB이며 앱 재시작 후 적용된다. 앱의 문서·메일 수집 연결은 같은 LanceDB `Session`을
+공유해 이전 버전 manifest·메타데이터 캐시가 연결마다 큰 기본 한도로 누적되는 것을 제한한다.
+기존 설정 파일에 키가 없거나 양의 정수가 아니면 번들 YAML 기본값을 사용한다.
+인덱서를 직접 생성하는 호출도 별도 세션을 주입하지 않으면 같은 한도의 세션을 사용한다.
+질문 전용 읽기 연결의 요청 수명과 저장 형식은 유지한다. 캐시 한도는 프로세스 전체 메모리 한도가
+아니며, 수집 완료 때 GC·Arrow `release_unused()`·작업 집합 축소를 추가하지 않는다.
+
 **수집 사이클 메모리 진단**: `collector.memory_diagnostics_enabled`는 정확한 boolean `true`만
 활성화하며 기본값은 `false`다. `collector.memory_diagnostics_mode` 기본값은 `basic`이다.
 구형 설정의 `enabled: true`도 mode가 없거나 잘못됐으면 basic으로 처리하고 사용자 파일에는 새

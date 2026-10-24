@@ -58,6 +58,7 @@ class Indexer:
         batch_size: int = 32,
         crypto=None,
         maintenance_config=None,
+        lance_session: Any | None = None,
     ) -> None:
         """LanceDB에 연결하고 chunks 테이블을 준비한다.
 
@@ -79,7 +80,10 @@ class Indexer:
         else:
             self._crypto = crypto
 
-        self._db = lancedb.connect(str(db_path))
+        if lance_session is None:
+            from knowmate.rag.lance_session import create_indexing_session
+            lance_session = create_indexing_session()
+        self._db = lancedb.connect(str(db_path), session=lance_session)
         self.table_was_recreated = False
         try:
             self._table = self._db.open_table(TABLE_NAME)

@@ -17,6 +17,10 @@ Outlook은 그 위에 얹는다. 스키마는 **Outlook까지 고려한 풀 스�
 
 ---
 
+대량 수집 뒤 남는 DB 캐시는 [수집기 DB 캐시 한도](DESIGN.md)의 `lancedb_cache` 설정으로
+제한한다. 문서·메일 수집 연결은 하나의 세션을 공유하며, 본문·벡터 윈도우의 참조 해제와
+DB 캐시의 수명은 구분한다. 저장 스키마·메일 인덱스 버전은 변경하지 않는다.
+
 ## 1. 메일 파싱 (`secure/mysingle_reader.py` → `parse_mail_file`)
 
 - **대상**: `.mysingle`(Knox) / `.eml`(표준). 둘 다 RFC822+MIME라 하나의 파서(`parse_mail_file`)로 처리, `parse_mysingle`은 하위호환 래퍼.
