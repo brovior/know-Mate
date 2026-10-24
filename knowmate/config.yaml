@@ -20,6 +20,9 @@ chunking:
                               # 매우 느리다 — 범위 단위로 묶어 왕복을 블록당 1회로 줄인다.
                               # 크게 잡을수록 왕복이 줄지만 순간 메모리가 늘어난다.
                               # 비우거나 잘못된 값이면 1000으로 폴백.
+lancedb_cache:
+  index_cache_mib: 64         # 수집기의 문서·메일 공용 캐시 한도. 앱 재시작 후 적용
+  metadata_cache_mib: 64      # 이전 manifest·메타데이터의 장시간 누적을 제한
 lancedb_maintenance:
   enabled: true
   # chunks/emails 별 sidecar가 backlog와 마지막 결과를 독립적으로 기억한다.

@@ -227,6 +227,7 @@ class EmailIndexer:
         batch_size: int = 32,
         crypto=None,
         maintenance_config=None,
+        lance_session: Any | None = None,
     ) -> None:
         """emails 테이블에 연결하고 EmailIndexer를 초기화한다."""
         import lancedb
@@ -242,7 +243,10 @@ class EmailIndexer:
         else:
             self._crypto = crypto
 
-        db = lancedb.connect(str(db_path))
+        if lance_session is None:
+            from knowmate.rag.lance_session import create_indexing_session
+            lance_session = create_indexing_session()
+        db = lancedb.connect(str(db_path), session=lance_session)
         self.table, self.table_was_recreated = get_or_create_emails_table(db, with_status=True)
         try:
             self.table_is_empty = self.table.count_rows() == 0

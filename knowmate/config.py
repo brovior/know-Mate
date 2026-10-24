@@ -190,6 +190,21 @@ def memory_diagnostics_settings(collector: dict[str, Any]) -> tuple[bool, str]:
     return True, bundled["collector"]["memory_diagnostics_mode"]
 
 
+def indexing_cache_settings(raw: dict[str, Any] | None) -> tuple[int, int]:
+    """Return indexing cache byte limits using bundled defaults for old configs."""
+    with _bundled_config_source().open(encoding="utf-8") as handle:
+        defaults = yaml.safe_load(handle)["lancedb_cache"]
+    values = raw if isinstance(raw, dict) else {}
+    limits = []
+    for key in ("index_cache_mib", "metadata_cache_mib"):
+        value = values.get(key, defaults[key])
+        if type(value) is not int or value < 1:
+            logger.warning("[lancedb_cache] invalid %s; using bundled default", key)
+            value = defaults[key]
+        limits.append(value * 1024 * 1024)
+    return limits[0], limits[1]
+
+
 def _bundled_document_state_defaults() -> dict[str, Any]:
     """Read document checkpoint defaults from the bundled YAML source."""
     with _bundled_config_source().open(encoding="utf-8") as handle:
