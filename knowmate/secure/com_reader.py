@@ -609,7 +609,7 @@ def _release_ppt_references(*, poisoned: bool = False) -> None:
     _trace_ppt_cache_slots("cache_clear_after")
 
 
-def _get_ppt_app() -> Any:
+def _get_ppt_app(registration_timeout_sec: float | None = None) -> Any:
     """Reuse the exact read proof, acquiring quit authority only by direct launch."""
     from knowmate.secure import office_guard, ppt_shutdown
     office_guard.ensure_application_open("POWERPNT.EXE")
@@ -630,7 +630,9 @@ def _get_ppt_app() -> Any:
     client = _require_win32com()
     prepared = getattr(_tls, "ppt_launch_ready", None)
     logger.info("[ppt] launch preparation: prepared=%s", prepared is not None)
-    launched = ppt_shutdown.launch_and_bind(client, prepared[0].office_bitness) if prepared is not None else None
+    launched = (ppt_shutdown.launch_and_bind(client, prepared[0].office_bitness,
+                                           registration_timeout_sec=registration_timeout_sec)
+                if prepared is not None else None)
     if launched is None:
         dispatched = _dispatch_owned_app(client, "PowerPoint.Application", "POWERPNT.EXE")
         app, proof, ticket = dispatched.app, dispatched.proved, None
@@ -946,12 +948,14 @@ class PowerPointComReader:
     """Read a PPT once, using a compatible add-in or a safe single COM fallback."""
 
     def __init__(self, mode: str | None = None, policy: str = "ready",
-                 operation: PptOperation | None = None) -> None:
+                 operation: PptOperation | None = None,
+                 registration_timeout_sec: float | None = None) -> None:
         """Receive mode, preparation policy and file-scoped checks from the caller."""
         from knowmate.config import ppt_reader_mode
         self.mode = ppt_reader_mode({} if mode is None else {"ppt_reader_mode": mode})
         self.policy = policy
         self.operation = operation
+        self.registration_timeout_sec = registration_timeout_sec
 
     def _check(self, stage: str = "read") -> None:
         if self.operation is not None:
@@ -1039,7 +1043,8 @@ class PowerPointComReader:
                 try:
                     self._check("dispatch")
                     with timer.stage(com_stage.STAGE_DISPATCH):
-                        ppt = _get_ppt_app()
+                        ppt = (_get_ppt_app() if self.registration_timeout_sec is None
+                               else _get_ppt_app(self.registration_timeout_sec))
                     self._check("dispatch")
                     service = None
                     if self.mode != "com" and self.policy != "com_only":
@@ -1281,7 +1286,8 @@ class ComReader:
     """확장자를 보고 Word/Excel/PowerPoint COM 리더로 라우팅하는 TextExtractor 구현체."""
 
     def __init__(self, xlsx_block_rows: int | None = None, *, ppt_reader_mode: str | None = None,
-                 ppt_policy: str = "ready", ppt_operation: PptOperation | None = None) -> None:
+                 ppt_policy: str = "ready", ppt_operation: PptOperation | None = None,
+                 ppt_registration_timeout_sec: float | None = None) -> None:
         """xlsx_block_rows: Excel 범위 읽기 블록 크기(config `chunking.xlsx_block_rows`).
 
         리더 3개를 인스턴스 속성으로 보유한다(이전에는 모듈 레벨 싱글톤). 리더 객체는
@@ -1290,7 +1296,8 @@ class ComReader:
         """
         self._word = WordComReader()
         self._excel = ExcelComReader(block_rows=xlsx_block_rows)
-        self._ppt = PowerPointComReader(ppt_reader_mode, ppt_policy, ppt_operation)
+        self._ppt = PowerPointComReader(ppt_reader_mode, ppt_policy, ppt_operation,
+                                       ppt_registration_timeout_sec)
 
     def extract(self, path: str) -> str:
         """확장자에 따라 적합한 COM 리더로 파일을 파싱해 텍스트를 반환한다.

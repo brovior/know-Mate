@@ -17,6 +17,7 @@ public sealed class ReaderHost
     public ReaderCollection Presentations { get; set; }
     public ReaderCollection ProtectedViewWindows { get; set; }
     public ReaderCollection SlideShowWindows { get; set; }
+    public ReaderCommands CommandBars { get; private set; }
     public Action OnQuit;
     public int QuitCount;
     public bool FailAlerts;
@@ -28,10 +29,17 @@ public sealed class ReaderHost
     }
     public ReaderHost()
     {
+        CommandBars = new ReaderCommands(this);
         Presentations = new ReaderCollection(); ProtectedViewWindows = new ReaderCollection();
         SlideShowWindows = new ReaderCollection();
     }
-    public void Quit() { QuitCount++; if (OnQuit != null) OnQuit(); }
+    public void Quit() { throw new Exception("external_quit_forbidden"); }
+    public void ExitCommand() { QuitCount++; if (OnQuit != null) OnQuit(); }
+}
+public sealed class ReaderCommands {
+    private readonly ReaderHost host;
+    public ReaderCommands(ReaderHost value) { host=value; }
+    public void ExecuteMso(string command) { if(command!="FileExit")throw new Exception("wrong_command"); host.ExitCommand(); }
 }
 public sealed class ReaderAddin { public object Object { get; set; } }
 public sealed class ReaderConnectionPoint : IConnectionPoint
@@ -85,7 +93,7 @@ public static class ReaderHarness
     public static int Main(string[] args)
     {
         Assembly assembly = Assembly.LoadFrom(args[0]);
-        Expect(assembly.GetName().Version.ToString() == "1.0.5.0", "version_mismatch");
+        Expect(assembly.GetName().Version.ToString() == "1.0.5.10", "version_mismatch");
         Type type = assembly.GetType("AegisDesk.PptReader.Connect", true);
         Expect(type.GUID == new Guid("287A80D2-804A-46D3-A0E9-CA31C6FC3D09"), "clsid_mismatch");
         Expect(((ProgIdAttribute)Attribute.GetCustomAttribute(type, typeof(ProgIdAttribute))).Value == "AegisDesk.PptReader", "progid_mismatch");
@@ -93,9 +101,12 @@ public static class ReaderHarness
         Expect(reader.GUID == new Guid("65152412-DFD3-47EC-8346-3F2675ED0C15") && reader.GetMethods().Length == 3,
             "legacy_reader_abi_mismatch");
         Type lifecycle = assembly.GetType("AegisDesk.PptReader.IPptReaderLifecycle", true);
+        Type clientShutdown = assembly.GetType("AegisDesk.PptReader.IPptReaderClientShutdown", true);
         Expect(lifecycle.GUID == new Guid("9A20F4A6-6364-4BA7-930B-3E8857BEAF60")
             && lifecycle.GetMethods().Length == 4
-            && ((ComDefaultInterfaceAttribute)Attribute.GetCustomAttribute(type, typeof(ComDefaultInterfaceAttribute))).Value == lifecycle,
+            && clientShutdown.GUID == new Guid("EC5AF9D4-8022-48CD-9D9F-1EF5CC647CC7")
+            && clientShutdown.GetMethods().Length == 7
+            && ((ComDefaultInterfaceAttribute)Attribute.GetCustomAttribute(type, typeof(ComDefaultInterfaceAttribute))).Value == clientShutdown,
             "lifecycle_abi_mismatch");
         Expect(((DispIdAttribute)Attribute.GetCustomAttribute(lifecycle.GetMethod("TryQuitIfIdle"), typeof(DispIdAttribute))).Value == 4,
             "quit_dispid_mismatch");
@@ -110,7 +121,7 @@ public static class ReaderHarness
         type.GetMethod("OnConnection").Invoke(instance, new object[] { new ReaderHost(), 1, addin, null });
         Expect(Object.ReferenceEquals(instance, addin.Object)
             && (int)type.GetMethod("ProtocolVersion").Invoke(instance, null) == 3
-            && (string)type.GetMethod("ReaderVersion").Invoke(instance, null) == "1.0.5.0", "production_connection_mismatch");
+            && (string)type.GetMethod("ReaderVersion").Invoke(instance, null) == "1.0.5.10", "production_connection_mismatch");
         // A fake host has no native typelib: it must never reach Quit even in candidate builds.
         Expect((string)type.GetMethod("TryQuitIfIdle").Invoke(instance, null) == "not_supported", "unverified_host_accepted");
         type.GetMethod("OnDisconnection").Invoke(instance, new object[] { 1, null });
@@ -126,6 +137,32 @@ public static class ReaderHarness
 
     private static void TestGuard()
     {
+        foreach(string close in new[]{"PresentationBeforeClose","ProtectedViewWindowBeforeClose"}) {
+            var host=new ReaderHost();var point=new ReaderConnectionPoint();object guard=Guard(host,point);
+            Expect(Request(guard,false)=="quit_requested"&&point.Unadvised==0,"deferred_guard_dropped_early");
+            Expect(point.Cancel(close,false),"deferred_close_not_cancelled");
+            Expect(!point.Cancel(close,false),"later_manual_close_blocked");
+            var query=guardType.GetMethod("QueryOutcome",BindingFlags.Instance|BindingFlags.NonPublic);
+            Expect((string)query.Invoke(guard,null)=="protected"&&point.Unadvised==1,"deferred_cancellation_not_observed");
+            Expect((string)query.Invoke(guard,null)=="protected"&&point.Unadvised==1,"duplicate_deferred_cleanup");
+        }
+
+        foreach (string close in new string[] { "PresentationBeforeClose", "ProtectedViewWindowBeforeClose" })
+        {
+            var host = new ReaderHost(); var point = new ReaderConnectionPoint(); object guard = Guard(host, point);
+            int calls = 0;
+            Action callback = delegate {
+                calls++;
+                Expect(point.Cancel(close, false), "callback_late_document_unprotected");
+                Expect(Request(guard, false) == "protected", "callback_reentry");
+                guardType.GetMethod("Disconnect", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(guard, null);
+                Expect(point.Cancel(close, false), "callback_disconnect_cleared_guard");
+            };
+            object[] args = { false, 0, callback };
+            string outcome = (string)guardType.GetMethod("TryQuitIfIdleTracked", BindingFlags.Instance | BindingFlags.NonPublic).Invoke(guard, args);
+            Expect(outcome == "protected" && calls == 1 && host.QuitCount == 0, "callback_guard_result");
+            Expect(!point.Cancel(close, false), "callback_guard_retained");
+        }
         foreach (string collection in new string[] { "Presentations", "ProtectedViewWindows", "SlideShowWindows" })
         {
             var host = new ReaderHost(); var point = new ReaderConnectionPoint();
@@ -186,7 +223,10 @@ public static class ReaderHarness
         {
             var host = new ReaderHost(); var point = new ReaderConnectionPoint { FailUnadvise = true };
             object guard = Guard(host, point);
-            ExpectUnknown(guard, "ppt_quit_outcome_unknown");
+            Expect(Request(guard, false) == "quit_requested" && point.Unadvised == 0, "deferred_unadvise_too_early");
+            Expect(point.Cancel("PresentationBeforeClose", false), "deferred_close_failure_unprotected");
+            var query=guardType.GetMethod("QueryOutcome",BindingFlags.Instance|BindingFlags.NonPublic);
+            Expect((string)query.Invoke(guard,null) == "failed", "unadvise_failure_reported_as_protected");
             Expect(Request(guard, false) == "not_supported" && host.QuitCount == 1 && point.Unadvised == 1
                 && !point.Cancel("PresentationBeforeClose", false), "unadvise_failure_guard_active");
         }
@@ -207,6 +247,7 @@ public sealed class ManagedSink
 {
     private readonly AegisDesk.PptReader.PptShutdownState state;
     public ManagedSink(AegisDesk.PptReader.PptShutdownState value) { state=value; }
-    public void PresentationBeforeClose(object value,ref bool cancel) { if(state.Active) { cancel=true; state.Cancelled=true; } }
+    public void UserOpen() { state.ObserveUserActivity(); }
+    public void PresentationBeforeClose(object value,ref bool cancel) { if(state.Active) { cancel=true; state.Cancelled=true; state.CloseCancelled=true; if(state.DeferredProtection)state.Active=false; } }
     public void ProtectedViewWindowBeforeClose(object value,int reason,ref bool cancel) { PresentationBeforeClose(value,ref cancel); }
 }

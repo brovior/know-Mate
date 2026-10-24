@@ -329,9 +329,10 @@ def _make_worker(tmp_path: Path, watch_folder: str):
     return worker, indexer, state_file
 
 
-def test_unconfirmed_native_apartment_defers_com_but_indexes_plain(tmp_path, native_com_backend):
+def test_unconfirmed_native_apartment_defers_com_but_indexes_plain(tmp_path, native_com_backend, monkeypatch):
     """An environment-level COM failure must not become a file failure or stop plain work."""
     from knowmate.secure import AutoReader
+    from knowmate.secure import office_guard
     from knowmate.collector.state import load_state
     from knowmate.collector.failure_state import load_failures
     folder = tmp_path / "docs"
@@ -339,6 +340,8 @@ def test_unconfirmed_native_apartment_defers_com_but_indexes_plain(tmp_path, nat
     (folder / "unavailable.doc").write_bytes(b"synthetic")
     (folder / "plain.txt").write_text("synthetic plain text", encoding="utf-8")
     native_com_backend.apartment = lambda: (0, 0)
+    # Reach the apartment failure even when the developer has Office open.
+    monkeypatch.setattr(office_guard, "_enumerate_processes", lambda: [])
     worker, _indexer, state_file = _make_worker(tmp_path, str(folder))
     worker._extractor = AutoReader()
     errors = []

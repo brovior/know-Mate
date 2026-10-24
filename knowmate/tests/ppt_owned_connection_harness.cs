@@ -15,7 +15,7 @@ partial class Probe {
   Action cancel=()=>{object[] a={null,false};sink.GetType().GetMethod("PresentationBeforeClose").Invoke(sink,a);Check((bool)a[1],"active_cancel");};
   if(scenario=="nonzero")spy.Children["Presentations"].CountValue=1;
   spy.Children["Presentations"].OnInvoke=n=>{if(n!="Count")return;if(scenario=="cancel_count")cancel();if(scenario=="disconnect_count")guard.Disconnect();if(scenario=="broken_count")state.MarkBroken();};
-  spy.OnQuit=()=>{if(scenario=="cancel_quit")cancel();if(scenario=="disconnect_quit")guard.Disconnect();if(scenario=="broken_quit")state.MarkBroken();if(scenario=="quit_fatal")throw new COMException("fixture",unchecked((int)0x80010108));if(scenario=="quit_unknown")throw new InvalidOperationException();};
+  spy.OnQuit=()=>{if(scenario=="cancel_quit"||scenario.StartsWith("unadvise_"))cancel();if(scenario=="disconnect_quit")guard.Disconnect();if(scenario=="broken_quit")state.MarkBroken();if(scenario=="quit_fatal")throw new COMException("fixture",unchecked((int)0x80010108));if(scenario=="quit_unknown")throw new InvalidOperationException();};
   if(scenario=="refused")point.AdviseError=unchecked((int)0x80040202);
   if(scenario=="limit")point.AdviseError=unchecked((int)0x80040201);
   if(scenario=="partial"||scenario=="fatal_advise"){point.Partial=true;point.AdviseError=scenario=="partial"?unchecked((int)0x80004005):unchecked((int)0x80010108);}
@@ -30,6 +30,12 @@ partial class Probe {
   else{Check(error==null,"unexpected_error_"+scenario);string expected=scenario=="nonzero"||scenario.StartsWith("cancel_")?"protected":scenario=="disconnect_count"||scenario=="refused"||scenario=="limit"||scenario=="bad_contract"?"not_supported":"quit_requested";Check(result==expected,"result_"+scenario+"_"+result);}
   bool quit=scenario=="idle"||scenario=="alias"||scenario=="cancel_quit"||scenario=="disconnect_quit"||scenario=="broken_quit"||scenario.StartsWith("quit_")||scenario.StartsWith("unadvise_");
   Check(spy.Quits==(quit?1:0)&&spy.AfterQuit==0,"single_quit_"+scenario);
+  if(scenario=="idle"||scenario=="alias"){
+   Check(state.Active&&point.Refs==2+(alias!=IntPtr.Zero?1:0)&&point.Unadvised==0,"retained_for_late_close_"+scenario);
+   cancel();Check(!state.Active&&state.CloseCancelled,"late_close_cancelled_"+scenario);
+   Check(guard.QueryOutcome()=="protected"&&point.Unadvised==1,"late_close_yielded_"+scenario);
+   Check(guard.QueryOutcome()=="protected"&&point.Unadvised==1,"late_cleanup_once_"+scenario);
+  }
   Check(point.Refs==1+(alias!=IntPtr.Zero?1:0),"owned_cp_refs_before_gc_"+scenario);
   if(scenario=="partial"||scenario=="fatal_advise"||scenario=="zero_cookie"||scenario.StartsWith("disconnect_")||scenario.StartsWith("broken_")||scenario.StartsWith("quit_"))Check(point.Unadvised==0,"unsafe_unadvise_"+scenario);
   if(state!=null){Check(!state.Active,"inactive_after_return");object[] a={null,false};sink.GetType().GetMethod("PresentationBeforeClose").Invoke(sink,a);Check(!(bool)a[1],"inactive_sink_cancels");}

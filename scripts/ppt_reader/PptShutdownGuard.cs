@@ -9,14 +9,29 @@ internal sealed class PptShutdownGuard {
  object application;readonly PptLifecycleTrace lifecycle;readonly int mainThread;
  readonly Func<object,IConnectionPoint> resolvePoint;readonly Func<PptShutdownState,object> createSink;
  bool disconnected,entered,attempted,broken;
+ PptShutdownState retainedState;PptConnectionLease retainedLease;object retainedSink;
+ bool yielded;
+ internal string QueryOutcome(){
+  if(Thread.CurrentThread.ManagedThreadId!=mainThread)return "not_supported";
+  if(retainedState!=null&&retainedState.CloseCancelled){yielded=true;ReleaseRetained();}
+  if(broken)return "failed";
+  return yielded?"protected":attempted?"quit_requested":"not_supported";
+ }
+ void ReleaseRetained(){
+  var lease=retainedLease;var state=retainedState;object sink=retainedSink;
+  retainedLease=null;retainedState=null;retainedSink=null;
+  if(state!=null)state.Active=false;
+  if(lease!=null){lease.Complete();broken|=state.Broken||lease.Errors.Poison||lease.Errors.Unknown;}
+  GC.KeepAlive(sink);
+ }
  internal PptShutdownGuard(object host,int thread,Func<object,IConnectionPoint> resolver):this(host,thread,resolver,PptSinkLoader.Create,null){}
  internal PptShutdownGuard(object host,int thread,Func<object,IConnectionPoint> resolver,Func<PptShutdownState,object> factory):this(host,thread,resolver,factory,null){}
  internal PptShutdownGuard(object host,int thread,Func<object,IConnectionPoint> resolver,Func<PptShutdownState,object> factory,PptLifecycleTrace trace){application=host;mainThread=thread;resolvePoint=resolver;createSink=factory;lifecycle=trace;}
- internal void Disconnect(){disconnected=true;application=null;}
+ internal void Disconnect(){disconnected=true;application=null;ReleaseRetained();}
  internal bool Entered {get{return entered;}}
  void Trace(int stage,PptShutdownState state,int detail){if(lifecycle!=null)lifecycle.Record(stage,(state.Cancelled?1:0)|(state.Broken?2:0)|(disconnected?4:0)|(attempted?8:0)|(state.Active?16:0)|(broken?32:0),detail);}
  internal string TryQuitIfIdle(bool reading){int ignored;return TryQuitIfIdleTracked(reading,out ignored);}
- internal string TryQuitIfIdleTracked(bool reading,out int completedToken){
+ internal string TryQuitIfIdleTracked(bool reading,out int completedToken,Action requestQuit=null){
   completedToken=0;
   if(disconnected||broken)return "not_supported";
   if(entered||attempted||reading)return "protected";
@@ -25,20 +40,26 @@ internal sealed class PptShutdownGuard {
   object host=application,sink=null;var state=new PptShutdownState();var session=new PptConnectionLease(state,()=>disconnected);
   bool setup=true,quitStarted=false,publish=false;string result="failed";
   try{
-   result=Execute(host,state,session,ref sink,ref setup,ref quitStarted);
+   result=Execute(host,state,session,ref sink,ref setup,ref quitStarted,requestQuit);
    publish=quitStarted;
-  }catch(CountInterrupted exc){result=exc.Outcome;broken|=state.Broken;}
+  }catch(CountInterrupted exc){result=exc.Outcome;broken|=state.Broken;publish=quitStarted;}
   catch(Exception exc){
    session.Errors.Observe(exc,true);
    if(quitStarted||exc is CountCleanupFailed||exc is PptCleanupOutcomeUnknown)session.Errors.Unknown=true;
    broken|=setup||session.Errors.Poison;
    result=setup?"not_supported":"failed";publish=!setup&&!quitStarted;
   }finally{
-   state.Active=false;
-   if(session.Subscription==SubscriptionPhase.Confirmed&&!session.Errors.Poison&&!state.Broken&&!disconnected)Trace(12,state,0);
-   else Trace(15,state,(session.Subscription!=SubscriptionPhase.Confirmed?1:0)|(session.Errors.Poison?2:0)|(disconnected?4:0));
-   session.Complete();broken|=state.Broken||session.Errors.Poison;
-   if(session.UnadviseAttempts!=0){if(session.Subscription==SubscriptionPhase.Removed)Trace(13,state,0);else Trace(14,state,session.Errors.Chosen==null?0:session.Errors.Chosen.HResult);}
+   bool retain=requestQuit==null&&result=="quit_requested"&&!disconnected&&!state.Broken&&!session.Errors.Poison&&!session.Errors.Unknown;
+   if(retain){
+    state.DeferredProtection=true;retainedState=state;retainedLease=session;retainedSink=sink;
+    Trace(17,state,0);
+   }else{
+    state.Active=false;
+    if(session.Subscription==SubscriptionPhase.Confirmed&&!session.Errors.Poison&&!state.Broken&&!disconnected)Trace(12,state,0);
+    else Trace(15,state,(session.Subscription!=SubscriptionPhase.Confirmed?1:0)|(session.Errors.Poison?2:0)|(disconnected?4:0));
+    session.Complete();broken|=state.Broken||session.Errors.Poison;
+    if(session.UnadviseAttempts!=0){if(session.Subscription==SubscriptionPhase.Removed)Trace(13,state,0);else Trace(14,state,session.Errors.Chosen==null?0:session.Errors.Chosen.HResult);}
+   }
    Trace(16,state,0);GC.KeepAlive(sink);GC.KeepAlive(host);entered=false;
    if(lifecycle!=null)lifecycle.End(invocation);
   }
@@ -48,7 +69,7 @@ internal sealed class PptShutdownGuard {
   if(publish&&lifecycle!=null)completedToken=lifecycle.Complete(invocation);
   return result;
  }
- string Execute(object host,PptShutdownState state,PptConnectionLease session,ref object sink,ref bool setup,ref bool quitStarted){
+ string Execute(object host,PptShutdownState state,PptConnectionLease session,ref object sink,ref bool setup,ref bool quitStarted,Action requestQuit){
   // Null resolver is the production route: native metadata, real validator and CP.
   if(resolvePoint==null)session.Resolve(host);else session.AcquireExisting(resolvePoint(host));
   sink=createSink(state);
@@ -65,9 +86,13 @@ internal sealed class PptShutdownGuard {
   foreach(string collection in new[]{"Presentations","ProtectedViewWindows","SlideShowWindows"})if(RawCount.Read(host,collection,check)!=0)return "protected";
   if(state.Broken){broken=true;return "not_supported";}
   if(disconnected||state.Cancelled)return "protected";
-  attempted=true;quitStarted=true;Trace(10,state,0);((dynamic)host).Quit();Trace(11,state,0);
+  attempted=true;quitStarted=true;Trace(10,state,0);
+  if(requestQuit==null)((dynamic)host).CommandBars.ExecuteMso("FileExit");
+  else requestQuit();
+  Trace(11,state,0);
   if(state.Broken){session.Errors.Unknown=true;throw new COMException("ppt_quit_outcome_unknown",unchecked((int)0x80004005));}
-  return state.Cancelled?"protected":"quit_requested";
+  if(state.CloseCancelled){yielded=true;return "protected";}
+  return "quit_requested";
  }
         private static COMException FatalTransport(Exception error)
         {

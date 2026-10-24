@@ -27,7 +27,7 @@ def test_native_lifecycle_tokens_and_rpc_invariants(tmp_path, arch):
     exe = tmp_path / 'Lifecycle.exe'
     run([CSC, '/nologo', '/reference:Microsoft.CSharp.dll', '/reference:System.Core.dll',
          '/platform:' + arch, '/out:' + str(exe), local,
-         ROOT / 'scripts/ppt_reader/PptReader.cs', ROOT / 'scripts/ppt_reader/PptShutdownGuard.cs',
+         ROOT / 'scripts/ppt_reader/PptReader.cs', ROOT / 'scripts/ppt_reader/PptCallerQuit.cs', ROOT / 'scripts/ppt_reader/PptShutdownGuard.cs',
          *[ROOT / 'scripts/ppt_reader' / n for n in ('PptShutdownEvents.cs', 'PptOwnedMetadata.cs', 'PptEventValidator.cs', 'PptEventSignatures.cs')],
          ROOT / 'knowmate/tests/ppt_lifecycle_harness.cs',
          ROOT / 'knowmate/tests/ppt_managed_count_fixture.cs'])

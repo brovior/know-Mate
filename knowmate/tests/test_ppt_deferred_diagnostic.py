@@ -30,7 +30,7 @@ def test_deferred_existing_guard_and_unowned_sentinels(tmp_path, arch):
     assert state.count(boundary) == 1
     local = tmp_path / 'State.cs'; local.write_text(state.split(boundary)[0], encoding='utf-8')
     exe = tmp_path / 'Connect.exe'
-    names = ['PptReader.cs','PptShutdownGuard.cs','PptShutdownEvents.cs','PptOwnedMetadata.cs',
+    names = ['PptReader.cs','PptCallerQuit.cs','PptShutdownGuard.cs','PptShutdownEvents.cs','PptOwnedMetadata.cs',
              'PptEventValidator.cs','PptEventSignatures.cs','PptDeferredGate.cs','PptDeferredDiagnostic.cs']
     run([CSC, '/nologo', '/define:AEGIS_PPT_DEFERRED_DIAGNOSTIC', '/main:DeferredConnectHarness',
          '/reference:System.Windows.Forms.dll', '/reference:Microsoft.CSharp.dll', '/reference:System.Core.dll',

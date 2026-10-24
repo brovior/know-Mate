@@ -13,8 +13,11 @@ public class Host {
  public Counts Presentations {get {Calls.Add("presentations");return Docs;}}
  public Counts ProtectedViewWindows {get {Calls.Add("protectedviews");return new Counts();}}
  public Counts SlideShowWindows {get {Calls.Add("slideshows");return new Counts();}}
- public void Quit(){Calls.Add("quit");if(OnQuit!=null)OnQuit();}
+ public ExitCommands CommandBars {get{return new ExitCommands(this);}}
+ public void Exit(){Calls.Add("quit");if(OnQuit!=null)OnQuit();}
+ public void Quit(){throw new Exception("external_quit_forbidden");}
 }
+public class ExitCommands {readonly Host host;public ExitCommands(Host value){host=value;}public void ExecuteMso(string id){if(id!="FileExit")throw new Exception("wrong_command");host.Exit();}}
 public class Addin { public object Object {get;set;} }
 public class Point:IConnectionPoint {
  public List<string> Calls; public Action OnUnadvise;
@@ -80,9 +83,9 @@ class LifecycleHarness {
   };
   Check(reader.TryQuitIfIdle()=="quit_requested","normal_return_"+mode);
   references(synchronous);
-  Check(!guard.Entered&&!state.Active,"inactive_after_return_"+mode);
+  Check(!guard.Entered&&state.Active==!synchronous,"retained_after_return_"+mode);
   string expected="resolve,sink,advise,alerts_set,alerts_get,presentations,protectedviews,slideshows,quit";
-  if(!synchronous)expected+=",unadvise";
+  Check(!host.Calls.Contains("unadvise"),"no_unadvise_before_async_close_"+mode);
   Check(String.Join(",",host.Calls)==expected,"exact_rpc_sequence_"+mode);
   if(mode.StartsWith("delayed_")) { callbacks();Check(!guard.Entered&&!state.Active,"delayed_inactive_"+mode); }
   int count=host.Calls.Count;int secondToken;
@@ -103,19 +106,19 @@ class LifecycleHarness {
   reader.GetType().GetField("shutdown",BindingFlags.NonPublic|BindingFlags.Instance).SetValue(reader,guard);
   Action nested=delegate{Check(reader.TryQuitIfIdle()=="protected","nested_status");Check(PptLifecycleFile.Writes==0,"nested_export");};
   if(mode=="nested_quit")host.OnQuit=nested;
-  if(mode=="nested_unadvise")point.OnUnadvise=nested;
-  if(mode=="cancel")host.OnQuit=delegate{state.Cancelled=true;};
+  if(mode=="nested_unadvise"){point.OnUnadvise=nested;host.OnQuit=delegate{state.CloseCancelled=true;};}
+  if(mode=="cancel")host.OnQuit=delegate{state.Cancelled=true;state.CloseCancelled=true;};
   if(mode=="broken")host.OnQuit=delegate{state.MarkBroken();};
   if(mode=="fatal")host.OnQuit=delegate{throw new COMException("fixed",unchecked((int)0x800706BA));};
   if(mode=="unknown")host.OnQuit=delegate{throw new InvalidOperationException();};
-  if(mode=="unadvise_fail")point.OnUnadvise=delegate{throw new COMException("fixed",unchecked((int)0x80004005));};
+  if(mode=="unadvise_fail"){host.OnQuit=delegate{state.CloseCancelled=true;};point.OnUnadvise=delegate{throw new COMException("fixed",unchecked((int)0x80004005));};}
   if(mode=="disconnect")host.OnQuit=delegate{reader.OnBeginShutdown(ref custom);};
   if(mode=="count")host.Docs.Count=1;
   string status;
   try {status=reader.TryQuitIfIdle();}catch(COMException e){status="exception:"+e.HResult.ToString("X8");}
   bool noComplete=mode=="count"||mode=="broken"||mode=="fatal"||mode=="unknown"||mode=="unadvise_fail";
   Check(PptLifecycleFile.Writes==(enabled&&!noComplete?1:0),"export_count_"+mode);
-  Check(state==null||!state.Active,"sink_inactive");
+  Check(state==null||state.Active==(status=="quit_requested"&&mode!="disconnect"),"sink_retained_only_for_pending_exit");
   if(mode=="fatal"||mode=="unknown"||mode=="broken"||mode=="disconnect")Check(!host.Calls.Contains("unadvise"),"extra_rpc");
   if(enabled&&mode=="unadvise_fail"){bool found=false;foreach(object entry in (Array)Field(trace,"entries")){if((int)entry.GetType().GetField("stage",BindingFlags.Instance|BindingFlags.NonPublic).GetValue(entry)==14)found=true;}Check(found,"failure_trace_before_publication");}
   if(enabled&&mode=="disconnect")Check(PptLifecycleFile.Text.Contains(" 2 ")&&PptLifecycleFile.Text.Contains(" 3 0 "),"disconnect_trace");

@@ -154,7 +154,7 @@ def ensure_admitted() -> None:
         raise OfficeCleanupPendingError(_EXE, reason)
 
 
-def launch_and_bind(win32com: Any, bitness: int) -> tuple[Any, tuple[int, Any], LaunchTicket] | None:
+def launch_and_bind(win32com: Any, bitness: int, *, registration_timeout_sec: float | None = None) -> tuple[Any, tuple[int, Any], LaunchTicket] | None:
     """Launch once under the caller's machine lock, then verify exact COM host."""
     from knowmate.secure import office_guard as guard
     from knowmate.secure.ppt_launch import (
@@ -195,6 +195,8 @@ def launch_and_bind(win32com: Any, bitness: int) -> tuple[Any, tuple[int, Any], 
         _sequence += 1
         ticket = _ticket = LaunchTicket(_sequence, threading.get_ident())
     launched = None
+    observer = None
+    observer_attached = False
     started_call = False
     try:
         guard.ensure_application_open(_EXE)
@@ -213,11 +215,27 @@ def launch_and_bind(win32com: Any, bitness: int) -> tuple[Any, tuple[int, Any], 
         ticket = _set_ticket(ticket, pid=launched.pid, identity=launched.identity)
         if ticket is None or ticket.identity is None:
             raise guard.OfficeCleanupPendingError(_EXE, "launch_identity_unknown")
-        guard.ensure_application_open(_EXE)
-        processes = guard._enumerate_processes()
-        if processes is None or guard._pids_for(_EXE, processes) != {ticket.pid}:
-            raise guard.OfficeCleanupPendingError(_EXE, "launch_host_ambiguous")
-        app = win32com.Dispatch("PowerPoint.Application")
+        observer = launched.detach_observation()
+        from knowmate.config import ppt_registration_timeout_seconds
+        from knowmate.secure.ppt_active import wait_for_active_app
+
+        def check_target() -> None:
+            guard.ensure_application_open(_EXE)
+            with _lock:
+                if _ticket is not ticket:
+                    raise guard.OfficeCleanupPendingError(_EXE, "launch_ticket_changed")
+            if observer.poll().status != "timeout":
+                raise guard.OfficeCleanupPendingError(_EXE, "launch_original_exited")
+            processes = guard._enumerate_processes()
+            if processes is None or guard._pids_for(_EXE, processes) != {ticket.pid}:
+                raise guard.OfficeCleanupPendingError(_EXE, "launch_host_ambiguous")
+            if guard._process_creation_identity(ticket.pid) != ticket.identity:
+                raise guard.OfficeCleanupPendingError(_EXE, "launch_identity_changed")
+
+        timeout = ppt_registration_timeout_seconds(
+            {} if registration_timeout_sec is None else {"ppt_registration_timeout_sec": registration_timeout_sec}
+        )
+        app = wait_for_active_app(win32com, check_target, timeout)
         guard.ensure_application_open(_EXE)
         app.DisplayAlerts = 2
         if app.DisplayAlerts != 2:
@@ -253,11 +271,11 @@ def launch_and_bind(win32com: Any, bitness: int) -> tuple[Any, tuple[int, Any], 
         ready = _set_ticket(ticket, state="ready", proof_generation=proof[1].generation)
         if ready is None:
             raise guard.OfficeCleanupPendingError(_EXE, "launch_ticket_changed")
-        observer = launched.detach_observation()
         with _lock:
             attached = _ticket is ready
             if attached:
                 _observations[ready.generation] = _ObservationTarget(observer, proof[1])
+                observer_attached = True
         if not attached:
             observer.close()
             raise guard.OfficeCleanupPendingError(_EXE, "launch_ticket_changed")
@@ -276,6 +294,8 @@ def launch_and_bind(win32com: Any, bitness: int) -> tuple[Any, tuple[int, Any], 
                     _ticket = None
         raise
     finally:
+        if observer is not None and not observer_attached:
+            observer.close()
         if launched is not None:
             launched.close()
 
@@ -355,7 +375,23 @@ def request_quit(app: Any, proof: Any, ticket: LaunchTicket | None, cache: Any,
             snapshot = {pid: snapshot_record}
             try:
                 logger.info("[ppt] quit decision: reason=service_call pid=%d generation=%d", pid, ticket.generation)
-                status = service.TryQuitIfIdle()
+                from knowmate.secure.ppt_caller_quit import request_guarded_quit
+
+                def check_quit_target() -> None:
+                    with _lock:
+                        target = _observations.get(pending.generation)
+                        if _ticket is not pending or target is None:
+                            raise guard.OfficeCleanupPendingError(_EXE, "quit_target_changed")
+                        alive = target.observer.poll().status == "timeout"
+                    with guard._owned_lock:
+                        same_record = guard._owned_pids.get(pid) is snapshot_record
+                    processes = guard._enumerate_processes()
+                    if (not alive or not same_record or processes is None
+                            or guard._pids_for(_EXE, processes) != {pid}
+                            or guard._process_creation_identity(pid) != record.creation_identity):
+                        raise guard.OfficeCleanupPendingError(_EXE, "quit_target_changed")
+
+                status = request_guarded_quit(service, app, check_quit_target)
             except Exception as exc:  # noqa: BLE001 -- opaque COM/OS failures remain pending
                 logger.warning("[ppt] 정상 종료 RPC 결과 불명: error_type=%s", type(exc).__name__)
                 return "pending", snapshot

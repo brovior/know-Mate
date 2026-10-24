@@ -7,6 +7,12 @@ using System.IO;
 using System.Reflection;
 using AegisDesk.PptReader;
 using TYPEATTR=System.Runtime.InteropServices.ComTypes.TYPEATTR;
+[ComVisible(true),ClassInterface(ClassInterfaceType.AutoDispatch)]
+public sealed class ExitCommands {
+ readonly Action exit;
+ public ExitCommands(Action action){exit=action;}
+ public void ExecuteMso(string command){if(command!="FileExit")throw new Exception("wrong_ui_command");exit();}
+}
 class NativeObject {
  [UnmanagedFunctionPointer(CallingConvention.StdCall)]delegate int Q(IntPtr p,ref Guid id,out IntPtr r);
  [UnmanagedFunctionPointer(CallingConvention.StdCall)]delegate int R(IntPtr p);
@@ -19,7 +25,7 @@ class NativeObject {
  Dictionary<int,string> names=new Dictionary<int,string>();Delegate[] roots;
  internal NativeObject(ITypeInfo info,bool child) {
   Info=info;IsChild=child;IntPtr a;info.GetTypeAttr(out a);identity=((TYPEATTR)Marshal.PtrToStructure(a,typeof(TYPEATTR))).guid;info.ReleaseTypeAttr(a);
-  foreach(string n in child?new[]{"Count"}:new[]{"Presentations","ProtectedViewWindows","SlideShowWindows","DisplayAlerts","Quit"}){int[] id=new int[1];info.GetIDsOfNames(new[]{n},1,id);names[id[0]]=n;}
+  foreach(string n in child?new[]{"Count"}:new[]{"Presentations","ProtectedViewWindows","SlideShowWindows","DisplayAlerts","Quit","CommandBars"}){int[] id=new int[1];info.GetIDsOfNames(new[]{n},1,id);names[id[0]]=n;}
   roots=new Delegate[]{new Q(Query),new R(Add),new R(Release),new C(InfoCount),new T(TypeInfo),new RawCount.GetNames(GetNames),new RawCount.Invoke(Invoke)};
   IntPtr table=Marshal.AllocHGlobal(IntPtr.Size*7);for(int i=0;i<7;i++)Marshal.WriteIntPtr(table,i*IntPtr.Size,Marshal.GetFunctionPointerForDelegate(roots[i]));Pointer=Marshal.AllocHGlobal(IntPtr.Size);Marshal.WriteIntPtr(Pointer,table);
  }
@@ -36,7 +42,8 @@ class NativeObject {
  }
  int Invoke(IntPtr p,int id,ref Guid iid,uint lcid,ushort flags,ref RawCount.Parameters args,IntPtr result,ref RawCount.ErrorInfo error,out uint argError){
   argError=0;string n;if(!names.TryGetValue(id,out n))return unchecked((int)0x80020003);
-  if(n=="Quit"){Quits++;if(AtQuit!=null)AtQuit();return 0;}
+  if(n=="Quit")throw new Exception("external_quit_forbidden");
+  if(n=="CommandBars"){Marshal.GetNativeVariantForObject(new ExitCommands(()=>{Quits++;if(AtQuit!=null)AtQuit();}),result);return 0;}
   if(n=="DisplayAlerts"){if((flags&4)==0)Marshal.GetNativeVariantForObject(2,result);return 0;}
   if(iid!=Guid.Empty||(flags!=2&&!(IsChild&&flags==3))||args.count!=0||args.namedCount!=0)return unchecked((int)0x80070057);
   if(IsChild){CountCalls++;if(OnRpc!=null)OnRpc("count");

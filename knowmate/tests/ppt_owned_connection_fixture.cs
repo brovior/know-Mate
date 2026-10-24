@@ -29,7 +29,7 @@ class Spy {
  public Dictionary<int,string> Names=new Dictionary<int,string>(); public int Quits,AfterQuit,CountValue; public Action OnQuit; public Action<string> OnInvoke;public int FindError,CpcError;public bool FindPartial;
  public Spy(ITypeInfo info,bool collection=false) { Collection=collection;
   Info=info;IntPtr a;info.GetTypeAttr(out a);HostIid=((TYPEATTR)Marshal.PtrToStructure(a,typeof(TYPEATTR))).guid;info.ReleaseTypeAttr(a);
-  foreach(string name in (collection ? new[]{"Count"} : new[]{"Quit","DisplayAlerts","Presentations","ProtectedViewWindows","SlideShowWindows"})) {int[] ids=new int[1];info.GetIDsOfNames(new[]{name},1,ids);Names.Add(ids[0],name);}
+  foreach(string name in (collection ? new[]{"Count"} : new[]{"Quit","CommandBars","DisplayAlerts","Presentations","ProtectedViewWindows","SlideShowWindows"})) {int[] ids=new int[1];info.GetIDsOfNames(new[]{name},1,ids);Names.Add(ids[0],name);}
   roots=new Delegate[]{new Q(Query),new R(Add),new R(Release),new C(Count),new T(TypeInfo),Probe.Adapter(this,"GetNames","GetNames"),Probe.Adapter(this,"Invoke","Invoke")};
   var table=Marshal.AllocHGlobal(IntPtr.Size*7);for(int j=0;j<7;j++)Marshal.WriteIntPtr(table,j*IntPtr.Size,Marshal.GetFunctionPointerForDelegate(roots[j]));Pointer=Marshal.AllocHGlobal(IntPtr.Size);Marshal.WriteIntPtr(Pointer,table);
   containerRoots=new Delegate[]{new Q(Query),new R(Add),new R(Release),new EnumPoint(EnumPoints),new PptConnectionLease.FindProc(Find)};
@@ -47,6 +47,7 @@ class Spy {
   if(Collection){Marshal.GetNativeVariantForObject(CountValue,result);return 0;} if(Quits>0)AfterQuit++;
   int argc=Marshal.ReadInt32(pars,IntPtr.Size*2),named=Marshal.ReadInt32(pars,IntPtr.Size*2+4);
   if(name=="Quit") {Console.WriteLine("QUIT_INVOKE id="+id+" flags="+flags+" argc="+argc+" named="+named);Probe.Check((flags&1)!=0&&(flags&~3)==0&&argc==0&&named==0,"quit_dispatch_contract");Quits++;if(OnQuit!=null)OnQuit();return 0;}
+  if(name=="CommandBars"){Marshal.GetNativeVariantForObject(new OwnedExitCommands(()=>{Quits++;if(OnQuit!=null)OnQuit();}),result);return 0;}
   if(name=="DisplayAlerts"){if((flags&4)==0)Marshal.GetNativeVariantForObject(2,result);return 0;}
   var child=Children[name]; child.Add(child.Pointer); Marshal.WriteInt16(result,9); Marshal.WriteIntPtr(result,8,child.Pointer); return 0;
  }catch(Exception e){Console.WriteLine("SPY_ERROR "+e.GetType().Name+" "+e.Message);return e is COMException?e.HResult:unchecked((int)0x80004005);}}
@@ -84,3 +85,6 @@ partial class Probe {
  public static void Check(bool yes,string code){if(!yes)throw new Exception(code);}
  static ITypeInfo Find(ITypeLib lib,string expected){for(int i=0;i<lib.GetTypeInfoCount();i++){string n,d,h;int c;lib.GetDocumentation(i,out n,out d,out c,out h);if(n==expected){ITypeInfo t;lib.GetTypeInfo(i,out t);return t;}}throw new Exception(expected);}
 }
+
+[ComVisible(true),ClassInterface(ClassInterfaceType.AutoDispatch)]
+public sealed class OwnedExitCommands {readonly Action exit;public OwnedExitCommands(Action action){exit=action;}public void ExecuteMso(string command){if(command!="FileExit")throw new Exception("wrong_ui_command");exit();}}

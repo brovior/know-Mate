@@ -5,8 +5,8 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading;
 
-[assembly: AssemblyVersion("1.0.5.0")]
-[assembly: AssemblyFileVersion("1.0.5.0")]
+[assembly: AssemblyVersion("1.0.5.10")]
+[assembly: AssemblyFileVersion("1.0.5.10")]
 [assembly: ComVisible(false)]
 
 namespace AegisDesk.PptReader
@@ -62,7 +62,7 @@ namespace AegisDesk.PptReader
 #elif AEGIS_PPT_DEFERRED_DIAGNOSTIC
     [ComDefaultInterface(typeof(IPptReaderDeferredDiagnostic))]
 #else
-    [ComDefaultInterface(typeof(IPptReaderLifecycle))]
+    [ComDefaultInterface(typeof(IPptReaderClientShutdown))]
 #endif
     public sealed partial class Connect : StandardOleMarshalObject, IDTExtensibility2, IPptReader, IPptReaderLifecycle
 #if AEGIS_PPT_LIFETIME_DIAGNOSTIC

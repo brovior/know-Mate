@@ -19,6 +19,12 @@ internal static class CaptureEventHarness {
   Passive(state,delegate(ref bool cancel){sink.WindowBeforeDoubleClick(null,ref cancel);},103);
   Passive(state,delegate(ref bool cancel){sink.PresentationBeforeSave(null,ref cancel);},118);
   Passive(state,delegate(ref bool cancel){sink.ProtectedViewWindowBeforeEdit(null,ref cancel);},126);
+  foreach(bool active in new[]{false,true}){
+   state.Active=active;state.Cancelled=false;sink.PresentationOpen(null);Require(state.Cancelled==active);
+   state.Cancelled=false;sink.NewPresentation(null);Require(state.Cancelled==active);
+   state.Cancelled=false;sink.WindowActivate(null,null);Require(state.Cancelled==active);
+   state.Cancelled=false;sink.ProtectedViewWindowOpen(null);Require(state.Cancelled==active);
+  }
   foreach(bool active in new[]{false,true})foreach(bool initial in new[]{false,true}){
    state.Active=active;state.Events.Clear();bool cancel=initial;sink.PresentationBeforeClose(null,ref cancel);
    Require(cancel==(active||initial)&&state.Events.Count==2);Require(state.Events[0].Incoming==initial&&state.Events[1].Incoming==initial&&state.Events[1].Outgoing==cancel&&state.Events[1].Set==active);
@@ -31,9 +37,10 @@ internal static class CaptureEventHarness {
 namespace AegisDesk.PptReader {
  public sealed class PptShutdownState {
   internal sealed class Entry {internal int Kind;internal bool Enter,Incoming,Outgoing,Set;}
-  internal readonly List<Entry> Events=new List<Entry>();public bool Active,Cancelled;
+  internal readonly List<Entry> Events=new List<Entry>();public bool Active,Cancelled,CloseCancelled,DeferredProtection;
   public void EventBoundary(int kind,bool enter,bool incoming,bool outgoing,bool set){Events.Add(new Entry{Kind=kind,Enter=enter,Incoming=incoming,Outgoing=outgoing,Set=set});}
   public void RecordCancellation(int kind){}public void MarkBroken(){}
+  public void ObserveUserActivity(){if(Active)Cancelled=true;}
  }
 }
 namespace Microsoft.Office.Core {public enum MsoSyncEventType {Unused}}

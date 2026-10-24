@@ -92,7 +92,7 @@ No diagnostic IID was added. The runner returns nonzero if any comparison is PAR
 or FAIL; it preserves each result separately. Timeouts affect only its test children.
 
 
-## Product integration follow-up (1.0.5.0 candidate)
+## Product integration follow-up (1.0.5.10 candidate)
 
 The earlier run15/loader1 descriptions above are historical evidence. Product sources
 now integrate the full contract into a PIA-free core plus optional Events assembly.

@@ -57,7 +57,7 @@ def test_native_raw_count_integrated(tmp_path, arch, fault_copy):
     policy = tmp_path / "Policy.cs"
     policy.write_text("namespace AegisDesk.PptReader { internal static class ShutdownBuildPolicy { public const bool Enabled=true; } }", encoding="utf-8")
     exe = tmp_path / "RawCount.exe"
-    sources = [SOURCE / name for name in ("PptReader.cs", "PptShutdownGuard.cs", "PptShutdownState.cs",
+    sources = [SOURCE / name for name in ("PptReader.cs", "PptCallerQuit.cs", "PptShutdownGuard.cs", "PptShutdownState.cs",
                "PptShutdownEvents.cs", "PptOwnedMetadata.cs", "PptSinkLoader.cs", "PptPackageIdentity.cs", "PptEventSignatures.cs", "PptEventValidator.cs")]
     run([CSC, "/nologo", "/optimize+", "/reference:Microsoft.CSharp.dll", "/reference:System.Core.dll",
          "/reference:System.Web.Extensions.dll", "/platform:" + arch, "/out:" + str(exe),

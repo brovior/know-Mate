@@ -237,6 +237,7 @@ class MainWindow(QMainWindow):
                 cfg.get("extractor", "fake"),
                 xlsx_block_rows=chunking.get("xlsx_block_rows"),
                 ppt_reader_mode=ppt_reader_mode(cfg.get("collector", {})),
+                ppt_registration_timeout_sec=cfg.get("collector", {}).get("ppt_registration_timeout_sec"),
             )
             self._pump_startup()
 

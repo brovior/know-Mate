@@ -3,6 +3,234 @@
 현재 원인 분석과 다음 검증의 정본이다. 작업 상태는 [ROADMAP.md](ROADMAP.md), 구현 계약은
 [DESIGN.md](design/DESIGN.md), 완료 이력은 [UPDATE_NOTES.md](UPDATE_NOTES.md)를 따른다.
 
+## 같은 프로세스의 마지막 검사 직후 열림 경합 재현 (2026-10-24)
+
+**현재 Windows x64·Office에서 저장/미저장 문서 1개·2개, 네 사례 모두 실제 닫기 취소와 문서 유지를 확인했다.**
+기존 후보 1.0.5.10의 복사본을 진단용 1.0.5.12로 빌드하고, 마지막 빈 컬렉션 검사·취소 상태 검사
+직후부터 기존 `FileExit` 호출 전 사이에 인증된 합성 문서를 같은 Application에서 열도록 계측했다.
+제품 소스·의존성·기존 frozen EXE는 변경하지 않았다. 실제 GUI 사용자 입력의 도착 시점을 추측하는
+시험과 달리 해당 코드 위치의 순서를 고정한 실기 시험이며, 변경하지 않은 frozen 앱 전체 인덱싱 시험과 구분한다.
+
+| 문서 상태 | 문서 수 | 원 PID | 종료 명령 반환 뒤 실제 닫기 취소 |
+|---|---|---|---|
+| 저장됨 | 1 | 26160 | 9.004ms 뒤 |
+| 미저장 변경 | 1 | 32492 | 7.123ms 뒤 |
+| 저장됨 | 2 | 10780 | 20.874ms 뒤 |
+| 미저장 변경 | 2 | 27272 | 19.047ms 뒤 |
+
+각 시험은 PowerPoint 0개에서 시작했고, 실제 Reader로 합성 파일을 읽고 닫은 뒤 종료 경계를 시험했다.
+PID·생성 identity·STA thread 및 단조 시각으로 `빈 검사 완료 → 같은 호스트 문서 Open → 종료 명령
+진입·반환 → PresentationBeforeClose의 cancel=false→true` 순서를 확인했다. 이벤트는 이미
+`DeferredProtection=True` 상태에서 발생했으며, `QueryQuitOutcome`과 Python 요청 결과는 모두
+`protected`였다. 이벤트 콜백에서는 원시 값만 버퍼에 넣고 정상 RPC에서 기록했으며 누락은 0건이다.
+
+문서 창·슬라이드 수·저장 상태는 15초 뒤에도 같았다. 미저장 문서 각각의 추가 슬라이드와
+`Saved=False`도 유지됐고, 두 문서 사례에서는 다른 문서가 함께 닫히지 않았다. 저장 확인 창을
+수동 취소하지 않았다. 관찰 후 인증한 합성 문서만 저장·수동 닫기·정상 Quit으로 정리해 다음 수동
+닫기가 막히지 않는 것도 확인했다. 주입을 끈 같은 진단 Reader의 대조 시험은 PID 4852의 실제 종료를 확인했다.
+
+최초 진단 1.0.5.11은 계측 코드의 Office 저장 상태 값 변환 오류로 종료 명령 전에 중단되어 제외했다.
+일반 종료 비교기의 `experiment_complete=false`·`remaining`은 해당 비교기가 프로세스 종료만 성공으로
+정의하기 때문이다. 이 보호 시험은 별도 `race-verification.json`의 실제 이벤트·문서 유지·수동 정리
+증거로 판정하며 자동종료 성공으로 바꾸어 집계하지 않는다.
+
+근거는 `.aegisdesk_build/ppt-last-check-race/`의 `race-verification.json`,
+`diagnostic-provenance.json`, `{saved,unsaved}-{one,two}-v12/internal_quit/`의
+`race-host.jsonl`·`protection-live.json`, 각 시험의 `manual-cleanup.json`이다.
+진단용 등록은 정식 helper `/remove`로 제거하고 기존 candidate helper `/prepare`로 1.0.5.10을 복원했다.
+복원한 DLL·Events 해시는 기존 candidate와 같고 frozen payload 세 파일도 변경되지 않았다. 복원 후 합성 읽기·정상종료
+대조 시험도 PID 29260의 원 handle 종료를 확인했다. 최종 PowerPoint·AegisDesk 프로세스는 0개다.
+다른 Office 버전·실제 사내 DRM·일반 배포 승인은 이 결과에 포함하지 않는다.
+
+## 같은 STA의 Office 종료 명령과 지연된 닫기 보호 후보 (2026-10-24)
+
+1.0.5.10 후보는 빈 문서 확인과 `FileExit` 명령을 Reader STA 안에서 처리하고, 명령 반환 뒤에도
+닫기 이벤트 보호를 유지하도록 변경했다. 외부 Application.Quit 콜백은 차단했다. 문서 열림 감지와
+실제 닫기 취소를 구분하며 취소 확인 후에는 종료 권한을 포기한다. 새 패키지·타이머·강제종료는 없다.
+최종 candidate `77faffb-dirty.a409a982`의 빌드·frozen 자체 진단을 완료했다. 일반 배포 종료는 비활성이다.
+
+실제 Reader 단독 시험은 PID 33040의 종료를 확인했다. 변경하지 않은 frozen 앱의
+`ppt-host-exit-index-001`·`002`는 각각 PowerPoint 0개에서 시작해 합성 `.ppt` 1청크를 fake 임베딩으로 저장하고,
+AegisDesk가 생성한 PID 23224·30144의 원 handle 종료와 잔류 0개를 확인했다. 종료 중 RPC 단절은
+`pending`으로 처리한 뒤 OS 관측으로 종료를 확정했으며 재요청·외부 Quit·강제종료는 없었다.
+
+`ppt-user-open-{saved,unsaved}-host-exit-001`은 인덱싱 중 같은 호스트에 사용자 합성 문서를 열었다.
+원 PID 20736·16788에서 `protected` 반환 후 창·슬라이드·저장 상태가 인덱싱 완료 15초 뒤와
+AegisDesk 종료 뒤에도 유지됐다. 미저장 문서는 추가한 슬라이드와 `Saved=False`도 유지됐다.
+각각 19·28청크를 저장했고 나머지 시험 파일은 사용자 사용 중으로 보류됐다. 관찰 후에는 인증한
+합성 문서만 정상 저장·닫기·Quit으로 정리했다.
+
+종료 요청 로그 직후 문서를 연 `ppt-host-exit-race-saved-001`·`ppt-host-exit-race-file-unsaved-001`도
+문서를 유지했다. 전자는 기존 호스트 COM Open이 실패한 뒤 명시적 파일 실행으로 새 PID 26840에서,
+후자는 PowerPoint 실행파일에 파일을 전달해 새 PID 27364에서 열렸다. 원 호스트는 먼저 종료됐다.
+두 문서 모두 15초 및 AegisDesk 종료 후 유지됐다. 이 파일 실행 시험만으로는 같은 호스트에서 마지막
+검사 이후의 경합을 재현하지 못했으며, 해당 구간은 위의 별도 계측 실기 시험에서 네 사례를 검증했다.
+
+전체 회귀는 2,157 통과·11 실패·8 skip이었다. 시험 모형의 기존 Quit 호출·즉시 이벤트 해제 가정을
+수정한 뒤 관련 19개, native Count 2개, 실제 이벤트 수신기/소유 참조 2개를 재실행해 실패 8건을 해소했다.
+나머지 3건은 심볼릭 링크/reparse 시험의 Windows 권한 오류 1314이며 통과로 처리하지 않는다.
+별도 종료 관련 97개 및 수정한 managed harness 재실행 1개도 통과했다. 설치된 1.0.5.10 DLL의
+해시는 최종 빌드 payload와 일치한다.
+
+앞선 재확인 후보 1.0.5.6은 기존 Count 뒤 문서 추가 시험에서 저장·미저장 문서를 유지했다.
+그러나 재확인 반환 뒤에 문서를 추가한 `race-after-confirm-saved`에서는 `protected` 반환 뒤에도
+원 PID 18824가 종료되고 문서 연결이 끊겼다. 재확인만으로 공백이 해소되지 않아 해당 후보는 채택하지 않았다.
+
+별도 내부 호출 비교에서 Application.Quit은 UI 스레드로 옮겨도 PID 31228이 남았다.
+Office `FileExit` 명령은 지연 UI 실험의 PID 25500, 기존 Reader RPC 안의 실험 PID 21216 모두
+원 handle의 실제 종료를 확인했다. 이 결과로 최종 후보에서는 별도 UI 타이머를 사용하지 않는다.
+외부 왕복을 남긴 FileExit 경합 실험은 미저장 문서의 저장 확인 창이 떠서 자동 보호 성공으로 판정하지 않았다.
+
+시험용 PID 27328의 저장 확인 창은 사용자 잠금 해제 후 수동 취소했다. 같은 문서의 창·2슬라이드·
+미저장 상태가 15초 유지된 뒤 합성 문서만 저장·닫고 정상 Quit으로 원 handle의 종료를 확인했다.
+이 결과는 수동 취소가 필요했으므로 자동 보호 통과가 아니다. 현재 PowerPoint·AegisDesk는 0개다. 근거는 `.aegisdesk_build/quit-invoke-experiment/`의
+`race-boundary-fixed-{saved,unsaved}`·`race-after-confirm-saved`·`ui-quit-no-user`·
+`ui-quit-command-no-user`·`inline-quit-command-no-user`·`ui-file-exit-after-confirm-unsaved`다.
+최종 후보 회귀·빌드 로그는 `.aegisdesk_build/ppt-host-exit-*`와
+`.aegisdesk_build/candidate-ppt-host-exit/`에 보존한다.
+
+## Quit 직전 사용자 문서 보호 실패 (2026-10-24)
+
+**Reader 1.0.5.5 후보는 빈 문서 검사 후 Quit 직전에 열린 사용자 문서를 보호하지 못했다.**
+저장된 합성 문서와 미저장 변경이 있는 합성 문서 각각 재현됐다. 일반 배포 자동종료는 계속
+비활성이며, 무조작 자동종료·인덱싱 중 미리 열린 문서 보호의 이전 통과 결과로 이 경합을 승인하지 않는다.
+
+변경하지 않은 frozen EXE `77faffb-dirty.5a75e8fa`의 `ppt-quit-race-live-001`은 실제 합성 `.ppt`
+인덱싱 1청크 저장 후 `caller Quit` 로그를 관측한 즉시 별도 PowerPoint 실행파일로 사용자 파일을
+열었다. 원 PID 11236은 종료됐고, 사용자 파일은 새 PID 20356에서 열려 15초 관찰 및 AegisDesk
+종료 뒤에도 유지됐다. 새 호스트로 분리된 결과이며 동일 호스트의 종료 취소 이벤트 검증은 아니다.
+
+별도 `compare-race-boundary.py` 진단은 설치된 원본 Reader·Events DLL과 제품의
+`request_guarded_quit()`을 그대로 사용하고, 시험용 target-check 콜백에서만 문서를 추가했다.
+Reader의 빈 컬렉션 검사 완료 → 호출자 콜백 진입 → 같은 Application에 합성 문서를 쓰기 가능·
+창 표시로 열고 경로·창·슬라이드·저장 상태 확인 → 제품의 정상 Quit 순서를 QPC로 기록했다.
+제품 코드·설치 파일·기본 설정 변경과 새 의존성은 없다. 이 진단은 frozen 앱 전체 인덱싱 재현과 구분한다.
+
+`race-boundary-saved`의 PID 33508은 1슬라이드·창 1개·`Saved=True`,
+`race-boundary-unsaved`의 PID 22264는 빈 슬라이드 추가 후 2슬라이드·`Saved=False`를 확인했다.
+두 시험 모두 `protected`가 아닌 `quit_requested`가 반환됐고, **그 뒤 문서 확인**에서
+`RPC_E_DISCONNECTED(0x80010108)`가 발생했다. 원 handle 관측은 두 프로세스의 실제 종료를
+확인했다. 시험 도구는 추가한 문서에 Close/Save/Saved 변경을 하지 않았고 PowerPoint를 강제종료하지 않았다.
+따라서 단순 Open 실패나 프로세스 잔류와 다르게 사용자 문서 보호 실패로 판정한다.
+
+두 host trace는 `dropped=0`이며 Quit 진입·반환 시 Active 비트가 켜져 있고 Cancelled 비트는 꺼져
+있었다. 이후 Unadvise가 성공했다. 현행 Count 검사와 실제 Quit 사이의 문서 추가를 이벤트 보호가
+막지 못한 것은 확인됐지만, Office 내부 이벤트 전달·실제 문서 닫힘·구독 해제의 세부 순서는 미확정이다.
+다음 작업은 이 경합을 막는 종료 설계 보완과 같은 시점의 회귀 검증이다.
+
+근거는 `.aegisdesk_build/ppt-quit-race-final-report.json`, `ppt-quit-race-live-001/`,
+`quit-invoke-experiment/race-boundary-{saved,unsaved}/`의 `race-boundary.json`·`caller.jsonl`·
+`result.json` 및 `ppt-race-boundary-{saved,unsaved}-trace/`다. 일반 비교기의
+`experiment_complete=false`는 Quit 후 보호 확인 실패이며, 콜백 진입·문서 열림·Quit 반환은
+별도 기록으로 확인했다. 테스트 끝에 남은 PowerPoint·AegisDesk는 0개다.
+
+## 내부 Quit 잔류와 보호된 호출자 Quit (2026-10-24)
+
+Office 인증 갱신 후에도 기존 후보의 실제 합성 PPT 인덱싱은 성공하고 내부 Quit 후 PID는 남았다.
+`ppt-index-live-007`의 원 PID 32804, 1청크 저장 및 lifecycle trace의 Quit 진입·반환·Unadvise 성공을
+확인했다. 인증 갱신만으로 이 현상이 해소되지는 않았다. 동적 호출을 Reflection·명시적 native
+IDispatch METHOD/반환 VARIANT 없음으로 바꾼 별도 1.0.5.1·1.0.5.2 시험도 각각 25초·20초 뒤 잔류했다.
+
+1.0.5.4 별도 시험은 같은 호스트 Count·이벤트 보호 안에서 동기 COM 콜백으로 호출자의 원
+Application 프록시에 Quit을 요청했다. 합성 읽기·닫기 후 `quit_requested`가 반환됐고, 원 handle의
+실제 종료를 7.11초, 호출자 종료를 7.43초에 확인했다(콜백 MTA=1). 이는 시험 시작 기준 시간이며
+Quit 반환 뒤 경과시간과 다르다. Python 호출 스레드와 COM 콜백 스레드는 달랐으나 같은 프로세스
+MTA였다. 내부 Application의 Quit이 종료로 이어지지 않는 Office 구현상의 상세 조건은 미확정이다.
+
+수정 후보 1.0.5.5는 기존 보호를 유지하고 이 콜백을 한 요청 동안만 허용한다. 새 활성화·비보호
+외부 Quit 재시도·강제종료는 없다. 원 handle·identity·종료 세대·단독 프로세스·소유 기록을 콜백 직전
+재확인한다. 일반 배포는 계속 비활성이며, 합성 PPT에 대한 실제 앱 검증 결과는 다음과 같다.
+
+새 frozen 빌드 `77faffb-dirty.5a75e8fa`는 selftest를 통과했다. 독립 시험 `ppt-index-live-009`와
+`ppt-index-live-010`은 각각 PowerPoint·AegisDesk 0개에서 시작했다. AegisDesk가 직접 띄운
+원 PID 5956·22232에 연결해 Reader 1.0.5.5로 합성 바이너리 `.ppt`를 읽었고, fake 임베딩으로
+각각 chunks 1행·emails 0행을 저장했다(`count_rows()` 확인). 두 시험 모두 `aegisdesk.log`에
+호출자 Quit·`quit_requested`·`actual_exit`가 남았으며, 독립 관측도 보존한 원 프로세스 handle의
+종료를 각각 14:07:30.832·14:08:47.971에 확인했다. AegisDesk는 당시 계속 실행 중이었고
+시험 중 PowerPoint 수동 실행·수동 종료·강제종료는 없었다. Quit 반환부터 실제 종료까지 약 2초였다.
+
+같은 최종 Reader 1.0.5.5의 내부 Quit 대조 시험도 12초 후 잔류했다. 별도 보호 시험은 이미 열린
+합성 문서 1개가 있으면 `protected`로 반환하고 프로세스를 유지했다. 반면 콜백 중 문서 추가를
+시도한 시험은 `RPC_E_DISCONNECTED(0x80010108)` 후 PID 26104가 남았다. 단절이 문서 열기와
+Quit 이후 조회 중 어디서 발생했는지는 미확정이며 이 시험은 보호 성공 증거가 아니다. 정상 Quit과
+창 닫기로 정리되지 않아 사용자가 직접 정리했고, 다음 시험 전 PowerPoint 0개를 확인했다.
+Quit 직전·진행 중 문서 추가·DRM·사내 Office 보호 조건은 추가 검증이 필요하다.
+
+인덱싱 도중 사용자 파일을 여는 추가 시험은 같은 frozen 빌드에서 저장된 문서와 미저장 변경이
+있는 문서 각각 통과했다. `ppt-user-open-saved-003`·`ppt-user-open-unsaved-003` 모두
+PowerPoint·AegisDesk 0개에서 시작하고, AegisDesk의 직접 기동·연결 후 실제 인덱싱 중
+PowerPoint 실행파일에 별도 합성 `.pptx` 경로를 전달해 열었다. 사용자 파일은 감시 폴더 밖에 뒀다.
+실제 문서 열림은 각각 14:26:05·14:27:02, 인덱싱 정리 완료는 14:26:16·14:27:06에 확인했다.
+원 PID 27012·32712는 유지됐고 `service_return status=protected`로 반환해 호출자 Quit은 없었다.
+
+각 시험의 60개 합성 인덱싱 대상 중 29개·9개가 저장됐다(`count_rows()` 확인). 사용자 실행파일이
+원 호스트로 파일을 인계하는 동안 생긴 추가 PID는 외부 점유로 감지해 나머지 31개·51개 읽기를
+일시 보류했다. 두 번째 시험은 사용자 문서에 빈 슬라이드를 추가해 `Saved=False`로 만든 뒤,
+정리 완료 후 15초 이상 및 AegisDesk 시험 프로세스 종료 뒤에도 2슬라이드·미저장 상태가 유지됐다.
+첫 시험도 같은 관측 구간에 원 문서·창·저장 상태가 유지됐으며, 관측 후 별도 시험 정리에서만
+합성 문서를 닫고 정상 Quit했다. 새 의존성·제품 코드·기본 설정 변경은 없다.
+
+최종 근거는 `.aegisdesk_build/ppt-user-open-final-report.json`과 각 시험 폴더의 `report.json`·
+`appdata/AegisDesk/logs/aegisdesk.log`다. 첫 shell 연결 시험은 문서 열림 미확인, 다음 시험은
+미지원 DocumentWindow.HWND 때문에 도구가 중단돼 최종 2회 통과 집계에서 제외했다.
+이번 결과는 인덱싱 중 열려 종료 판단 전에 존재한 문서의 보호이며, Quit과 동시에 문서가 열리는
+경합의 취소 이벤트 검증을 대신하지 않는다.
+
+필수 전체 pytest는 2158 PASS / 8 SKIP / 10 FAIL이다. 실제 Word 프로세스의 간섭을 받던 대역
+1건은 격리했고, 동시 실제 앱 시험의 machine lock과 충돌한 종료 테스트 6건도 앱 종료 뒤 재실행해
+통과했다(최종 관련 69 PASS, 별도 집중 검증 88 PASS; 중복 포함). 남은 3건은 symlink/reparse
+fixture 생성 권한 부족(Windows 1314)이다. 전체 통과로 판정하지 않는다. 동시 실행 영향을 받은
+실제 앱 시험 `ppt-index-live-008`은 자동종료 경로를 타지 않아 성공 집계에서 제외했다.
+최종 보고는 `.aegisdesk_build/ppt-caller-final-report.json`, 실제 앱 근거는 각 시험 폴더의
+`baseline.json`·`process-trace.jsonl`·`observation.json`·`appdata/AegisDesk/logs/aegisdesk.log`다.
+
+근거는 `.aegisdesk_build/quit-invoke-experiment/`의 `internal-result`, `raw-result`,
+`callback-result-3` 및 `ppt-index-live-007`에 보존했다. 초기 콜백 2회는 인터페이스 조회 실패로
+Quit 비교 전에 중단됐으며 성공 증거에 포함하지 않는다.
+
+## 직접 기동 직후 COM 연결의 추가 프로세스 생성 (2026-10-22)
+
+`77faffb` candidate와 Office `16.0.20430.20182`에서 PowerPoint 0개 상태로 실제 앱 인덱싱을
+시작해도 직접 실행한 PID와 COM 창의 PID가 달라 읽기가 연기됐다. 임베딩은 fake,
+문서 추출은 auto/addin이며 합성 바이너리 `.ppt`만 사용했다. 인덱싱 성공 건수는 0이다.
+
+원인은 직접 기동 직후 기존 COM 객체를 찾지 못했을 때의 생성 폴백이다. `ppt_shutdown.launch_and_bind()`는
+`CreateProcess` 직후 `win32com.client.Dispatch()`를 호출한다. 설치된 pywin32의 Dispatch는
+`pythoncom.connect()`가 실패하면 `CoCreateInstance()`로 진행한다. 호출 추적 2회에서
+`connect → MK_E_UNAVAILABLE(0x800401E3) → CoCreateInstance → 두 번째 POWERPNT.EXE 생성`을 확인했다.
+최초 프로세스는 호출자의 Quit 없이 코드 0으로 종료됐다. 이전 사이클 PID를 재사용한 비교가 아니다.
+
+3초 기동 대기 후에는 기존 객체 연결이 성공하고 생성 폴백을 타지 않았다. 별도 진단에서
+새 프로세스를 만들지 않는 `GetActiveObject()`만 제한 시간 동안 재시도한 2회도 원 PID에 연결됐다.
+`WaitForInputIdle()` 성공 후에도 추가 프로세스가 잠시 생긴 사례가 있어 이를 COM 등록 완료 증거로 쓰지 않는다.
+
+추가 조회 시험은 PowerPoint의 클래스 식별자로 실행 중 COM 객체 등록 목록(ROT)을 직접 확인했다.
+원 프로세스가 살아 있어도 약 97ms 시점에는 등록이 없고 기존 객체 조회가 `MK_E_UNAVAILABLE`로
+실패했다. 약 920ms에 등록이 확인됐으며 약 1198ms에 같은 PID 연결이 반환됐다. 호출자와 원
+PowerPoint는 모두 Windows 세션 1·비승격 상태였고 설정·권한 변경이나 두 번째 PPT 생성은 없었다.
+이 재현의 오류는 프로세스 생성과 COM 객체 등록 사이의 시간차다. Office 내부 등록 시점의
+결정 조건이나 사내 환경에서도 같은 지연이 발생하는지는 미확인이다.
+
+직접 기동 분기는 이제 `GetActiveObject()`로 기존 객체만 조회하고 등록 대기 오류에만 재시도한다.
+재시도 전후 원 handle·PID·생성 identity·단독 프로세스 집합을 확인한다. 기본 대기는
+`collector.ppt_registration_timeout_sec` 10초이며 다른 COM 오류·대상 변경·시간초과는 읽기를 보류한다.
+기존 호스트나 CreateProcess 미시작 시의 읽기 경로는 유지한다.
+
+수정 candidate `77faffb-dirty.727ba198`를 빌드하고 frozen selftest를 통과했다. 실제 앱 시험
+`ppt-index-live-004`는 PowerPoint·AegisDesk 0개에서 시작했다. 수집기가 띄운 PID 20352 하나에
+16회·1296ms 후 연결됐고, Reader 1.0.5.0이 합성 `.ppt`를 읽어 fake 임베딩 1청크를 저장했다.
+`aegisdesk.log`의 `documents_complete`에서 `quit_requested`가 반환됐으나 원 handle은 30초 후에도
+살아 있었으며 앱 종료 뒤 추가 12초 관측에서도 남았다. **등록 경쟁은 해소됐지만 자동종료는 실패했다.**
+사후 정리에서 동일 PID·생성 identity·빈 문서 집합·창 소유를 확인한 외부 정상 Quit은 실제 종료됐다.
+이는 시험 정리이며 자동종료 성공이나 제품의 외부 Quit 허용 근거가 아니다.
+
+추가 종료 비교는 frozen caller의 COM 초기화 실패로 중단됐고, 소스 비교는 이전 Dispatch 연결의
+대상 변경으로 중단됐다. 등록 대기만 적용한 로컬 비교 adapter도 확인용 창 이후 visible-window 보호
+조건에서 중단됐다. 이 비교들은 Quit 비교 완료 증거가 아니며 내부 Quit 잔류 원인은 미확정이다.
+관련 회귀는 최종 코드 기준 199 PASS / 4 SKIP이다. 전체 pytest는 2151 PASS / 8 SKIP / 7 FAIL이며,
+테스트 대역 인자 4건은 수정 후 관련 재실행에서 통과했다. 나머지 3건은 symlink/reparse fixture 생성의
+Windows 권한 부족(1314)으로 미통과했다. 사내 환경·DRM·일반 배포 자동종료 승인은 미검증이다.
+
 ## 진단의 호출 준비와 PowerPoint 직접 실행 순서 (2026-10-22)
 
 후속 VDI 시험은 `bind_step=probe_precheck`, `reason=target_changed`, 원 핸들 `os_status=exited`이며

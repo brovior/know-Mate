@@ -70,7 +70,7 @@ Phase 1~4 완료(RAG 지식검색), 5a 완료(Knox `.mysingle` + 표준 `.eml` �
 | 상태 JSON·유휴 스캔 | 단계별 실측 대기 | JSON 처리와 실제 파일 접근 비용을 구분한 뒤 개선 선택 |
 | 검색·임베딩·COM 성능 | 실측 대기 | 진단 문서의 검증 자료 확보 |
 | PowerPoint 추가 기능 운영 적용 | 1.0.4.0 요청 전용 native 저장 후보, 사내 ACL PASS·writer 일부 통과 보고. 링크 fixture·정리·stdout·최종 결과 요약 보완, 기본 disabled 유지 | [저장 검증](guides/PPT_READER.md#ppt-요청-저장과-충돌-진단)과 다른 관리자 UAC 후 원래 helper 완료 저장을 우선 확인. [운영 설계](design/PPT_ADDIN_INDEXING.md)·[검증 절차](guides/PPT_READER.md)의 최종 released 파일 승인 시험 후 동일 파일 배포. 기존 orphan-only 임시파일 복구는 별도 과제 |
-| PowerPoint 인덱싱 후 자동종료 #116 | 직접 실행 증명·호스트 정상종료·사용자 문서 보호 후보 구현, candidate만 시험 | [자동종료 검증](guides/PPT_READER.md#powerpoint-자동종료-후보-검증)의 실제 Windows·Office 시험 후 별도 배포 활성화 |
+| PowerPoint 인덱싱 후 자동종료 #116 | 같은 STA의 FileExit·반환 이후 닫기 보호 후보 구현. frozen 인덱싱 및 동일 호스트의 마지막 검사 직후 열림 경합 4사례 확인. 기본 disabled 유지 | [정밀 경합 검증](DIAGNOSTICS.md#같은-프로세스의-마지막-검사-직후-열림-경합-재현-2026-10-24): 현재 Windows x64·Office에서 저장/미저장 문서 1개·2개 보호 확인. 사내 DRM·다른 Office·일반 배포 승인 보류 |
 | PowerPoint 종료 3방식 비교 | 설치된 Reader로 외부 Quit·내부 Quit·참조 해제를 새 프로세스에서 비교하는 명시적 진단 | [격리된 VDI 실행](guides/PPT_READER.md#powerpoint-종료-3방식-비교-진단)의 실제 Windows x86/x64·frozen·Office·DRM 검증. 일반 배포 종료 안전성 승인을 대신하지 않음 |
 | PowerPoint 종료 진단 한 번 수집 | core 우선 관측·단회 요청·외부 보존·schema3 판독 및 별도1.0.6 진단 빌드 후보 구현. live 잠금 유지 | [새 진단 안내](guides/PPT_CAPTURE.md)의 x86/x64 native·정확한 패키지 pin·Office 합성 gate 대기. 기존 checkpoint121 잠금·일반 배포 기본값 유지 |
 | PowerPoint 참조 수명·원 handle 비교 | native MTA scope·예외 프레임 정리·원 handle 관측과 별도1.0.7 진단 후보. mock/replay만 허용 | [진단 안내](guides/PPT_CAPTURE.md#별도-참조-수명-비교-후보-1070)의 Windows·Office·사용자 보호 증거 대기. live·빌드·설치·등록·일반 배포 활성화 미실행 |
