@@ -41,7 +41,7 @@ def test_external_metadata_boundary(tmp_path, arch, apartment, observe_unload):
         directory = tmp_path / name
         directory.mkdir()
         stamp = directory / "Stamp.cs"
-        stamp.write_text('using System.Reflection; [assembly:AssemblyVersion("1.0.5.10")] '
+        stamp.write_text('using System.Reflection; [assembly:AssemblyVersion("1.0.5.11")] '
                          f'public class Stamp {{public static string Value="{name}";}}', encoding="utf-8")
         dll = directory / "AegisDesk.PptReader.dll"
         _run([str(compiler), "/nologo", "/target:library", f"/out:{dll}", str(metadata), str(stamp)])

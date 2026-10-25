@@ -7,7 +7,7 @@ namespace AegisDesk.PptSetup
 {
     internal static partial class RequestWriter
     {
-        internal static Dictionary<string, object> Read(RequestDirectoryLease lease, string id)
+        internal static Dictionary<string, object> Read(IReservationNamespace lease, string id)
         {
             if (lease == null) throw new SetupFailure("lease_recheck", "policy");
             lease.Recheck(); string path = Path.Combine(lease.ChildPath, Basename(id));
@@ -48,7 +48,7 @@ namespace AegisDesk.PptSetup
             for (int index = 0; index != first.Length; index++) if (first[index] != second[index]) return false;
             return true;
         }
-        internal static void Write(RequestDirectoryLease lease, Dictionary<string, object> values, RequestWriteMode mode)
+        internal static void Write(IReservationNamespace lease, Dictionary<string, object> values, RequestWriteMode mode)
         {
             if (lease == null) throw new SetupFailure("lease_recheck", "policy");
             lease.Recheck();

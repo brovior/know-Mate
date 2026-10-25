@@ -79,7 +79,7 @@ def test_added_executable_initializer_invalidates_source_set(tmp_path: Path) -> 
 def test_wrong_source_version_is_rejected(tmp_path: Path) -> None:
     root, output = _source_tree(tmp_path)
     source = root / builder.CORE[0]
-    source.write_text(source.read_text().replace("1.0.5.10", "2.0.0.0"))
+    source.write_text(source.read_text().replace("1.0.5.11", "2.0.0.0"))
     with pytest.raises(ValueError, match="source_version"):
         builder.copy_sources(output / "generated", root)
 

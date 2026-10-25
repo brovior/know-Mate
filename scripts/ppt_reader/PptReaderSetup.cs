@@ -2,8 +2,8 @@ using System;
 using System.IO;
 using System.Reflection;
 
-[assembly: AssemblyVersion("1.0.5.10")]
-[assembly: AssemblyFileVersion("1.0.5.10")]
+[assembly: AssemblyVersion("1.0.5.11")]
+[assembly: AssemblyFileVersion("1.0.5.11")]
 
 namespace AegisDesk.PptSetup
 {
@@ -21,6 +21,10 @@ namespace AegisDesk.PptSetup
                     result = Machine.Check("check");
                     code = result.machine_safe ? 0 : (result.status == "busy" ? 10 : 12);
                 }
+                else if (args.Length == 2 && operation == "elevated-repair-parent")
+                { ParentRepair.Elevated(args[1]); return 0; }
+                else if (args.Length == 2 && operation == "recover-parent")
+                { ParentRepair.Recover(args[1]); result = Machine.Check(operation); code = result.machine_safe ? 0 : 13; }
                 else if (args.Length == 2 && (operation == "elevated-install" || operation == "elevated-remove"))
                 {
                     if (!Machine.Admin || !Contract.PayloadValid()) throw new IOException("payload_invalid");
@@ -97,7 +101,8 @@ namespace AegisDesk.PptSetup
         private static int PrepareLeased(bool remove, ref Result result, ref RequestDirectoryLease lease)
         {
             string operation = remove ? "remove" : "prepare";
-            Reservation request;
+            Reservation request = null;
+            bool repairParent = false;
             using (var gate = new MachineLock())
             {
                 result = Machine.Check(operation, true);
@@ -117,9 +122,17 @@ namespace AegisDesk.PptSetup
                     request = Reservation.Create(lease);
                 }
                 catch (SetupFailure error)
-                { error.Apply(result); result.status = "failed"; result.reason = "acl_unavailable"; result.machine_safe = false; return 12; }
+                {
+                    if (!remove && Contract.AutoInstallEnabled && error.Stage == "parent_policy") repairParent = true;
+                    else { error.Apply(result); result.status = "failed"; result.reason = "acl_unavailable"; result.machine_safe = false; return 12; }
+                }
                 catch (Exception error)
                 { SetupFailure.From("request_create", error).Apply(result); result.status = "failed"; result.reason = "acl_unavailable"; result.machine_safe = false; return 12; }
+            }
+            if (repairParent)
+            {
+                int repaired = ParentRepair.Run(ref result, out lease, out request);
+                if (repaired != 0) return repaired;
             }
             lease.Recheck();
             int code = Elevation.Run(remove, request);

@@ -11,7 +11,10 @@ namespace AegisDesk.PptSetup
 {
     // Namespace lease only. READ sharing does not freeze WRITE_DAC or defeat a
     // malicious trusted directory owner, Administrator, or System account.
-    internal sealed class RequestDirectoryLease : IDisposable
+    internal interface IReservationNamespace
+    { string ChildPath { get; } void Recheck(); }
+
+    internal sealed class RequestDirectoryLease : IDisposable, IReservationNamespace
     {
         [StructLayout(LayoutKind.Sequential)]
         private struct FileInfo
@@ -45,7 +48,7 @@ namespace AegisDesk.PptSetup
 
         private readonly List<Entry> entries = new List<Entry>();
         private bool disposed;
-        internal string ChildPath { get { if (disposed || entries.Count == 0) throw new SetupFailure("lease_recheck", "policy"); return entries[entries.Count - 1].path; } }
+        public string ChildPath { get { if (disposed || entries.Count == 0) throw new SetupFailure("lease_recheck", "policy"); return entries[entries.Count - 1].path; } }
         internal static RequestDirectoryLease Acquire()
         { return AcquireAt(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), true); }
         internal static RequestDirectoryLease AcquireExisting()
@@ -143,7 +146,7 @@ namespace AegisDesk.PptSetup
         }
         private static string SecurityKey(DirectorySecurity acl)
         { return acl.GetSecurityDescriptorSddlForm(AccessControlSections.Owner | AccessControlSections.Access); }
-        internal void Recheck()
+        public void Recheck()
         {
             if (disposed) throw new SetupFailure("lease_recheck", "policy");
             try
