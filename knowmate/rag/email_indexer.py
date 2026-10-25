@@ -207,7 +207,7 @@ def _migrate_emails_schema(db, table) -> tuple[object, bool]:
 
 def get_or_create_emails_table(db, *, with_status: bool = False):
     """emails 테이블을 열거나 생성하고, 요청 시 재생성 여부도 반환한다."""
-    if EMAIL_TABLE_NAME in db.table_names():
+    if EMAIL_TABLE_NAME in db.list_tables().tables:
         table = db.open_table(EMAIL_TABLE_NAME)
         result, recreated = _migrate_emails_schema(db, table)
     else:

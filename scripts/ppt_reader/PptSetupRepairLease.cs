@@ -46,7 +46,7 @@ namespace AegisDesk.PptSetup
         private readonly List<Entry> entries = new List<Entry>();
         private bool disposed;
         private string helperSid;
-        public string ChildPath { get { if (disposed || entries.Count == 0) throw new SetupFailure("lease_recheck", "policy"); return entries[entries.Count - 1].path; } }
+        public string ChildPath { get { if (disposed || entries.Count == 0) throw new SetupFailure("lease_recheck", "policy") { PolicyReason = "namespace_changed" }; return entries[entries.Count - 1].path; } }
         internal string ParentPath { get { return Path.GetDirectoryName(ChildPath); } }
         internal string ParentIdentity
         {
@@ -129,7 +129,8 @@ namespace AegisDesk.PptSetup
             try
             {
                 DirectorySecurity acl = ReadSecurity(entry.handle);
-                if (!(parent ? ParentSecurity.Legacy(acl, helperSid) : RequestDirectory.Compatible(acl, false))) throw new SetupFailure(policyStage, "policy");
+                if (parent) ParentSecurity.RequireRepairable(acl, helperSid, policyStage);
+                else if (!RequestDirectory.Compatible(acl, false)) throw new SetupFailure(policyStage, "policy");
                 entry.security = SecurityKey(acl);
             }
             catch (SetupFailure) { throw; }
@@ -175,7 +176,7 @@ namespace AegisDesk.PptSetup
         private static DirectorySecurity ReadSecurity(SafeFileHandle handle)
         {
             IntPtr owner, group, dacl, sacl, descriptor;
-            uint code = GetSecurityInfo(handle, 1, 5, out owner, out group, out dacl, out sacl, out descriptor);
+            uint code = GetSecurityInfo(handle, 1, 7, out owner, out group, out dacl, out sacl, out descriptor);
             if (code != 0) throw new Win32Exception((int)code);
             try
             {
@@ -187,10 +188,10 @@ namespace AegisDesk.PptSetup
             finally { LocalFree(descriptor); }
         }
         private static string SecurityKey(DirectorySecurity acl)
-        { return acl.GetSecurityDescriptorSddlForm(AccessControlSections.Owner | AccessControlSections.Access); }
+        { return acl.GetSecurityDescriptorSddlForm(AccessControlSections.Owner | AccessControlSections.Group | AccessControlSections.Access); }
         public void Recheck()
         {
-            if (disposed) throw new SetupFailure("lease_recheck", "policy");
+            if (disposed) throw new SetupFailure("lease_recheck", "policy") { PolicyReason = "namespace_changed" };
             try
             {
                 string parent = Path.GetDirectoryName(ChildPath);
@@ -201,11 +202,11 @@ namespace AegisDesk.PptSetup
                 {
                     FileInfo now = Inspect(entry);
                     if (now.volume != entry.identity.volume || now.indexHigh != entry.identity.indexHigh || now.indexLow != entry.identity.indexLow)
-                        throw new SetupFailure("lease_recheck", "policy");
+                        throw new SetupFailure("lease_recheck", "policy") { PolicyReason = "namespace_changed" };
                     if (entry.policy == null) continue;
                     DirectorySecurity acl = ReadSecurity(entry.handle);
                     if (!(entry.policy == "parent" ? ParentSecurity.Legacy(acl, helperSid) : RequestDirectory.Compatible(acl, false)) || SecurityKey(acl) != entry.security)
-                        throw new SetupFailure("lease_recheck", "policy");
+                        throw new SetupFailure("lease_recheck", "policy") { PolicyReason = "namespace_changed" };
                 }
             }
             catch (Exception error) { throw SetupFailure.From("lease_recheck", error); }

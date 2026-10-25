@@ -61,17 +61,27 @@ namespace AegisDesk.PptSetup
         internal static bool Absent(string id)
         {
             Machine.NoLinks(Root);
-            if (!Directory.Exists(Root)) return !File.Exists(Root);
+            FileAttributes attributes;
+            try { attributes = File.GetAttributes(Root); }
+            catch (FileNotFoundException) { return true; }
+            catch (DirectoryNotFoundException) { return true; }
+            if ((attributes & FileAttributes.Directory) == 0 || (attributes & FileAttributes.ReparsePoint) != 0) return false;
             using (var pin = ParentSecurity.OpenSecurity(Root, false))
             {
                 ParentSecurity.Inspect(pin, Root, true);
                 ValidateDirectory(ParentSecurity.Read(pin));
-                return !File.Exists(PathFor(id)) && !Directory.Exists(PathFor(id)) &&
-                    !HasTemporary(Root, id);
+                string basename = RequestWriter.Basename(id);
+                foreach (string path in Directory.GetFileSystemEntries(Root))
+                {
+                    string name = Path.GetFileName(path);
+                    if (String.Equals(name, basename, StringComparison.OrdinalIgnoreCase) ||
+                        name.StartsWith(basename + ".", StringComparison.OrdinalIgnoreCase)) return false;
+                }
+                return true;
             }
         }
 
-        private static void ValidateDirectory(DirectorySecurity acl)
+        internal static void ValidateDirectory(DirectorySecurity acl)
         {
             var owner = acl.GetOwner(typeof(SecurityIdentifier));
             if (!acl.AreAccessRulesProtected || !acl.AreAccessRulesCanonical ||
@@ -119,7 +129,7 @@ namespace AegisDesk.PptSetup
                     (create ? File.Exists(path) || Directory.Exists(path) : !File.Exists(path)))
                     throw new SetupFailure("parent_repair_backup", "policy");
                 if (!create) ValidateFile(path);
-                Contract.AtomicWrite(path, data, FileAcl());
+                Contract.AtomicWrite(path, data, FileAcl(), backupCommit: true);
                 ValidateFile(path);
             }
         }

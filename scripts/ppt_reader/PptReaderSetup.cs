@@ -2,8 +2,8 @@ using System;
 using System.IO;
 using System.Reflection;
 
-[assembly: AssemblyVersion("1.0.5.11")]
-[assembly: AssemblyFileVersion("1.0.5.11")]
+[assembly: AssemblyVersion("1.0.5.13")]
+[assembly: AssemblyFileVersion("1.0.5.13")]
 
 namespace AegisDesk.PptSetup
 {
@@ -24,7 +24,10 @@ namespace AegisDesk.PptSetup
                 else if (args.Length == 2 && operation == "elevated-repair-parent")
                 { ParentRepair.Elevated(args[1]); return 0; }
                 else if (args.Length == 2 && operation == "recover-parent")
-                { ParentRepair.Recover(args[1]); result = Machine.Check(operation); code = result.machine_safe ? 0 : 13; }
+                { Result recovery; bool retry = ParentRepair.Recover(args[1], out recovery);
+                  result = retry ? recovery : Machine.Check(operation);
+                  if (retry) { result.policy_reason = "reservation_released_retry_required"; result.machine_safe = false; }
+                  code = retry || result.machine_safe ? 0 : 13; }
                 else if (args.Length == 2 && (operation == "elevated-install" || operation == "elevated-remove"))
                 {
                     if (!Machine.Admin || !Contract.PayloadValid()) throw new IOException("payload_invalid");

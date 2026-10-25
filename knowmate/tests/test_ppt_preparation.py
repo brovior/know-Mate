@@ -258,6 +258,41 @@ def test_native_helper_diagnostic_logs_fixed_fields_and_always_rechecks(tmp_path
     gate.shutdown()
 
 
+@pytest.mark.parametrize("policy_reason", ["unknown_write", "reservation_released_retry_required",
+    "confidential-marker", None, []])
+def test_policy_diagnostic_logs_are_bounded_and_never_replace_postcheck(tmp_path, caplog, policy_reason: object) -> None:
+    """Log only fixed policy diagnostics from checks and injected helper results."""
+    class PolicyProcess(Process):
+        def read_result(self) -> SetupResult:
+            """Supply an untrusted diagnostic without granting readiness."""
+            return SetupResult(status="failed", reason="acl_unavailable", policy_reason=policy_reason)
+
+    checks = []
+    results = iter([SetupResult(status="outdated", machine_safe=True, office_bitness=64,
+        auto_install_mode="candidate", policy_reason=policy_reason),
+        SetupResult(status="outdated", machine_safe=False, policy_reason=policy_reason)])
+
+    def check() -> SetupResult:
+        """Return independent initial and post-install safety observations."""
+        checks.append(1)
+        return next(results)
+
+    process = PolicyProcess(exit_code=12)
+    gate, policies, _ = coordinator(tmp_path, checker=check, process_factory=lambda: process)
+    with caplog.at_level("INFO"):
+        gate.begin()
+        wait_until(lambda: process.started == 1)
+        gate._poll_setup()
+        wait_until(lambda: bool(policies))
+    lines = [record.getMessage() for record in caplog.records
+             if record.getMessage().startswith(("PPT 준비 점검:", "PPT 설치 도구 종료:"))]
+    expected = policy_reason if isinstance(policy_reason, str) and policy_reason != "confidential-marker" else None
+    assert len(lines) == 3 and all(f"policy_reason={expected}" in line for line in lines)
+    assert "confidential-marker" not in caplog.text
+    assert len(checks) == 2 and policies == ["ppt_pending"] and process.closed == 1
+    gate.shutdown()
+
+
 def test_decline_is_persisted_for_original_user_version(tmp_path):
     result = SetupResult(status="missing", machine_safe=True, office_bitness=64, auto_install_mode="candidate")
     process = Process(exit_code=11)

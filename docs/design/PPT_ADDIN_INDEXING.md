@@ -501,17 +501,28 @@ HKLM 세 키를 대조한다. 같은 1.0.0.0의 실제 두 설치 이력인 `70f
 않는다. 실제 Reader 설치 루트·버전 폴더·파일은 Admin/System 소유의 보호된 ACL이어야 한다.
 고정 외곽 `ProgramFiles/AegisDesk`만 역사적 생성 방식의 inherited ACL을 허용한다. 소유자는
 여전히 Admin/System이며 canonical/non-null ACL과 비관리자 쓰기 차단을 요구한다. Windows
-TrustedInstaller의 고정 service SID에는 실제 상속형인 현재 폴더 ID+FullControl과 자식용
-CI|IO|ID+GenericAll만 허용한다. CREATOR OWNER도 실제 OI|CI|IO|ID+GenericAll만 외곽에서
-허용하며, 다른 SID의 inherit-only 쓰기·변형 flags는 거절한다. 실제 Reader 루트·파일에는 이
+TrustedInstaller의 고정 service SID에는 현재 폴더(None)와 자식 디렉터리(CI|IO)에서
+FullControl 상한의 부분 권한을 허용한다. Windows가 specific 상속 시 저장하는 CI(non-IO)는
+None+CI|IO의 정확한 합집합이므로 외곽의 고정 TI에 한해 같은 범위로 판정한다. CREATOR OWNER는 OI|CI|IO에서만 같은 상한을
+허용한다. ID 유무·generic/specific·SYNCHRONIZE·split/duplicate 표현 차이는 의미로 판정하되,
+다른 SID의 inherit-only 쓰기·scope 확대는 거절한다. 실제 Reader 루트·파일에는 이
 TrustedInstaller/CREATOR OWNER 예외를 적용하지 않는다. 원래 사용자의 HKCU
 shadow·disabled를 사전 검사하고, 승격 자식은 HKLM·파일을 다시 확인한다.
 
-부모 소유자는 원래 helper의 실제 토큰 SID 또는 Admin/System만 허용한다. 역사적 FullControl·
-CREATOR OWNER·Users RX와 정확한 Users Write(`0x00100116`, CI) 조합만 수리한다. 최초 수동
-복구가 명시화한 같은 권한과 부모에만 추가한 RX|CreateDirectories도 허용한다. deny·낯선 SID·
-callback/object ACE·다른 쓰기 mask/flags는 거절한다. 부모 바로 아래는 기존의 protected
-`PptReaderRequests` 하나만 있어야 하며, 다른 파일·폴더·링크는 보존하고 수리를 거절한다.
+부모 소유자는 원래 helper의 실제 토큰 SID 또는 Admin/System만 허용한다. generic mask는
+unsigned 32bit file mapping(GR=0x120089, GW=0x120116, GX=0x1200a0, GA=0x1f01ff) 후
+역할별 상한으로 비교한다. BA/System ACE가 모두 있어야 하며 실제 handle 열기 권한은 OS가
+검증한다. 소유자·BA·System은 FullControl 부분집합, CO는 OI|CI|IO의 같은 상한만 지원한다.
+Users RX는 None/CI/OI|CI, 역사적 쓰기는 CI에서 RX|0x116 상한이며 쓰기 비트가 최소 하나
+남아 있어야 Repairable이다. Windows가 CI/generic 쓰기를 None/specific + CI|IO/generic으로
+나눠 저장하면 두 역할의 쓰기 기여가 정확히 같은 경우에만 CI의 동등 표현으로 합쳐 분석한다.
+기존 합법적인 None/P의 CreateDirectories 기여는 별도로 보존한다. 쌍이 없는 IO 쓰기는 거절한다. Users 부모 전용 권한은 None에서 RX|CreateDirectories 상한이다.
+추가 SID는 알려진 상속 scope의 읽기/실행 부분집합만 보존한다. deny·callback/object·unknown ACE,
+unknown mask/flags·NP·동등 쌍으로 증명되지 않은 IO 쓰기와
+DELETE/DELETE_CHILD/WRITE_DAC/WRITE_OWNER는 거절한다.
+부모 바로 아래는 기존 protected `PptReaderRequests` 하나뿐이어야 한다. child/request/backup의
+프로그램 생성 exact 정책은 완화하지 않는다. 의미 분석과 별도로 lease의 원시 owner/group/DACL과
+file identity를 재검사하므로 의미가 같은 변경도 작업 중에는 `namespace_changed`로 중단한다.
 
 원래 helper는 mutex 안에서 별도 `RepairPreparationLease`와 기존 strict child/writer를 통해
 schema 1 예약을 **UAC 전에** durable 저장한다. 일반 lease를 완화하거나 새 marker/schema를
@@ -523,9 +534,18 @@ Admin/System만 쓸 수 있는 설치 루트의 `repair-backups/<UUID>.json`에 
 ACL의 Admin/System FullControl·Users Read를 열린 파일 handle에서 정확히 확인한다. SID·SDDL은
 앱 stdout/로그에 출력하지 않는다. machine 차단 근거는 감사 파일이 아니라 기존 미완료 예약이다.
 
+백업 파일 교체에서 Win32 1175(원래 두 이름 보존)만 100ms 뒤 최대 한 번 재시도한다. 최초
+교체 전에 source/target file identity·hash·길이·raw owner/group/DACL과 루트 identity/ACL을
+고정하고, 재시도 직전 모두 동일하며 다른 partial이 없음을 다시 증명한다. strict ACL 검사를
+완화하지 않는다. 다른 오류·변조·두 번째 실패는 추가 교체/자동 삭제 없이 중단한다. 이 처리는
+백업 전용이며 일반 설치 기록·저널·요청 저장 경로에는 적용하지 않는다.
+
 부모만 대상으로 `NtSetSecurityObject(DACL_SECURITY_INFORMATION)`를 두 번 호출한다. 첫 저장은
-상속 권한을 명시화하고 protected로 만든 뒤 재조회하며, 두 번째 저장은 허용표의 Users Write만
-제거하고 부모에만 RX|CreateDirectories를 보장한다. owner/group과 모든 기존 하위 ACL·내용은
+상속 권한을 명시화하고 protected로 만든 뒤 재조회하며, 두 번째 저장은 증명된 Users/CI 또는
+동등 None/CI|IO 쌍의 각 ACE의
+expanded specific mask에서 0x116만 제거한다. 읽기/실행/SYNCHRONIZE 잔여 권한은 보존하고
+부모에만 RX|CreateDirectories를 보장한다. NTFS의 generic 매핑·동일 잔여 중복 제거를 예상값에
+반영하며 실제 readback은 exact 비교한다. owner/group과 모든 기존 하위 ACL·내용은
 보존한다. 하위 전파를 일으키는 SetSecurityInfo/Set-Acl 등으로 대체하거나 재귀 수정하지 않는다.
 예상치 않은 sibling이 발견되면 보존하고 pending으로 중단한다.
 
@@ -536,14 +556,16 @@ ACL의 Admin/System FullControl·Users Read를 열린 파일 handle에서 정확
 
 | 중단 상태 | 관리자 `/recover-parent UUID`의 허용 동작 |
 |---|---|
-| backup·부분 파일 없음, helper/child 종료 입증, unprotected inherited 원본 ACL | 기존 예약만 complete. 부모·설치 파일·등록은 변경하지 않음 |
+| backup·부분 파일 없음, helper/child 종료 입증, 현재 Repairable 및 normal lease 거절, 설치 1.0.0.0 재증명 | ACL·설치·등록 변경 없이 기존 reserved/elevated 예약만 complete. `reservation_released_retry_required`, outdated/unsafe로 반환하고 새 prepare 필요 |
 | 온전한 protected backup과 같은 file identity, 원본/중간/최종 ACL 일치 | 안전한 최종 DACL로만 전진한 뒤 예약 완료. Reader 업데이트는 다음 prepare에서 진행 |
-| backup 없음+protected explicit, backup 손상/temporary, 대상·PID identity 불명, 다른 sibling | 보존하고 pending 유지. 자동 삭제·광범위 권한 복원 없음 |
+| backup 없음+최종 safe ACL, backup 손상/temporary, 다른 버전 예약, 대상·PID identity 불명, 다른 sibling | 보존하고 pending 유지. 자동 삭제·광범위 권한 복원 없음 |
 
-**protected explicit 원본은 첫 저장 후 중간 ACL과 구분할 수 없다.** 따라서 자동 수리 시작은
-지원하지만 backup 생성 전 중단되어 backup이 없는 경우에는 명시 recovery도 완료하지 않는다.
-이는 지원 범위의 보수적 제한이다. 복구된 예약의 늦은 승격 자식은 reserved 상태 검사를 통과할
-수 없어 변경에 진입하지 못한다. 실행 결과와 미검증 범위는 [진단](../DIAGNOSTICS.md#ppt-구버전-부모-폴더-권한-복구-2026-10-25)을 따른다.
+protected 원본과 첫 저장 후 중간 ACL을 구분하거나 복구 완료로 간주하지 않는다. 둘 다 현재
+Repairable이면 관리자 명시 회수는 예약만 해제하고, 다음 prepare가 새 UUID·백업부터 재시작한다.
+이 분기의 identity/원시 ACL 불변 보장 구간은 새 recovery lease 취득부터 complete 저장까지다.
+과거 helper 시작 당시 같은 객체였다고 주장하지 않는다. ready는 반환하지 않으며, 늦은 자식은
+complete 상태 검사에서 거절된다. 복구는 같은 버전/payload에만 허용하고 구버전 미완료 증거는
+자동 삭제하지 않는다. 실행 결과와 미검증 범위는 [진단](../DIAGNOSTICS.md#ppt-acl-표현-호환-2026-10-25)을 따른다.
 
 ## 9. 개발 설계 검증 상태
 
@@ -621,7 +643,7 @@ poison 이후에는 Count·Quit을 포함한 새 RPC를 요청하지 않는다.
 QThread의 MTA에서만 사용하며 UI·타이머·OS 종료 helper로 넘기지 않는다. 동기 RPC가 멈췄다고
 타임아웃만으로 취소됐다고 간주하지 않는다. 앱의 제한된 종료는 PowerPoint 강제종료를 허용하지 않는다.
 
-Reader 1.0.5.11 후보는 호스트 STA에서 빈 컬렉션 확인과 `CommandBars.ExecuteMso("FileExit")`를
+Reader 1.0.5.13 후보는 호스트 STA에서 빈 컬렉션 확인과 `CommandBars.ExecuteMso("FileExit")`를
 연속 실행한다. 확인 후 외부 클라이언트에 Quit을 맡기던 경로는 사용하지 않는다.
 이전 실험 메서드 `TryQuitIfIdleWithCaller`·`ConfirmCallerQuit`은 `not_supported`로 차단한다.
 문서 열림·새 문서·창 활성화를 관측하면 해당 종료 시도의 포기를 유지하며, 실제 종료 명령 전에
@@ -639,7 +661,7 @@ Python은 같은 수집 QThread에서 한 번만 요청하고, 짧은 상태 조
 강제종료와 새 패키지 의존성은 추가하지 않는다. 사용자 문서 보호·일반 배포 승인은 실제 검증 대상이다.
 
 기존 dual 인터페이스는 유지하고 새 기본 인터페이스로 lifecycle을 노출한다. 요구 버전은
-reader/Events/setup 모두 1.0.5.11, protocol 3이며 추출 JSON schema 1·청크·인덱스 형식은 바꾸지 않는다.
+reader/Events/setup 모두 1.0.5.13, protocol 3이며 추출 JSON schema 1·청크·인덱스 형식은 바꾸지 않는다.
 사전 검증과 사용자 문서 보호 시험은 [운영 검증 절차](../guides/PPT_READER.md#powerpoint-자동종료-후보-검증)를 따른다.
 
 

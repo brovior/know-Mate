@@ -9,7 +9,8 @@ from pathlib import Path
 import pytest
 
 
-def test_native_parent_only_security_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("architecture", ["x86", "x64"])
+def test_native_parent_only_security_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, architecture: str) -> None:
     """네이티브 두 단계 저장이 기존 하위 항목을 보존하는지 확인한다."""
     compiler = Path(os.environ.get("WINDIR", "")) / "Microsoft.NET/Framework/v4.0.30319/csc.exe"
     if os.name != "nt" or not compiler.is_file():
@@ -20,7 +21,7 @@ def test_native_parent_only_security_gate(tmp_path: Path, monkeypatch: pytest.Mo
                       'public const string AutoInstallMode = "candidate"; } }', encoding="utf-8")
     source = root / "scripts/ppt_reader"
     executable = tmp_path / "ParentNativeHarness.exe"
-    command = [str(compiler), "/nologo", "/main:ParentNativeHarness", f"/out:{executable}",
+    command = [str(compiler), "/nologo", f"/platform:{architecture}", "/main:ParentNativeHarness", f"/out:{executable}",
                "/reference:System.Core.dll", "/reference:System.Security.dll", "/reference:System.Web.Extensions.dll",
                str(source / "PptReaderSetup.cs"), *(str(path) for path in sorted(source.glob("PptSetup*.cs"))),
                str(root / "knowmate/tests/ppt_parent_native_harness.cs"), str(policy)]
@@ -72,7 +73,7 @@ def test_historical_checker_blocks_existing_schema_reservation(tmp_path: Path, s
     requests = tmp_path / "requests"
     requests.mkdir()
     request_id = "33e979c6-c5c4-40af-845a-64c80517d1ae"
-    value = dict(schema=1, request_id=request_id, required_version="1.0.5.11", helper_sid="S-1-5-21-1-2-3-1001",
+    value = dict(schema=1, request_id=request_id, required_version="1.0.5.13", helper_sid="S-1-5-21-1-2-3-1001",
                  helper_pid=123, helper_creation_ticks="638901000000000000", child_pid=456 if state == "elevated" else None,
                  child_creation_ticks="638901000000000001" if state == "elevated" else None, state=state)
     (requests / f"{request_id}.json").write_text(json.dumps(value), encoding="utf-8")
@@ -92,3 +93,22 @@ def test_lifecycle_fixture_binding_compiles_without_changing_repair_core(tmp_pat
     provenance = json.loads((executable.parent / "provenance.json").read_text(encoding="utf-8"))
     core = provenance["sources"]["PptSetupParentRepair.cs"]
     assert core["original_sha256"] == core["bound_sha256"]
+
+
+def test_actual_main_nonadmin_error_json_is_accepted_by_python(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """실제 Main의 초기 예외가 null 결과로 크래시하지 않고 제한 JSON을 반환한다."""
+    compiler = Path(os.environ.get("WINDIR", "")) / "Microsoft.NET/Framework64/v4.0.30319/csc.exe"
+    if os.name != "nt" or not compiler.is_file():
+        pytest.skip("Windows .NET Framework compiler 필요")
+    from knowmate.tests.ppt_parent_lifecycle_build import build_fixture
+    from knowmate.secure import ppt_installation
+
+    executable = build_fixture(tmp_path / "endpoint", nonadmin_endpoint=True)
+    result = subprocess.run([str(executable), "/recover-parent", "invalid"], capture_output=True, timeout=20, check=False)
+    monkeypatch.setattr(ppt_installation, "auto_install_mode", lambda: "candidate")
+    parsed = ppt_installation.parse_setup_result(result.stdout.decode("utf-8"), result.returncode, "recover-parent")
+    assert result.returncode == 12
+    assert parsed.status == "failed" and parsed.reason == "acl_unavailable"
+    assert parsed.stage == "parent_repair_recover" and parsed.error_type == "policy"
+    assert not parsed.machine_safe
+    assert not (executable.parent / "native").exists()

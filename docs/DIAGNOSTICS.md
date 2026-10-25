@@ -1051,6 +1051,67 @@ OS·HTTP 연결 제한과 종료 유예로 기다리며, 워커가 끝내 복귀
 PID·생성 identity로 검증된 소유 프로세스만 정리하고 PowerPoint Quit·강제 종료 금지를
 유지한다. 하드 종료 경로의 무조건 종료를 유지하며 그 경로에 블로킹 정리를 추가하지 않는다.
 
+## PPT ACL 표현 호환 (2026-10-25)
+
+후속 경고 정리: 아래 최초 전체 회귀의 경고 128개는 LanceDB `table_names()` 폐기 예정 API
+경고 124회와 PPT native 시험의 한글 컴파일 출력 UTF-8 해독 예외 4회다. 메일·검색·시험의 목록
+조회는 `list_tables().tables`로 교체했고, 현재 고정 버전의 로컬 DB에서 14개 테이블 이름을
+모두 조회하며 기존 메일 데이터를 유지하는 회귀를 추가했다. 컴파일러 `/utf8output`과 Python의
+명시적 UTF-8 수집으로 한글 진단을 보존한다. 경고 무시 설정이나 의존성 변경은 없다.
+후속 전체 `pytest knowmate/tests -v -W error`는 **2,257 PASS·6 SKIP·74 subtests PASS**,
+경고 보고 없음, exit0, 1366.64초다. 관련 34개도 `-W error`에서 통과했다. 근거는
+`.aegisdesk_build/warning-cleanup/full-pytest.log`와 `report.json`이다. 이 후속 소스의 앱 EXE
+재빌드·실제 Office/사내 검증은 실행하지 않았으며, 아래 최초 후보 패키지의 소스 지문과 구분한다.
+
+1.0.5.13 후보는 부모 ACL을 exact mask 대신 역할별 unsigned generic mapping·권한 상한으로
+분석한다. Users/CI 쓰기 0x116/0x100116·generic·부분/분리 권한을 지원하고 잔여 읽기·실행·sync를
+보존한다. 외곽 ProgramFiles/AegisDesk의 TI/CO만 같은 의미의 허용 scope/권한을 수용한다.
+strict child/request/backup과 일반 parent 정책은 유지한다. 원시 ACL/identity 재검사와 exact native
+readback을 완화하지 않는다. 상세 정책은 [설계 §8-7](design/PPT_ADDIN_INDEXING.md#8-7-구버전-부모-폴더-권한-복구-후보)을 따른다.
+
+백업 없는 명시 회수는 현재 Repairable/normal 거절/legacy 1.0.0.0/프로세스 종료를 같은 mutex에서
+검증하고 예약 state만 complete로 바꾼다. protected 원본과 중간 상태를 구분하지 않으며 현재
+recovery lease부터 완료까지 원시 ACL·identity를 보존한다. 결과는 outdated/unsafe 및
+`reservation_released_retry_required`이고, 새 prepare에서 새 UUID·정식 백업으로 재시도한다.
+
+Windows가 generic 상속 쓰기를 현재 객체/디렉터리 후손의 두 ACE로 나누는 실제 저장 표현은
+정확한 쓰기 기여 쌍만 허용한다. 외곽 TI의 CI(non-IO)도 None+CI|IO와 현재/후손 coverage가
+동일한 표현으로만 허용한다(`ac92fcb1` 격리 실측). OI·NP·다른 SID/불일치 쓰기는 거절한다.
+
+새 matrix에서 기존 managed File.Replace의 1175를 반복 관측했다. 실패 순간 source/target의
+DELETE/WRITE/WRITE_DAC 실제 open은 성공했고 exact backup ACL·원래 두 이름과 hash가 보존됐다.
+지속 권한 부족이나 특정 외부 locker가 원인이라고 확정하지 않는다. 백업 전용 저장은 1175에만
+ID/hash/raw 보안/루트/다른 partial을 재검사한 뒤 최대 한 번(100ms) 재시도하도록 제한했다.
+일반 메타데이터 저장이나 다른 HRESULT에는 적용하지 않는다.
+
+초기 standalone AtomicProbe는 같은 FileSecurity 객체를 재사용해 두 번째 temp ACL의 변경 표시가
+소모된 시험 준비 오류가 있었다. 해당 128쌍의 AdminOnly/동일 ACL 결과는 증거에서 제외한다.
+최종 fixture는 파일마다 새 ACL을 적용하고 실제 readback과 strict ACL을 첫 시도 전에 검사한다.
+입력 상속 설정의 재상속 원복·AI controlbit 정규화·Access-only 쓰기 문제도 준비 오류로 구분했다.
+
+확정한 .13 회귀는 다음과 같다. 아래 .11 수치를 새 후보의 검증으로 사용하지 않는다.
+
+- 관련 pytest **8 PASS**, 40.09초. native x86/x64 각각 직접 CI 입력 32변형·실제 kernel generic 쌍 6변형의 두 native 저장, 최종 모든 Users 후손 W=0/현재 P상한, scope별 읽기/실행/sync 잔여·하위 ACL/내용 보존을 확인했다. unknown/불일치 쌍·scope·위험 권한 거절과 실제 OS 접근 거부도 구분했다.
+- 격리 lifecycle **133사례 PASS**: 실제 저장 입력/상속을 재조회한 부모6×보호2×분리2×외곽4=96 인계, 백업 commit fault12, raw/group 경합2, 실제 Main 오류6, backup 없는 ACL 무변경 회수·새 UUID 재시도3, 기존14회귀. helper의 논리 승격/liveness와 HKCU 격리 등록·Office closed/64는 모형 경계다. 합성 legacy DLL의 native 파일/해시/등록 증명·backup·namespace lease·native DACL·예약 writer·핵심 Run/Elevated/Recover는 실행했다.
+- fault gate는 매 파일의 실제 strict ACL을 먼저 검증하고 clean/permanent1175는 정확히 2attempt, 다른 HRESULT·file/root identity/hash/ACL/group·partial 변조는 첫 시도 후 거절했다. 무주입 core의 첫 Replace207회 중 실제1175가2번 발생해 각1회 엄격 재검사 후 완료했다.
+- 실제 Main의 retry JSON3개와 실패 JSON6개를 Python parser의 candidate 정책에 연결해 검사했다. encoded 역사 URL은 일반 checker에서 repairable일 수 있으므로, 예약-only 결과는 같은 mutex에서 전용 legacy 증명으로 관측한 outdated/unsafe snapshot이다. 일반 checker 정책은 바꾸지 않았다.
+- 실제 ordinary helper35312→같은 계정 UAC admin child33036에서 private parent의 0x116 실제 입력, native2저장, child exit0와 정상 lease→예약 완료를 확인했다. 전체 제품 설치·다른 관리자·lifecycle의 모든 다중 프로세스 경합을 통과한 것으로 해석하지 않는다.
+
+최종 lifecycle 증거는 `.aegisdesk_build/plp/b4cfbf41`, 실제 UAC는
+`.aegisdesk_build/pu13/case-0533613b4a434a2fb2746daf1d83c18b`다. 각 증거의 C#20개 원본 hash를
+현재 소스와 대조했고 mismatch0, lifecycle ParentRepair 핵심은 byte 동일이다. helper 종료를
+확인한 뒤 실행한14개 `.plp` GUID의 HKCU 시험 키만 정리했고 운영 레지스트리는 변경하지 않았다.
+결과 요약은 `.aegisdesk_build/ppt-acl-portability`에 보존했다. 첫 UAC fixture의 audit 변경 표시·
+경로/ACL 준비 실패는 제품 성공/실패 수치와 분리했다.
+
+필수 `.venv/Scripts/python.exe -X utf8 -m pytest knowmate/tests -v`는 **2,256 PASS·6 SKIP·74 subtests PASS**,
+exit0, 1025.57초(17:05)다. 경고128개에는 기존 capture-buffer native 시험4개의 subprocess UTF-8
+컴파일 출력 해독 경고가 포함되며 새 ACL 복구 시험에서는 발생하지 않았다. 로그는
+`.aegisdesk_build/ppt-acl-portability/full-pytest.log`, 종료코드는 `full-pytest-exit.txt`에 보존했다.
+candidate payload 빌드·검증 결과는 `.aegisdesk_build/ppt-acl-portability/payload-build-*`의 별도
+기록을 따른다. 전체 EXE 빌드·실제 Reader 설치/Office·사내/도메인·다른 관리자 검증은 미완료다.
+실제 ProgramData/HKLM/Office 설치는 변경하지 않았다.
+
 ## PPT 구버전 부모 폴더 권한 복구 (2026-10-25)
 
 1.0.0.0 설치가 남긴 ProgramData 부모의 상속 Users Write 때문에 `acl_unavailable /
