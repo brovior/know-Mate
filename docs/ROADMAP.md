@@ -63,7 +63,8 @@ Phase 1~4 완료(RAG 지식검색), 5a 완료(Knox `.mysingle` + 표준 `.eml` �
 
 | 항목 | 상태·다음 행동 | 시작 조건 |
 |---|---|---|
-| PPT 구버전 부모 ACL 복구 | 1.0.0.0 설치·정확한 legacy ACL만 부모 DACL 복구하는 1.0.5.11 후보. native 비전파·특수 예약·실제 동일 계정 UAC와 격리 lifecycle 14사례 통과. 전체 회귀 2,216 PASS·6 SKIP·74 subtests PASS | [권한 복구 진단](DIAGNOSTICS.md#ppt-구버전-부모-폴더-권한-복구-2026-10-25)의 새 payload 검증 및 실제 구버전 업데이트·다른 관리자·PPT 종료/문서 보호 승인. 기존 설치 유지 |
+| PPT ACL 표현 호환 | 역할별 상한·generic/sync/subset·외곽 TI/CO 호환 및 백업 없는 예약-only 회수의 1.0.5.13 후보 구현. 관련8 PASS·격리133사례·실제 동일 계정 UAC 통과, 전체2,256 PASS·6 SKIP·74 subtests PASS | [호환 진단](DIAGNOSTICS.md#ppt-acl-표현-호환-2026-10-25)의 별도 candidate payload 기록 확인, 실제 사내 업데이트·다른 관리자·Office 승인. 기존 설치 유지 |
+| PPT 구버전 부모 ACL 복구(이전 후보) | 1.0.0.0 설치·정확한 legacy ACL만 부모 DACL 복구한 이전 1.0.5.11 검증. native 비전파·특수 예약·실제 동일 계정 UAC와 격리 lifecycle 14사례 통과. 전체 회귀 2,216 PASS·6 SKIP·74 subtests PASS | [권한 복구 진단](DIAGNOSTICS.md#ppt-구버전-부모-폴더-권한-복구-2026-10-25)의 새 payload 검증 및 실제 구버전 업데이트·다른 관리자·PPT 종료/문서 보호 승인. 기존 설치 유지 |
 | COM poison 복구 뒤 점유 오판·오류 혼합 | 2초 캐시 epoch·정확한 앱 증명·최초/닫기 오류 분리 및 fake 회귀 구현 | [진단 §COM poison](DIAGNOSTICS.md#com-poison-복구-일관성-2026-10-15)의 실제 Windows·Office·DRM 검증 대기 |
 | 메모리 진단 부하 분리 | Windows 소스 OFF/basic 각 3회에서 경과시간 증가 5% 이내·각 24사이클 및 취소/재시작 확인. detailed 약 30배 부하 재현 | [진단 §1](DIAGNOSTICS.md#windows-소스-비교-2026-10-24)의 frozen EXE 30분 이상·전체 앱 종료·사내 시험 대기. 기본 OFF, 크래시 해결은 미확정 |
 | 대량 메일 완료 후 메모리 잔류 | 합성 mysingle 2,000건·10,000청크에서 유휴 Private Bytes 1,092→515MiB, 저장 결과 확인. 전체 2,182 PASS·1 FAIL·6 skip; 실패한 시간 민감 정리 모듈은 별도 22 PASS | [잔류 진단](DIAGNOSTICS.md#대량-메일-완료-뒤-메모리-잔류-2026-10-24)의 사내 원본·frozen·장시간·직렬 성능 검증 |

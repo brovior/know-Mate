@@ -10,7 +10,7 @@ namespace AegisDesk.PptSetup
     {
         internal readonly string Stage, ErrorType;
         internal readonly int? WinError;
-        internal string NativeStage, NtStatus, IoStatus;
+        internal string NativeStage, NtStatus, IoStatus, PolicyReason;
         internal SetupFailure(string stage, string type, int? winerror = null) : base("acl_unavailable")
         { Stage = stage; ErrorType = type; WinError = winerror; }
         internal static SetupFailure From(string stage, Exception error)
@@ -36,6 +36,6 @@ namespace AegisDesk.PptSetup
         }
         internal void Apply(Result result)
         { result.stage = Stage; result.error_type = ErrorType; result.winerror = WinError;
-          result.native_stage = NativeStage; result.ntstatus = NtStatus; result.io_status = IoStatus; }
+          result.native_stage = NativeStage; result.ntstatus = NtStatus; result.io_status = IoStatus; result.policy_reason = PolicyReason; }
     }
 }

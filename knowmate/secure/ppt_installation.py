@@ -33,6 +33,9 @@ _DIAGNOSTIC_STAGES = frozenset({"anchor_open", "parent_open", "parent_policy", "
 _DIAGNOSTIC_ERRORS = frozenset({"policy", "Win32Exception", "UnauthorizedAccessException",
     "IOException", "SecurityException", "InvalidOperationException", "ArgumentException", "NotSupportedException", "Exception"})
 _NATIVE_STAGES = frozenset({"commit_return", "commit_verify", "commit_close"})
+_POLICY_REASONS = frozenset({"unknown_write", "unsupported_ace", "unsupported_scope",
+    "unsupported_mask", "unsafe_owner", "missing_trusted_principal", "required_access_missing",
+    "namespace_changed", "reservation_released_retry_required"})
 _MAX_SETUP_OUTPUT = 16384
 
 
@@ -53,6 +56,12 @@ class SetupResult:
     native_stage: str | None = None
     ntstatus: str | None = None
     io_status: str | None = None
+    policy_reason: str | None = None
+
+    @property
+    def policy_diagnostic(self) -> str | None:
+        """Expose only fixed policy reasons, including for injected observations."""
+        return self.policy_reason if isinstance(self.policy_reason, str) and self.policy_reason in _POLICY_REASONS else None
 
     @property
     def native_diagnostic(self) -> tuple[str | None, str | None, str | None]:
@@ -112,8 +121,12 @@ def parse_setup_result(stdout: str, exit_code: int, operation: str = "check") ->
                    "auto_install_validated", "auto_install_mode"}
         diagnostic = {"stage", "error_type", "winerror"}
         native = {"native_stage", "ntstatus", "io_status"}
-        if not isinstance(value, dict) or set(value) not in (allowed, allowed | diagnostic, allowed | diagnostic | native):
+        if not isinstance(value, dict) or set(value) - {"policy_reason"} not in (
+                allowed, allowed | diagnostic, allowed | diagnostic | native):
             raise ValueError("setup_fields")
+        policy_reason = value.get("policy_reason")
+        if policy_reason is not None and (not isinstance(policy_reason, str) or policy_reason not in _POLICY_REASONS):
+            raise ValueError("setup_policy_reason")
         if diagnostic <= value.keys():
             if value["stage"] not in _DIAGNOSTIC_STAGES or value["error_type"] not in _DIAGNOSTIC_ERRORS:
                 raise ValueError("setup_diagnostic")
@@ -155,7 +168,8 @@ def parse_setup_result(stdout: str, exit_code: int, operation: str = "check") ->
         return SetupResult(value["status"], value["reason"], installed, bitness,
                            value["machine_safe"], value["auto_install_validated"], value["auto_install_mode"],
                            value.get("stage"), value.get("error_type"), value.get("winerror"),
-                           value.get("native_stage"), value.get("ntstatus"), value.get("io_status"))
+                           value.get("native_stage"), value.get("ntstatus"), value.get("io_status"),
+                           policy_reason)
     except (ValueError, TypeError, KeyError, UnicodeError):
         return SetupResult(reason="diagnostic_unavailable")
 

@@ -2,8 +2,8 @@ using System;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using AegisDesk.PptReader;
-[assembly: AssemblyVersion("1.0.5.11")]
-[assembly: AssemblyFileVersion("1.0.5.11")]
+[assembly: AssemblyVersion("1.0.5.13")]
+[assembly: AssemblyFileVersion("1.0.5.13")]
 [assembly: ComVisible(false)]
 namespace AegisDesk.PptEvents
 {

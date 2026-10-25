@@ -43,12 +43,9 @@ namespace AegisDesk.PptSetup
 
         internal static void ValidateBackupFreeOrigin(DirectorySecurity before, string sid)
         {
-            if (before.AreAccessRulesProtected || !ParentSecurity.Legacy(before, sid))
-                throw new SetupFailure("parent_repair_recover", "policy");
-            var raw = new RawSecurityDescriptor(before.GetSecurityDescriptorBinaryForm(), 0);
-            bool inherited = false;
-            foreach (GenericAce ace in raw.DiscretionaryAcl) inherited |= (ace.AceFlags & AceFlags.Inherited) != 0;
-            if (!inherited) throw new SetupFailure("parent_repair_recover", "policy");
+            ParentSecurity.RequireRepairable(before, sid, "parent_repair_recover");
+            if (RequestDirectory.Compatible(before, true))
+                throw new SetupFailure("parent_repair_recover", "policy") { PolicyReason = "required_access_missing" };
         }
 
         internal static int Run(ref Result result, out RequestDirectoryLease normal, out Reservation installation)
@@ -153,8 +150,12 @@ namespace AegisDesk.PptSetup
             }
         }
 
-        internal static void Recover(string id)
+        internal static bool Recover(string id)
+        { Result ignored; return Recover(id, out ignored); }
+
+        internal static bool Recover(string id, out Result outcome)
         {
+            outcome = null;
             Enabled();
             if (!Machine.Admin || !Machine.OfficeClosed()) throw new SetupFailure("parent_repair_recover", "policy");
             using (var gate = new MachineLock())
@@ -176,15 +177,38 @@ namespace AegisDesk.PptSetup
                     {
                         if (RepairBackup.Absent(id))
                         {
+                            if (request.state != "reserved" && request.state != "elevated") throw new SetupFailure("parent_repair_recover", "policy");
                             var special = lease as RepairPreparationLease;
                             if (special == null) throw new SetupFailure("parent_repair_recover", "policy");
                             using (var parent = ParentSecurity.OpenSecurity(special.ParentPath, false))
                             {
                                 var before = ParentSecurity.Read(parent);
-                                // protected 원본은 중간 저장과 구별할 수 없어 backup 없이 완료하지 않는다.
                                 ValidateBackupFreeOrigin(before, request.helper_sid);
+                                if (ParentSecurity.Inspect(parent, special.ParentPath, true) != special.ParentIdentity)
+                                    throw new SetupFailure("parent_repair_recover", "policy") { PolicyReason = "namespace_changed" };
+                                special.Recheck(); ValidateRequests(special, id);
+                                Reservation latest = Reservation.Load(id, special);
+                                if (latest.state != request.state || latest.helper_sid != request.helper_sid || latest.helper_pid != request.helper_pid ||
+                                    latest.helper_creation_ticks != request.helper_creation_ticks || latest.required_version != request.required_version ||
+                                    latest.child_pid != request.child_pid ||
+                                    latest.child_creation_ticks != request.child_creation_ticks ||
+                                    !Reservation.ProcessGone(latest.helper_pid, latest.helper_creation_ticks) ||
+                                    (latest.child_pid != null && !Reservation.ProcessGone(latest.child_pid.Value, latest.child_creation_ticks)) ||
+                                    !RepairBackup.Absent(id)) throw new SetupFailure("parent_repair_recover", "policy");
+                                special.Recheck();
+                                if (ParentSecurity.Inspect(parent, special.ParentPath, true) != special.ParentIdentity ||
+                                    ParentSecurity.Key(ParentSecurity.Read(parent)) != ParentSecurity.Key(before))
+                                    throw new SetupFailure("parent_repair_recover", "policy") { PolicyReason = "namespace_changed" };
+                                special.Recheck();
+                                if (ParentSecurity.Key(ParentSecurity.Read(parent)) != ParentSecurity.Key(before))
+                                    throw new SetupFailure("parent_repair_recover", "policy") { PolicyReason = "namespace_changed" };
+                                latest.state = "complete"; latest.Save();
+                                // 같은 mutex의 정확한 legacy 증명을 반환해 종료 뒤 ready 경합을 피한다.
+                                outcome = new Result("recover-parent") { status = "outdated", reason = "version_old", installed_version = "1.0.0.0",
+                                    office_bitness = legacy.Bitness, machine_safe = false, policy_reason = "reservation_released_retry_required" };
+                                return true;
                             }
-                            request.state = "complete"; request.Save(); return;
+
                         }
                         var backup = RepairBackup.Read(request);
                         string parentPath = Path.GetDirectoryName(lease.ChildPath);
@@ -209,6 +233,7 @@ namespace AegisDesk.PptSetup
                                 if (!Machine.OfficeClosed()) throw new SetupFailure("parent_repair_recover", "policy");
                                 backup["stage"] = "child_verified"; RepairBackup.Save(backup);
                                 Reservation.Load(id, normal).Recover();
+                                return false;
                             }
                         }
                     }

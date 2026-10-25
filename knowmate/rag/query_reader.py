@@ -43,7 +43,7 @@ class QueryReader:
             raise QueryIndexUnavailable("index_missing")
         try:
             self._db = lancedb.connect(str(db_path))
-            names = set(self._db.table_names())
+            names = set(self._db.list_tables().tables)
             for name in ("chunks", "emails"):
                 if name not in names:
                     continue

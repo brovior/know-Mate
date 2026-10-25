@@ -32,7 +32,7 @@ def _body(source: str, signature: str, replacement: str) -> str:
     return source[:start] + "{ " + replacement + " }" + source[end:]
 
 
-def build_fixture(output: Path) -> Path:
+def build_fixture(output: Path, *, nonadmin_endpoint: bool = False) -> Path:
     """실제 시스템을 대상으로 실행할 수 없는 고정 경로 시험 산출물을 만든다."""
     if output.exists():
         raise ValueError("fixture_output_must_be_new")
@@ -45,7 +45,7 @@ def build_fixture(output: Path) -> Path:
         "known folder paths -> compile-time fixture root", "HKLM/HKCU -> HKCU isolated fixture subkeys",
         "Machine.Admin logical transition on actual elevated fixture token", "Office presence/bitness -> closed/64",
         "RunRepair -> same-process logical elevated child", "ProcessGone -> controlled logical completion",
-        "backup/write fault hooks -> deterministic interruption",
+        "backup/write fault hooks -> deterministic interruption", "managed metadata commit failure -> fixture-only handle/ACL diagnostics",
     ]}
     for path in [root / "scripts/ppt_reader/PptReaderSetup.cs", *sorted((root / "scripts/ppt_reader").glob("PptSetup*.cs"))]:
         source = path.read_bytes().decode("utf-8")
@@ -69,6 +69,8 @@ def build_fixture(output: Path) -> Path:
             source = source.replace(boundary, 'RepairLifecycleFixture.Data')
         if path.name == "PptSetupState.cs":
             source = _once(source, '@"Global\\AegisDesk.PptReader.Machine.v1"', f'@"Local\\AegisDesk.PptReader.RepairFixture.{fixture_id}"')
+            source = _once(source, 'catch (Exception error) { if (request) throw SetupFailure.From("request_commit", error); throw; }',
+                           'catch (Exception error) { if (!request) RepairLifecycleFixture.AtomicFailure(path, temp, error); if (request) throw SetupFailure.From("request_commit", error); throw; }')
         if path.name == "PptSetupReservation.cs":
             source = _body(source, 'public static bool ProcessGone(int pid, string ticks)', 'return RepairLifecycleFixture.ProcessGone(pid, ticks);')
             source = _once(source, 'return RunOperation("/elevated-repair-parent ", request);', 'return RepairLifecycleFixture.Elevate(request);')
@@ -101,24 +103,30 @@ def build_fixture(output: Path) -> Path:
         if compiled.returncode:
             (output / "compile-error.txt").write_bytes(compiled.stdout + compiled.stderr)
             raise ValueError("fixture_compile_failed")
-    for version, directory in [("1.0.5.11", output), ("1.0.0.0", output / "legacy")]:
+    for version, directory in [("1.0.5.13", output), ("1.0.0.0", output / "legacy")]:
         directory.mkdir(exist_ok=True)
         payload_source = directory / "Payload.cs"
         payload_source.write_text(f'using System.Reflection; [assembly: AssemblyVersion("{version}")] internal class FixturePayload {{ }}', encoding="utf-8")
-        names = ["AegisDesk.PptReader.dll", "AegisDesk.PptReader.Events.dll"] if version == "1.0.5.11" else ["AegisDesk.PptReader.dll"]
+        names = ["AegisDesk.PptReader.dll", "AegisDesk.PptReader.Events.dll"] if version == "1.0.5.13" else ["AegisDesk.PptReader.dll"]
         for name in names:
             compile_sources(["/target:library", f"/out:{directory / name}", str(payload_source)])
     executable = output / "PptReaderSetup.exe"
-    compile_sources(["/main:RepairLifecycleFixture", f"/out:{executable}", "/reference:System.Core.dll",
+    if nonadmin_endpoint:
+        endpoint = output / "MainEndpoint.cs"
+        endpoint.write_text('internal static class MainErrorFixture { public static int Main(string[] args) { '
+                            'return AegisDesk.PptSetup.Program.Main(args); } }', encoding="utf-8")
+        source_paths.append(endpoint)
+    entrypoint = "MainErrorFixture" if nonadmin_endpoint else "RepairLifecycleFixture"
+    compile_sources([f"/main:{entrypoint}", f"/out:{executable}", "/reference:System.Core.dll",
                      "/reference:System.Security.dll", "/reference:System.Web.Extensions.dll", *(str(path) for path in source_paths),
                      str(paths), str(root / "knowmate/tests/ppt_parent_native_harness.cs"),
                      str(root / "knowmate/tests/ppt_parent_lifecycle_harness.cs")])
     names = ("AegisDesk.PptReader.dll", "AegisDesk.PptReader.Events.dll", "PptReaderSetup.exe")
-    manifest = dict(schema=1, reader_version="1.0.5.11", protocol=3, payload_schema=2,
+    manifest = dict(schema=1, reader_version="1.0.5.13", protocol=3, payload_schema=2,
                     prog_id="AegisDesk.PptReader", reader_class="AegisDesk.PptReader.Connect",
                     reader_clsid="287A80D2-804A-46D3-A0E9-CA31C6FC3D09", reader_iid="9A20F4A6-6364-4BA7-930B-3E8857BEAF60",
                     auto_install_mode="candidate", auto_install_enabled=True, auto_install_validated=False, auto_shutdown_enabled=True,
-                    assembly_versions={name: "1.0.5.11" for name in names},
+                    assembly_versions={name: "1.0.5.13" for name in names},
                     files={name: hashlib.sha256((output / name).read_bytes()).hexdigest() for name in names})
     (output / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     (output / "provenance.json").write_text(json.dumps(provenance, indent=2), encoding="utf-8")

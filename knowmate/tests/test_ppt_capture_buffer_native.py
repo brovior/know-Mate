@@ -22,11 +22,11 @@ def test_real_mapping_publish_loss_and_lazy_binding(tmp_path: Path, architecture
         pytest.skip(".NET compiler unavailable: native gate remains UNEXECUTED")
     executable = tmp_path / ("capture_" + architecture + ".exe")
     sources = [ROOT / "scripts/ppt_reader/PptCaptureBuffer.cs", ROOT / "scripts/ppt_reader/PptExternalTrace.cs", ROOT / "knowmate/tests/ppt_capture_buffer_harness.cs"]
-    result = subprocess.run([str(compiler), "/nologo", "/unsafe", "/target:exe", "/platform:" + architecture,
+    result = subprocess.run([str(compiler), "/nologo", "/utf8output", "/unsafe", "/target:exe", "/platform:" + architecture,
         "/define:AEGIS_PPT_EXTERNAL_DIAGNOSTIC;AEGIS_PPT_CAPTURE_DIAGNOSTIC", "/out:" + str(executable),
-        *map(str, sources)], capture_output=True, text=True, timeout=30)
+        *map(str, sources)], capture_output=True, text=True, encoding="utf-8", timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
-    result = subprocess.run([str(executable), mode], capture_output=True, text=True, timeout=10)
+    result = subprocess.run([str(executable), mode], capture_output=True, text=True, encoding="utf-8", timeout=10)
     assert result.returncode == 0, result.stdout + result.stderr
     assert json.loads(result.stdout.strip()) == {"result": "PASS", "office_started": False}
 
@@ -39,10 +39,10 @@ def test_cancel_argument_telemetry_preserves_actual_callback_values(tmp_path: Pa
     if not compiler.is_file():
         pytest.skip(".NET compiler unavailable: event regression remains UNEXECUTED")
     executable = tmp_path / "capture_events.exe"
-    result = subprocess.run([str(compiler), "/nologo", "/target:exe", "/platform:" + architecture,
+    result = subprocess.run([str(compiler), "/nologo", "/utf8output", "/target:exe", "/platform:" + architecture,
         "/out:" + str(executable), str(ROOT / "scripts/ppt_events/PptEventSink.cs"),
-        str(ROOT / "knowmate/tests/ppt_capture_event_harness.cs")], capture_output=True, text=True, timeout=30)
+        str(ROOT / "knowmate/tests/ppt_capture_event_harness.cs")], capture_output=True, text=True, encoding="utf-8", timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
-    result = subprocess.run([str(executable)], capture_output=True, text=True, timeout=10)
+    result = subprocess.run([str(executable)], capture_output=True, text=True, encoding="utf-8", timeout=10)
     assert result.returncode == 0, result.stdout + result.stderr
     assert json.loads(result.stdout.strip()) == {"result": "PASS", "office_started": False}

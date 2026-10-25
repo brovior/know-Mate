@@ -18,7 +18,7 @@ from knowmate.secure import ppt_installation as installation
 
 def result_json(**changes):
     value = dict(schema=1, operation="check", status="ready", reason="registration_ok",
-                 required_version="1.0.5.11", installed_version="1.0.5.11", office_bitness=64,
+                 required_version="1.0.5.13", installed_version="1.0.5.13", office_bitness=64,
                  scope="Machine", machine_safe=True, auto_install_validated=False, auto_install_mode="disabled")
     value.update(changes)
     return json.dumps(value)
@@ -26,7 +26,7 @@ def result_json(**changes):
 
 def reservation(**changes):
     value = dict(schema=1, request_id="33e979c6-c5c4-40af-845a-64c80517d1ae",
-                 required_version="1.0.5.11", helper_sid="S-1-5-21-1-2-3-1001", helper_pid=123,
+                 required_version="1.0.5.13", helper_sid="S-1-5-21-1-2-3-1001", helper_pid=123,
                  helper_creation_ticks="638901000000000000", child_pid=None,
                  child_creation_ticks=None, state="complete")
     value.update(changes)
@@ -61,6 +61,71 @@ def test_optional_setup_diagnostic_bundle_preserves_observed_safety():
     assert value.reason == "acl_unavailable" and value.stage == "parent_policy"
     assert value.error_type == "policy" and value.winerror is None
     assert value.installed_version == "1.0.0.0" and not value.machine_safe
+
+
+@pytest.mark.parametrize("policy_reason", ["unknown_write", "unsupported_ace", "unsupported_scope",
+    "unsupported_mask", "unsafe_owner", "missing_trusted_principal", "required_access_missing",
+    "namespace_changed", "reservation_released_retry_required"])
+@pytest.mark.parametrize("diagnostic", [False, True])
+def test_fixed_policy_reason_is_optional_additive_diagnostic(policy_reason: str, diagnostic: bool) -> None:
+    """Preserve fixed policy reasons without changing result safety or schema."""
+    fields = dict(operation="prepare", status="busy", reason="reservation_unresolved",
+        installed_version="1.0.0.0", machine_safe=False, policy_reason=policy_reason)
+    if diagnostic:
+        fields.update(stage="parent_repair_check", error_type="policy", winerror=None)
+    value = installation.parse_setup_result(result_json(**fields), 12, "prepare")
+    assert value.policy_reason == value.policy_diagnostic == policy_reason and not value.machine_safe
+    assert value.reason == "reservation_unresolved" and value.status == "busy"
+
+
+def test_reservation_release_policy_reason_preserves_outdated_result() -> None:
+    """A released reservation requires retry and never asserts Reader readiness."""
+    value = installation.parse_setup_result(result_json(operation="recover-parent", status="outdated",
+        reason="version_old", installed_version="1.0.0.0", machine_safe=False,
+        policy_reason="reservation_released_retry_required"), 0, "recover-parent")
+    assert value.status == "outdated" and not value.machine_safe
+    assert value.policy_reason == "reservation_released_retry_required"
+
+
+def test_nullable_policy_reason_preserves_existing_contracts() -> None:
+    """Both absent and null diagnostics remain compatible with existing helpers."""
+    expected = installation.parse_setup_result(result_json(), 0)
+    assert installation.parse_setup_result(result_json(policy_reason=None), 0) == expected
+    assert expected.policy_reason is None and expected.status == "ready"
+
+
+@pytest.mark.parametrize("policy_reason", ["confidential-marker", "UNKNOWN_WRITE", "", [], {}, True, 5])
+def test_unknown_policy_reason_is_rejected_without_leaking_input(policy_reason: object) -> None:
+    """Reject arbitrary reason values instead of reflecting helper text into logs."""
+    value = installation.parse_setup_result(result_json(policy_reason=policy_reason), 0)
+    assert value == installation.SetupResult(reason="diagnostic_unavailable")
+    assert "confidential-marker" not in repr(value)
+
+
+def test_policy_reason_preserves_native_group_and_rejects_schema_expansion() -> None:
+    """Accept the bounded reason alongside native details without widening groups."""
+    output = native_failure_json(policy_reason="required_access_missing")
+    value = installation.parse_setup_result(output, 12, "prepare")
+    assert value.policy_reason == "required_access_missing"
+    assert value.native_diagnostic == ("commit_return", "C0000035", None)
+    fields = json.loads(output)
+    del fields["error_type"]
+    assert installation.parse_setup_result(json.dumps(fields), 12, "prepare").reason == "diagnostic_unavailable"
+    fields = json.loads(output)
+    fields["extra"] = "confidential-marker"
+    assert installation.parse_setup_result(json.dumps(fields), 12, "prepare").reason == "diagnostic_unavailable"
+    duplicate = output[:-1] + ', "policy_reason":"unknown_write"}'
+    assert installation.parse_setup_result(duplicate, 12, "prepare").reason == "diagnostic_unavailable"
+
+
+@pytest.mark.parametrize("changes,code", [
+    ({"required_version": "1.0.5.11"}, 0), ({"required_version": "1.0.5.12"}, 0),
+    ({"status": "ready", "machine_safe": False}, 0), ({"status": "ready"}, 12),
+    ({"installed_version": "1.0.0.0"}, 0)])
+def test_policy_reason_cannot_bypass_existing_readiness_validation(changes: dict[str, object], code: int) -> None:
+    """Keep version, actual safety and exit checks authoritative with diagnostics."""
+    value = installation.parse_setup_result(result_json(policy_reason="namespace_changed", **changes), code)
+    assert value == installation.SetupResult(reason="diagnostic_unavailable")
 
 
 @pytest.mark.parametrize("stage", ["parent_repair_check", "parent_repair_backup",

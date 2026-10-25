@@ -112,8 +112,28 @@ def test_empty_existing_db_remains_empty(tmp_path):
     db.drop_table("chunks")
     reader = QueryReader(tmp_path / "index")
     assert reader.table is None and reader.email_indexer is None
-    assert db.table_names() == []
+    assert db.list_tables().tables == []
     reader.close()
+
+
+def test_catalog_preserves_mail_and_documents_among_many_tables(tmp_path):
+    """Read all local table names without recreating mail data or missing documents."""
+    from knowmate.rag.email_indexer import get_or_create_emails_table
+
+    db, _ = database(tmp_path, name="aaa_00", schema=SCHEMA)
+    for number in range(1, 12):
+        db.create_table(f"aaa_{number:02d}", schema=SCHEMA)
+    db.create_table("chunks", schema=SCHEMA)
+    db.create_table("emails", data=[row(EMAIL_SCHEMA)], schema=EMAIL_SCHEMA)
+    emails, recreated = get_or_create_emails_table(db, with_status=True)
+    assert not recreated and emails.count_rows() == 1
+    assert len(db.list_tables().tables) == 14
+    reader = QueryReader(tmp_path / "index")
+    try:
+        assert reader.table.count_rows() == 0
+        assert reader.email_indexer.table.count_rows() == 1
+    finally:
+        reader.close()
 
 
 @pytest.mark.parametrize("fail_unprotect", [False, True])
@@ -260,8 +280,8 @@ def test_pipeline_connection_exposes_only_read_apis(tmp_path, monkeypatch):
         def __getattr__(self, name):
             pytest.fail(f"non-read table API {name}")
     class ReadConnection:
-        def table_names(self):
-            return ["chunks"]
+        def list_tables(self, *, page_token=None):
+            return SimpleNamespace(tables=["chunks"], page_token=None)
         def open_table(self, name):
             calls.append(name)
             return ReadTable()

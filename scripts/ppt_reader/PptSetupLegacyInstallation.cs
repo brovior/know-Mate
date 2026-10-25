@@ -24,7 +24,7 @@ namespace AegisDesk.PptSetup
         {
             Machine.NoLinks(path);
             SafeFileHandle handle = CreateFile(path, 0x00120081, 1, IntPtr.Zero, 3, directory ? 0x02200000U : 0x00200000U, IntPtr.Zero);
-            if (handle.IsInvalid) { handle.Dispose(); throw new SetupFailure("parent_repair_check", "policy"); }
+            if (handle.IsInvalid) { int code = Marshal.GetLastWin32Error(); handle.Dispose(); throw SetupFailure.From("parent_repair_check", new System.ComponentModel.Win32Exception(code)); }
             handles.Add(handle);
             ParentSecurity.Inspect(handle, path, directory);
             if (platformAnchor) return;
@@ -43,23 +43,29 @@ namespace AegisDesk.PptSetup
                 var ace = entry as CommonAce;
                 if (ace == null || ace.IsCallback || ace.AceQualifier != AceQualifier.AccessAllowed)
                     return false;
-                // 구버전 외곽 폴더가 Windows ProgramFiles에서 상속한 설치 서비스 권한만 허용한다.
-                if (ace.SecurityIdentifier.Value == "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464")
+                string sid = ace.SecurityIdentifier.Value;
+                AceFlags scope = ace.AceFlags & ~AceFlags.Inherited;
+                uint expanded = ParentSecurity.Expand(ace.AccessMask);
+                if (sid == "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464")
                 {
-                    if (!inheritedContainer) return false;
-                    if (ace.AceFlags == AceFlags.Inherited && ace.AccessMask == 0x1f01ff) continue;
-                    if (ace.AceFlags == (AceFlags.ContainerInherit | AceFlags.InheritOnly | AceFlags.Inherited) && ace.AccessMask == 0x10000000) continue;
-                    return false;
+                    if (!inheritedContainer || (scope != AceFlags.None && scope != AceFlags.ContainerInherit && scope != (AceFlags.ContainerInherit | AceFlags.InheritOnly)) ||
+                        (expanded & ~ParentSecurity.Full) != 0) return false;
+                    continue;
                 }
-                if (ace.SecurityIdentifier.Value == "S-1-3-0")
+                if (sid == "S-1-3-0")
                 {
-                    if (inheritedContainer && ace.AceFlags == (AceFlags.ObjectInherit | AceFlags.ContainerInherit | AceFlags.InheritOnly | AceFlags.Inherited) &&
-                        ace.AccessMask == 0x10000000) continue;
-                    return false;
+                    if (!inheritedContainer || scope != (AceFlags.ObjectInherit | AceFlags.ContainerInherit | AceFlags.InheritOnly) ||
+                        (expanded & ~ParentSecurity.Full) != 0) return false;
+                    continue;
                 }
-                if (ace.SecurityIdentifier.Value != "S-1-5-32-544" && ace.SecurityIdentifier.Value != "S-1-5-18" &&
-                    (ace.AccessMask & unchecked((int)0x500d0156)) != 0)
-                    return false;
+                if (inheritedContainer)
+                {
+                    if ((scope & ~(AceFlags.ObjectInherit | AceFlags.ContainerInherit | AceFlags.InheritOnly)) != 0) return false;
+                    uint upper = sid == "S-1-5-32-544" || sid == "S-1-5-18" ? ParentSecurity.Full : ParentSecurity.ReadExecute;
+                    if ((expanded & ~upper) != 0) return false;
+                }
+                else if (sid != "S-1-5-32-544" && sid != "S-1-5-18" &&
+                    (ace.AccessMask & unchecked((int)0x500d0156)) != 0) return false;
             }
             return true;
         }

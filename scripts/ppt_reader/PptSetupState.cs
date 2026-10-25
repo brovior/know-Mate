@@ -16,7 +16,7 @@ namespace AegisDesk.PptSetup
         public string scope = "Machine";
         public bool machine_safe, auto_install_validated = Contract.AutoInstallValidated;
         public string auto_install_mode = Contract.AutoInstallMode;
-        public string stage, error_type;
+        public string stage, error_type, policy_reason;
         public string native_stage, ntstatus, io_status;
         public int? winerror;
         public Result(string op) { operation = op; }
@@ -30,6 +30,7 @@ namespace AegisDesk.PptSetup
             };
             if (stage != null) { values["stage"] = stage; values["error_type"] = error_type; values["winerror"] = winerror; }
             if (native_stage != null) { values["native_stage"] = native_stage; values["ntstatus"] = ntstatus; values["io_status"] = io_status; }
+            if (policy_reason != null) values["policy_reason"] = policy_reason;
             return values;
         }
         public void Emit() { Console.WriteLine(Contract.Json.Serialize(Values())); }
@@ -39,7 +40,7 @@ namespace AegisDesk.PptSetup
     {
         // No implementation in shipping builds: compiler removes every call.
         static partial void TraceAtomic(string stage);
-        public const string Version = "1.0.5.11";
+        public const string Version = "1.0.5.13";
         public const string ProgId = "AegisDesk.PptReader";
         public const string ClassId = "{287A80D2-804A-46D3-A0E9-CA31C6FC3D09}";
         public const string ReaderIid = "9A20F4A6-6364-4BA7-930B-3E8857BEAF60";
@@ -105,7 +106,7 @@ namespace AegisDesk.PptSetup
             if (new FileInfo(path).Length > 1048576) throw new InvalidDataException("metadata_size");
             return Json.Deserialize<Dictionary<string, object>>(File.ReadAllText(path));
         }
-        public static void AtomicWrite(string path, object value, System.Security.AccessControl.FileSecurity security = null, bool request = false)
+        public static void AtomicWrite(string path, object value, System.Security.AccessControl.FileSecurity security = null, bool request = false, bool backupCommit = false)
         {
             string temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
             TraceAtomic("atomic_path_check");
@@ -132,7 +133,7 @@ namespace AegisDesk.PptSetup
             try
             {
                 TraceAtomic("atomic_commit_probe");
-                if (File.Exists(path)) { TraceAtomic("atomic_replace_call"); File.Replace(temp, path, null); }
+                if (File.Exists(path)) { TraceAtomic("atomic_replace_call"); if (backupCommit) BackupCommit.Commit(temp, path); else File.Replace(temp, path, null); }
                 else { TraceAtomic("atomic_move_call"); File.Move(temp, path); }
                 TraceAtomic("atomic_done");
             }
