@@ -3,7 +3,7 @@
 다른 PC의 미완성 진단 소스 검토는 [checkpoint 이전 안내](PPT_CHECKPOINT_HANDOFF.md)를 먼저 따른다.
 아래 후보 안내는 현재 PC의 설치 버전을 뜻하지 않으며 설치 실행 승인이 아니다.
 
-현재 소스의 요구 버전은 Reader/Events/setup 모두 **1.0.5.13**이다. 선택적 Events DLL을 포함하므로
+현재 소스의 요구 버전은 Reader/Events/setup 모두 **1.0.5.14**이다. 선택적 Events DLL을 포함하므로
 [오프라인 통합·복구 조건](../design/PPT_EVENT_ADAPTER.md)을 먼저 확인한다.
 실제 설치·Office 검증 승인이 나기 전에는 아래 설치 절차를 실행하지 않는다.
 승인 전에는 기존 설치본을 유지한다. 기본 빌드는 자동 설치를 끈 `disabled`이며,
@@ -43,7 +43,7 @@ UI는 계속 사용할 수 있고 설치 관찰 동안 최초 인덱싱은 대�
 
 PowerPoint와 AegisDesk를 정상 종료하고 새 candidate를 실행한다. 별도 config 옵션은 없으며,
 조건을 통과하면 부모 권한 복구와 Reader 업데이트에 **최대 두 번의 UAC**가 나타날 수 있다.
-준비 완료 로그의 설치 버전 `1.0.5.13`과 `status=ready`를 먼저 확인한다. 이후 새 구형 `.ppt`를
+준비 완료 로그의 설치 버전 `1.0.5.14`과 `status=ready`를 먼저 확인한다. 이후 새 구형 `.ppt`를
 fake embedding으로 처리해 같은 PID의 `process observation ... status=exited`까지 확인한다.
 이번 변경만으로 실제 사내 업데이트·PPT 종료가 통과했다고 판단하지 않는다.
 
@@ -76,6 +76,34 @@ Reader 준비 완료가 아니다. 앱을 다시 실행해 새 UUID·백업으�
 개발 회귀는 `pytest knowmate/tests/test_ppt_parent_repair.py -v`다. 일반 pytest는 실제 UAC를
 요청하지 않으며 lifecycle fixture를 컴파일하고 네이티브 비전파·특수 lease를 검사한다. 수동 승격
 lifecycle 검증 산출물과 OS fake 범위는 [진단 결과](../DIAGNOSTICS.md#ppt-구버전-부모-폴더-권한-복구-2026-10-25)에 있다.
+
+## 관리자 설치 실패 진단
+
+1.0.5.14 후보는 관리자 도구의 결과를 일반 도구가 수집했을 때 기존 `aegisdesk.log`에 전달한다.
+별도 config 옵션이나 추가 로그 파일은 없다. `PPT 설치 도구 종료`의 최종 `code`와
+`child_diagnostic_state`를 먼저 확인하고, 이어지는 `PPT 관리자 도구 진단`을 읽는다.
+`valid`는 선택 진단의 형식이 유효하다는 뜻이며 설치 성공이 아니다. `absent`는 선택 진단 없음,
+`malformed`는 잘못된 선택 진단 폐기다. 실제 수신 여부는 각 줄의 `transport=received`로 구분한다.
+
+`phase=parent_repair/install/remove`는 부모 권한 복구·설치·제거를 구분한다. 한 번 준비 과정에서
+복구와 설치가 연속 실행되면 각 한 줄씩 최대 두 줄이 남는다. `child_exit_code`는 해당 관리자
+프로세스의 실제 종료 코드이며, 사후 점검 실패로 바뀔 수 있는 일반 도구의 최종 코드와 다르다.
+`last_stage/last_target`은 마지막 위치, `primary_*`는 최초 실패, `secondary_*`는 후속 복구 실패다.
+
+| 확인할 필드 | 의미 |
+|---|---|
+| `primary_stage=mutation_machine_check` 및 `primary_check_status/reason` | 실제 변경 직전 재점검에서 거절됨. 내부 오류가 있으면 해당 하위 stage도 확인 |
+| `primary_stage=install_root_create`, `primary_target` | 설치 디렉터리 생성 실패. `program_files_parent`와 `reader_root`를 구분 |
+| `primary_stage=install_root_policy`, `primary_policy_reason=root_owner_untrusted/root_write_untrusted` | 기존 설치 폴더의 소유자·쓰기 정책 거절이며 OS 접근 오류와 다름 |
+| `primary_stage=install_journal/install_registry/install_record` | 저널·등록·설치 기록 단계 실패 |
+| `primary_winerror` / `primary_hresult` | 실제 Win32 오류와 원래 예외 HRESULT. HRESULT 하위 비트로 Win32 오류를 추정하지 않음 |
+| `transport=unavailable/peer_mismatch/malformed/timeout` | 진단을 얻지 못했거나 거절함. 이 상태를 성공이나 안전 판정으로 사용하지 않음 |
+
+앱의 설치 관찰 제한 시간이 지났거나 앱을 종료해 결과 수집을 끝냈다면 이 진단이 앱 로그에
+남지 않을 수 있다. 설치 도구는 계속 수행하며, 별도의 영구 로그 보관·사후 수집 기능은 추가하지
+않았다. 오류 메시지·경로·SID·문서 본문은 전송하지 않고 고정 단계와 오류 값만 기록한다.
+기존 `code=13 / mutation_failed`와 새 진단을 함께 보존하며, 독립 사후 점검·보류 판단은 그대로다.
+이 후보는 진단 보강이며 사내 설치 실패나 PPT 자동종료의 해결 확인을 뜻하지 않는다.
 
 ## 빌드와 읽기 전용 점검(개발 도구)
 

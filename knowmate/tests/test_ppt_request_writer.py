@@ -401,7 +401,7 @@ def test_writer_interruption_requires_complete_expected_target_json(monkeypatch,
     anchor = tmp_path / ("ppt-writer-" + uuid.uuid4().hex)
     child = anchor / "AegisDesk" / "PptReaderRequests"
     request_id = str(uuid.uuid4())
-    record = {"schema": 1, "request_id": request_id, "required_version": "1.0.5.13", "helper_sid": "S-1-5-21-1001",
+    record = {"schema": 1, "request_id": request_id, "required_version": "1.0.5.14", "helper_sid": "S-1-5-21-1001",
               "helper_pid": 123, "helper_creation_ticks": "123456", "child_pid": None, "child_creation_ticks": None, "state": state}
     def run(command, **kwargs):
         if command[2] == "cleanup":

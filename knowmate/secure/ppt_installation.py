@@ -16,22 +16,19 @@ from typing import BinaryIO, Callable
 from knowmate.secure.ppt_operation import PptPreparationPending
 from knowmate.secure.ppt_policy import auto_install_mode, auto_install_enabled, REQUIRED_VERSION
 from knowmate.secure.ppt_setup_output import create_setup_output
+from knowmate.secure.ppt_child_diagnostics import (
+    CHILD_DIAGNOSTICS_ABSENT, CHECK_REASONS, CHECK_STATUSES, ERROR_TYPES,
+    ChildDiagnosticBundle, sanitize_child_diagnostics,
+)
 
 MUTEX_NAME = r"Global\AegisDesk.PptReader.Machine.v1"
-_STATUSES = frozenset({"ready", "missing", "outdated", "repairable", "disabled",
-                       "conflict", "busy", "unknown", "failed"})
-_REASONS = frozenset({"registration_ok", "not_installed", "version_old",
-    "registration_missing", "disabled", "hkcu_shadow", "registration_foreign",
-    "office_busy", "office_unknown", "mutex_busy", "mutex_unavailable",
-    "reservation_unresolved", "journal_unresolved", "prototype_gate",
-    "payload_invalid", "acl_unavailable", "permission_declined", "launch_failed",
-    "child_unconfirmed", "mutation_failed", "removed", "check_failed"})
+_STATUSES = CHECK_STATUSES
+_REASONS = CHECK_REASONS
 _DIAGNOSTIC_STAGES = frozenset({"anchor_open", "parent_open", "parent_policy", "child_open",
     "child_policy", "request_create", "request_acl", "request_commit", "lease_recheck",
     "parent_repair_check", "parent_repair_backup", "parent_repair_write",
     "parent_repair_verify", "parent_repair_recover"})
-_DIAGNOSTIC_ERRORS = frozenset({"policy", "Win32Exception", "UnauthorizedAccessException",
-    "IOException", "SecurityException", "InvalidOperationException", "ArgumentException", "NotSupportedException", "Exception"})
+_DIAGNOSTIC_ERRORS = ERROR_TYPES
 _NATIVE_STAGES = frozenset({"commit_return", "commit_verify", "commit_close"})
 _POLICY_REASONS = frozenset({"unknown_write", "unsupported_ace", "unsupported_scope",
     "unsupported_mask", "unsafe_owner", "missing_trusted_principal", "required_access_missing",
@@ -57,6 +54,12 @@ class SetupResult:
     ntstatus: str | None = None
     io_status: str | None = None
     policy_reason: str | None = None
+    child_diagnostics: object = CHILD_DIAGNOSTICS_ABSENT
+
+    @property
+    def child_diagnostic(self) -> ChildDiagnosticBundle:
+        """Expose copied, fixed child scalars even for directly injected observations."""
+        return sanitize_child_diagnostics(self.child_diagnostics)
 
     @property
     def policy_diagnostic(self) -> str | None:
@@ -121,7 +124,7 @@ def parse_setup_result(stdout: str, exit_code: int, operation: str = "check") ->
                    "auto_install_validated", "auto_install_mode"}
         diagnostic = {"stage", "error_type", "winerror"}
         native = {"native_stage", "ntstatus", "io_status"}
-        if not isinstance(value, dict) or set(value) - {"policy_reason"} not in (
+        if not isinstance(value, dict) or set(value) - {"policy_reason", "child_diagnostics"} not in (
                 allowed, allowed | diagnostic, allowed | diagnostic | native):
             raise ValueError("setup_fields")
         policy_reason = value.get("policy_reason")
@@ -165,11 +168,14 @@ def parse_setup_result(stdout: str, exit_code: int, operation: str = "check") ->
             raise ValueError("setup_ready")
         if exit_code != 0 and value["status"] in {"ready", "missing", "outdated", "repairable"}:
             raise ValueError("setup_exit")
+        child_diagnostics = value.get("child_diagnostics", CHILD_DIAGNOSTICS_ABSENT)
+        if sanitize_child_diagnostics(child_diagnostics, operation=operation).state == "malformed":
+            child_diagnostics = None
         return SetupResult(value["status"], value["reason"], installed, bitness,
                            value["machine_safe"], value["auto_install_validated"], value["auto_install_mode"],
                            value.get("stage"), value.get("error_type"), value.get("winerror"),
                            value.get("native_stage"), value.get("ntstatus"), value.get("io_status"),
-                           policy_reason)
+                           policy_reason, child_diagnostics)
     except (ValueError, TypeError, KeyError, UnicodeError):
         return SetupResult(reason="diagnostic_unavailable")
 

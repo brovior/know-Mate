@@ -31,6 +31,7 @@ namespace AegisDesk.PptSetup
             if (stage != null) { values["stage"] = stage; values["error_type"] = error_type; values["winerror"] = winerror; }
             if (native_stage != null) { values["native_stage"] = native_stage; values["ntstatus"] = ntstatus; values["io_status"] = io_status; }
             if (policy_reason != null) values["policy_reason"] = policy_reason;
+            try { object children=ChildDiagnostics.Observations;if(children!=null)values["child_diagnostics"]=children; }catch {}
             return values;
         }
         public void Emit() { Console.WriteLine(Contract.Json.Serialize(Values())); }
@@ -40,7 +41,7 @@ namespace AegisDesk.PptSetup
     {
         // No implementation in shipping builds: compiler removes every call.
         static partial void TraceAtomic(string stage);
-        public const string Version = "1.0.5.13";
+        public const string Version = "1.0.5.14";
         public const string ProgId = "AegisDesk.PptReader";
         public const string ClassId = "{287A80D2-804A-46D3-A0E9-CA31C6FC3D09}";
         public const string ReaderIid = "9A20F4A6-6364-4BA7-930B-3E8857BEAF60";

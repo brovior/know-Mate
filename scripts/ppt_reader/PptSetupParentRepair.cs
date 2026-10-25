@@ -114,36 +114,46 @@ namespace AegisDesk.PptSetup
 
         internal static void Elevated(string id)
         {
-            Enabled();
+            ChildDiagnostics.Mark("child_payload_check","payload");Enabled();
+            ChildDiagnostics.Mark("child_admin_check","none");
             if (!Machine.Admin) throw new SetupFailure("parent_repair_check", "policy");
+            ChildDiagnostics.Mark("child_machine_lock","none");
             using (var gate = new MachineLock())
-            using (var special = RepairPreparationLease.Acquire(OriginalSid(id)))
+            using (var special = ChildDiagnostics.At("child_lease_acquire","request",delegate {return RepairPreparationLease.Acquire(OriginalSid(id));}))
             {
+                ChildDiagnostics.Mark("child_reservation_load","request");
                 Reservation request = Reservation.Load(id, special);
-                using (var helper = RepairHelper.Acquire(request))
-                using (var legacy = LegacyInstallation.Acquire(false, id))
+                using (var helper = ChildDiagnostics.At("parent_repair_check","request",delegate {return RepairHelper.Acquire(request);}))
+                using (var legacy = ChildDiagnostics.At("parent_repair_check","record",delegate {return LegacyInstallation.Acquire(false, id);}))
                 {
                     ValidateRequests(special, id); helper.Recheck();
-                    request.EnterChild();
-                    using (var writable = special.OpenMutationHandle())
+                    ChildDiagnostics.Mark("child_reservation_enter","request");request.EnterChild();
+                    using (var writable = ChildDiagnostics.At("parent_repair_write","request",delegate {return special.OpenMutationHandle();}))
                     {
                         var before = ParentSecurity.Read(writable);
                         if (ParentSecurity.Inspect(writable, special.ParentPath, true) != special.ParentIdentity)
                             throw new SetupFailure("parent_repair_verify", "policy");
+                        ChildDiagnostics.Mark("parent_repair_backup","record");
                         var backup = RepairBackup.Create(request, special.ParentIdentity, before);
+                        ChildDiagnostics.Mark("parent_repair_verify","request");
                         helper.Recheck(); special.RecheckMutation((string)backup["before"]);
                         if (!Machine.OfficeClosed()) throw new IOException("office_busy");
+                        ChildDiagnostics.Mark("parent_repair_write","request");
                         ParentSecurity.Write(writable, ParentSecurity.Transform(before, request.helper_sid, false));
+                        ChildDiagnostics.Mark("parent_repair_verify","request");
                         helper.Recheck(); special.RecheckMutation((string)backup["intermediate"]);
-                        backup["stage"] = "protected"; RepairBackup.Save(backup);
+                        backup["stage"] = "protected"; ChildDiagnostics.Mark("parent_repair_backup","record");RepairBackup.Save(backup);
+                        ChildDiagnostics.Mark("parent_repair_verify","request");
                         helper.Recheck(); special.RecheckMutation((string)backup["intermediate"]);
                         if (!Machine.OfficeClosed()) throw new IOException("office_busy");
+                        ChildDiagnostics.Mark("parent_repair_write","request");
                         ParentSecurity.Write(writable, ParentSecurity.Transform(before, request.helper_sid, true));
+                        ChildDiagnostics.Mark("parent_repair_verify","request");
                         helper.Recheck(); special.RecheckMutation((string)backup["final"]);
-                        using (var normal = RequestDirectoryLease.AcquireExisting())
+                        using (var normal = ChildDiagnostics.At("child_lease_acquire","request",delegate {return RequestDirectoryLease.AcquireExisting();}))
                         {
                             ValidateRequests(normal, id); helper.Recheck();
-                            backup["stage"] = "child_verified"; RepairBackup.Save(backup);
+                            backup["stage"] = "child_verified"; ChildDiagnostics.Mark("parent_repair_backup","record");RepairBackup.Save(backup);
                         }
                     }
                 }
