@@ -293,6 +293,59 @@ def test_policy_diagnostic_logs_are_bounded_and_never_replace_postcheck(tmp_path
     gate.shutdown()
 
 
+@pytest.mark.parametrize("safe", [False, True])
+@pytest.mark.parametrize("valid", [False, True])
+def test_child_phase_logs_preserve_primary_and_recheck_safety(tmp_path, caplog, safe: bool, valid: bool) -> None:
+    """Log sanitized repair/install observations without treating either as the postcheck."""
+    primary = dict(stage="install_root_policy", target="reader_root", error_type="policy",
+        policy_reason="root_owner_untrusted", winerror=None, hresult=None, native_stage=None,
+        ntstatus=None, io_status=None, check_status=None, check_reason=None)
+    secondary = {**primary, "stage": "install_rollback", "target": "journal", "error_type": "IOException",
+                 "policy_reason": None, "hresult": "80070497"}
+    records = [dict(phase="parent_repair", transport="received", child_exit_code=0,
+        last_stage="child_complete", last_target="none", primary=None, secondary=None),
+        dict(phase="install", transport="received", child_exit_code=13,
+             last_stage="install_rollback", last_target="journal", primary=primary, secondary=secondary)]
+    if not valid:
+        records[1]["primary"] = {**primary, "message": "confidential-marker"}
+
+    class ChildProcess(Process):
+        def read_result(self) -> SetupResult:
+            """Inject an observation that still needs the production log sanitizer."""
+            return SetupResult(status="failed", reason="mutation_failed", child_diagnostics=records)
+
+    checks = []
+    results = iter([SetupResult(status="outdated", machine_safe=True, office_bitness=64,
+        auto_install_mode="candidate"), SetupResult(status="outdated", machine_safe=safe)])
+
+    def check() -> SetupResult:
+        """Keep safety observations independent from helper telemetry."""
+        checks.append(1)
+        return next(results)
+
+    process = ChildProcess(exit_code=13)
+    gate, policies, _ = coordinator(tmp_path, checker=check, process_factory=lambda: process)
+    with caplog.at_level("INFO"):
+        gate.begin()
+        wait_until(lambda: process.started == 1)
+        gate._poll_setup()
+        wait_until(lambda: bool(policies))
+    assert len(checks) == 2 and policies == (["com_only"] if safe else ["ppt_pending"])
+    assert process.closed == 1 and "confidential-marker" not in caplog.text
+    lines = [record.getMessage() for record in caplog.records
+             if record.getMessage().startswith("PPT 관리자 도구 진단:")]
+    if valid:
+        assert len(lines) == 2
+        assert "phase=parent_repair transport=received child_exit_code=0" in lines[0]
+        assert "phase=install transport=received child_exit_code=13" in lines[1]
+        assert "primary_stage=install_root_policy" in lines[1] and "primary_policy_reason=root_owner_untrusted" in lines[1]
+        assert "secondary_stage=install_rollback" in lines[1] and "secondary_hresult=80070497" in lines[1]
+        assert "child_diagnostic_state=valid" in caplog.text
+    else:
+        assert not lines and "child_diagnostic_state=malformed" in caplog.text
+    gate.shutdown()
+
+
 def test_decline_is_persisted_for_original_user_version(tmp_path):
     result = SetupResult(status="missing", machine_safe=True, office_bitness=64, auto_install_mode="candidate")
     process = Process(exit_code=11)

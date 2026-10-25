@@ -53,6 +53,22 @@ namespace Microsoft.Win32
 }
 namespace AegisDesk.PptSetup
 {
+    // Policy-only memory fixtures do not exercise the separate native diagnostic transport.
+    internal static class ChildDiagnostics
+    {
+        private sealed class EmptyScope : IDisposable { public void Dispose() { } }
+        internal static bool HasPrimary { get { return false; } }
+        internal static IDisposable Scope(string stage,string target) { return new EmptyScope(); }
+        internal static void Mark(string stage,string target) { }
+        internal static void Pending(Exception error) { }
+        internal static void Policy(string reason) { }
+        internal static void Attach(Exception error) { }
+        internal static void Capture(Exception error) { }
+        internal static void CaptureSecondary(Exception error) { }
+        internal static void Gate(Result check) { }
+        internal static string Target(string directory) { return "none"; }
+    }
+
     internal sealed class Blob { internal string Version,Hash; internal byte[] Bytes=new byte[0]; internal Blob(string version,string hash) { Version=version; Hash=hash; } }
     internal static class File
     {

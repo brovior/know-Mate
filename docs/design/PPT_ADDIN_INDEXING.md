@@ -567,6 +567,42 @@ Repairable이면 관리자 명시 회수는 예약만 해제하고, 다음 prepa
 complete 상태 검사에서 거절된다. 복구는 같은 버전/payload에만 허용하고 구버전 미완료 증거는
 자동 삭제하지 않는다. 실행 결과와 미검증 범위는 [진단](../DIAGNOSTICS.md#ppt-acl-표현-호환-2026-10-25)을 따른다.
 
+### 8-8. 관리자 설치 진단 전달 후보
+
+1.0.5.14 후보는 관리자 helper의 최초 실패와 후속 복구 실패를 일반 helper 결과와 앱 로그에
+전달한다. 진단은 설치 승인·완료·안전 판정의 근거가 아니며 기존 예외 전파·종료 코드·독립
+Machine.Check·예약/저널/백업 schema와 권한 정책을 바꾸지 않는다.
+
+일반 helper는 매 승격 전에 무작위 이름의 일회성 local named pipe를 만든다. native 생성은
+FIRST_PIPE_INSTANCE·REJECT_REMOTE_CLIENTS·OVERLAPPED와 현재 사용자/Admin/System만의
+protected ACL을 적용한다. 자식은 Anonymous SQOS로 연결해 일반 서버가 관리자 token을
+impersonate하지 못하게 하고 서버 PID/생성시각을 확인한다. 서버는 수신 직후 보관한 peer PID를
+실제 ShellExecuteEx가 반환한 자식 process handle과 대조한다. 인증 실패는 진단 폐기다.
+파일이나 예약 필드를 추가하지 않는다. 기존 두 인수 승격 실행은 유지하며 진단 인수는 nonce와
+원래 helper PID/생성시각만 추가한다. 설치·파일·레지스트리 대상 경로를 입력받지 않는다.
+
+내부 wire는 길이 2KiB 이하의 단일 binary frame과 EOF다. 고정 magic/schema·요청/nonce GUID·
+버전·phase·실제 자식 PID/종료 코드·마지막 단계·primary/secondary tuple을 엄격 검증한다.
+자식 connect/write는 각각 500ms, 실제 자식 종료 뒤 부모 수집·취소 정리는 최대 1000ms로
+제한한다. pending I/O 취소와 callback 예외를 정리하며 진단 실패가 기존 설치 예외를 덮거나
+helper를 kill하지 않는다. 원래 자식 process 종료 관찰은 기존처럼 독립해서 유지한다.
+
+일반 JSON의 선택 `child_diagnostics` 배열은 최대 두 요소이며 허용 순서는 복구→설치 또는
+단일 복구/설치/제거다. 요소는 phase, transport, child_exit_code, last_stage, last_target,
+primary, secondary 일곱 필드다. 자식 종료 코드는 실제 해당 handle에서 확인한 값이며 일반
+helper의 최종 코드와 같다고 요구하지 않는다. 첫 실패는 고정하고 후속 rollback 실패만 별도로
+보존한다. 원래 LastError/HRESULT는 wrapper/상태 변환 전에 포착하며, 처리 후 성공한 예상
+예외는 terminal 실패로 보고하지 않는다. 정책 거절에는 원래 OS 오류를 합성하지 않는다.
+
+Python은 기존 base 계약을 그대로 검증한다. 유효한 base에서 선택 배열만 손상되면 배열을
+통째로 폐기하고 `malformed`로만 기록한다. base·중복 key·전체 출력 16KiB 위반은 기존처럼
+전체 결과를 거절한다. 직접 주입한 관측도 같은 sanitizer를 거치고, 로그는 고정 어휘·숫자·
+8자리 upper hex만 출력한다. helper 메시지·stack·경로·계정/SID·문서 내용은 전송하지 않는다.
+
+앱이 일반 helper의 종료 결과를 수집했을 때만 앱 로그로 전달된다. 기존 관찰 timeout·앱 종료
+뒤의 영구 보관/재수집은 범위 밖이다. 판독은 [관리자 설치 실패 진단](../guides/PPT_READER.md#관리자-설치-실패-진단),
+실제 시험 범위와 미검증 환경은 [helper 진단 결과](../DIAGNOSTICS.md#ppt-관리자-helper-진단-전달-2026-10-26)를 따른다.
+
 ## 9. 개발 설계 검증 상태
 
 설계 에이전트 작성 후 별도 검증 에이전트가 실제 코드와 대조했다. PPT의 강제 종료 없는
@@ -643,7 +679,7 @@ poison 이후에는 Count·Quit을 포함한 새 RPC를 요청하지 않는다.
 QThread의 MTA에서만 사용하며 UI·타이머·OS 종료 helper로 넘기지 않는다. 동기 RPC가 멈췄다고
 타임아웃만으로 취소됐다고 간주하지 않는다. 앱의 제한된 종료는 PowerPoint 강제종료를 허용하지 않는다.
 
-Reader 1.0.5.13 후보는 호스트 STA에서 빈 컬렉션 확인과 `CommandBars.ExecuteMso("FileExit")`를
+Reader 1.0.5.14 후보는 호스트 STA에서 빈 컬렉션 확인과 `CommandBars.ExecuteMso("FileExit")`를
 연속 실행한다. 확인 후 외부 클라이언트에 Quit을 맡기던 경로는 사용하지 않는다.
 이전 실험 메서드 `TryQuitIfIdleWithCaller`·`ConfirmCallerQuit`은 `not_supported`로 차단한다.
 문서 열림·새 문서·창 활성화를 관측하면 해당 종료 시도의 포기를 유지하며, 실제 종료 명령 전에
@@ -661,7 +697,7 @@ Python은 같은 수집 QThread에서 한 번만 요청하고, 짧은 상태 조
 강제종료와 새 패키지 의존성은 추가하지 않는다. 사용자 문서 보호·일반 배포 승인은 실제 검증 대상이다.
 
 기존 dual 인터페이스는 유지하고 새 기본 인터페이스로 lifecycle을 노출한다. 요구 버전은
-reader/Events/setup 모두 1.0.5.13, protocol 3이며 추출 JSON schema 1·청크·인덱스 형식은 바꾸지 않는다.
+reader/Events/setup 모두 1.0.5.14, protocol 3이며 추출 JSON schema 1·청크·인덱스 형식은 바꾸지 않는다.
 사전 검증과 사용자 문서 보호 시험은 [운영 검증 절차](../guides/PPT_READER.md#powerpoint-자동종료-후보-검증)를 따른다.
 
 

@@ -128,11 +128,14 @@ namespace AegisDesk.PptSetup
                 if (!held) gate = new MachineLock();
                 NoLinks(Root);
                 if (!ReservationsSafe(own)) { result.status = "busy"; result.reason = "reservation_unresolved"; return result; }
+                ChildDiagnostics.Mark("machine_record_check","record");
                 var ownedRecord = Mutation.VersionBoundary();
                 if (ownedRecord != null) result.installed_version = (string)ownedRecord["version"];
                 if (File.Exists(Journal) || MetadataTemporaryFiles()) { result.status = "busy"; result.reason = "journal_unresolved"; return result; }
                 result.machine_safe = true;
+                ChildDiagnostics.Mark("machine_office_check","none");
                 result.office_bitness = OfficeBitness();
+                ChildDiagnostics.Mark("machine_registry_check","registry");
                 using (RegistryKey machine = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, View(result.office_bitness.Value)))
                 using (RegistryKey user = RegistryKey.OpenBaseKey(RegistryHive.CurrentUser, View(result.office_bitness.Value)))
                 {
@@ -160,8 +163,8 @@ namespace AegisDesk.PptSetup
                     result.status = "ready"; result.reason = "registration_ok"; return result;
                 }
             }
-            catch (IOException ex) { if (ex.Message == "downgrade_blocked" || ex.Message == "installation_unknown") { result.status = "conflict"; result.reason = ex.Message; return result; } result.reason = ex.Message == "mutex_busy" ? "mutex_busy" : "office_unknown"; result.status = result.reason == "mutex_busy" ? "busy" : "unknown"; if (result.reason == "mutex_busy") result.machine_safe = false; return result; }
-            catch { result.status = "unknown"; result.reason = "check_failed"; result.machine_safe = false; return result; }
+            catch (IOException ex) { ChildDiagnostics.Pending(ex);if (ex.Message == "downgrade_blocked" || ex.Message == "installation_unknown") { result.status = "conflict"; result.reason = ex.Message; return result; } result.reason = ex.Message == "mutex_busy" ? "mutex_busy" : "office_unknown"; result.status = result.reason == "mutex_busy" ? "busy" : "unknown"; if (result.reason == "mutex_busy") result.machine_safe = false; return result; }
+            catch (Exception error) { ChildDiagnostics.Pending(error);result.status = "unknown"; result.reason = "check_failed"; result.machine_safe = false; return result; }
             finally { if (gate != null) gate.Dispose(); }
         }
     }

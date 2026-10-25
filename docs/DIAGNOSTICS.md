@@ -1051,6 +1051,57 @@ OS·HTTP 연결 제한과 종료 유예로 기다리며, 워커가 끝내 복귀
 PID·생성 identity로 검증된 소유 프로세스만 정리하고 PowerPoint Quit·강제 종료 금지를
 유지한다. 하드 종료 경로의 무조건 종료를 유지하며 그 경로에 블로킹 정리를 추가하지 않는다.
 
+## PPT 관리자 helper 진단 전달 (2026-10-26)
+
+사내 1.0.0.0→1.0.5.13 업데이트에서 UAC 이후 `code=13 / mutation_failed`가 남고 journal·
+새 버전 복사·등록 전 실패했다는 사용자 진단 보고를 받았다. 배포 버전/해시와 기존 설치 기록은
+정상이라는 보고이며, 실제 사내 API/OS 오류는 아직 확정하지 않았다. `ProgramData/AegisDesk`의
+요청 생성 성공과 `ProgramFiles/AegisDesk/PptReader`의 설치 ACL 검증은 별개다.
+
+코드에서 승격 자식의 상세 오류를 일반 helper가 exitcode로만 수신하고 최종 `mutation_failed`로
+축약하는 경로를 확인했다. 기존 사용자 소유 임시 폴더의 실제 Protect 메서드 사본은 ACL을
+바꾸지 않은 채 `acl_unavailable`/code13으로 실패했고 journal은 생성되지 않았다. 이는 가능한
+실패 경로의 컴포넌트 재현이며 사내 원인 확정이 아니다.
+
+1.0.5.14 후보는 일회성 local pipe로 phase별 마지막 단계와 최초/후속 오류의 고정 scalar를
+전달한다. 원래 오류가 wrapper/상태로 바뀌기 전에 포착하며 예외 메시지·stack·경로·SID·본문은
+제외한다. 진단 수집 실패는 기존 설치 결과·독립 안전 점검·예약/저널/ACL 정책을 바꾸지 않는다.
+설계와 판독은 [§8-8](design/PPT_ADDIN_INDEXING.md#8-8-관리자-설치-진단-전달-후보) 및
+[안내](guides/PPT_READER.md#관리자-설치-실패-진단)를 따른다. 의존성 추가는 없다.
+
+최종 소스에서 주 에이전트가 직접 실행한 전체 `pytest knowmate/tests -v -W error`는
+**2,407 PASS·6 SKIP·74 subtests PASS**, 경고 보고 없음, exit0, 1228.13초(20:28)다.
+로그와 종료 코드는 `.aegisdesk_build/ppt-helper-diagnostics/full-pytest.log` 및
+`full-pytest-exit.txt`에 있다. Python 계약/로그 관련 358개(34.75초), 통신·컴포넌트 54개와 기존
+부모 회귀 8개를 합친 62개(178.60초)도 통과했다. 부분 시험은 전체와 중복되므로 합산하지 않는다.
+손상된 선택 진단·직접 주입·다른 작업의 stale phase를 폐기하고 독립 사후 점검을 유지했다.
+
+실제 일반 helper→동일 계정 runas 관리자 child의 두 컴포넌트 사례는 실제 token·pipe·Anonymous
+SQOS와 원래 Protect의 `root_write_untrusted`를 확인했다. 관리자 token impersonation의 token
+open이 1347로 거절되고, child13의 관측이 일반 helper로 전달됐다. 이 결과는 제품 설치 전체
+시험과 구분한다. 최종 근거는 `.aegisdesk_build/hdc/ecb36361/parent-verification.json`이다.
+
+별도의 실제 UAC 관리자 controller와 그 token을 상속한 실제 child 흐름은 private 고정 경로와
+HKCU 시험 경계에서 Main→Mutation/Check/native writer/pipe를 실행했다. 19개 on/off 쌍,
+38개 관측 모두 통과했고, 주 에이전트가 실제 Python parser로 38개를 재검증했다. 19쌍의 상태·
+종료코드·저널·예약은 같았으며 rollback 두 사례의 `secondary.target=record`도 확인했다.
+ShellExecuteEx·Office·고정 설치 경로·HKCU는 시험 경계이므로 위 ordinary→runas 시험과
+혼동하지 않는다. 최종 근거는 `.aegisdesk_build/hdf/55a02871/parent-verification.json`이다.
+두 최종 fixture의 제품 C# 25개 SHA는 현재 소스와 모두 일치한다.
+
+최초 flow에서는 실제 rollback File.Replace의 HRESULT 80070497(1175) 때문에 on/off 상태가
+달라져 실패했다. 원래 primary와 실제 secondary가 분리된 증거는 보존하지만 전체 통과로 세지
+않으며, 일반 record/journal 재시도는 추가하지 않았다. 다른 긴 경로 fixture의 요청 저장 실패는
+원래 JSON이 없어 MAX_PATH·WinError를 확정할 수 없다. 위 최종 결과는 짧은 새 fixture에서
+검증했고, 이전 checkpoint·848c 실행이나 rollback target 수정 전 61%에서 중단한 전체 실행을
+최종 소스 성공 증거로 사용하지 않는다. 상세 검토는
+`.aegisdesk_build/plan-review-loop/ppt-helper-diagnostics/code-review.md`에 보존했다.
+
+candidate payload 빌드·무결성 검증은 `.aegisdesk_build/ppt-helper-diagnostics/payload-build-*`의
+별도 기록을 따른다. 전체 앱 EXE·운영 설치·실제 사내 실패·Office/PPT 자동종료·원격 UNC·다른
+관리자 계정은 미검증이다. 앱이 설치 결과 관찰을 끝내거나 종료한 뒤의 영구 로그 보관/재수집은
+추가하지 않았다. 이전 .13 결과를 .14 사내 설치 성공으로 바꾸어 해석하지 않는다.
+
 ## PPT ACL 표현 호환 (2026-10-25)
 
 후속 경고 정리: 아래 최초 전체 회귀의 경고 128개는 LanceDB `table_names()` 폐기 예정 API

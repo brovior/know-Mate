@@ -19,10 +19,26 @@ from PyQt6.QtCore import QObject, QTimer, pyqtSignal
 from knowmate.secure.ppt_installation import (
     DetachedSetupProcess, REQUIRED_VERSION, SetupLaunchNotStarted, SetupResult, check_installation,
 )
+from knowmate.secure.ppt_child_diagnostics import ChildDiagnosticBundle
 
 logger = logging.getLogger(__name__)
 _LEGACY_REASONS = {"mutation_failed", "launch_failed", "check_failed"}
 _SUPPRESS_REASONS = {"permission_declined", *_LEGACY_REASONS}
+
+
+def _log_child_diagnostics(bundle: ChildDiagnosticBundle) -> None:
+    """Log at most two validated phase observations without using raw helper payloads."""
+    fields = ("stage", "target", "error_type", "policy_reason", "winerror", "hresult",
+              "native_stage", "ntstatus", "io_status", "check_status", "check_reason")
+    message = ("PPT 관리자 도구 진단: phase=%s transport=%s child_exit_code=%s "
+               "last_stage=%s last_target=%s " +
+               " ".join(f"primary_{field}=%s" for field in fields) + " " +
+               " ".join(f"secondary_{field}=%s" for field in fields))
+    for child in bundle.records:
+        logger.info(message, child.phase, child.transport, child.child_exit_code,
+                    child.last_stage, child.last_target,
+                    *(getattr(child.primary, field, None) for field in fields),
+                    *(getattr(child.secondary, field, None) for field in fields))
 
 
 def preparation_policy(mode: str, result: SetupResult) -> str:
@@ -201,12 +217,15 @@ class PptPreparationCoordinator(QObject):
                 # Diagnostic I/O is never the authority for machine safety and
                 # must not prevent the independent post_check below.
                 logger.debug("PPT 설치 도구 진단: reason=diagnostic_unavailable")
+            children = diagnostic.child_diagnostic
             logger.info("PPT 설치 도구 종료: code=%s result=%s reason=%s stage=%s error_type=%s "
                         "winerror=%s required_version=%s installed_version=%s "
-                        "native_stage=%s ntstatus=%s io_status=%s policy_reason=%s", exit_code, outcome,
+                        "native_stage=%s ntstatus=%s io_status=%s policy_reason=%s "
+                        "child_diagnostic_state=%s", exit_code, outcome,
                         diagnostic.reason, diagnostic.stage, diagnostic.error_type, diagnostic.winerror,
                         REQUIRED_VERSION, diagnostic.installed_version, *diagnostic.native_diagnostic,
-                        diagnostic.policy_diagnostic)
+                        diagnostic.policy_diagnostic, children.state)
+            _log_child_diagnostics(children)
             if exit_code == 11:
                 self._save_suppression("permission_declined")
             self._close_observation()

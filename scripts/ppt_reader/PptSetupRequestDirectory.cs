@@ -96,7 +96,8 @@ namespace AegisDesk.PptSetup
                     if (code != 183)
                     {
                         if (nativeErrors) throw new Win32Exception(code);
-                        throw new IOException("acl_unavailable");
+                        ChildDiagnostics.NativeFailure(code);
+                        var failure=new IOException("acl_unavailable");ChildDiagnostics.Attach(failure);throw failure;
                     }
                 }
                 return created;

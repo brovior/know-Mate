@@ -11,6 +11,7 @@ namespace AegisDesk.PptSetup
 {
     internal static partial class Mutation
     {
+        static partial void TraceMutation(string stage);
         /// <summary>Return the unescaped file URL expected by .NET COM registration.</summary>
         public static string RegistrationCodeBase(string path)
         {
@@ -21,6 +22,7 @@ namespace AegisDesk.PptSetup
 
         public static void Protect(string directory)
         {
+            ChildDiagnostics.Mark("install_root_create",ChildDiagnostics.Target(directory));TraceMutation("install_root_create");
             Machine.NoLinks(directory);
             string parent = Path.GetDirectoryName(directory);
             if (!Directory.Exists(parent) || String.Equals(directory, Machine.Root, StringComparison.OrdinalIgnoreCase)) Protect(parent);
@@ -32,19 +34,21 @@ namespace AegisDesk.PptSetup
                     InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
             acl.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(WellKnownSidType.BuiltinUsersSid, null), FileSystemRights.ReadAndExecute,
                 InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
+            ChildDiagnostics.Mark("install_root_create",ChildDiagnostics.Target(directory));TraceMutation("install_root_create");
             RequestDirectory.Create(directory, acl);
+            ChildDiagnostics.Mark("install_root_policy",ChildDiagnostics.Target(directory));TraceMutation("install_root_policy");
             Machine.NoLinks(directory);
             DirectorySecurity existing = Directory.GetAccessControl(directory);
             var owner = (SecurityIdentifier)existing.GetOwner(typeof(SecurityIdentifier));
             if (!owner.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid) && !owner.IsWellKnown(WellKnownSidType.LocalSystemSid))
-                throw new IOException("acl_unavailable");
+                { ChildDiagnostics.Policy("root_owner_untrusted");var failed=new IOException("acl_unavailable");ChildDiagnostics.Attach(failed);throw failed; }
             foreach (FileSystemAccessRule rule in existing.GetAccessRules(true, true, typeof(SecurityIdentifier)))
             {
                 var sid = (SecurityIdentifier)rule.IdentityReference;
                 if (rule.AccessControlType == AccessControlType.Allow && !sid.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid) &&
                     !sid.IsWellKnown(WellKnownSidType.LocalSystemSid) &&
                     (rule.FileSystemRights & (FileSystemRights.Write | FileSystemRights.Delete | FileSystemRights.DeleteSubdirectoriesAndFiles |
-                        FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership)) != 0) throw new IOException("acl_unavailable");
+                        FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership)) != 0) {ChildDiagnostics.Policy("root_write_untrusted");var failed=new IOException("acl_unavailable");ChildDiagnostics.Attach(failed);throw failed;}
             }
         }
         public static bool RegistrationValid(RegistryKey root, string version)
@@ -149,17 +153,22 @@ namespace AegisDesk.PptSetup
         }
         public static void Recover()
         {
-            VersionBoundary();
+            bool rollback=ChildDiagnostics.HasPrimary;
+            ChildDiagnostics.Mark(rollback?"install_rollback":"mutation_version_check","record");VersionBoundary();
+            ChildDiagnostics.Mark(rollback?"install_rollback":"mutation_recovery","journal");
             Machine.NoLinks(Machine.Journal);
             if (!File.Exists(Machine.Journal)) return;
             if (!Protected(Machine.Journal)) throw new IOException("journal_unresolved");
             var data = ReadRecoveryJournal();
             int bitness = (int)data["bitness"];
             var snapshots = (Dictionary<string, object>)data["keys"];
+            ChildDiagnostics.Mark(rollback?"install_rollback":"mutation_recovery","registry");
             using (RegistryKey root = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, Machine.View(bitness)))
                 foreach (string path in Contract.Keys) RestoreKey(root, path, snapshots[path]);
+            ChildDiagnostics.Mark(rollback?"install_rollback":"mutation_recovery","record");
             if (data["record"] == null) { if (File.Exists(Machine.Record)) File.Delete(Machine.Record); }
             else Contract.AtomicWrite(Machine.Record, data["record"], FileAcl());
+            ChildDiagnostics.Mark(rollback?"install_rollback":"mutation_recovery","journal");
             File.Delete(Machine.Journal);
         }
         private static void Journal(RegistryKey root, int bitness)
@@ -176,52 +185,63 @@ namespace AegisDesk.PptSetup
 
         public static void Apply(bool remove, string own, RequestDirectoryLease lease)
         {
+            ChildDiagnostics.Mark("mutation_office_check","none");
             if (!Machine.OfficeClosed()) throw new IOException("office_busy");
-            if (!Machine.Admin || !Machine.ReservationsSafe(own)) throw new IOException("mutation_blocked");
-            lease.Recheck();
-            VersionBoundary();
-            Recover();
+            ChildDiagnostics.Mark("mutation_reservations_check","request");
+            if (!Machine.Admin || !Machine.ReservationsSafe(own)) {ChildDiagnostics.Policy("mutation_blocked");throw new IOException("mutation_blocked");}
+            ChildDiagnostics.Mark("mutation_lease_check","request");lease.Recheck();
+            ChildDiagnostics.Mark("mutation_version_check","record");VersionBoundary();
+            ChildDiagnostics.Mark("mutation_recovery","journal");Recover();
+            ChildDiagnostics.Mark("mutation_machine_check","none");
             Result state = Machine.Check("check", true, false, own);
-            if (!state.machine_safe || state.office_bitness == null || state.status == "conflict" || (!remove && state.status == "disabled")) throw new IOException("mutation_blocked");
-            if (remove && !Owned()) throw new IOException("installation_unknown");
-            if (Owned() && Convert.ToInt32(Contract.Read(Machine.Record)["bitness"]) != state.office_bitness.Value) throw new IOException("installation_view_changed");
+            if (!state.machine_safe || state.office_bitness == null || state.status == "conflict" || (!remove && state.status == "disabled")) {ChildDiagnostics.Gate(state);throw new IOException("mutation_blocked");}
+            ChildDiagnostics.Mark("mutation_ownership_check","record");TraceMutation("mutation_ownership_check");
+            if (remove && !Owned()) {ChildDiagnostics.Policy("installation_unknown");throw new IOException("installation_unknown");}
+            if (Owned() && Convert.ToInt32(Contract.Read(Machine.Record)["bitness"]) != state.office_bitness.Value) {ChildDiagnostics.Policy("installation_view_changed");throw new IOException("installation_view_changed");}
             Protect(Machine.Root);
-            lease.Recheck();
+            ChildDiagnostics.Mark("mutation_lease_check","request");lease.Recheck();
+            ChildDiagnostics.Mark("install_registry","registry");TraceMutation("install_registry");
             using (RegistryKey root = RegistryKey.OpenBaseKey(RegistryHive.LocalMachine, Machine.View(state.office_bitness.Value)))
             {
                 // Expose the journal before any own registry mutation; every
                 // interrupted stage is restored under the next mutation lock.
-                lease.Recheck();
-                Journal(root, state.office_bitness.Value);
+                ChildDiagnostics.Mark("mutation_lease_check","request");lease.Recheck();
+                ChildDiagnostics.Mark("install_journal","journal");TraceMutation("install_journal");Journal(root, state.office_bitness.Value);
                 try
                 {
+                    ChildDiagnostics.Mark("mutation_office_check","none");
                     if (!Machine.OfficeClosed()) throw new IOException("office_busy");
-                    lease.Recheck();
+                    ChildDiagnostics.Mark("mutation_lease_check","request");lease.Recheck();
                     if (remove)
                     {
+                        ChildDiagnostics.Mark("install_registry","registry");TraceMutation("install_registry");
                         foreach (string key in Contract.Keys) root.DeleteSubKeyTree(key, false);
-                        File.Delete(Machine.Record);
+                        ChildDiagnostics.Mark("install_record","record");TraceMutation("install_record");File.Delete(Machine.Record);
                     }
                     else
                     {
+                        ChildDiagnostics.Mark("child_payload_check","payload");
                         if (!Contract.PayloadValid()) throw new IOException("payload_invalid");
                         string path = Machine.InstalledDll(Contract.Version);
                         Protect(Path.GetDirectoryName(path));
                         var hashes = new Dictionary<string, object>();
                         foreach (string name in Contract.InstalledFiles)
                         {
+                            ChildDiagnostics.Mark("install_payload_copy","payload");TraceMutation("install_payload_copy");
                             string source = Path.Combine(Contract.PayloadDirectory, name);
                             string target = Path.Combine(Path.GetDirectoryName(path), name);
                             Machine.NoLinks(source); Machine.NoLinks(target);
                             string hash = Contract.Hash(source);
                             if (File.Exists(target)) { if (Contract.Hash(target) != hash) throw new IOException("same_version_changed"); }
                             else File.Copy(source, target, false);
-                            File.SetAccessControl(target, FileAcl());
+                            ChildDiagnostics.Mark("install_file_acl","payload");TraceMutation("install_file_acl");File.SetAccessControl(target, FileAcl());
+                            ChildDiagnostics.Mark("install_verify","payload");TraceMutation("install_verify");
                             AssemblyName identity = AssemblyName.GetAssemblyName(target);
                             if (Contract.Hash(target) != hash || identity.Name != Path.GetFileNameWithoutExtension(name) ||
                                 identity.Version.ToString() != Contract.Version) throw new IOException("copy_invalid");
                             hashes[name] = hash;
                         }
+                        ChildDiagnostics.Mark("install_registry","registry");TraceMutation("install_registry");
                         string server = Contract.Keys[0] + @"\InprocServer32";
                         string assembly = AssemblyName.GetAssemblyName(path).FullName;
                         Set(root, Contract.Keys[0], "", "Aegis Desk PPT Reader");
@@ -236,17 +256,24 @@ namespace AegisDesk.PptSetup
                         Set(root, Contract.Keys[2], "FriendlyName", "Aegis Desk PPT Reader");
                         Set(root, Contract.Keys[2], "Description", "In-process PowerPoint reader");
                         Set(root, Contract.Keys[2], "LoadBehavior", 3, RegistryValueKind.DWord);
+                        ChildDiagnostics.Mark("install_record","record");TraceMutation("install_record");
                         Contract.AtomicWrite(Machine.Record, new Dictionary<string, object> { { "schema", 2 }, { "prog_id", Contract.ProgId },
                             { "class_id", Contract.ClassId }, { "scope", "Machine" }, { "bitness", state.office_bitness.Value },
                             { "version", Contract.Version }, { "path", path }, { "sha256", hashes[Contract.Dll] }, { "files", hashes } }, FileAcl());
+                        ChildDiagnostics.Mark("install_verify","registry");TraceMutation("install_verify");
                         if (!RegistrationValid(root, Contract.Version)) throw new IOException("registration_invalid");
                     }
-                    File.Delete(Machine.Journal);
+                    ChildDiagnostics.Mark("install_journal","journal");TraceMutation("install_journal");File.Delete(Machine.Journal);
                     // Retain versioned payload files, including old versions.
                     // Registration removal is safe; file cleanup needs a separate
                     // verified file-use procedure and never overwrites a DLL.
                 }
-                catch { Recover(); throw; }
+                catch (Exception error)
+                {
+                    ChildDiagnostics.Capture(error);ChildDiagnostics.Mark("install_rollback","journal");TraceMutation("install_rollback");
+                    try {Recover();}catch(Exception rollback){ChildDiagnostics.CaptureSecondary(rollback);throw;}
+                    throw;
+                }
             }
         }
     }

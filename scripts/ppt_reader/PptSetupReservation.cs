@@ -124,20 +124,28 @@ namespace AegisDesk.PptSetup
         { return RunOperation("/elevated-repair-parent ", request); }
         private static int RunOperation(string operation, Reservation request)
         {
+            ChildDiagnosticServer diagnostics=null;
+            try {diagnostics=ChildDiagnosticServer.Start(request.request_id,operation.IndexOf("repair-parent",StringComparison.Ordinal)>=0?"parent_repair":operation.IndexOf("remove",StringComparison.Ordinal)>=0?"remove":"install");}catch {}
             var info = new ExecuteInfo { size = Marshal.SizeOf(typeof(ExecuteInfo)), mask = 0x40 | 0x100,
                 verb = "runas", file = System.Reflection.Assembly.GetExecutingAssembly().Location,
-                parameters = operation + request.request_id, show = 0 };
-            if (!ShellExecuteEx(ref info)) return Marshal.GetLastWin32Error() == 1223 ? 11 : 14;
-            if (info.process == IntPtr.Zero) return 14; // request may still exist; never mark complete
+                parameters = operation + request.request_id + (diagnostics==null?"":diagnostics.Arguments), show = 0 };
+            uint? observed=null;bool owns=false;
             try
             {
-                // Intentionally no timeout or kill-on-close; app observation is
-                // independent and may end while this helper remains alive.
+                if (!ShellExecuteEx(ref info)) return Marshal.GetLastWin32Error() == 1223 ? 11 : 14;
+                if (info.process == IntPtr.Zero) return 14;
+                owns=true;
+                // Preserve the original independent, unlimited process observation.
                 if (WaitForSingleObject(info.process, 0xffffffff) != 0) return 14;
                 uint code;
-                return GetExitCodeProcess(info.process, out code) ? (int)code : 14;
+                if(!GetExitCodeProcess(info.process,out code))return 14;
+                observed=code;return (int)code;
             }
-            finally { CloseHandle(info.process); }
+            finally
+            {
+                if(diagnostics!=null){try {ChildDiagnostics.Add(diagnostics.Finish(owns?info.process:IntPtr.Zero,observed));}catch {}finally {diagnostics.Dispose();}}
+                if(owns)CloseHandle(info.process);
+            }
         }
     }
 }

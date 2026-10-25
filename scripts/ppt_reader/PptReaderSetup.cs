@@ -2,14 +2,20 @@ using System;
 using System.IO;
 using System.Reflection;
 
-[assembly: AssemblyVersion("1.0.5.13")]
-[assembly: AssemblyFileVersion("1.0.5.13")]
+[assembly: AssemblyVersion("1.0.5.14")]
+[assembly: AssemblyFileVersion("1.0.5.14")]
 
 namespace AegisDesk.PptSetup
 {
     internal static class Program
     {
         internal static int Main(string[] args)
+        {
+            ChildDiagnostics.Reset();string[] normalized;var diagnostic=ChildDiagnosticSession.Begin(args,out normalized);int observed=12;
+            try {observed=MainCore(normalized);return observed;}
+            finally {if(diagnostic!=null){try {diagnostic.Finish(observed);}catch {}finally {diagnostic.Dispose();}}}
+        }
+        private static int MainCore(string[] args)
         {
             string operation = args.Length == 0 ? "check" : args[0].TrimStart('/');
             Result result = new Result(operation);
@@ -30,13 +36,21 @@ namespace AegisDesk.PptSetup
                   code = retry || result.machine_safe ? 0 : 13; }
                 else if (args.Length == 2 && (operation == "elevated-install" || operation == "elevated-remove"))
                 {
-                    if (!Machine.Admin || !Contract.PayloadValid()) throw new IOException("payload_invalid");
+                    ChildDiagnostics.Mark("child_admin_check","none");
+                    bool admin=Machine.Admin;
+                    if(admin)ChildDiagnostics.Mark("child_payload_check","payload");
+                    if (!admin || !Contract.PayloadValid()) throw new IOException("payload_invalid");
+                    ChildDiagnostics.Mark("child_machine_lock","none");
                     using (var gate = new MachineLock())
                     {
+                        ChildDiagnostics.Mark("child_lease_acquire","request");
                         using (var lease = RequestDirectoryLease.AcquireExisting())
                         {
+                            ChildDiagnostics.Mark("child_reservation_load","request");
                             Reservation request = Reservation.Load(args[1], lease);
+                            ChildDiagnostics.Mark("child_reservation_enter","request");
                             request.EnterChild();
+                            ChildDiagnostics.Mark("mutation_lease_check","request");
                             lease.Recheck();
                             Mutation.Apply(operation == "elevated-remove", request.request_id, lease);
                         }
@@ -73,17 +87,19 @@ namespace AegisDesk.PptSetup
             }
             catch (SetupFailure ex)
             {
+                ChildDiagnostics.Capture(ex);
                 ex.Apply(result); result.status = "failed"; result.reason = "acl_unavailable";
                 result.machine_safe = false; code = 12;
             }
             catch (IOException ex)
             {
+                ChildDiagnostics.Capture(ex);
                 code = FailureCode(ex);
                 result.status = code == 10 ? "busy" : "failed";
                 result.reason = code == 10 || ex.Message == "payload_invalid" ? ex.Message : "mutation_failed";
                 result.machine_safe = false;
             }
-            catch { result.status = "unknown"; result.reason = "check_failed"; result.machine_safe = false; code = 12; }
+            catch (Exception error) { ChildDiagnostics.Capture(error); result.status = "unknown"; result.reason = "check_failed"; result.machine_safe = false; code = 12; }
             result.Emit();
             return code;
         }

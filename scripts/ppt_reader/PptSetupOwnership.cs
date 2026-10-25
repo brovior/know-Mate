@@ -29,28 +29,35 @@ namespace AegisDesk.PptSetup
                 return (string)data["prog_id"] == Contract.ProgId && (string)data["class_id"] == Contract.ClassId &&
                     (string)data["scope"] == "Machine" && String.Equals((string)data["path"],
                     Machine.InstalledDll((string)data["version"]), StringComparison.OrdinalIgnoreCase);
-            } catch { return false; }
+            } catch (Exception error) { ChildDiagnostics.Pending(error);return false; }
         }
         public static bool Owned()
         {
-            try {
-                Machine.NoLinks(Machine.Record);
-                return Protected(Machine.Record) && RecordIdentity(Contract.Read(Machine.Record));
-            } catch { return false; }
+            using(ChildDiagnostics.Scope("machine_record_check","record"))
+            {
+                try {
+                    Machine.NoLinks(Machine.Record);
+                    return Protected(Machine.Record) && RecordIdentity(Contract.Read(Machine.Record));
+                } catch (Exception error) { ChildDiagnostics.Pending(error);return false; }
+            }
         }
         // Also called before Recover: a stale helper must not restore/delete a newer record.
         internal static Dictionary<string, object> VersionBoundary()
         {
             Machine.NoLinks(Machine.Record);
             if (!File.Exists(Machine.Record)) {
-                if (Directory.Exists(Machine.Record)) throw new IOException("installation_unknown");
+                if (Directory.Exists(Machine.Record)) throw OwnershipFailure("installation_unknown");
                 return null;
             }
-            if (!Protected(Machine.Record)) throw new IOException("installation_unknown");
+            if (!Protected(Machine.Record)) throw OwnershipFailure("installation_unknown");
             var record = Contract.Read(Machine.Record);
-            if (!RecordIdentity(record)) throw new IOException("installation_unknown");
+            if (!RecordIdentity(record)) throw OwnershipFailure("installation_unknown");
             if (new Version((string)record["version"]) > new Version(Contract.Version)) throw new IOException("downgrade_blocked");
             return record;
+        }
+        private static IOException OwnershipFailure(string reason)
+        {
+            ChildDiagnostics.Policy(reason);var failure=new IOException(reason);ChildDiagnostics.Attach(failure);return failure;
         }
         private static Dictionary<string, object> ReadRecoveryJournal()
         {
@@ -72,7 +79,7 @@ namespace AegisDesk.PptSetup
                 ValidateSnapshot(snapshots[key], previous, 0);
             }
                 return data;
-            } catch (Exception) { throw new IOException("journal_unresolved"); }
+            } catch (Exception error) { ChildDiagnostics.Pending(error);var failed=new IOException("journal_unresolved");ChildDiagnostics.Attach(failed);throw failed; }
         }
         private static void ValidateSnapshot(object snapshot, Dictionary<string, object> previous, int depth)
         {
