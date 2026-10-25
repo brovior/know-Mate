@@ -27,7 +27,9 @@ _REASONS = frozenset({"registration_ok", "not_installed", "version_old",
     "payload_invalid", "acl_unavailable", "permission_declined", "launch_failed",
     "child_unconfirmed", "mutation_failed", "removed", "check_failed"})
 _DIAGNOSTIC_STAGES = frozenset({"anchor_open", "parent_open", "parent_policy", "child_open",
-    "child_policy", "request_create", "request_acl", "request_commit", "lease_recheck"})
+    "child_policy", "request_create", "request_acl", "request_commit", "lease_recheck",
+    "parent_repair_check", "parent_repair_backup", "parent_repair_write",
+    "parent_repair_verify", "parent_repair_recover"})
 _DIAGNOSTIC_ERRORS = frozenset({"policy", "Win32Exception", "UnauthorizedAccessException",
     "IOException", "SecurityException", "InvalidOperationException", "ArgumentException", "NotSupportedException", "Exception"})
 _NATIVE_STAGES = frozenset({"commit_return", "commit_verify", "commit_close"})

@@ -1,12 +1,12 @@
 # 운영 PPT Reader 개발 검증
 
 다른 PC의 미완성 진단 소스 검토는 [checkpoint 이전 안내](PPT_CHECKPOINT_HANDOFF.md)를 먼저 따른다.
-아래 1.0.5.0 후보 안내는 현재 PC의 설치 버전을 뜻하지 않으며 설치 실행 승인이 아니다.
+아래 후보 안내는 현재 PC의 설치 버전을 뜻하지 않으며 설치 실행 승인이 아니다.
 
-현재 소스의 요구 버전은 **1.0.5.0**이다. 선택적 Events DLL 통합 후보이므로
+현재 소스의 요구 버전은 Reader/Events/setup 모두 **1.0.5.11**이다. 선택적 Events DLL을 포함하므로
 [오프라인 통합·복구 조건](../design/PPT_EVENT_ADAPTER.md)을 먼저 확인한다.
 실제 설치·Office 검증 승인이 나기 전에는 아래 설치 절차를 실행하지 않는다.
-기존 1.0.4.0 설치본은 그대로 유지한다. 기본 빌드는 자동 설치를 끈 `disabled`이며,
+승인 전에는 기존 설치본을 유지한다. 기본 빌드는 자동 설치를 끈 `disabled`이며,
 개발 빌드의 `candidate`/`released`에서 앱 시작부터 자동 설치를 실행한다.
 시험 DLL의 내용 일치/속도 결과를 운영 DLL·자동 설치의 성공으로 간주하지 않는다.
 아래 명령은 Windows 개발 PC에서 실행한다. 문서 원문은 로그/파일로 기록하지 않는다.
@@ -33,6 +33,40 @@ UI는 계속 사용할 수 있고 설치 관찰 동안 최초 인덱싱은 대�
 선택 모드의 폴더만 정리하므로 후보 빌드가 일반 배포 결과를 덮어쓰지 않는다.
 `fast`는 개발 반복용이며 배포하지 않는다. 모드는 빌드 출처·C# 상수·manifest에 함께 내장된다.
 설정 파일·실행 환경변수·manifest만 바꿔서 자동 설치를 켤 수 없다.
+
+## 구버전 부모 폴더 권한 복구 후보
+
+1.0.0.0 Reader에서 `acl_unavailable / parent_policy / policy`로 업데이트가 막혔을 때의 후보다.
+다른 설치 버전이나 임의로 수정된 폴더까지 수리하지 않는다. 기존 Reader 설치 기록과
+`C:\ProgramData\AegisDesk\PptReaderRequests`가 남아 있고 부모 아래에 다른 항목이 없어야 한다.
+구체적인 허용·거절 기준은 [설계 §8-7](../design/PPT_ADDIN_INDEXING.md#8-7-구버전-부모-폴더-권한-복구-후보)을 따른다.
+
+PowerPoint와 AegisDesk를 정상 종료하고 새 candidate를 실행한다. 별도 config 옵션은 없으며,
+조건을 통과하면 부모 권한 복구와 Reader 업데이트에 **최대 두 번의 UAC**가 나타날 수 있다.
+준비 완료 로그의 설치 버전 `1.0.5.11`과 `status=ready`를 먼저 확인한다. 이후 새 구형 `.ppt`를
+fake embedding으로 처리해 같은 PID의 `process observation ... status=exited`까지 확인한다.
+이번 변경만으로 실제 사내 업데이트·PPT 종료가 통과했다고 판단하지 않는다.
+
+| 단계 | 로그의 `stage` | 처리 |
+|---|---|---|
+| 기존 설치·부모·요청 검사 | `parent_repair_check` | 지원 버전/owner/ACL/기타 항목을 확인. 광범위 ACL 초기화 금지 |
+| 감사 파일 생성·검사 | `parent_repair_backup` | 보호된 backup 및 부분 파일 상태 확인. 파일 임의 삭제 금지 |
+| 부모 DACL 쓰기·재검사 | `parent_repair_write` / `parent_repair_verify` | 미완료 예약 유지. 앱 재실행만으로 재개하지 않음 |
+| 관리자 명시 회수 | `parent_repair_recover` | 살아 있는 helper/child, identity 불명·지원하지 않는 상태는 보류 |
+
+중단 후 `reservation_unresolved`라면 관리자 명시 회수가 필요하다. 앱과 해당 설치 helper가
+정상 종료했는지 먼저 확인한다. 미완료 UUID는 요청 파일의 `request_id`와 `state`에서 확인하며,
+본문·SID·SDDL을 앱 로그에 복사하지 않는다. 검증한 candidate payload의 `PptReaderSetup.exe`에
+관리자 권한으로 `/recover-parent UUID`를 전달한다. 이 명령은 부모를 안전한 방향으로 좁히고
+예약을 완료할 뿐 Reader를 업데이트하지 않는다. 성공 후 앱을 다시 실행해 일반 업데이트를 진행한다.
+
+backup이 없고 부모가 이미 protected explicit이면 원본과 중간 저장을 구분할 수 없어 회수도
+거절한다. 이때는 요청·backup·부모 ACL을 보존해 진단하며, 폴더 삭제나 예약 complete 수동 편집으로
+우회하지 않는다. 이 PC에 보관된 과거 시험용 동일 버전 DLL을 새 빌드로 덮어써 설치하지 않는다.
+
+개발 회귀는 `pytest knowmate/tests/test_ppt_parent_repair.py -v`다. 일반 pytest는 실제 UAC를
+요청하지 않으며 lifecycle fixture를 컴파일하고 네이티브 비전파·특수 lease를 검사한다. 수동 승격
+lifecycle 검증 산출물과 OS fake 범위는 [진단 결과](../DIAGNOSTICS.md#ppt-구버전-부모-폴더-권한-복구-2026-10-25)에 있다.
 
 ## 빌드와 읽기 전용 점검(개발 도구)
 

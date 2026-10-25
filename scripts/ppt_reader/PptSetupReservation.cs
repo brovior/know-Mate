@@ -9,7 +9,7 @@ namespace AegisDesk.PptSetup
 {
     internal sealed class Reservation
     {
-        private RequestDirectoryLease lease;
+        private IReservationNamespace lease;
         public int schema = 1;
         public string request_id, required_version = Contract.Version, helper_sid;
         public int helper_pid;
@@ -50,7 +50,7 @@ namespace AegisDesk.PptSetup
         }
         public void Save()
         { RequestWriter.Write(lease, (Dictionary<string, object>)Values(this), RequestWriteMode.ReplaceExisting); }
-        public static Reservation Create(RequestDirectoryLease lease)
+        public static Reservation Create(IReservationNamespace lease)
         {
             lease.Recheck();
             using (Process current = Process.GetCurrentProcess())
@@ -62,7 +62,7 @@ namespace AegisDesk.PptSetup
                 return request;
             }
         }
-        public static Reservation Load(string id, RequestDirectoryLease lease)
+        public static Reservation Load(string id, IReservationNamespace lease)
         {
             lease.Recheck();
             Guid guid;
@@ -119,10 +119,14 @@ namespace AegisDesk.PptSetup
         [DllImport("kernel32.dll")] private static extern bool CloseHandle(IntPtr handle);
 
         public static int Run(bool remove, Reservation request)
+        { return RunOperation(remove ? "/elevated-remove " : "/elevated-install ", request); }
+        internal static int RunRepair(Reservation request)
+        { return RunOperation("/elevated-repair-parent ", request); }
+        private static int RunOperation(string operation, Reservation request)
         {
             var info = new ExecuteInfo { size = Marshal.SizeOf(typeof(ExecuteInfo)), mask = 0x40 | 0x100,
                 verb = "runas", file = System.Reflection.Assembly.GetExecutingAssembly().Location,
-                parameters = (remove ? "/elevated-remove " : "/elevated-install ") + request.request_id, show = 0 };
+                parameters = operation + request.request_id, show = 0 };
             if (!ShellExecuteEx(ref info)) return Marshal.GetLastWin32Error() == 1223 ? 11 : 14;
             if (info.process == IntPtr.Zero) return 14; // request may still exist; never mark complete
             try

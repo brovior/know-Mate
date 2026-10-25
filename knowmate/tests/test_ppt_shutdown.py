@@ -157,7 +157,7 @@ def origin(launch, monkeypatch):
         check_target()
         return service.TryQuitIfIdle()
     monkeypatch.setattr(ppt_caller_quit, "request_guarded_quit", invoke)
-    service = SimpleNamespace(ProtocolVersion=lambda: 3, ReaderVersion=lambda: "1.0.5.10",
+    service = SimpleNamespace(ProtocolVersion=lambda: 3, ReaderVersion=lambda: "1.0.5.11",
                               TryQuitIfIdle=Mock(return_value="quit_requested"))
     app.COMAddIns = SimpleNamespace(Item=Mock(return_value=SimpleNamespace(Connect=True, Object=service)))
     monkeypatch.setattr(ppt_policy, "auto_shutdown_enabled", lambda: True)
@@ -395,7 +395,7 @@ def test_installation_stamp_detects_registry_dll_and_record_mutations(monkeypatc
     monkeypatch.setitem(sys.modules, "winreg", module)
     monkeypatch.setattr(ppt_installation, "_known_folder", lambda identifier: tmp_path)
     directory = tmp_path / "AegisDesk/PptReader"
-    versioned = directory / "1.0.5.10"
+    versioned = directory / "1.0.5.11"
     versioned.mkdir(parents=True)
     dll = versioned / "AegisDesk.PptReader.dll"
     dll.write_bytes(b"compiled candidate")
@@ -403,7 +403,7 @@ def test_installation_stamp_detects_registry_dll_and_record_mutations(monkeypatc
     events.write_bytes(b"compiled events")
     record = directory / "installation.json"
     digest = hashlib.sha256(dll.read_bytes()).hexdigest()
-    metadata = {"schema": 2, "version": "1.0.5.10", "sha256": digest,
+    metadata = {"schema": 2, "version": "1.0.5.11", "sha256": digest,
                 "files": {dll.name: digest, events.name: hashlib.sha256(events.read_bytes()).hexdigest()}}
     record.write_text(json.dumps(metadata))
     first = ppt_launch.installation_stamp()

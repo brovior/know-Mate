@@ -13,7 +13,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 VERSION = "1.0.6.0"
-PREVIOUS_VERSION = "1.0.5.10"
+PREVIOUS_VERSION = "1.0.5.11"
 PAYLOADS = ("AegisDesk.PptReader.dll", "AegisDesk.PptReader.Events.dll", "PptReaderSetup.exe")
 COLLECTOR = "PptCaptureCollector.exe"
 DEFINES = "/define:AEGIS_PPT_DEFERRED_DIAGNOSTIC;AEGIS_PPT_EXTERNAL_DIAGNOSTIC;AEGIS_PPT_CAPTURE_DIAGNOSTIC"

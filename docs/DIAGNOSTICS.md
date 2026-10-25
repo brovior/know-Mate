@@ -1051,6 +1051,75 @@ OS·HTTP 연결 제한과 종료 유예로 기다리며, 워커가 끝내 복귀
 PID·생성 identity로 검증된 소유 프로세스만 정리하고 PowerPoint Quit·강제 종료 금지를
 유지한다. 하드 종료 경로의 무조건 종료를 유지하며 그 경로에 블로킹 정리를 추가하지 않는다.
 
+## PPT 구버전 부모 폴더 권한 복구 (2026-10-25)
+
+1.0.0.0 설치가 남긴 ProgramData 부모의 상속 Users Write 때문에 `acl_unavailable /
+parent_policy / policy`가 발생할 수 있다. 일반 ACL 검사를 완화하지 않고 정확한 legacy 설치와
+ACL을 확인한 뒤 부모 DACL만 좁히는 1.0.5.11 후보를 구현했다. 구현 계약은
+[설계 §8-7](design/PPT_ADDIN_INDEXING.md#8-7-구버전-부모-폴더-권한-복구-후보), 판독·운영 절차는
+[Reader 안내](guides/PPT_READER.md#구버전-부모-폴더-권한-복구-후보)를 따른다.
+
+### 확인한 결과
+
+Windows 11 Pro 10.0.26200·로컬 NTFS·.NET Framework compiler에서 아래를 실행했다.
+이번 작업은 실제 ProgramData 권한·Reader 설치·HKLM 등록·Office를 변경하지 않았다.
+
+| 검증 | 결과와 범위 |
+|---|---|
+| native 일반/특수 lease | 일반 lease는 역사적 ACL을 거절하고 특수 lease만 기존 schema 1 reserved 생성·읽기·complete 저장 성공. 일반 토큰의 elevated 전이는 거절 |
+| native parent-only 저장 | `NtSetSecurityObject(info=4)` 두 번으로 부모 protected 및 최종 ACL 확인. protected/unprotected·다단계 하위 owner/group/DACL·합성 내용 hash 유지. 첫 저장 전/후 sibling 파일·디렉터리 생성 보존 |
+| native handle 공유 | namespace READ pin과 보안 WRITE_DAC handle 동시 취득. 새 write/delete 및 선점 write handle 충돌 확인. read-only handle의 DACL 쓰기 거절 |
+| 입력·복구 거절 | 낯선 SID/deny/mask·flag 변형, 다른 owner·sibling, NULL/generic/불량 감사 ACL 거절. backup 없는 protected explicit 원본은 명시 회수도 거절 |
+| 역사적 checker | 실제 `70fe63f`와 `c5c638a`의 1.0.0.0 소스를 컴파일해 새 요구 버전 schema 1 reserved/elevated를 모두 pending 처리. 경로 binding만 fixture로 치환 |
+| 현재 Python checker | 실제 native writer로 만든 reserved 파일을 `_machine_records_safe`가 보류 |
+| 실제 UAC 2-process | ordinary helper→동일 계정 관리자 UAC child의 실제 token/image/payload 검사, reserved→elevated, native DACL 두 단계, 자식 종료 관측 후 ordinary 정상 lease→complete 성공 |
+| 생산 lifecycle 핵심 | 원본 Run/Elevated/Recover와 실제 backup·writer·lease·legacy 파일/등록 검사를 아래 OS 경계만 격리해 **14사례 PASS** |
+
+lifecycle 14사례는 정상 복구→설치 reserved 인계, 같은 1.0.0.0의 encoded/unescaped CodeBase,
+UAC 취소, unknown code·child 보류와 늦은 child 거절, backup 생성 전/후·각 native 저장 직후 중단,
+backup 없는 원본 예약 회수 및 backup 있는 안전한 전진, backup 누락/temporary/내용 손상/불량
+ACL 거절, sibling 보존·pending이다. 각 예약 commit에서 별도 스레드가 동일 mutex를 얻지 못해
+복구 complete→설치 reserved 인계가 같은 mutex 구간에 있음을 확인했다.
+
+이 lifecycle controller는 실제 관리자 토큰에서 실행했지만 **논리 Admin·process-gone·동기
+Elevation은 시험 binding**이다. known-folder 경로는 고정 workspace fixture, HKLM/HKCU는
+`HKCU\Software\AegisDeskRepairFixture\<시험 GUID>` 아래, Office는 closed/64로 격리했다.
+protected 1.0.0.0 fixture assembly·record·SHA·두 역사적 URL의 등록 비교, backup 보안·저장,
+Nt DACL·일반/특수 lease·writer는 실제 코드를 실행했다. 사본의 `ParentRepair` 핵심은 원본 byte와
+동일하며 `provenance.json`에 원본·binding SHA 및 경계를 기록했다. 실제 다른 사용자/다른 관리자
+UAC·다른 프로세스 간 모든 중단·동시 실행·Reader 업데이트를 통합 통과했다고 해석하지 않는다.
+
+### 회귀와 보완
+
+- 새 pytest **6 PASS**, 기존 request writer 행렬 포함 **14 PASS**, 계약·버전 관련 **287 PASS·3 SKIP**.
+- 필수 `.venv/Scripts/python.exe -X utf8 -m pytest knowmate/tests -v`: **2,216 PASS·6 SKIP·74 subtests PASS**, exit 0, 1046.89초. 경고 128개에는 기존 capture-buffer native 시험 4개의 subprocess UTF-8 출력 해독 경고가 포함된다. 새 repair 시험에서는 이 경고가 발생하지 않았다.
+- 첫 전체 실행은 후속 리뷰에서 구버전 ProgramFiles 외곽 container의 상속 호환 문제가 발견되어
+  56% 진행 상태에서 중단했다. 미완료 결과를 최종 통과 수치로 사용하지 않는다. 역사적 Protect가
+  Reader 루트만 보호해 부모는 상속 상태였음을 fixture에 반영했고, 실제 ProgramFiles DACL을
+  private anchor에만 복사해 검증했다. 외곽에만 정확한 TrustedInstaller/CREATOR OWNER 상속
+  예외를 허용한 뒤 최종 lifecycle 14사례와 native 거절 행렬을 다시 통과했다.
+- 첫 통합 시험에서 Windows wildcard `id.json.*`가 base `id.json`까지 반환해 정상 backup을
+  temporary로 오인한 결함을 발견했다. 전체 파일명에 `id.json.` exact prefix를 적용하고 base-only/
+  실제 temporary 회귀 및 최종 14사례로 재검증했다.
+- 설치 경로 pin에 FILE_LIST_DIRECTORY/FILE_READ_DATA를 포함해 native 공유 제약을 유지했다.
+  native 저장은 AUTO_INHERITED 제어 비트를 정규화하므로 예상 DACL도 그 비트를 제거해 비교한다.
+- 처음 실패한 lifecycle 시도는 fixture의 lease 경로 binding 누락으로 실제 ProgramData의 읽기
+  검사에서 거절됐다. 예약·권한 변경 전 종료했다. 이후 모든 known-folder 참조를 치환했다.
+  긴 시험 경로의 MAX_PATH 실패와 사본의 LF/CRLF hash 차이도 시험 도구 문제로 분리해 수정했다.
+
+격리 증거는 `.aegisdesk_build/pl/1ff4d5f4`(최종 lifecycle),
+`.aegisdesk_build/ppt-parent-uac-fixture/case-778808b2e07e4b71a2776fdb881ac8bd`(실제 UAC),
+`.aegisdesk_build/ppt-parent-repair/full-pytest.log`에 보존한다. 실패 시도는 성공 건수에 넣지 않는다.
+수동 lifecycle의 재현 빌더는 `knowmate/tests/ppt_parent_lifecycle_build.py`이며 무인 pytest는
+UAC를 실행하지 않는다. 시험 helper/controller 종료를 확인한 뒤 컴파일 GUID에 해당하는 HKCU 시험 키만 정리했으며, 운영 레지스트리는 변경하지 않았다.
+
+### 남은 승인 범위
+
+현재 설치·과거 시험 DLL은 유지한다. 새 candidate payload의 컴파일·manifest 점검과 실제 기존
+1.0.0.0→1.0.5.11 설치, 원래 사용자 ready, 구형 `.ppt`/fake embedding 인덱싱 후 동일 PID 종료,
+저장/미저장 사용자 문서 보호는 구분해 검증해야 한다. 동일 버전의 과거 시험 DLL을 새 payload로
+덮어써 설치하지 않는다. 다른 Office/OS·사내 DRM·A/B/C 계정·장시간은 미검증이다.
+
 ## 5. 완료된 개선과 과거 분석
 
 현재 완료 상황은 [수정노트](UPDATE_NOTES.md)에서 확인한다. 주요 개선은

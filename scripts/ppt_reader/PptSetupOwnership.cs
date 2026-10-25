@@ -108,8 +108,15 @@ namespace AegisDesk.PptSetup
                 }
                 if (item.Key == "Class" && !Object.Equals(value, Contract.ReaderClass)) throw new IOException("journal_unresolved");
             }
-            if (values.ContainsKey("CodeBase") && !Object.Equals(((Dictionary<string, object>)values["CodeBase"])["value"],
-                RegistrationCodeBase(Machine.InstalledDll(version)))) throw new IOException("journal_unresolved");
+            if (values.ContainsKey("CodeBase"))
+            {
+                object codeBase = ((Dictionary<string, object>)values["CodeBase"])["value"];
+                bool current = Object.Equals(codeBase, RegistrationCodeBase(Machine.InstalledDll(version)));
+                // 1.0.0.0의 실제 설치 journal만 역사적 공백 인코딩을 복원한다.
+                bool legacy = (string)previous["version"] == "1.0.0.0" && version == "1.0.0.0" &&
+                    Object.Equals(codeBase, new Uri(Machine.InstalledDll(version)).AbsoluteUri);
+                if (!current && !legacy) throw new IOException("journal_unresolved");
+            }
             foreach (var child in children) {
                 if (String.IsNullOrEmpty(child.Key) || child.Key.IndexOfAny(new[]{'\\','/'}) >= 0) throw new IOException("journal_unresolved");
                 Version childVersion;

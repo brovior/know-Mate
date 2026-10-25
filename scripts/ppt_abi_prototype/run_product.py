@@ -29,7 +29,7 @@ def main() -> int:
         for name in names:
             shutil.copyfile(args.payload / name, directory / name)
         hashes = {name: hashlib.sha256((directory / name).read_bytes()).hexdigest() for name in names}
-        record = dict(schema=2, version="1.0.5.10", prog_id="AegisDesk.PptReader",
+        record = dict(schema=2, version="1.0.5.11", prog_id="AegisDesk.PptReader",
                       class_id="{287A80D2-804A-46D3-A0E9-CA31C6FC3D09}", scope="Machine",
                       bitness=32 if arch == "x86" else 64, path=str(directory / names[0]),
                       sha256=hashes[names[0]], files=hashes)

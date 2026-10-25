@@ -18,7 +18,7 @@ from knowmate.secure import ppt_installation as installation
 
 def result_json(**changes):
     value = dict(schema=1, operation="check", status="ready", reason="registration_ok",
-                 required_version="1.0.5.10", installed_version="1.0.5.10", office_bitness=64,
+                 required_version="1.0.5.11", installed_version="1.0.5.11", office_bitness=64,
                  scope="Machine", machine_safe=True, auto_install_validated=False, auto_install_mode="disabled")
     value.update(changes)
     return json.dumps(value)
@@ -26,7 +26,7 @@ def result_json(**changes):
 
 def reservation(**changes):
     value = dict(schema=1, request_id="33e979c6-c5c4-40af-845a-64c80517d1ae",
-                 required_version="1.0.5.10", helper_sid="S-1-5-21-1-2-3-1001", helper_pid=123,
+                 required_version="1.0.5.11", helper_sid="S-1-5-21-1-2-3-1001", helper_pid=123,
                  helper_creation_ticks="638901000000000000", child_pid=None,
                  child_creation_ticks=None, state="complete")
     value.update(changes)
@@ -61,6 +61,39 @@ def test_optional_setup_diagnostic_bundle_preserves_observed_safety():
     assert value.reason == "acl_unavailable" and value.stage == "parent_policy"
     assert value.error_type == "policy" and value.winerror is None
     assert value.installed_version == "1.0.0.0" and not value.machine_safe
+
+
+@pytest.mark.parametrize("stage", ["parent_repair_check", "parent_repair_backup",
+    "parent_repair_write", "parent_repair_verify", "parent_repair_recover"])
+@pytest.mark.parametrize("status,reason,code", [
+    ("failed", "acl_unavailable", 12), ("busy", "reservation_unresolved", 12),
+    ("failed", "permission_declined", 11), ("failed", "mutation_failed", 13)])
+def test_parent_repair_diagnostic_preserves_failure_contract(
+    stage: str, status: str, reason: str, code: int,
+) -> None:
+    """Keep fixed repair diagnostics observable without permitting a COM read."""
+    value = installation.parse_setup_result(result_json(operation="prepare", status=status,
+        reason=reason, installed_version="1.0.0.0", machine_safe=False,
+        stage=stage, error_type="policy", winerror=None), code, "prepare")
+    assert (value.status, value.reason, value.stage) == (status, reason, stage)
+    assert value.error_type == "policy" and value.winerror is None
+    assert not value.machine_safe and value.native_diagnostic == (None, None, None)
+
+
+@pytest.mark.parametrize("changes", [
+    {"stage": "parent_repair_unknown"}, {"reason": "parent_repair_succeeded"},
+    {"extra": "confidential-marker"}, {"error_type": "policy", "winerror": 5},
+    {"required_version": "1.0.5.10"}, {"status": "ready"},
+    {"native_stage": "commit_verify", "ntstatus": "00000000", "io_status": "00000000"}])
+def test_parent_repair_diagnostics_do_not_relax_output_schema(changes: dict[str, object]) -> None:
+    """Reject unknown stages, stale payloads and unsupported diagnostic fields."""
+    fields = dict(operation="prepare", status="busy", reason="reservation_unresolved",
+        installed_version="1.0.0.0", machine_safe=False, stage="parent_repair_write",
+        error_type="policy", winerror=None)
+    fields.update(changes)
+    value = installation.parse_setup_result(result_json(**fields), 12, "prepare")
+    assert value == installation.SetupResult(reason="diagnostic_unavailable")
+    assert "confidential-marker" not in repr(value)
 
 
 def native_failure_json(**changes):
