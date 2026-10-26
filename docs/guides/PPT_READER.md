@@ -3,7 +3,7 @@
 다른 PC의 미완성 진단 소스 검토는 [checkpoint 이전 안내](PPT_CHECKPOINT_HANDOFF.md)를 먼저 따른다.
 아래 후보 안내는 현재 PC의 설치 버전을 뜻하지 않으며 설치 실행 승인이 아니다.
 
-현재 소스의 요구 버전은 Reader/Events/setup 모두 **1.0.5.15**이다. 선택적 Events DLL을 포함하므로
+현재 소스의 요구 버전은 Reader/Events/setup 모두 **1.0.5.16**이다. 선택적 Events DLL을 포함하므로
 [오프라인 통합·복구 조건](../design/PPT_EVENT_ADAPTER.md)을 먼저 확인한다.
 실제 설치·Office 검증 승인이 나기 전에는 아래 설치 절차를 실행하지 않는다.
 승인 전에는 기존 설치본을 유지한다. 기본 빌드는 자동 설치를 끈 `disabled`이며,
@@ -37,12 +37,16 @@ UI는 계속 사용할 수 있고 설치 관찰 동안 최초 인덱싱은 대�
 ## 설치 부모의 TrustedInstaller 호환 후보
 
 `install_root_policy / program_files_parent / root_write_untrusted`에서 유일한 거절 항목이
-TrustedInstaller의 상속된 FullControl·현재 폴더 전용 Allow라면 1.0.5.15 후보로 검증한다.
+TrustedInstaller의 상속된 FullControl·현재 폴더 전용 Allow라면 1.0.5.16 후보로 검증한다.
 정확한 Windows service SID와 고정 `ProgramFiles/AegisDesk`에만 예외를 적용한다.
 부모 ACL을 변경하거나 Reader 루트·버전 폴더·DLL의 쓰기 정책을 완화하지 않는다.
 다른 SID·범위·소유자 문제는 계속 거절될 수 있다. 새 의존성이나 수동 권한 수정은 필요 없다.
 
-새 candidate 빌드에서 설치 결과 `ready`, `installed_version=1.0.5.15`를 먼저 확인한다.
+1.0.5.16은 설치 도구와 `PptSinkLoader`가 같은 판정 소스를 사용한다. 1.0.5.15의 설치만 성공하고
+종료 서비스가 `not_supported`였다면 Reader/Events/setup 모두 새 버전으로 업데이트해 검증한다.
+별도 setup EXE를 Reader가 참조하거나 Windows ACL을 수정하지 않는다.
+
+새 candidate 빌드에서 설치 결과 `ready`, `installed_version=1.0.5.16`을 먼저 확인한다.
 그 뒤 `policy_ready=True`와 인덱싱 완료 후 원 PowerPoint PID의 실제 종료를 따로 확인한다.
 설치 정책 시험 통과만으로 PPT 자동종료 성공을 판정하지 않는다.
 근거와 미검증 범위는 [TrustedInstaller 진단](../DIAGNOSTICS.md#설치-부모-trustedinstaller-신뢰-누락-2026-10-26)을 따른다.

@@ -5,8 +5,8 @@ using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Threading;
 
-[assembly: AssemblyVersion("1.0.5.15")]
-[assembly: AssemblyFileVersion("1.0.5.15")]
+[assembly: AssemblyVersion("1.0.5.16")]
+[assembly: AssemblyFileVersion("1.0.5.16")]
 [assembly: ComVisible(false)]
 
 namespace AegisDesk.PptReader

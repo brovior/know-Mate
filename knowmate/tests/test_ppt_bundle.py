@@ -19,13 +19,13 @@ def payload(tmp_path):
     for name in PAYLOAD_FILES:
         (tmp_path / name).write_bytes(b"synthetic payload")
     manifest = {
-        "schema": 1, "reader_version": "1.0.5.15", "protocol": 3, "payload_schema": 2,
+        "schema": 1, "reader_version": "1.0.5.16", "protocol": 3, "payload_schema": 2,
         "prog_id": "AegisDesk.PptReader", "reader_class": "AegisDesk.PptReader.Connect",
         "reader_clsid": "287A80D2-804A-46D3-A0E9-CA31C6FC3D09",
         "reader_iid": "9A20F4A6-6364-4BA7-930B-3E8857BEAF60",
         "auto_install_validated": False, "auto_install_mode": "disabled",
         "auto_install_enabled": False, "auto_shutdown_enabled": False, "build": build,
-        "assembly_versions": {name: "1.0.5.15" for name in PAYLOAD_FILES},
+        "assembly_versions": {name: "1.0.5.16" for name in PAYLOAD_FILES},
         "files": {name: hashlib.sha256(b"synthetic payload").hexdigest() for name in PAYLOAD_FILES},
     }
     (tmp_path / "manifest.json").write_text(json.dumps(manifest))
@@ -91,7 +91,7 @@ def test_production_managed_harness_on_windows(tmp_path):
                  str(root / "scripts/ppt_reader/PptShutdownEvents.cs"), str(root / "scripts/ppt_reader/PptOwnedMetadata.cs"),
                  str(root / "scripts/ppt_reader/PptShutdownGuard.cs"),
                  str(root / "knowmate/tests/ppt_managed_count_fixture.cs"),
-                 *[str(root / "scripts/ppt_reader" / name) for name in ("PptShutdownState.cs", "PptSinkLoader.cs", "PptPackageIdentity.cs", "PptEventSignatures.cs", "PptEventValidator.cs")], str(policy)]]
+                 *[str(root / "scripts/ppt_reader" / name) for name in ("PptShutdownState.cs", "PptSinkLoader.cs", "PptSetupInstallRootPolicy.cs", "PptPackageIdentity.cs", "PptEventSignatures.cs", "PptEventValidator.cs")], str(policy)]]
     for name, args in (("ppt_reader_harness.cs", []),
                        ("ppt_probe_harness.cs", ["AegisDesk.PptReader.Connect"]),
                        ("ppt_probe_connection_harness.cs", ["--production"])):

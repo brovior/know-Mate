@@ -29,7 +29,7 @@ namespace AegisDesk.PptReader
                 if((File.Exists(current)||Directory.Exists(current)) && (File.GetAttributes(current)&FileAttributes.ReparsePoint)!=0)
                     throw new IOException("ppt_event_reparse");
         }
-        private static void Protected(string path,bool directory)
+        private static void Protected(string path,bool directory,string readerRoot)
         {
             NoLinks(path);
             FileSystemSecurity acl=directory?(FileSystemSecurity)Directory.GetAccessControl(path):File.GetAccessControl(path);
@@ -38,8 +38,9 @@ namespace AegisDesk.PptReader
                 throw new IOException("ppt_event_owner");
             foreach(FileSystemAccessRule rule in acl.GetAccessRules(true,true,typeof(SecurityIdentifier))) {
                 var sid=(SecurityIdentifier)rule.IdentityReference;
-                if(rule.AccessControlType==AccessControlType.Allow && !sid.IsWellKnown(WellKnownSidType.BuiltinAdministratorsSid)
-                    && !sid.IsWellKnown(WellKnownSidType.LocalSystemSid)
+                if(rule.AccessControlType==AccessControlType.Allow &&
+                    !AegisDesk.PptSetup.InstallRootPolicy.TrustedWriter(path,readerRoot,sid.Value,
+                        rule.InheritanceFlags,rule.PropagationFlags,rule.FileSystemRights,directory)
                     && (rule.FileSystemRights&(FileSystemRights.Write|FileSystemRights.Delete|FileSystemRights.DeleteSubdirectoriesAndFiles|FileSystemRights.ChangePermissions|FileSystemRights.TakeOwnership))!=0)
                     throw new IOException("ppt_event_acl");
             }
@@ -57,8 +58,8 @@ namespace AegisDesk.PptReader
                 string core=Path.Combine(directory,CoreDll), record=Path.Combine(root,"installation.json");
                 if(!String.Equals(Path.GetFullPath(typeof(Connect).Assembly.Location),Path.GetFullPath(core),StringComparison.OrdinalIgnoreCase))
                     throw new IOException("ppt_event_install_location");
-                foreach(string path in new[]{Path.GetDirectoryName(root),root,directory}) Protected(path,true);
-                foreach(string path in new[]{record,core,Path.Combine(directory,EventsDll)}) Protected(path,false);
+                foreach(string path in new[]{Path.GetDirectoryName(root),root,directory}) Protected(path,true,root);
+                foreach(string path in new[]{record,core,Path.Combine(directory,EventsDll)}) Protected(path,false,root);
                 return LoadValidated(directory,record,state);
             } catch(Exception) { throw new COMException("ppt_event_dependency_unavailable"); }
         }

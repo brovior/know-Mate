@@ -22,7 +22,7 @@ def source_tree(tmp_path: Path) -> tuple[Path, Path, Path]:
                      "knowmate/tests/ppt_capture_buffer_harness.cs", "knowmate/tests/test_ppt_capture_buffer_native.py"):
         path = root / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text('version = "1.0.5.15"\n', encoding="utf-8")
+        path.write_text('version = "1.0.5.16"\n', encoding="utf-8")
     info = tmp_path / "info"
     info.mkdir()
     (info / "PptBuildPolicy.cs").write_text("candidate\n", encoding="utf-8")
@@ -36,8 +36,8 @@ def source_tree(tmp_path: Path) -> tuple[Path, Path, Path]:
 def test_generated_version_does_not_change_normal_product_sources(tmp_path: Path) -> None:
     root, info, output = source_tree(tmp_path)
     generated = build_capture.copy_sources(output / "generated", info, root)
-    assert REQUIRED_VERSION == "1.0.5.15"
-    assert '"1.0.5.15"' in (root / "scripts/ppt_reader/PptReader.cs").read_text()
+    assert REQUIRED_VERSION == "1.0.5.16"
+    assert '"1.0.5.16"' in (root / "scripts/ppt_reader/PptReader.cs").read_text()
     assert '"1.0.6.0"' in (output / "generated/scripts/ppt_reader/PptReader.cs").read_text()
     assert "CaptureAssemblyVersion.cs" in generated
     assert generated["scripts/ppt_reader/PptReader.cs"] != build_capture.digest(root / "scripts/ppt_reader/PptReader.cs")
