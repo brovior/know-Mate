@@ -29,7 +29,7 @@ def main() -> int:
     commands = [
         [str(compiler), "/nologo", "/target:library", "/platform:anycpu", f"/out:{core}",
          "/reference:Microsoft.CSharp.dll", "/reference:System.Core.dll", "/reference:System.Web.Extensions.dll",
-         *[str(reader / name) for name in ("PptReader.cs", "PptCallerQuit.cs", "PptShutdownGuard.cs", "PptShutdownEvents.cs", "PptOwnedMetadata.cs", "PptShutdownState.cs", "PptSinkLoader.cs", "PptPackageIdentity.cs", "PptEventSignatures.cs", "PptEventValidator.cs")],
+         *[str(reader / name) for name in ("PptReader.cs", "PptCallerQuit.cs", "PptShutdownGuard.cs", "PptShutdownEvents.cs", "PptOwnedMetadata.cs", "PptShutdownState.cs", "PptRawCount.cs", "PptSinkLoader.cs", "PptSetupInstallRootPolicy.cs", "PptPackageIdentity.cs", "PptEventSignatures.cs", "PptEventValidator.cs")],
          str(reader.parent / "ppt_shared/PptExtractionCore.cs"), str(policy)],
         [str(compiler), "/nologo", "/target:library", "/platform:anycpu",
          f"/out:{output / 'OptionalSink.Probe.dll'}", f"/reference:{references['pia']}",

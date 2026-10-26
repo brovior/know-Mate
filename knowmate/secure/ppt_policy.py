@@ -4,7 +4,7 @@ from __future__ import annotations
 import sys
 from knowmate.build_info import get_build_info
 
-REQUIRED_VERSION = "1.0.5.15"
+REQUIRED_VERSION = "1.0.5.16"
 AUTO_INSTALL_MODES = frozenset({"disabled", "candidate", "released"})
 
 

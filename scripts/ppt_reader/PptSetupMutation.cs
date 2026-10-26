@@ -47,7 +47,7 @@ namespace AegisDesk.PptSetup
                 var sid = (SecurityIdentifier)rule.IdentityReference;
                 if (rule.AccessControlType == AccessControlType.Allow &&
                     !InstallRootPolicy.TrustedWriter(directory, Machine.Root, sid.Value,
-                        rule.InheritanceFlags, rule.PropagationFlags, rule.FileSystemRights) &&
+                        rule.InheritanceFlags, rule.PropagationFlags, rule.FileSystemRights, true) &&
                     (rule.FileSystemRights & (FileSystemRights.Write | FileSystemRights.Delete | FileSystemRights.DeleteSubdirectoriesAndFiles |
                         FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership)) != 0) {ChildDiagnostics.Policy("root_write_untrusted");var failed=new IOException("acl_unavailable");ChildDiagnostics.Attach(failed);throw failed;}
             }

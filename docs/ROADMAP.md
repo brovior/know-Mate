@@ -63,7 +63,7 @@ Phase 1~4 완료(RAG 지식검색), 5a 완료(Knox `.mysingle` + 표준 `.eml` �
 
 | 항목 | 상태·다음 행동 | 시작 조건 |
 |---|---|---|
-| PPT 설치 부모 TrustedInstaller 호환 | 1.0.5.15 후보에서 고정 부모·정확한 service SID·현재 폴더 쓰기 ACE만 허용. Reader 루트·파일 보호와 기존 ACL 유지 | [TrustedInstaller 진단](DIAGNOSTICS.md#설치-부모-trustedinstaller-신뢰-누락-2026-10-26)의 사내 1.0.0.0→1.0.5.15 실제 업데이트·Office 종료 검증. 이전1.0.5.14 helper 진단 검증과 구분 |
+| PPT 설치/종료 로더 TrustedInstaller 호환 | 1.0.5.15 사내 설치 성공 보고. 1.0.5.16은 누락된 이벤트 로더에도 공통 정책 적용. 고정 부모·정확한 SID·현재 폴더에만 허용하며 Reader 내부 보호 유지 | [로더 진단](DIAGNOSTICS.md#종료-이벤트-로더의-설치-부모-acl-검사-누락-2026-10-26)의 새 candidate 업데이트·이벤트 로딩·인덱싱/앱 종료 후 원 PID 종료 확인. 실제 Office/DRM은 미검증 |
 | PPT ACL 표현 호환 | 역할별 상한·generic/sync/subset·외곽 TI/CO 호환 및 백업 없는 예약-only 회수의 이전 1.0.5.13 후보 구현. 관련8 PASS·격리133사례·실제 동일 계정 UAC 통과, 전체2,256 PASS·6 SKIP·74 subtests PASS | [호환 진단](DIAGNOSTICS.md#ppt-acl-표현-호환-2026-10-25)의 별도 candidate payload 기록 확인, 실제 사내 업데이트·다른 관리자·Office 승인. 기존 설치 유지 |
 | PPT 구버전 부모 ACL 복구(이전 후보) | 1.0.0.0 설치·정확한 legacy ACL만 부모 DACL 복구한 이전 1.0.5.11 검증. native 비전파·특수 예약·실제 동일 계정 UAC와 격리 lifecycle 14사례 통과. 전체 회귀 2,216 PASS·6 SKIP·74 subtests PASS | [권한 복구 진단](DIAGNOSTICS.md#ppt-구버전-부모-폴더-권한-복구-2026-10-25)의 새 payload 검증 및 실제 구버전 업데이트·다른 관리자·PPT 종료/문서 보호 승인. 기존 설치 유지 |
 | COM poison 복구 뒤 점유 오판·오류 혼합 | 2초 캐시 epoch·정확한 앱 증명·최초/닫기 오류 분리 및 fake 회귀 구현 | [진단 §COM poison](DIAGNOSTICS.md#com-poison-복구-일관성-2026-10-15)의 실제 Windows·Office·DRM 검증 대기 |

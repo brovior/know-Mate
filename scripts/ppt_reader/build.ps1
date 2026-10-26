@@ -36,7 +36,7 @@ $externalSources = @(Get-ChildItem (Join-Path $PSScriptRoot 'PptExternal*.cs') |
     /reference:Microsoft.CSharp.dll /reference:System.Core.dll /reference:System.Web.Extensions.dll `
     (Join-Path $PSScriptRoot 'PptReader.cs') (Join-Path $PSScriptRoot 'PptCallerQuit.cs') (Join-Path $PSScriptRoot 'PptShutdownEvents.cs') (Join-Path $PSScriptRoot 'PptOwnedMetadata.cs') `
     (Join-Path $PSScriptRoot 'PptShutdownGuard.cs') (Join-Path $PSScriptRoot 'PptRawCount.cs') $policySource `
-    (Join-Path $PSScriptRoot 'PptShutdownState.cs') (Join-Path $PSScriptRoot 'PptSinkLoader.cs') `
+    (Join-Path $PSScriptRoot 'PptShutdownState.cs') (Join-Path $PSScriptRoot 'PptSinkLoader.cs') (Join-Path $PSScriptRoot 'PptSetupInstallRootPolicy.cs') `
     (Join-Path $PSScriptRoot 'PptPackageIdentity.cs') `
     (Join-Path $PSScriptRoot 'PptDeferredGate.cs') (Join-Path $PSScriptRoot 'PptDeferredDiagnostic.cs') `
     (Join-Path $PSScriptRoot 'PptEventSignatures.cs') (Join-Path $PSScriptRoot 'PptEventValidator.cs') `
@@ -59,7 +59,7 @@ $setupSources = @(Get-ChildItem (Join-Path $PSScriptRoot 'PptSetup*.cs') | ForEa
     (Join-Path $PSScriptRoot 'PptReaderSetup.cs') $policySource @setupSources
 if ($LASTEXITCODE -ne 0) { throw 'ppt_setup_build_failed' }
 foreach ($payload in @($reader, $events, $setup)) {
-    if ([Reflection.AssemblyName]::GetAssemblyName($payload).Version.ToString() -ne '1.0.5.15') {
+    if ([Reflection.AssemblyName]::GetAssemblyName($payload).Version.ToString() -ne '1.0.5.16') {
         throw 'ppt_payload_assembly_version_mismatch'
     }
 }

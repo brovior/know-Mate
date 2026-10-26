@@ -1051,6 +1051,36 @@ OS·HTTP 연결 제한과 종료 유예로 기다리며, 워커가 끝내 복귀
 PID·생성 identity로 검증된 소유 프로세스만 정리하고 PowerPoint Quit·강제 종료 금지를
 유지한다. 하드 종료 경로의 무조건 종료를 유지하며 그 경로에 블로킹 정리를 추가하지 않는다.
 
+## 종료 이벤트 로더의 설치 부모 ACL 검사 누락 (2026-10-26)
+
+1.0.5.15의 사내 설치는 성공했으나 `PptSinkLoader`가 설치 외곽의 TrustedInstaller FullControl을
+거절해 이벤트 DLL 생성·연결과 종료 명령에 도달하지 못했다는 보고를 받았다. Reader/Events 버전·
+해시·설치 기록·candidate 정책·Office PIA와 Reader 내부 ACL은 정상이라는 보고다.
+코드에서도 설치 `Protect`와 달리 로더의 `Protected`에 Admin/System 전용 쓰기 검사가 남아 있었다.
+이 경로는 `not_supported`와 PID 관측 timeout으로 끝나며 Quit 반환 후 미종료와 구분한다.
+
+1.0.5.16은 기존 순수 `InstallRootPolicy` 소스를 Reader와 setup에 각각 컴파일해 같은 판정을 쓴다.
+예외는 정확한 TrustedInstaller SID·고정 부모·현재 폴더 전용·FullControl 상한이며, 파일에는
+적용하지 않는다. Reader 루트·버전 폴더·설치 기록·DLL, 소유자·링크·hash·MVID·PIA 검사는 유지한다.
+setup EXE 참조나 새 런타임 의존성은 없고, 기존 Windows ACL을 바꾸지 않는다.
+normal/capture·수동 fixture의 Reader 빌드 입력에도 공통 소스를 포함한다.
+
+리뷰 수정 후 Linux 전체 `pytest knowmate/tests -v`는 **2,333 PASS·121 SKIP·74 subtests PASS**,
+exit0, 62.29초다. 공통 C# 판정 실행 37개와 양쪽 consumer/컴파일 입력 계약 2개,
+실제 수동 Core 소스 목록 참조 컴파일 2개가 포함된다. 초기 실행의 기존 scanner escape
+SyntaxWarning 1개는 별도 수정하지 않았다. .NET Framework 4.8 참조 어셈블리와
+Roslyn/C#5로 normal Reader·capture Reader·setup을 컴파일한 세 경우도 통과했다.
+이는 Linux 참조 컴파일이며 실제 Windows 빌드·ACL API·Events/Office PIA 로딩·UAC 업데이트·
+인덱싱/앱 종료 후 실제 PID 종료·DRM은 **UNEXECUTED**다.
+
+개발 완료 후 별도 agent가 실제 소스를 독립 리뷰하고 표적 시험 131 PASS·1 SKIP을 확인했다.
+신규 ACL 결함은 없었으나 기존 `run_loader`와 `run_product` cached Core의 `PptRawCount.cs`
+누락으로 수동 검증이 컴파일 전에 막히는 Medium 1건을 발견했다. 기존 main과 수정본의 실제
+소스 목록 참조 컴파일에서 같은 실패를 확인한 기존 문제이며 정식 제품 빌드에는 해당하지 않는다.
+두 목록을 수정하고 실제 목록을 컴파일하는 회귀 시험을 추가했다. 같은 agent의 독립 재검증은
+41 PASS이며 이번 코드리뷰의 미해결 Critical/High/Medium/Low는 모두 0건이다. 실제 Windows·
+Office 검증이나 배포 승인으로 해석하지 않는다. 위 부분 시험은 전체와 중복되므로 합산하지 않는다.
+
 ## 설치 부모 TrustedInstaller 신뢰 누락 (2026-10-26)
 
 사내 업데이트의 `code=13`, `install_root_policy / program_files_parent / root_write_untrusted`에서

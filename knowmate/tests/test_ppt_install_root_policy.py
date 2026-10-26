@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import ast
 from pathlib import Path
 import shutil
 import subprocess
@@ -32,7 +33,7 @@ def policy_caller(tmp_path_factory: pytest.TempPathFactory):
         'class Program { static void Main(string[] a) { '
         'bool allowed = InstallRootPolicy.TrustedWriter(a[0], a[1], a[2], '
         '(InheritanceFlags)int.Parse(a[3]), (PropagationFlags)int.Parse(a[4]), '
-        '(FileSystemRights)int.Parse(a[5])); Console.WriteLine(allowed ? "ALLOW" : "DENY"); } }',
+        '(FileSystemRights)int.Parse(a[5]), bool.Parse(a[6])); Console.WriteLine(allowed ? "ALLOW" : "DENY"); } }',
         encoding="utf-8")
     environment = dict(os.environ, DOTNET_CLI_TELEMETRY_OPTOUT="1", DOTNET_SKIP_FIRST_TIME_EXPERIENCE="1")
     built = subprocess.run([dotnet, "build", "Policy.csproj", "--configuration", "Release", "--nologo",
@@ -43,12 +44,12 @@ def policy_caller(tmp_path_factory: pytest.TempPathFactory):
     reader = parent / "PptReader"
 
     def run(sid: str, location: str = "parent", inheritance: int = 0,
-            propagation: int = 0, rights: int = FULL) -> bool:
-        locations = {"parent": str(parent), "reader": str(reader), "version": str(reader / "1.0.5.15"),
+            propagation: int = 0, rights: int = FULL, is_directory: bool = True) -> bool:
+        locations = {"parent": str(parent), "reader": str(reader), "version": str(reader / "1.0.5.16"),
                      "file": str(reader / "AegisDesk.PptReader.dll"), "foreign": str(parent) + "Extra",
                      "case": str(parent).upper(), "empty": ""}
         result = subprocess.run([dotnet, str(temporary / "bin/Release/net8.0/Policy.dll"), locations[location],
-                                 str(reader), sid, str(inheritance), str(propagation), str(rights)],
+                                 str(reader), sid, str(inheritance), str(propagation), str(rights), str(is_directory)],
                                 env=environment, capture_output=True, text=True, timeout=10)
         assert result.returncode == 0, result.stdout + result.stderr
         assert result.stdout.strip() in {"ALLOW", "DENY"}
@@ -84,5 +85,43 @@ def test_trustedinstaller_unknown_access_bits_remain_rejected(policy_caller):
 
 @pytest.mark.parametrize("sid", ["S-1-5-32-544", "S-1-5-18"])
 @pytest.mark.parametrize("location", ["parent", "reader", "version"])
-def test_original_admin_system_writer_contract_is_preserved(policy_caller, sid, location):
-    assert policy_caller(sid, location, inheritance=3)
+@pytest.mark.parametrize("is_directory", [True, False])
+def test_original_admin_system_writer_contract_is_preserved(policy_caller, sid, location, is_directory):
+    assert policy_caller(sid, location, inheritance=3, is_directory=is_directory)
+
+
+@pytest.mark.parametrize("location", ["parent", "case", "reader", "file"])
+def test_file_acl_never_receives_trustedinstaller_directory_exception(policy_caller, location):
+    assert not policy_caller(TI, location, is_directory=False)
+
+
+def test_setup_and_runtime_loader_share_the_same_writer_predicate():
+    """Prevent the independent ACL allowlists that caused the runtime-only rejection."""
+    root = Path(__file__).resolve().parents[2]
+    setup = (root / "scripts/ppt_reader/PptSetupMutation.cs").read_text()
+    loader = (root / "scripts/ppt_reader/PptSinkLoader.cs").read_text()
+    gate = loader[loader.index("private static void Protected"):loader.index("internal static object Create")]
+    assert "InstallRootPolicy.TrustedWriter(" in setup
+    assert "InstallRootPolicy.TrustedWriter(" in gate
+    assert "!sid.IsWellKnown" not in gate
+    assert "Protected(path,false,root)" in loader
+
+
+def test_every_reader_compile_path_includes_the_shared_policy_source():
+    """Catch source-list omissions on Linux before a Windows C# compile is attempted."""
+    from scripts.ppt_reader import build_capture
+    root = Path(__file__).resolve().parents[2]
+    policy = "PptSetupInstallRootPolicy.cs"
+    assert policy in build_capture.CORE
+    script = (root / "scripts/ppt_reader/build.ps1").read_text()
+    compile_reader = script[script.index("& $compiler /nologo /target:library"):
+                            script.index("throw 'ppt_reader_build_failed'")]
+    assert policy in compile_reader
+    for relative in ("scripts/ppt_abi_prototype/run_product.py", "scripts/ppt_abi_prototype/run_loader.py",
+                     "knowmate/tests/test_ppt_owned_connection.py", "knowmate/tests/test_ppt_bundle.py",
+                     "knowmate/tests/test_ppt_raw_count.py"):
+        tree = ast.parse((root / relative).read_text())
+        lists = [[item.value for item in node.elts if isinstance(item, ast.Constant)] for node in ast.walk(tree)
+                 if isinstance(node, (ast.Tuple, ast.List))]
+        consumers = [names for names in lists if "PptSinkLoader.cs" in names]
+        assert consumers and all(policy in names for names in consumers), relative

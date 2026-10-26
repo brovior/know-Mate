@@ -103,11 +103,11 @@ def build_fixture(output: Path, *, nonadmin_endpoint: bool = False) -> Path:
         if compiled.returncode:
             (output / "compile-error.txt").write_bytes(compiled.stdout + compiled.stderr)
             raise ValueError("fixture_compile_failed")
-    for version, directory in [("1.0.5.15", output), ("1.0.0.0", output / "legacy")]:
+    for version, directory in [("1.0.5.16", output), ("1.0.0.0", output / "legacy")]:
         directory.mkdir(exist_ok=True)
         payload_source = directory / "Payload.cs"
         payload_source.write_text(f'using System.Reflection; [assembly: AssemblyVersion("{version}")] internal class FixturePayload {{ }}', encoding="utf-8")
-        names = ["AegisDesk.PptReader.dll", "AegisDesk.PptReader.Events.dll"] if version == "1.0.5.15" else ["AegisDesk.PptReader.dll"]
+        names = ["AegisDesk.PptReader.dll", "AegisDesk.PptReader.Events.dll"] if version == "1.0.5.16" else ["AegisDesk.PptReader.dll"]
         for name in names:
             compile_sources(["/target:library", f"/out:{directory / name}", str(payload_source)])
     executable = output / "PptReaderSetup.exe"
@@ -122,11 +122,11 @@ def build_fixture(output: Path, *, nonadmin_endpoint: bool = False) -> Path:
                      str(paths), str(root / "knowmate/tests/ppt_parent_native_harness.cs"),
                      str(root / "knowmate/tests/ppt_parent_lifecycle_harness.cs")])
     names = ("AegisDesk.PptReader.dll", "AegisDesk.PptReader.Events.dll", "PptReaderSetup.exe")
-    manifest = dict(schema=1, reader_version="1.0.5.15", protocol=3, payload_schema=2,
+    manifest = dict(schema=1, reader_version="1.0.5.16", protocol=3, payload_schema=2,
                     prog_id="AegisDesk.PptReader", reader_class="AegisDesk.PptReader.Connect",
                     reader_clsid="287A80D2-804A-46D3-A0E9-CA31C6FC3D09", reader_iid="9A20F4A6-6364-4BA7-930B-3E8857BEAF60",
                     auto_install_mode="candidate", auto_install_enabled=True, auto_install_validated=False, auto_shutdown_enabled=True,
-                    assembly_versions={name: "1.0.5.15" for name in names},
+                    assembly_versions={name: "1.0.5.16" for name in names},
                     files={name: hashlib.sha256((output / name).read_bytes()).hexdigest() for name in names})
     (output / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
     (output / "provenance.json").write_text(json.dumps(provenance, indent=2), encoding="utf-8")
