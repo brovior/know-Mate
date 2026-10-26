@@ -79,7 +79,7 @@ def test_added_executable_initializer_invalidates_source_set(tmp_path: Path) -> 
 def test_wrong_source_version_is_rejected(tmp_path: Path) -> None:
     root, output = _source_tree(tmp_path)
     source = root / builder.CORE[0]
-    source.write_text(source.read_text().replace("1.0.5.14", "2.0.0.0"))
+    source.write_text(source.read_text().replace("1.0.5.15", "2.0.0.0"))
     with pytest.raises(ValueError, match="source_version"):
         builder.copy_sources(output / "generated", root)
 
@@ -152,7 +152,7 @@ def test_lifetime_branch_excludes_all_shutdown_guard_and_capture_code() -> None:
 def test_normal_and_capture_interfaces_keep_their_existing_defaults() -> None:
     normal = _preprocess(ROOT / builder.CORE[0])
     capture = _preprocess(ROOT / builder.CORE[0], "AEGIS_PPT_EXTERNAL_DIAGNOSTIC", "AEGIS_PPT_DEFERRED_DIAGNOSTIC")
-    assert "ComDefaultInterface(typeof(IPptReaderLifecycle))" in normal
+    assert "ComDefaultInterface(typeof(IPptReaderClientShutdown))" in normal
     assert "ComDefaultInterface(typeof(IPptExternalBootstrap))" in capture
     assert "IPptReaderLifetimeDiagnostic" not in normal + capture
     assert "new PptShutdownGuard" in normal and "new PptShutdownGuard" in capture

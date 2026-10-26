@@ -71,7 +71,8 @@ def main() -> int:
             [str(compiler), "/nologo", "/target:exe", f"/platform:{architecture}",
              f"/out:{executable}", "/reference:System.Core.dll", "/reference:System.Web.Extensions.dll",
              str(source / "ProductSetupMemory.cs"), str(source / "ProductSetupFixtures.cs"),
-             str(reader / "PptSetupMutation.cs"), str(reader / "PptSetupOwnership.cs"), str(reader / "PptSetupMachine.cs")], capture_output=True, timeout=30,
+             str(reader / "PptSetupMutation.cs"), str(reader / "PptSetupInstallRootPolicy.cs"),
+             str(reader / "PptSetupOwnership.cs"), str(reader / "PptSetupMachine.cs")], capture_output=True, timeout=30,
         )
         (output / f"{architecture}-rollback-compile.log").write_bytes(compiled.stdout + compiled.stderr)
         if compiled.returncode:

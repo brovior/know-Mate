@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if __package__ in {None, ""}:
     sys.path.insert(0, str(ROOT))
 VERSION = "1.0.7.0"
-PREVIOUS_VERSION = "1.0.5.14"
+PREVIOUS_VERSION = "1.0.5.15"
 PROTOCOL = 3
 IID = "F71674D8-CB02-405A-87D3-59177E1A1487"
 CLSID = "287A80D2-804A-46D3-A0E9-CA31C6FC3D09"

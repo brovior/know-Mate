@@ -603,6 +603,16 @@ Python은 기존 base 계약을 그대로 검증한다. 유효한 base에서 선
 뒤의 영구 보관/재수집은 범위 밖이다. 판독은 [관리자 설치 실패 진단](../guides/PPT_READER.md#관리자-설치-실패-진단),
 실제 시험 범위와 미검증 환경은 [helper 진단 결과](../DIAGNOSTICS.md#ppt-관리자-helper-진단-전달-2026-10-26)를 따른다.
 
+### 8-9. 설치 외곽 TrustedInstaller 쓰기 호환
+
+1.0.5.15의 설치 `Protect`는 Admin/System 쓰기 신뢰를 유지하고, 추가로 정확한 Windows
+TrustedInstaller service SID의 현재 폴더 전용 Allow만 고정 `ProgramFiles/AegisDesk`에서 허용한다.
+InheritanceFlags/PropagationFlags는 None, 권한은 FullControl 부분집합이어야 한다. 상속된 ACE와
+명시 ACE에 같은 범위를 적용한다. 표시 이름·service SID 접두사·다른 디렉터리에는 적용하지 않는다.
+Reader 루트·버전 폴더·파일, 소유자·링크 검사, 요청/복구 영역과 다른 주체의 쓰기 거절은 유지한다.
+기존 부모의 ACL을 재설정하지 않는다. 이 예외는 §8-7의 legacy 경계 분석 전체를 일반 설치로
+확대하지 않으며 CREATOR OWNER나 자식 전파 ACE의 쓰기까지 새로 허용하지 않는다.
+
 ## 9. 개발 설계 검증 상태
 
 설계 에이전트 작성 후 별도 검증 에이전트가 실제 코드와 대조했다. PPT의 강제 종료 없는
@@ -697,7 +707,7 @@ Python은 같은 수집 QThread에서 한 번만 요청하고, 짧은 상태 조
 강제종료와 새 패키지 의존성은 추가하지 않는다. 사용자 문서 보호·일반 배포 승인은 실제 검증 대상이다.
 
 기존 dual 인터페이스는 유지하고 새 기본 인터페이스로 lifecycle을 노출한다. 요구 버전은
-reader/Events/setup 모두 1.0.5.14, protocol 3이며 추출 JSON schema 1·청크·인덱스 형식은 바꾸지 않는다.
+reader/Events/setup 모두 1.0.5.15, protocol 3이며 추출 JSON schema 1·청크·인덱스 형식은 바꾸지 않는다.
 사전 검증과 사용자 문서 보호 시험은 [운영 검증 절차](../guides/PPT_READER.md#powerpoint-자동종료-후보-검증)를 따른다.
 
 

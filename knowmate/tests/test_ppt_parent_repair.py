@@ -73,7 +73,7 @@ def test_historical_checker_blocks_existing_schema_reservation(tmp_path: Path, s
     requests = tmp_path / "requests"
     requests.mkdir()
     request_id = "33e979c6-c5c4-40af-845a-64c80517d1ae"
-    value = dict(schema=1, request_id=request_id, required_version="1.0.5.14", helper_sid="S-1-5-21-1-2-3-1001",
+    value = dict(schema=1, request_id=request_id, required_version="1.0.5.15", helper_sid="S-1-5-21-1-2-3-1001",
                  helper_pid=123, helper_creation_ticks="638901000000000000", child_pid=456 if state == "elevated" else None,
                  child_creation_ticks="638901000000000001" if state == "elevated" else None, state=state)
     (requests / f"{request_id}.json").write_text(json.dumps(value), encoding="utf-8")

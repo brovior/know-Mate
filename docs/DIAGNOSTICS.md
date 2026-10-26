@@ -1051,6 +1051,27 @@ OS·HTTP 연결 제한과 종료 유예로 기다리며, 워커가 끝내 복귀
 PID·생성 identity로 검증된 소유 프로세스만 정리하고 PowerPoint Quit·강제 종료 금지를
 유지한다. 하드 종료 경로의 무조건 종료를 유지하며 그 경로에 블로킹 정리를 추가하지 않는다.
 
+## 설치 부모 TrustedInstaller 신뢰 누락 (2026-10-26)
+
+사내 업데이트의 `code=13`, `install_root_policy / program_files_parent / root_write_untrusted`에서
+거절 ACE가 Windows TrustedInstaller의 FullControl·현재 폴더 전용·상속 항목 하나라는 보고를 받았다.
+해당 부모는 `ProgramFiles/AegisDesk`이며 소유자는 Administrators, Reader 루트와 다른 읽기 ACE는 정상이다.
+기존 `Protect`가 Admin/System 이외의 쓰기를 모두 거절해 Windows servicing SID를 누락한 것이
+이 설치 실패의 직접 원인이다. 요청 부모의 과거 `legacy_write_missing`과 구분한다.
+
+1.0.5.15 후보는 고정 설치 부모·정확한 TrustedInstaller SID·None inheritance/propagation·
+FullControl 상한에만 쓰기 예외를 적용한다. 이름이나 service SID 접두사로 허용하지 않는다.
+Reader 루트·버전 폴더·파일, 다른 주체의 쓰기, 다른 상속 scope에는 적용하지 않는다.
+소유자 조건은 계속 Admin/System이며, 기존 부모 ACL은 수정하지 않는다.
+Reader/Events/setup·요구 버전과 시험 fixture는 1.0.5.15로 맞춘다. 일반 배포 자동종료 정책과
+기존 요청/복구/롤백 계약은 유지한다. 실제 사내 업데이트와 PowerPoint 종료 성공은 별도 검증한다.
+
+Linux 전체 `pytest knowmate/tests -v`는 **2,319 PASS·121 SKIP·74 subtests PASS**, exit0,
+62.05초다. 실제 제품 C# 판정 소스를 .NET 8 시험 프로젝트로 실행한 27개 경계 시험도 포함한다.
+이는 Windows ACL API 시험이 아니다. 기존 main에서도 실패하던 정상 default interface 기대값을
+현재 `IPptReaderClientShutdown`에 맞춰 갱신했으며 제품 인터페이스는 바꾸지 않았다.
+Windows x86/x64 ACL·실제 UAC 업데이트·제품 DLL/EXE 빌드·Office/DRM은 **UNEXECUTED**다.
+
 ## PPT 관리자 helper 진단 전달 (2026-10-26)
 
 사내 1.0.0.0→1.0.5.13 업데이트에서 UAC 이후 `code=13 / mutation_failed`가 남고 journal·
