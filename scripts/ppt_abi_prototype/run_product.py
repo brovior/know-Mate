@@ -80,7 +80,7 @@ def main() -> int:
                     reader = source.parent / "ppt_reader"
                     command += [str(reader / name) for name in (
                         "PptReader.cs", "PptCallerQuit.cs", "PptShutdownEvents.cs", "PptOwnedMetadata.cs", "PptShutdownGuard.cs", "PptShutdownState.cs",
-                        "PptSinkLoader.cs", "PptSetupInstallRootPolicy.cs", "PptPackageIdentity.cs", "PptEventSignatures.cs", "PptEventValidator.cs")]
+                        "PptRawCount.cs", "PptSinkLoader.cs", "PptSetupInstallRootPolicy.cs", "PptPackageIdentity.cs", "PptEventSignatures.cs", "PptEventValidator.cs")]
                     command += [str(source.parent / "ppt_shared/PptExtractionCore.cs"),
                                 str(args.payload.resolve().parent / "PptBuildPolicy.cs")]
                 else:

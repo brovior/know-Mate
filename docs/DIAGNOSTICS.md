@@ -1065,12 +1065,21 @@ PID·생성 identity로 검증된 소유 프로세스만 정리하고 PowerPoint
 setup EXE 참조나 새 런타임 의존성은 없고, 기존 Windows ACL을 바꾸지 않는다.
 normal/capture·수동 fixture의 Reader 빌드 입력에도 공통 소스를 포함한다.
 
-Linux 전체 `pytest knowmate/tests -v`는 **2,331 PASS·121 SKIP·74 subtests PASS**, exit0,
-69.99초다. 공통 C# 판정 실행 37개와 양쪽 consumer/컴파일 입력 계약 2개가 포함된다.
-기존 scanner의 escape SyntaxWarning 1개가 남았다. .NET Framework 4.8 참조 어셈블리와
+리뷰 수정 후 Linux 전체 `pytest knowmate/tests -v`는 **2,333 PASS·121 SKIP·74 subtests PASS**,
+exit0, 62.29초다. 공통 C# 판정 실행 37개와 양쪽 consumer/컴파일 입력 계약 2개,
+실제 수동 Core 소스 목록 참조 컴파일 2개가 포함된다. 초기 실행의 기존 scanner escape
+SyntaxWarning 1개는 별도 수정하지 않았다. .NET Framework 4.8 참조 어셈블리와
 Roslyn/C#5로 normal Reader·capture Reader·setup을 컴파일한 세 경우도 통과했다.
 이는 Linux 참조 컴파일이며 실제 Windows 빌드·ACL API·Events/Office PIA 로딩·UAC 업데이트·
 인덱싱/앱 종료 후 실제 PID 종료·DRM은 **UNEXECUTED**다.
+
+개발 완료 후 별도 agent가 실제 소스를 독립 리뷰하고 표적 시험 131 PASS·1 SKIP을 확인했다.
+신규 ACL 결함은 없었으나 기존 `run_loader`와 `run_product` cached Core의 `PptRawCount.cs`
+누락으로 수동 검증이 컴파일 전에 막히는 Medium 1건을 발견했다. 기존 main과 수정본의 실제
+소스 목록 참조 컴파일에서 같은 실패를 확인한 기존 문제이며 정식 제품 빌드에는 해당하지 않는다.
+두 목록을 수정하고 실제 목록을 컴파일하는 회귀 시험을 추가했다. 같은 agent의 독립 재검증은
+41 PASS이며 이번 코드리뷰의 미해결 Critical/High/Medium/Low는 모두 0건이다. 실제 Windows·
+Office 검증이나 배포 승인으로 해석하지 않는다. 위 부분 시험은 전체와 중복되므로 합산하지 않는다.
 
 ## 설치 부모 TrustedInstaller 신뢰 누락 (2026-10-26)
 
