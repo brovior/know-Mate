@@ -84,7 +84,8 @@ def test_email_only_and_request_exclusion_snapshot(tmp_path, monkeypatch):
     agent = KnowledgeAgent(cfg, tmp_path)
     cfg["collector"]["exclude_files"].clear()
     monkeypatch.setattr("knowmate.config.get_config", lambda: pytest.fail("global config"))
-    result = agent.handle("내용", {"scopes": ["local"]})
+    assert agent._get_pipeline()["retriever"].search("내용", ["local"]) == []
+    result = agent.handle("내용", {"scopes": ["mail"]})
     assert "excluded marker" not in json.dumps(result)
     assert "allowed body" in json.dumps(result)
     assert table.count_rows() == 2

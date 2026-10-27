@@ -205,6 +205,10 @@ EMAIL_SCHEMA = pa.schema([
 
 **chunks ↔ emails 비교**
 
+검색 화면의 내 메일함(`mail`) 체크만 메일 검색 여부를 결정한다. 메일 행의 저장 `scope`는
+기존 `local`을 유지하며 내 PC 문서(`local`) 체크와 연결하지 않는다. 문서만 선택하면 메일을,
+메일만 선택하면 문서의 벡터·키워드 검색을 생략한다. 메일의 날짜·제외·삭제 조건은 그대로 적용한다.
+
 | 개념 | chunks (파일) | emails (메일) |
 |---|---|---|
 | 중복 판별 | 경로 + state.json | `mail_uid` + mtime |

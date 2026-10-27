@@ -87,6 +87,16 @@ class Retriever:
     ) -> list[dict[str, Any]]:
         """쿼리를 벡터 검색해 권한 필터·복호화·샌드위치 배열 후 청크 dict 리스트를 반환한다."""
         self._check_cancel()
+        if scopes is not None:
+            if not isinstance(scopes, list) or any(
+                not isinstance(scope, str) or scope not in {"local", "shared", "mail"}
+                for scope in scopes
+            ):
+                raise ValueError("invalid scopes")
+            if not scopes:
+                return []
+        document_scopes = [scope for scope in (scopes if scopes is not None else ["local", "shared"])
+                           if scope in {"local", "shared"}]
         t0 = time.perf_counter()
         vec = self._embed.embed([query])[0]
         self._check_cancel()
@@ -129,21 +139,21 @@ class Retriever:
 
         # chunks 테이블 검색 (날짜 필터 적용 시 점수 문턱 완화 — 해당 기간을 폭넓게 회수)
         chunks_rows = self._search_table(
-            self._table, vec, scopes, use_owner_filter=True,
+            self._table, vec, document_scopes, use_owner_filter=True,
             extra_where=document_where,
             apply_threshold=(date_range is None),
             limit_override=max(date_limit_override or 0, self._top_k * 5)
             if excluded_keys else date_limit_override,
             excluded_path_keys=excluded_keys, path_column="file_path",
-        )
+        ) if document_scopes else []
 
         # 키워드 보강: 질의 단어가 파일명/경로와 일치하는 문서 청크를 강제 포함
         # (파일명을 직접 언급하는 질의는 벡터 유사도만으로 놓칠 수 있음)
         kw_where = _keyword_where(query)
-        if kw_where:
+        if document_scopes and kw_where:
             try:
                 kw_rows = self._search_table(
-                    self._table, vec, scopes,
+                    self._table, vec, document_scopes,
                     use_owner_filter=True,
                     extra_where=f"({kw_where}) AND ({document_exclusion})"
                     if document_exclusion else kw_where,
@@ -158,8 +168,8 @@ class Retriever:
             except Exception as exc:  # noqa: BLE001 - isolate search/resource failures without exposing payloads
                 logger.debug("키워드 보강 검색 실패(무시): error_type=%s", type(exc).__name__)
 
-        # emails 테이블 병합 (local scope 포함 시 또는 scopes=None)
-        if self._email_indexer and (scopes is None or "local" in scopes):
+        # 메일의 저장 scope는 local이지만 화면의 문서 범위와는 독립적이다.
+        if self._email_indexer and (scopes is None or "mail" in scopes):
             try:
                 from knowmate.collector.mail_exclusion import mail_exclusion_paths
                 excluded_mail_paths = mail_exclusion_paths(
@@ -247,11 +257,25 @@ class Retriever:
         ]
         columns = [name for name in columns if name in table.schema.names]
         where = "is_deleted = false"
+        if use_owner_filter:
+            document_scopes = [scope for scope in (scopes if scopes is not None else ["local", "shared"])
+                               if scope in {"local", "shared"}]
+            if not document_scopes:
+                return []
+            if not {"scope", "owner"}.issubset(columns):
+                raise ValueError("document scope schema unavailable")
+            owner = self._current_user.replace("'", "''")
+            conditions = []
+            if "local" in document_scopes:
+                conditions.append(f"(scope = 'local' AND owner = '{owner}')")
+            if "shared" in document_scopes:
+                conditions.append("scope = 'shared'")
+            where += f" AND ({' OR '.join(conditions)})"
         if extra_where:
             where += f" AND ({extra_where})"
         raw = (
             table.search(vec)
-            .where(where)
+            .where(where, prefilter=True)
             .select(columns + ["_distance"])
             .limit(limit_override or self._top_k * 2)
             .to_arrow()
@@ -292,14 +316,12 @@ class Retriever:
         if raw.empty:
             return []
 
-        # 권한 필터 (chunks 테이블 전용 — emails는 항상 local이고 owner 컬럼 없음)
-        if use_owner_filter and scopes is not None and "scope" in raw.columns:
-            raw = raw[raw["scope"].isin(scopes)]
-            if "owner" in raw.columns:
-                local_mask = raw["scope"] == "local"
-                other_mask = ~local_mask
-                local_filtered = raw[local_mask & (raw["owner"] == self._current_user)]
-                raw = pd.concat([raw[other_mask], local_filtered])
+        # DB 사전 필터 뒤에도 복호화 전에 문서 범위와 소유자를 재확인한다.
+        if use_owner_filter:
+            raw = raw[raw["scope"].isin(document_scopes)]
+            local_mask = raw["scope"] == "local"
+            local_filtered = raw[local_mask & (raw["owner"] == self._current_user)]
+            raw = pd.concat([raw[~local_mask], local_filtered])
 
         if raw.empty:
             return []

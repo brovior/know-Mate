@@ -156,7 +156,8 @@ def test_retriever_filters_excluded_mail_before_decryption(tmp_path):
     allowed = str(tmp_path / "allowed.mysingle")
 
     class Query:
-        def where(self, _where):
+        def where(self, _where, *, prefilter=False):
+            assert prefilter is True
             return self
 
         def select(self, _columns):
