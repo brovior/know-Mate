@@ -4,8 +4,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from pathlib import Path
-from PyQt6.QtCore import QObject, pyqtSlot, pyqtSignal
+from PyQt6.QtCore import QObject, QTimer, pyqtSlot, pyqtSignal
 
 
 class Bridge(QObject):
@@ -18,6 +19,7 @@ class Bridge(QObject):
     indexFinished  = pyqtSignal(str)  # 인덱싱 완료 메시지
     indexAlert     = pyqtSignal(str)  # 대량삭제 차단 등 UI 알림
     statusUpdated  = pyqtSignal(str)  # 인덱싱 완료 후 건수 현황 JSON
+    failuresChanged = pyqtSignal()  # coalesced failure metadata revision
 
     def __init__(self, main_window=None, collector_worker=None, parent=None, *,
                  query_config: dict | None = None, query_data_dir: Path | None = None,
@@ -40,6 +42,46 @@ class Bridge(QObject):
         self._local_count: int = 0
         self._shared_count: int = 0
         self._mail_count: int = 0
+        from knowmate.app.failure_view import FailureView
+        self._failure_view = FailureView()
+        self._failure_notify_pending = False
+        self._failure_last_notify = float("-inf")
+        self._failure_timer = QTimer(self)
+        self._failure_timer.setInterval(500)
+        self._failure_timer.timeout.connect(self._poll_failure_updates)
+        self._failure_timer.start()
+
+    def _poll_failure_updates(self) -> None:
+        """Publish one coalesced update and finalize only after native thread exit."""
+        if self._worker is None:
+            return
+        changed, terminal = self._failure_view.poll(self._worker)
+        if changed:
+            self._failure_notify_pending = True
+        now = time.monotonic()
+        if self._failure_notify_pending and (terminal is not None or now - self._failure_last_notify >= 0.5):
+            self._failure_notify_pending = False
+            self._failure_last_notify = now
+            self.failuresChanged.emit()
+        if terminal is not None:
+            if not terminal.get("persisted", True):
+                self.indexAlert.emit("실패 이력을 저장하지 못했습니다. 저장 후 다시 시도해 주세요.")
+            self._finish_worker_status(terminal.get("message", "인덱싱이 종료되었습니다."),
+                                       update_time=terminal.get("scope") == "all")
+
+    def _worker_write_guard(self) -> str | None:
+        """Reject overlapping writes and schedule a persistence-only retry when needed."""
+        self._poll_failure_updates()
+        if self._worker is not None and self._worker.isRunning():
+            return "busy"
+        if self._failure_view.active:
+            return "busy"
+        if self._worker is not None and getattr(self._worker, "failure_persistence_pending", False):
+            reserve = getattr(self._worker, "request_failure_persist", None)
+            if reserve is not None and reserve():
+                self._worker.start()
+            return "persistence_pending"
+        return None
 
     # ------------------------------------------------------------------
     # 에이전트 질의
@@ -332,31 +374,37 @@ class Bridge(QObject):
     # 수집기 슬롯
     # ------------------------------------------------------------------
 
-    @pyqtSlot()
-    def startReindex(self) -> None:
+    @pyqtSlot(result=str)
+    def startReindex(self) -> str:
         """증분 재인덱싱을 시작한다."""
         gate = getattr(self._win, "_request_index_start", None)
         if self._worker is None and gate is None:
             self.indexAlert.emit("수집기가 초기화되지 않았습니다.")
-            return
-        if self._worker is not None and self._worker.isRunning():
-            self.indexAlert.emit("인덱싱이 이미 진행 중입니다.")
-            return
+            return "error"
+        blocked = self._worker_write_guard()
+        if blocked:
+            self.indexAlert.emit("실패 이력을 저장하지 못했습니다. 저장 후 다시 시도해 주세요."
+                                 if blocked == "persistence_pending" else "인덱싱이 이미 진행 중입니다.")
+            return blocked
         if gate is not None:
-            gate(retry_failures=True)
+            return gate(retry_failures=True) or "ok"
         else:
             if hasattr(self._worker, "request_failure_retry"):
                 self._worker.request_failure_retry()
             self._worker.start()
+        return "ok"
 
     @pyqtSlot()
     def cancelReindex(self) -> None:
         """진행 중인 재인덱싱을 취소한다."""
         preparation = getattr(self._win, "_ppt_preparation", None)
+        queued = preparation is not None and preparation.start_pending
         if preparation is not None:
             preparation.cancel_start()
         if self._worker and self._worker.isRunning():
             self._worker.cancel()
+        elif queued:
+            self.indexFinished.emit("인덱싱 시작 요청을 취소했습니다.")
 
     @pyqtSlot(result=str)
     def getIndexStatus(self) -> str:
@@ -471,7 +519,8 @@ class Bridge(QObject):
         excluded_keys = {normalize_path_key(p) for p in excluded_raw if isinstance(p, str)}
 
         failure_file = getattr(self._worker, "_failure_file", None) or (get_data_dir() / "index_failure.json")
-        records = failure_state.load_failures(failure_file)
+        records = (self._failure_view.records if self._failure_view.records is not None
+                   else failure_state.load_failures(failure_file))
         policy = failure_state.BackoffPolicy.from_config(collector_cfg)
         now = self._get_now()
 
@@ -526,34 +575,20 @@ class Bridge(QObject):
         ):
             self.indexAlert.emit("수집기가 초기화되지 않았습니다.")
             return "error"
-        if self._worker is not None and self._worker.isRunning():
-            self.indexAlert.emit("인덱싱이 이미 진행 중입니다.")
-            return "busy"
-
-        from knowmate.collector import failure_state
-        failure_file = getattr(self._worker, "_failure_file", None)
-        if failure_file is None:
-            if gate is None:
-                return "error"
-            from knowmate.config import get_data_dir
-            failure_file = get_data_dir() / "index_failure.json"
-        records = failure_state.load_failures(failure_file)
-        found = failure_state.request_retry_one(records, path)
-        if found:
-            failure_state.save_failures(failure_file, records)
-        # 요청 자체를 남긴다 — 버튼을 눌렀다는 사실이 로그에 없어서, 재처리가
-        # 사용자 요청 때문인지 백오프 만료 때문인지 실기에서 판정할 수 없었다.
-        # 소비자 쪽 "실패 파일 재시도(사용자 요청)" 로그와 짝을 이룬다.
-        import logging
-        logging.getLogger(__name__).info(
-            "[failure] 사용자 「지금 다시 시도」 요청 (기록 %s): %s",
-            "있음" if found else "없음", path,
-        )
+        if not isinstance(path, str) or not path.strip():
+            return "error"
+        blocked = self._worker_write_guard()
+        if blocked:
+            return blocked
         if gate is not None:
-            gate()
-        else:
+            return gate(target_path=path) or "ok"
+        reserve = getattr(self._worker, "request_single_retry", None)
+        if reserve is None:
+            return "error"
+        result = reserve(path)
+        if result == "ok":
             self._worker.start()
-        return "ok" if found else "not_found"
+        return result
 
     @pyqtSlot(str, result=str)
     def excludeFile(self, path: str) -> str:
@@ -562,7 +597,7 @@ class Bridge(QObject):
         result = json.loads(self.excludeFiles(json.dumps([path], ensure_ascii=False)))
         if result.get("ok"):
             return "ok"
-        return result["error"] if result.get("error") in {"busy", "query_busy"} else "error"
+        return result["error"] if result.get("error") in {"busy", "query_busy", "persistence_pending"} else "error"
 
     @pyqtSlot(str, result=str)
     def unexcludeFile(self, path: str) -> str:
@@ -573,7 +608,7 @@ class Bridge(QObject):
         result = json.loads(self.unexcludeFiles(json.dumps([path], ensure_ascii=False)))
         if result.get("ok"):
             return "ok"
-        return result["error"] if result.get("error") in {"busy", "query_busy"} else "error"
+        return result["error"] if result.get("error") in {"busy", "query_busy", "persistence_pending"} else "error"
 
     @pyqtSlot(str, result=str)
     def excludeFiles(self, payload: str) -> str:
@@ -583,7 +618,11 @@ class Bridge(QObject):
         paths, error = self._parse_failure_paths(payload)
         if error:
             return json.dumps({"ok": False, "error": error})
-        if self._worker is not None and self._worker.isRunning():
+        blocked = self._worker_write_guard()
+        if blocked:
+            return json.dumps({"ok": False, "error": blocked})
+        preparation = getattr(self._win, "_ppt_preparation", None)
+        if preparation is not None and preparation.start_pending:
             return json.dumps({"ok": False, "error": "busy"})
 
         from knowmate.config import get_config, update_exclude_files
@@ -681,7 +720,11 @@ class Bridge(QObject):
         paths, error = self._parse_failure_paths(payload)
         if error:
             return json.dumps({"ok": False, "error": error})
-        if self._worker is not None and self._worker.isRunning():
+        blocked = self._worker_write_guard()
+        if blocked:
+            return json.dumps({"ok": False, "error": blocked})
+        preparation = getattr(self._win, "_ppt_preparation", None)
+        if preparation is not None and preparation.start_pending:
             return json.dumps({"ok": False, "error": "busy"})
 
         from knowmate.config import get_config, update_exclude_files
@@ -748,6 +791,14 @@ class Bridge(QObject):
 
     def set_worker(self, worker) -> None:
         """단일 수집기 워커를 등록하고 시그널을 바인딩한다 (수동·유휴 인덱싱 공유)."""
+        if self._worker is not None and self._worker is not worker:
+            if self._worker_write_guard() is not None:
+                raise RuntimeError("cannot replace a busy or unpersisted collector")
+            from knowmate.app.failure_view import FailureView
+            self._failure_view = FailureView()
+            self._worker.progress.disconnect(self._on_worker_progress)
+            self._worker.finished.disconnect(self._on_worker_finished)
+            self._worker.indexing_needed.disconnect(self.indexAlert)
         self._worker = worker
         worker.progress.connect(self._on_worker_progress)
         worker.finished.connect(self._on_worker_finished)
@@ -768,8 +819,15 @@ class Bridge(QObject):
 
     def _on_worker_finished(self, message: str) -> None:
         """워커 완료 시그널 처리."""
+        if hasattr(self._worker, "drain_failure_updates"):
+            return
+        self._finish_worker_status(message)
+
+    def _finish_worker_status(self, message: str, *, update_time: bool = True) -> None:
+        """Refresh aggregate status after the collector has actually stopped."""
         from datetime import datetime
-        self._last_indexed = datetime.now().strftime("%Y-%m-%d %H:%M")
+        if update_time:
+            self._last_indexed = datetime.now().strftime("%Y-%m-%d %H:%M")
         self.indexFinished.emit(message)
 
         # 문서·메일 개수를 바꿀 수 있는 변경이 이번 사이클에 하나도 없었으면(유휴

@@ -20,12 +20,18 @@ class Worker:
         self.started = 0
         self.retried = 0
         self.running = False
+        self.target_path = None
 
     def isRunning(self):
         return self.running
 
     def request_failure_retry(self):
         self.retried += 1
+
+    def request_single_retry(self, path):
+        """Capture the explicit intent without changing the broad retry flag."""
+        self.target_path = path
+        return "ok"
 
     def start(self):
         self.started += 1
@@ -111,9 +117,44 @@ def test_check_is_async_and_all_requests_coalesce(tmp_path):
     release.set()
     wait_until(lambda: bool(workers))
     assert policies == ["ready"]
-    assert workers[0].started == workers[0].retried == 1
+    assert workers[0].started == 1
+    assert workers[0].retried == 0  # a later request cannot widen the first intent
     gate.request_start(retry_failures=True)
     assert workers[0].started == 1
+    gate.shutdown()
+
+
+def test_queued_target_cannot_be_widened_and_cancel_removes_it(tmp_path):
+    """Keep one queued path and remove it before a later general request."""
+    gate, policies, workers = coordinator(tmp_path, platform="linux")
+    assert gate.request_start(target_path="a.pptx") == "ok"
+    assert gate.start_pending
+    assert gate.request_start(retry_failures=True) == "busy"
+    assert gate.request_start(target_path="b.pptx") == "busy"
+    assert gate.request_start() == "busy"
+    gate.begin()
+    assert workers[0].target_path == "a.pptx"
+    assert workers[0].started == 1
+    assert workers[0].retried == 0
+    gate.shutdown()
+
+    other, _, second = coordinator(tmp_path, platform="linux")
+    assert other.request_start(target_path="a.pptx") == "ok"
+    other.cancel_start()
+    assert other.request_start(retry_failures=True) == "ok"
+    other.begin()
+    assert second[0].target_path is None
+    assert second[0].retried == second[0].started == 1
+    other.shutdown()
+
+
+def test_invalid_target_never_falls_back_to_general_start(tmp_path):
+    """Reject an empty target while preserving a later valid start."""
+    gate, _, workers = coordinator(tmp_path, platform="linux")
+    assert gate.request_start(target_path="") == "error"
+    assert not gate.start_pending
+    gate.begin()
+    assert workers[0].started == 0
     gate.shutdown()
 
 
@@ -395,8 +436,8 @@ def test_bridge_manual_and_targeted_retry_use_gate_before_worker(tmp_path, monke
                         _request_index_start=lambda **kwargs: starts.append(kwargs)))
     bridge.startReindex()
     assert bridge.retryFile(target) == "ok"
-    assert starts == [{"retry_failures": True}, {}]
-    assert failure_state.load_failures(tmp_path / "index_failure.json")[target].force_retry
+    assert starts == [{"retry_failures": True}, {"target_path": target}]
+    assert not failure_state.load_failures(tmp_path / "index_failure.json")[target].force_retry
 
 
 def test_tray_and_idle_share_start_gate():

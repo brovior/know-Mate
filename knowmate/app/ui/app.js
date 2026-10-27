@@ -41,6 +41,7 @@ new QWebChannel(qt.webChannelTransport, function(channel) {
   bridge.indexFinished.connect(onIndexFinished);
   bridge.indexAlert.connect(onIndexAlert);
   bridge.statusUpdated.connect(onStatusUpdated);
+  if (bridge.failuresChanged) bridge.failuresChanged.connect(refreshFailAttention);
   onBridgeReady();
 });
 
@@ -727,7 +728,7 @@ function addFolder() {
 function startFullIndex() {
   closeOnboarding();
   if (bridge) {
-    bridge.startReindex();
+    startReindex();
   } else {
     showToast("브리지가 준비되지 않았습니다.");
   }
@@ -736,9 +737,10 @@ function startFullIndex() {
 /* -- 증분 재인덱싱 -- */
 function startReindex() {
   if (!bridge) { showToast("브리지가 준비되지 않았습니다."); return; }
-  // 클릭 즉시 로딩 상태 표시 (progress 시그널 오기 전에도 보이도록)
-  showIndexRunning();
-  bridge.startReindex();
+  Promise.resolve(bridge.startReindex()).then(result => {
+    if (result === "ok") showIndexRunning();
+    else showToast(_failureRequestMessage(result));
+  }).catch(() => showToast("인덱싱을 시작하지 못했습니다."));
 }
 
 function showIndexRunning() {
@@ -1072,14 +1074,51 @@ function openConfigFile() {
 let _failCards = [];
 let _failFilter = "all";
 let _failBulkRunning = false;
+let _failRefreshTask = null;
+let _failRefreshPending = false;
+let _failRequestGeneration = 0;
+let _failWaitTimer = null;
 
 function refreshFailAttention() {
-  if (!bridge) return;
-  bridge.getFailures().then(json => {
-    let cards;
-    try { cards = JSON.parse(json); } catch { return; }
-    _renderFailAttention(cards);
-  }).catch(() => {});
+  return _refreshFailures().catch(() => {});
+}
+
+function _failuresPanelOpen() {
+  const overlay = document.getElementById("failuresOverlay");
+  return !!overlay && overlay.classList.contains("show");
+}
+
+function _refreshFailures(invalidate = false) {
+  if (!bridge) return Promise.resolve();
+  if (invalidate) _failRequestGeneration++;
+  _failRefreshPending = true;
+  if (_failRefreshTask) return _failRefreshTask;
+  _failRefreshTask = (async () => {
+    while (_failRefreshPending) {
+      _failRefreshPending = false;
+      const generation = _failRequestGeneration;
+      const cards = JSON.parse(await bridge.getFailures());
+      if (!Array.isArray(cards)) throw new Error("invalid failures");
+      if (generation !== _failRequestGeneration) continue;
+      _failCards = cards;
+      _renderFailAttention(cards);
+      if (_failuresPanelOpen()) {
+        const body = document.getElementById("failBody");
+        const scroll = body ? body.scrollTop : 0;
+        renderFailuresPanel();
+        if (body) body.scrollTop = scroll;
+      }
+    }
+  })().finally(() => { _failRefreshTask = null; });
+  return _failRefreshTask;
+}
+
+function _refreshFailureWaitLabels() {
+  if (!_failuresPanelOpen()) return;
+  document.querySelectorAll("#failBody [data-next-retry]").forEach(label => {
+    const value = label.dataset.nextRetry;
+    label.textContent = _formatFailWait(value === "" ? null : Number(value));
+  });
 }
 
 function _renderFailAttention(cards) {
@@ -1097,17 +1136,21 @@ function _renderFailAttention(cards) {
 
 function openFailuresPanel() {
   if (!bridge) { showToast("브리지가 준비되지 않았습니다."); return; }
-  bridge.getFailures().then(json => {
-    try { _failCards = JSON.parse(json); } catch { _failCards = []; }
-    _failFilter = "all";
-    renderFailuresPanel();
-    document.getElementById("failuresOverlay").classList.add("show");
-  }).catch(() => showToast("실패 목록을 불러오지 못했습니다."));
+  _failFilter = "all";
+  document.getElementById("failuresOverlay").classList.add("show");
+  if (_failWaitTimer === null) _failWaitTimer = setInterval(_refreshFailureWaitLabels, 30000);
+  return _refreshFailures(true).catch(() => showToast("실패 목록을 불러오지 못했습니다."));
 }
 
 function closeFailuresPanel() {
   document.getElementById("failuresOverlay").classList.remove("show");
+  if (_failWaitTimer !== null) clearInterval(_failWaitTimer);
+  _failWaitTimer = null;
 }
+
+if (window.addEventListener) window.addEventListener("unload", () => {
+  if (_failWaitTimer !== null) clearInterval(_failWaitTimer);
+});
 
 function _failCategory(card) {
   if (card.excluded) return "excluded";
@@ -1197,6 +1240,8 @@ function runBulkFailureAction() {
       showToast("질문 처리가 끝난 뒤 다시 시도해 주세요.");
     } else if (error && error.message === "busy") {
       showToast("인덱싱이 끝난 후 다시 시도해 주세요.");
+    } else if (error && error.message === "persistence_pending") {
+      showToast(_failureRequestMessage("persistence_pending"));
     } else {
       showToast(isUnexclude ? "일괄 제외 해제에 실패했습니다." : "일괄 인덱싱 제외에 실패했습니다.");
     }
@@ -1222,13 +1267,7 @@ function _bulkFailureSuccessMessage(isUnexclude, result) {
 }
 
 function _refreshFailuresAfterBulk() {
-  return bridge.getFailures().then(json => {
-    let cards;
-    try { cards = JSON.parse(json); } catch { throw new Error("invalid failures"); }
-    _failCards = cards;
-    renderFailuresPanel();
-    _renderFailAttention(cards);
-  });
+  return _refreshFailures(true);
 }
 
 // data-act → 실행할 함수. 경로는 HTML을 거치지 않고 카드 객체에서 직접 꺼내
@@ -1322,7 +1361,7 @@ function _renderFailCard(card, index) {
         <span><span class="k">단계</span> ${escHtml(card.stage_label)}</span>
         <span><span class="k">실패</span> ${card.consecutive_failures}회</span>
         <span><span class="k">마지막</span> ${_formatFailTimestamp(card.last_failed_ts)}</span>
-        <span class="k">다음 자동 재시도</span><span class="next">${waitLabel}</span>
+        <span class="k">다음 자동 재시도</span><span class="next" data-next-retry="${Number.isFinite(card.next_retry_ts) ? card.next_retry_ts : ""}">${waitLabel}</span>
       </div>
       <div class="f-actions">
         ${act("retry", "⟳ 지금 다시 시도", "f-btn primary")}
@@ -1335,10 +1374,16 @@ function _renderFailCard(card, index) {
 function retryFailureFile(path) {
   if (!bridge) return;
   bridge.retryFile(path).then(result => {
-    if (result === "busy") { showToast("인덱싱이 이미 진행 중입니다."); return; }
-    closeFailuresPanel();
+    if (result !== "ok") { showToast(_failureRequestMessage(result)); return; }
     showIndexRunning();
   }).catch(() => showToast("재시도 요청에 실패했습니다."));
+}
+
+function _failureRequestMessage(result) {
+  if (result === "busy") return "인덱싱 또는 종료 정리가 이미 진행 중입니다.";
+  if (result === "persistence_pending") return "실패 이력을 저장하지 못했습니다. 저장 후 다시 시도해 주세요.";
+  if (result === "not_found") return "재시도할 파일의 실패 이력을 찾을 수 없습니다.";
+  return "재시도 요청을 시작하지 못했습니다.";
 }
 
 function excludeFailureFile(path) {
@@ -1346,12 +1391,9 @@ function excludeFailureFile(path) {
   bridge.excludeFile(path).then(result => {
     if (result === "query_busy") { showToast("질문 처리가 끝난 뒤 다시 시도해 주세요."); return; }
     if (result === "busy") { showToast("인덱싱이 끝난 후 다시 시도해 주세요."); return; }
+    if (result === "persistence_pending") { showToast(_failureRequestMessage(result)); return; }
     if (result !== "ok") { showToast("인덱싱 제외에 실패했습니다."); return; }
-    bridge.getFailures().then(json => {
-      try { _failCards = JSON.parse(json); } catch { _failCards = []; }
-      renderFailuresPanel();
-      refreshFailAttention();
-    });
+    _refreshFailures(true).catch(() => showToast("목록을 갱신하지 못했습니다."));
   }).catch(() => showToast("인덱싱 제외에 실패했습니다."));
 }
 
@@ -1360,12 +1402,9 @@ function unexcludeFailureFile(path) {
   bridge.unexcludeFile(path).then(result => {
     if (result === "query_busy") { showToast("질문 처리가 끝난 뒤 다시 시도해 주세요."); return; }
     if (result === "busy") { showToast("인덱싱이 끝난 후 다시 시도해 주세요."); return; }
+    if (result === "persistence_pending") { showToast(_failureRequestMessage(result)); return; }
     if (result !== "ok") { showToast("제외 해제에 실패했습니다."); return; }
-    bridge.getFailures().then(json => {
-      try { _failCards = JSON.parse(json); } catch { _failCards = []; }
-      renderFailuresPanel();
-      refreshFailAttention();
-    });
+    _refreshFailures(true).catch(() => showToast("목록을 갱신하지 못했습니다."));
   }).catch(() => showToast("제외 해제에 실패했습니다."));
 }
 

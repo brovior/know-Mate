@@ -254,6 +254,7 @@ class MainWindow(QMainWindow):
                 data_dir=get_data_dir(), make_worker=self._make_worker, parent=self,
             )
             self._ppt_preparation.failed.connect(self._bridge.indexAlert.emit)
+            self._ppt_preparation.failed.connect(self._bridge.indexFinished.emit)
             QTimer.singleShot(0, self._ppt_preparation.begin)
             self._pump_startup()
 
@@ -299,13 +300,21 @@ class MainWindow(QMainWindow):
         """
         self._request_index_start()
 
-    def _request_index_start(self, *, retry_failures: bool = False) -> None:
+    def _request_index_start(self, *, retry_failures: bool = False,
+                             target_path: str | None = None) -> str:
         """수동·재시도·트레이·유휴 시작을 하나의 PPT 준비 게이트에 전달한다."""
         preparation = getattr(self, "_ppt_preparation", None)
         if preparation is not None:
-            preparation.request_start(retry_failures=retry_failures)
+            blocked = self._bridge._worker_write_guard()
+            if blocked:
+                return blocked
+            kwargs = {"retry_failures": retry_failures}
+            if target_path is not None:
+                kwargs["target_path"] = target_path
+            return preparation.request_start(**kwargs)
         else:
             self._bridge.indexAlert.emit("수집기가 초기화되지 않았습니다.")
+            return "error"
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)

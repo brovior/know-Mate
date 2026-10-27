@@ -254,6 +254,11 @@ class _FakeWorkerForFailures:
     def start(self):
         self._running = True
 
+    def request_single_retry(self, path):
+        """Reserve a file without modifying the durable failure record."""
+        self.target_path = path
+        return "ok"
+
 
 class TestFailureManagementSlots:
     def _patch_collector_config(self, monkeypatch, exclude_files=None):
@@ -364,7 +369,7 @@ class TestFailureManagementSlots:
         assert cards[0]["excluded"] is True
         assert cards[0]["next_retry_ts"] is None
 
-    def test_retry_file_sets_force_retry_and_starts_worker(self, tmp_path, monkeypatch):
+    def test_retry_file_reserves_target_without_gui_failure_write(self, tmp_path, monkeypatch):
         from knowmate.collector import failure_state
 
         failure_file = tmp_path / "index_failure.json"
@@ -383,7 +388,8 @@ class TestFailureManagementSlots:
 
         assert result == "ok"
         assert worker.isRunning() is True
-        assert failure_state.load_failures(failure_file)[target].force_retry is True
+        assert worker.target_path == target
+        assert failure_state.load_failures(failure_file)[target].force_retry is False
 
     def test_retry_file_refuses_when_worker_running(self, tmp_path):
         worker = _FakeWorkerForFailures(tmp_path / "f.json", tmp_path / "s.json", running=True)

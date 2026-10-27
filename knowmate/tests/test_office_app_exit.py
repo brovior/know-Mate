@@ -146,16 +146,19 @@ def test_multiple_pid_waits_share_one_deadline(monkeypatch):
     for pid in range(1, 5):
         register(pid)
     native_environment(monkeypatch, [("EXCEL.EXE", pid) for pid in range(1, 5)])
+    clock = [100.0]
+    monkeypatch.setattr(guard.time, "monotonic", lambda: clock[0])
     calls = []
     def terminate(pid, record, timeout):
         calls.append((pid, timeout))
-        time.sleep(timeout)
+        clock[0] += timeout
         return "remaining"
     monkeypatch.setattr(guard, "_terminate_and_confirm", terminate)
     started = time.monotonic()
     result = guard.cleanup_owned_processes(guard.begin_owned_cleanup(), deadline=started + 0.03)
-    assert time.monotonic() - started < 0.15
+    assert time.monotonic() - started == pytest.approx(0.03)
     assert len(calls) == 1
+    assert calls[0][1] == pytest.approx(0.03)
     assert result.remaining == frozenset(range(1, 5))
 
 

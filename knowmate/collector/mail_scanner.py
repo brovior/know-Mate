@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Iterable, Iterator, TYPE_CHECKING
+from typing import Callable, Iterable, Iterator, TYPE_CHECKING
 
 from knowmate.collector import failure_state
 from knowmate.collector.mail_discovery import MailDiscoverySnapshot
@@ -326,11 +326,17 @@ def run_mail_scan(
     preloaded_state_load_s: float = 0.0,
     discovery_snapshot: MailDiscoverySnapshot | None = None,
     discovery_get_now=None,
+    target_path: str | None = None,
+    preloaded_failures: dict | None = None,
+    persist_failures: Callable[[], bool] | None = None,
+    on_target_rejected: Callable[[str], None] | None = None,
 ) -> tuple[int, int]:
     """메일을 순환 처리하되 한 수집 사이클의 실제 시도 수를 제한한다.
 
     성공 캐시 적중과 백오프 대기는 예산을 쓰지 않는다. 상태가 없는 기존 설치는
     매 사이클 최대 N건만 ``is_indexed``로 확인해 캐시를 점진적으로 구축한다.
+    target_path는 선택 파일만 확인하며, preloaded_failures와 persist_failures는
+    문서 단계에서 이어받은 worker 소유 실패 이력과 저장 확인을 공유한다.
     """
     from knowmate.secure.mysingle_reader import CorruptMailBodyError, parse_mail_file
 
@@ -345,6 +351,28 @@ def run_mail_scan(
     now_fn = get_now or time.time
     cycle_started = time.perf_counter()
     metrics = _MailScanMetrics()
+    targeted = target_path is not None
+    target_item = None
+    if targeted:
+        from knowmate.collector.scanner import normalize_path_key as document_path_key, validate_retry_target
+        if not mail_cfg.get("enabled", False) or max_per_scan == 0:
+            logger.warning("[mail_scanner] 개별 재시도 불가: unavailable")
+            if on_target_rejected:
+                on_target_rejected("unavailable")
+            return 0, 0
+        admission, meta = validate_retry_target(
+            target_path, watch_folders, extensions=set(_mail_extensions(extensions)),
+            exclude_files=frozenset(document_path_key(path) for path in cfg.get("collector", {}).get("exclude_files", [])
+                                    if isinstance(path, str)),
+            max_file_size_mb=float(cfg.get("chunking", {}).get("max_file_size_mb", 30.0)),
+        )
+        if admission != "ok":
+            logger.warning("[mail_scanner] 개별 재시도 불가: %s", admission)
+            if on_target_rejected:
+                on_target_rejected(admission)
+            return 0, 0
+        target_item = {"path": target_path, "path_key": normalize_path_key(target_path),
+                       "mtime": meta["mtime"], "size": meta["size"]}
 
     if state_file is None or failure_file is None:
         from knowmate.config import get_data_dir
@@ -353,17 +381,24 @@ def run_mail_scan(
         failure_file = failure_file or data_dir / "mail_index_failure.json"
     table_was_recreated = bool(getattr(email_indexer, "table_was_recreated", False))
     invalidate_cache = table_was_recreated or bool(getattr(email_indexer, "table_is_empty", False))
-    if discovery_snapshot is not None and (invalidate_cache or retry_failures):
+    if discovery_snapshot is not None and not targeted and (invalidate_cache or retry_failures):
         discovery_snapshot.invalidate()
     if preloaded_state is None:
         state_load_started = time.perf_counter()
-        state = load_mail_scan_state(state_file, invalidate_cache=invalidate_cache)
+        state = load_mail_scan_state(state_file, invalidate_cache=invalidate_cache and not targeted, strict=targeted)
         metrics.state_load_s = time.perf_counter() - state_load_started
     else:
         state = preloaded_state
         metrics.state_load_s = max(float(preloaded_state_load_s), 0.0)
         # 선로드 호출자는 캐시 무효화를 DB 작업 전에 이미 저장해야 한다.
         invalidate_cache = False
+    if targeted and (table_was_recreated or getattr(email_indexer, "table_is_empty", False)) and state["files"]:
+        logger.warning("[mail_scanner] 개별 재시도 불가: recovery_required")
+        if on_state_persisted:
+            on_state_persisted(False)
+        if on_target_rejected:
+            on_target_rejected("recovery_required")
+        return 0, 0
 
     def save_state() -> bool:
         """메일 상태 저장 시간을 사이클 집계에 더한다."""
@@ -388,7 +423,10 @@ def run_mail_scan(
     def save_failures() -> None:
         """실패 이력 저장 시간을 사이클 집계에 더한다."""
         started = time.perf_counter()
-        failure_state.save_failures(failure_file, failures)
+        if persist_failures is not None:
+            persist_failures()
+        else:
+            failure_state.save_failures(failure_file, failures)
         metrics.failure_persist_s += time.perf_counter() - started
         metrics.failure_persists += 1
 
@@ -401,6 +439,8 @@ def run_mail_scan(
             logger.error("[mail_scanner] 캐시 무효화 상태를 저장하지 못해 이번 메일 스캔을 연기합니다")
             if on_state_persisted:
                 on_state_persisted(False)
+            if targeted and on_target_rejected:
+                on_target_rejected("state_save_failed")
             return 0, 0
         # 같은 EmailIndexer 인스턴스의 다음 유휴 사이클은 확정된 빈 캐시를
         # 그대로 사용할 수 있다. 실제 첫 저장 성공 시 table_is_empty는 다시 False가 된다.
@@ -409,16 +449,16 @@ def run_mail_scan(
         if hasattr(email_indexer, "table_is_empty"):
             email_indexer.table_is_empty = False
     failure_load_started = time.perf_counter()
-    failures = failure_state.load_failures(failure_file)
+    failures = preloaded_failures if preloaded_failures is not None else failure_state.load_failures(failure_file)
     metrics.state_load_s += time.perf_counter() - failure_load_started
     failures_dirty = False
-    if retry_failures:
+    if retry_failures and not targeted:
         failures_dirty = failure_state.request_retry_all(failures) > 0
     policy = failure_state.BackoffPolicy.from_config(cfg.get("collector", {}))
     # 과거 삭제 예약을 후보·성공 캐시 판정보다 먼저 소비한다. 실패해 남은 ID는
     # 아래 현재성 조회에서 무시해 같은 UID 복사본이 빈 성공 캐시를 만들지 않게 한다.
     pending_delete_started = time.perf_counter()
-    pending_changed = _retry_pending_deletes(state, email_indexer, metrics)
+    pending_changed = _retry_pending_deletes(state, email_indexer, metrics) if not targeted else False
     metrics.pending_delete_retry_s = time.perf_counter() - pending_delete_started
     if pending_changed:
         # 재시도 삭제 성공은 이후 후보 열거보다 먼저 durable state에 반영한다.
@@ -437,7 +477,7 @@ def run_mail_scan(
     discovery_mode = "fresh"
     discovery_age = 0.0
     discovered_items = None
-    if discovery_snapshot is not None:
+    if discovery_snapshot is not None and not targeted:
         from knowmate.config import mail_discovery_refresh_seconds
         from knowmate.collector.mail_scan_state import SCHEMA_VERSION
         from knowmate.rag import email_indexer as email_indexer_module
@@ -475,10 +515,19 @@ def run_mail_scan(
                 discovery_snapshot.refreshed_at = discovery_now
             else:
                 scan_status["complete"] = False
-    candidates, seen_keys, cached_failure_paths, cached_uid_mtimes, early_skipped_count = _collect_actionable_candidates(
-        watch_folders, extensions, state, failures, now_fn(), policy, metrics, excluded_keys,
-        scan_status, discovered_items=discovered_items,
-    )
+    if targeted:
+        # A cache hit alone cannot prove that a UID generation still exists in the DB.
+        target_item["cache_entry"] = state["files"].get(target_item["path_key"])
+        candidates, seen_keys, cached_failure_paths, cached_uid_mtimes, early_skipped_count = (
+            [target_item], set(), [], {}, 0,
+        )
+        discovery_mode = "targeted"
+        metrics.enumerated = metrics.actionable = 1
+    else:
+        candidates, seen_keys, cached_failure_paths, cached_uid_mtimes, early_skipped_count = _collect_actionable_candidates(
+            watch_folders, extensions, state, failures, now_fn(), policy, metrics, excluded_keys,
+            scan_status, discovered_items=discovered_items,
+        )
     metrics.enumerate_filter_sort_s = time.perf_counter() - enumerate_started
     if memory_diagnostics is not None:
         memory_diagnostics.log("after_mail_discovery", counters={
@@ -789,7 +838,9 @@ def run_mail_scan(
             chunk_id for chunk_id in state.get("pending_deletes", [])
             if isinstance(chunk_id, str)
         }
-        if ignored:
+        if targeted:
+            check = email_indexer.get_retry_index_state(mail_uid, item["mtime"], item["path"], ignored)
+        elif ignored:
             check = email_indexer.get_index_state(mail_uid, item["mtime"], ignored)
         else:
             check = email_indexer.get_index_state(mail_uid, item["mtime"])
@@ -862,8 +913,9 @@ def run_mail_scan(
     def advance_cursor(cursor_item: dict) -> None:
         """Keep rotation in discovery order even after live metadata changes."""
         nonlocal state_dirty
-        set_cursor(state, cursor_item)
-        state_dirty = True
+        if not targeted:
+            set_cursor(state, cursor_item)
+            state_dirty = True
 
     for item in _candidates_from_cursor(candidates, state.get("cursor")):
         if cancel_check and cancel_check():
@@ -876,7 +928,7 @@ def run_mail_scan(
         metrics.attempted += 1
         cursor_item = {"mtime": item["mtime"], "path_key": item["path_key"]}
 
-        if discovery_snapshot is not None:
+        if discovery_snapshot is not None and not targeted:
             metrics.active_file_checks += 1
             try:
                 live_stat = os.stat(path)
@@ -1057,7 +1109,8 @@ def run_mail_scan(
     # must finish, state must be durable, and neither cancellation nor global
     # error may have occurred.  Backoff entries are not actionable this cycle.
     if (
-        cancelled
+        targeted
+        or cancelled
         or (cancel_check and cancel_check())
         or stop_after_global_error
         or not scan_status["complete"]

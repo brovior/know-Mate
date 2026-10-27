@@ -83,6 +83,7 @@ class PptPreparationCoordinator(QObject):
         self._check_completed.connect(self._checked)
         self._pending_start = False
         self._retry_failures = False
+        self._target_path: str | None = None
         self._attempted = False
         self._after_install = False
         self._check_generation = 0
@@ -109,25 +110,43 @@ class PptPreparationCoordinator(QObject):
         else:
             self._start_check()
 
-    def request_start(self, *, retry_failures: bool = False) -> None:
-        """Keep one queued cycle and preserve a broad failure retry request."""
+    @property
+    def start_pending(self) -> bool:
+        """Report whether one explicit start is waiting for PPT preparation."""
+        return self._pending_start
+
+    def request_start(self, *, retry_failures: bool = False,
+                      target_path: str | None = None) -> str:
+        """Reserve one start without widening or replacing an earlier request."""
         if self._closed:
-            return
+            return "error"
+        if target_path is not None and (not isinstance(target_path, str) or not target_path.strip()):
+            return "error"
+        if self._pending_start:
+            return "busy"
         if self._worker is not None and self._worker.isRunning():
-            return
+            return "busy"
+        if self._worker is not None and getattr(self._worker, "failure_persistence_pending", False):
+            reserve = getattr(self._worker, "request_failure_persist", None)
+            if reserve is not None and reserve():
+                self._worker.start()
+            return "persistence_pending"
         self._pending_start = True
-        self._retry_failures = self._retry_failures or retry_failures
-        self._drain_start()
+        self._retry_failures = retry_failures if target_path is None else False
+        self._target_path = target_path
+        return self._drain_start() or "ok"
 
     def cancel_start(self) -> None:
         """Cancel only a queued indexing request; an active setup keeps running."""
         self._pending_start = False
         self._retry_failures = False
+        self._target_path = None
 
     def shutdown(self) -> None:
         """Cancel callbacks and starts, releasing observation without killing setup."""
         self._closed = True
         self._pending_start = False
+        self._target_path = None
         self._timer.stop()
         self._close_observation()
 
@@ -262,20 +281,31 @@ class PptPreparationCoordinator(QObject):
             # exception escape that callback and terminate the GUI event loop.
             logger.warning("수집기 초기화 실패: %s", type(exc).__name__)
             self._pending_start = False
+            self._target_path = None
+            self._retry_failures = False
             self.failed.emit("수집기가 초기화되지 않았습니다.")
             return
         logger.info("PPT 준비 상태: %s", policy)
         self._drain_start()
 
-    def _drain_start(self) -> None:
+    def _drain_start(self) -> str | None:
         if self._closed or self._worker is None or not self._pending_start:
             return
         self._pending_start = False
         retry, self._retry_failures = self._retry_failures, False
+        target, self._target_path = self._target_path, None
         if not self._worker.isRunning():
+            if target is not None:
+                reserve = getattr(self._worker, "request_single_retry", None)
+                result = reserve(target) if reserve is not None else "error"
+                if result != "ok":
+                    self.failed.emit("개별 파일 재시도를 시작하지 못했습니다.")
+                    return result
             if retry and hasattr(self._worker, "request_failure_retry"):
                 self._worker.request_failure_retry()
             self._worker.start()
+            return "ok"
+        return "busy"
 
     def _suppressed(self) -> bool:
         try:
