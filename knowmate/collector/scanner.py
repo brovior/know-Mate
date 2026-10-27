@@ -16,7 +16,7 @@ _LOCAL_DRIVES = {"c", "d", "e"}
 
 
 def get_scope(path: str) -> str:
-    """경로를 보고 'local' 또는 'shared'를 반환한다.
+    r"""경로를 보고 'local' 또는 'shared'를 반환한다.
 
     - UNC 경로(\\server\share) → shared
     - C:, D:, E: 드라이브 → local
@@ -35,6 +35,64 @@ def normalize_path_key(path: str) -> str:
     """경로 비교용 정규화 키. `/` 통일 + casefold — Windows 경로는 대소문자를
     구분하지 않고 `watch_folders`도 이미 `/` 정규화 관례를 쓴다(config.py 참고)."""
     return path.replace("\\", "/").casefold()
+
+
+def validate_retry_target(
+    path: str, watch_folders: list[str], *, extensions: set[str] | frozenset[str] | None = None,
+    exclude_files: frozenset[str] | None = None, max_file_size_mb: float = 30.0,
+) -> tuple[str, dict | None]:
+    """Check a direct retry with scanner policy without enumerating siblings."""
+    if not path or not os.path.isabs(path):
+        return "out_of_scope", None
+    source = os.path.abspath(path)
+    key = _retry_path_key(source)
+    if key in {_retry_path_key(excluded) for excluded in (exclude_files or frozenset())}:
+        return "excluded", None
+    if os.path.basename(path).startswith("~$") or Path(path).suffix.lower() not in (
+        SUPPORTED_EXT if extensions is None else extensions
+    ):
+        return "unsupported", None
+    try:
+        admitted = False
+        for folder in watch_folders:
+            root = os.path.abspath(folder)
+            root_key = _retry_path_key(root).rstrip("/")
+            lexical_inside = _retry_path_key(source).startswith(root_key + "/")
+            real_root = _retry_path_key(os.path.realpath(root)).rstrip("/")
+            real_inside = _retry_path_key(os.path.realpath(source)).startswith(real_root + "/")
+            if not lexical_inside or not real_inside:
+                continue
+            current = os.path.dirname(source)
+            while _retry_path_key(current) != _retry_path_key(root):
+                if os.path.islink(current) or (hasattr(os.path, "isjunction") and os.path.isjunction(current)):
+                    break
+                parent = os.path.dirname(current)
+                if parent == current:
+                    break
+                current = parent
+            else:
+                admitted = True
+                break
+        if not admitted:
+            return "out_of_scope", None
+        st = os.stat(source)
+        if not os.path.isfile(source):
+            return "not_found", None
+        if st.st_size > int(max_file_size_mb * 1024 * 1024):
+            return "too_large", None
+        return "ok", {"mtime": st.st_mtime, "mtime_ns": st.st_mtime_ns, "size": st.st_size}
+    except FileNotFoundError:
+        return "not_found", None
+    except OSError:
+        return "access_error", None
+
+
+def _retry_path_key(path: str) -> str:
+    """Compare extended Windows paths without changing their access spelling."""
+    key = normalize_path_key(os.path.normpath(path))
+    if key.startswith("//?/unc/"):
+        return "//" + key[8:]
+    return key[4:] if key.startswith("//?/") else key
 
 
 def iter_scan_folder(

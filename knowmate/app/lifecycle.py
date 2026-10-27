@@ -133,6 +133,7 @@ def _default_hard_exit(code: int = 0) -> NoReturn:
 def stop_worker(
     worker: Any, hard_exit: HardExit = _default_hard_exit,
     office_cleanup: Callable[[object], bool] | None = None,
+    *, policy_active: bool = False,
 ) -> bool:
     """Stop the worker after bounded Office cleanup; report any unsafe exit."""
     cleanup_started = False
@@ -143,7 +144,9 @@ def stop_worker(
         return office_cleanup(target)
 
     try:
-        return _stop_worker_impl(worker, hard_exit, cleanup_once if office_cleanup is not None else None)
+        policy_active = policy_active or getattr(worker, "policy_job_pending", False) is True
+        return _stop_worker_impl(worker, hard_exit, cleanup_once if office_cleanup is not None else None,
+                                 policy_active=policy_active)
     except Exception:
         # A Qt status/cancel/wait failure must not bypass owned Office cleanup.
         # The callback is bounded and logs on its daemon, never on this thread.
@@ -158,6 +161,7 @@ def stop_worker(
 def _stop_worker_impl(
     worker, hard_exit: HardExit = _default_hard_exit,
     office_cleanup: Callable[[object], bool] | None = None,
+    *, policy_active: bool = False,
 ) -> bool:
     """워커를 정상 종료 → 실패 시 강제 종료 → 그래도 실패 시 프로세스 하드 종료.
 
@@ -219,6 +223,9 @@ def _stop_worker_impl(
         except Exception:
             hard_exit(0)
             return True
+    if policy_active:
+        hard_exit(0)
+        return True
     if office_cleanup is None:
         try:
             stage = getattr(worker, "work_stage", "unknown")

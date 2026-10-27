@@ -69,6 +69,14 @@
 
       <!-- 사이드바 하단 -->
       <div class="sidebar-bottom">
+        <div class="failure-policy-progress compact" id="failurePolicySidebar" hidden aria-live="polite">
+          <div class="failure-policy-heading"><span class="failure-policy-spinner" aria-hidden="true"></span><span id="failurePolicySidebarTitle">문서 제외 처리 중</span></div>
+          <div class="failure-policy-track" id="failurePolicySidebarTrack" role="progressbar" aria-label="문서 제외 처리 진행률" aria-valuemin="0" aria-valuemax="100"><div class="failure-policy-fill" id="failurePolicySidebarFill"></div></div>
+          <div class="failure-policy-detail" id="failurePolicySidebarDetail"></div>
+          <div class="failure-policy-help" id="failurePolicySidebarHelp">문서 제외 처리 중에는 인덱싱과 제외 설정을 변경할 수 없습니다.</div>
+          <button class="failure-policy-recheck" id="failurePolicySidebarRecheck" type="button" onclick="recheckFailurePolicy()" hidden>상태 다시 확인</button>
+          <button class="failure-policy-open" type="button" onclick="openFailuresPanel()">진행 상황 보기</button>
+        </div>
         <div class="index-card">
           <div class="index-row">
             <span class="index-label" id="idxIcon">✅ 마지막 인덱싱</span>
@@ -298,6 +306,13 @@
 
     <div class="fail-body" id="failBody"></div>
 
+    <div class="failure-policy-progress" id="failurePolicyPanel" hidden aria-live="polite">
+      <div class="failure-policy-heading"><span class="failure-policy-spinner" aria-hidden="true"></span><span id="failurePolicyPanelTitle">검색 데이터 정리 중</span><span class="failure-policy-count" id="failurePolicyPanelCount"></span></div>
+      <div class="failure-policy-track" id="failurePolicyPanelTrack" role="progressbar" aria-label="문서 제외 처리 진행률" aria-valuemin="0" aria-valuemax="100"><div class="failure-policy-fill" id="failurePolicyPanelFill"></div></div>
+      <div class="failure-policy-detail" id="failurePolicyPanelDetail"></div>
+      <div class="failure-policy-help" id="failurePolicyPanelHelp">이 창을 닫아도 처리는 계속됩니다.</div>
+      <button class="failure-policy-recheck" id="failurePolicyPanelRecheck" type="button" onclick="recheckFailurePolicy()" hidden>상태 다시 확인</button>
+    </div>
     <div class="fail-footer">
       <span class="fail-foot-note">파일을 수정하면 대기 시간과 관계없이 즉시 다시 시도합니다.</span>
       <button class="btn-retry-all" id="btnRetryAll" onclick="startReindex()">전체 다시 시도</button>

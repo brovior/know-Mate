@@ -235,7 +235,8 @@ def test_worker_finally_releases_verified_refs_despite_apartment_or_release_erro
     native_com_backend.uninitialize = uninitialize
     com_reader.release_verified_pending_com_refs()
     worker = CollectorWorker(config={"collector": {}}, indexer=MagicMock(), extractor=MagicMock(),
-                             state_file=tmp_path / "state.json", com_cleanup_fn=MagicMock())
+                             state_file=tmp_path / "state.json", failure_file=tmp_path / "failure.json",
+                             com_cleanup_fn=MagicMock())
 
     def cycle():
         record = office_guard.OwnedOfficeProcess("EXCEL.EXE", 123, generation=2)
@@ -250,9 +251,8 @@ def test_worker_finally_releases_verified_refs_despite_apartment_or_release_erro
         def fail_release():
             raise RuntimeError("release failed")
         monkeypatch.setattr(com_reader, "release_unverified_com_refs", fail_release)
-        with pytest.raises(RuntimeError, match="release failed"):
-            worker.run()
-    else:
-        worker.run()
+    worker.run()
+    terminal = worker.drain_failure_updates()["terminal"]
+    assert terminal["status"] == ("error" if unverified_release_fails else "success")
     assert not com_reader._tls.verified_cleanup
     assert uninitialize.call_count == int(initialized)

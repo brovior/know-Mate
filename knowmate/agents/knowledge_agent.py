@@ -162,7 +162,7 @@ class KnowledgeAgent:
         check()
         scopes = context.get("scopes") or []
         if not scopes:
-            return [{"type": "text", "content": "검색 범위를 하나 이상 선택해주세요. (내 PC 문서 또는 공유 폴더)"}]
+            return [{"type": "text", "content": "검색 범위를 하나 이상 선택해주세요."}]
         from knowmate.rag.query_reader import QueryIndexUnavailable
         try:
             pipeline = self._get_pipeline()

@@ -14,7 +14,8 @@ function fixture() {
       classList: {add(){}, remove(){}, toggle(){}},
       appendChild(el) { this.children.push(el); },
       querySelector(){ return null; }, querySelectorAll(){ return []; },
-      addEventListener(){}, focus(){}, remove(){},
+      listeners: {}, addEventListener(name,fn){ this.listeners[name]=fn; },
+      closest(){ return null; }, focus(){}, remove(){},
       set innerHTML(value) { this._html=value; this.children=[]; }, get innerHTML(){ return this._html || ''; },
     };
   }
@@ -58,6 +59,46 @@ function response(f, req, status='success',extra={}) {
 }
 const tests = [];
 function test(name,run){tests.push({name,run});}
+
+function selectScopes(f, scopes) {
+ for (const [name,id] of [['local','chkLocal'],['shared','chkShared'],['mail','chkMail']]) {
+  const el=f.elements.get(id);el.checked=scopes.includes(name);el.listeners.change.call(el);
+ }
+}
+
+test('checkbox change events send all eight scope combinations',async()=>{
+ for(let mask=0;mask<8;mask++) {
+  const f=fixture();f.run('initScopeCheckboxes()');
+  const scopes=['local','shared','mail'].filter((_,index)=>mask&(1<<index));
+  selectScopes(f,scopes);f.input('question');const p=f.run('sendMsg()');await tick();
+  if(scopes.length) {
+   f.calls.saved[0].resolve('{"ok":true}');await p;
+   assert.deepEqual(f.calls.sent[0].scopes,scopes);
+  } else {
+   await p;assert.equal(f.calls.saved.length,0);assert.equal(f.calls.sent.length,0);
+   assert.match(f.calls.toasts[0],/검색 범위/);
+  }
+ }
+});
+
+test('scope changes during save and pending response affect only next question',async()=>{
+ const f=fixture();f.run('initScopeCheckboxes()');selectScopes(f,['mail']);
+ f.input('first');const sending=f.run('sendMsg()');await tick();
+ selectScopes(f,['shared']);f.calls.saved[0].resolve('{"ok":true}');await sending;
+ const first=f.calls.sent[0];assert.deepEqual(first.scopes,['mail']);
+ selectScopes(f,['local']);assert.deepEqual(first.scopes,['mail']);
+ const terminal=response(f,first);await tick();f.calls.saved[1].resolve('{"ok":true}');await terminal;
+ f.state(false,'IDLE',first.request_id);f.input('second');
+ const next=f.run('sendMsg()');await tick();f.calls.saved[2].resolve('{"ok":true}');await next;
+ assert.deepEqual(f.calls.sent[1].scopes,['local']);
+});
+
+test('navigation and scope changes cannot rewrite the pending request',async()=>{
+ const f=fixture();f.run('initScopeCheckboxes()');selectScopes(f,['shared','mail']);
+ const first=await accepted(f);const away=f.run('newThread()');await tick();await away;
+ selectScopes(f,['local']);assert.deepEqual(first.scopes,['shared','mail']);
+ assert.equal(f.calls.cancelled.length,0);
+});
 
 test('save ACK precedes dispatch and duplicate send is reserved', async()=>{
  const f=fixture();f.input('first');const p=f.run('sendMsg()'); await tick();

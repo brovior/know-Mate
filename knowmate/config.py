@@ -294,10 +294,33 @@ def update_exclude_files(paths: list[str]) -> None:
     updated = deepcopy(cfg)
     updated.setdefault("collector", {})["exclude_files"] = list(paths)
     _save_config(updated)
-    # CollectorWorker 등은 get_config()가 반환한 객체를 계속 참조한다. 저장 성공
-    # 뒤 기존 객체를 제자리 갱신해야 실행 중 구성도 디스크와 같은 값을 본다.
-    cfg.clear()
-    cfg.update(updated)
+    # GUI readers must observe one complete section while the worker publishes.
+    cfg["collector"] = updated["collector"]
+
+
+def get_cached_config() -> dict[str, Any] | None:
+    """Return an already loaded configuration without any filesystem access."""
+    return _cache
+
+
+def read_exclude_files() -> list[str]:
+    """Read a durable exclusion policy without modifying shared settings."""
+    with _get_config_path().open(encoding="utf-8") as handle:
+        cfg = yaml.safe_load(handle)
+    if not isinstance(cfg, dict) or not isinstance(cfg.get("collector"), dict):
+        raise ValueError("invalid exclusion configuration")
+    paths = cfg["collector"].get("exclude_files", [])
+    if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
+        raise ValueError("invalid exclusion paths")
+    return list(paths)
+
+
+def publish_exclude_files(paths: list[str]) -> None:
+    """Publish a verified durable policy with one shared-section replacement."""
+    cfg = get_config()
+    collector = deepcopy(cfg.get("collector", {}))
+    collector["exclude_files"] = list(paths)
+    cfg["collector"] = collector
 
 
 def update_settings(patch: dict[str, Any]) -> None:

@@ -3,6 +3,77 @@
 현재 원인 분석과 다음 검증의 정본이다. 작업 상태는 [ROADMAP.md](ROADMAP.md), 구현 계약은
 [DESIGN.md](design/DESIGN.md), 완료 이력은 [UPDATE_NOTES.md](UPDATE_NOTES.md)를 따른다.
 
+## 검색 범위 체크박스의 분리 (2026-10-27)
+
+메일 검색을 `local` 선택으로 판단해 내 메일함만 선택하면 누락되고 내 PC 문서만 선택해도
+메일이 포함됐다. 합성 데이터와 실제 임시 LanceDB로 8조합 중 4조합의 불일치를 재현했다.
+문서 범위·소유자를 후보 제한 뒤에 검사해, 더 가까운 비선택 문서 12건 뒤의 공유 문서가
+공유 폴더만 선택한 검색에서 누락되는 문제도 재현했다.
+
+메일 선택을 독립시키고 문서 범위·로컬 소유자 조건을 후보 제한 전에 적용했다. 복호화 전 방어
+검사도 유지한다. `test_search_scopes.py`는 8조합·후보 혼잡·삭제/제외·빈/잘못된 범위·내부 전체
+검색을, `test_primary_search_scopes.py`는 DB 필터를 무시하는 어댑터에서도 허용 자료만 복호화함을
+검증한다. 실제 Qt 질문 워커와 제품 JS 시험은 범위 전달과 질문 전송 후 체크 변경의 격리를 확인한다.
+검증 로그와 코드 리뷰는 `.aegisdesk_build/search-scope-validation/`에 보관한다.
+전체 회귀는 `pytest knowmate/tests -v -W error`로 2,536 통과·6 skip·74 subtests 통과,
+경고 0개(1,059.57초)다. 제품 JS의 실행형 회귀는 체크 변경·요청 스냅샷을 포함해 43개 시나리오다.
+
+의존성·DB 스키마·인덱스 버전 변경과 재인덱싱은 없다. 기존 C/D/E 기반 경로 분류, 비선택 테이블의
+스키마 오류로 초기화가 막히는 제약, 키워드 보강의 날짜 조건은 별도 문제다. 사내 API·업무 데이터와
+frozen 내장 UI는 미검증이다.
+
+## 대량 문서 제외의 화면 응답성 (2026-10-27)
+
+기존 일괄 제외는 화면 스레드에서 설정 저장·문서별 DB 삭제·state 정리·메일 제외 정리를 실행했다.
+배경 처리로 옮기고 팝업 하단과 사이드바에 단계·건수·작업 중 안내를 표시한다. 닫기·재열기·웹
+화면 재로드에도 작업을 유지하며, 새 인덱싱·정책 변경·질문을 실제 스레드 종료까지 차단한다.
+완료 건수 조회도 워커에서 수행하고, 설정 미확정 상태는 종료 후에도 읽기 재확인 전까지 보호한다.
+계약은 [대량 문서 제외](design/DESIGN.md#대량-문서-제외의-백그라운드-처리)를 따른다.
+
+10·150·1,000건의 합성 metadata와 실제 QThread/Qt 이벤트 루프에서 문서 삭제·완료 집계·native
+종료를 각각 막아도 heartbeat가 유지되고, 실제 종료 전 새 작업·완료 표시가 허용되지 않음을
+확인했다. 실제 임시 LanceDB에서는 선택 문서 삭제/비대상 보존과 메일 제외→해제→개별 재시도→
+재제외의 새 세대 정리를 검증했다. 원본 파일은 보존하며 본문·벡터를 진행 집계에 읽지 않는다.
+
+실제 제품 JS/HTML/CSS와 Qt Bridge/수집기 워커를 시험 전용 loopback transport로 연결하고,
+Edge headless에서 150건×25ms 지연 삭제를 실행했다. 팝업 닫기·재열기·웹 재로드 복원과 새
+인덱싱 거절, 브라우저 프레임 진행/JS 오류 없음, 150건 설정 저장·삭제를 확인했다. 최종 시험의
+Qt heartbeat는 401회, 작업 중 최대 간격은 31ms였다. 실제 사내 DB 처리시간 측정은 아니다.
+내장 QWebEngine host는 별도 단독 probe에서 native exit1로 paint 검증을 마치지 못해,
+동일 제품 UI의 Edge 렌더링과 Qt event loop를 대체 transport로 검증한 범위로 구분한다.
+
+근거는 `test_policy_worker.py`, `test_policy_storage.py`, `test_policy_shutdown.py`,
+`test_failure_policy_app.py`, `test_primary_bulk_policy.py`, `test_bulk_policy_ui.py` 및
+`.aegisdesk_build/bulk-policy-validation/`, `bulk-policy-live-report.json`, 화면 캡처다.
+전체 회귀는 `pytest knowmate/tests -v -W error`로 2,484 통과·6 skip·74 subtests 통과,
+경고 0개(1,008.24초)다. 실제 사내 150건·Office/DRM·frozen EXE는 미검증이며,
+의존성·DB/config 스키마 변경은 없다.
+
+## 개별 재시도 범위와 실패 목록 갱신 (2026-10-27)
+
+개별 버튼은 선택 파일의 대기만 해제한 뒤 일반 수집 사이클을 시작해, 다른 신규·변경 파일과
+대기 시간이 지난 실패 파일도 함께 처리했다. 실패 목록은 저장 파일만 읽고, 완료 시에도 열린
+패널 대신 사이드바 건수만 갱신했다. 실행 범위를 선택 파일로 고정하고 문서·메일의 처리 결과를
+화면에 주기적으로 전달하도록 바꿨다. 계약은 [개별 재시도](design/DESIGN.md#개별-재시도와-진행-중-목록)를 따른다.
+
+임시 LanceDB·fake 임베딩 시험에서 비대상 파일·메일·삭제 대기·순환 커서 보존과 최신 메일 UID의
+세대 보호를 확인했다. 실제 Qt 스레드와 이벤트 루프에서는 뒤 파일 처리 중 앞 파일의 성공을
+목록에 반영하고, COM 정리 중 새 요청을 거절하며, 저장전용 재시도가 거절된 인덱싱을 실행하지
+않는 것을 확인했다. Windows 대소문자·슬래시·장경로 표기도 제외 설정을 우회하지 않았다.
+
+JS 회귀는 패널 재열기 시 오래된 응답 폐기, 느린 응답 중 연속 결과 표시, 필터·스크롤 보존,
+시간 문구 갱신 시 재조회 없음 등 10개 시나리오다. 파일별 Qt 결과 이벤트 없이 경로별 최신
+메타데이터만 모으며, 기존 진행률 이벤트와는 구분한다. 실패 이력 초기 읽기가 늦을 때도
+불완전한 빈 목록을 공개하지 않는 회귀를 추가했다.
+
+근거는 `knowmate/tests/test_single_retry_core.py`, `test_mail_single_retry.py`, `test_retry_app.py`,
+`test_retry_integration.py`, `test_retry_ui.py`와 `.aegisdesk_build/single-retry-validation/`이다.
+최종 전체 회귀는 `pytest knowmate/tests -v -W error`로 2,448 통과·6 skip·74 subtests 통과,
+경고 0개(1,012.84초)다. 기존 COM 정리 테스트는 예외 재전파 대신 안전한 오류 종료를 확인하도록
+갱신했고, 공유 종료 제한 시간 테스트는 주입 시계로 PID들이 하나의 예산을 쓰는지 확인한다.
+실제 사내 Office·DRM 및 frozen 앱 검증은 미실행이며,
+설치·인덱스 형식·의존성은 변경하지 않았다.
+
 ## 대화 이동 뒤 응답 중단 (2026-10-24)
 
 질문 전송 후 다른 대화를 열면 `prepareNavigation()`이 요청을 무효화하고 `cancelQuery()`를

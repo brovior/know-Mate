@@ -13,7 +13,8 @@ from PyQt6.QtCore import QObject, QThread, QTimer, pyqtSignal
 
 from knowmate.collector.cleanup import CleanupManager
 from knowmate.collector.memory_diagnostics import MemoryDiagnostics
-from knowmate.collector.scanner import get_scope, iter_scan_folder, normalize_path_key
+from knowmate.collector.scanner import get_scope, iter_scan_folder, normalize_path_key, validate_retry_target
+from knowmate.collector.failure_updates import FailureUpdates
 from knowmate.collector.state import load_state, save_state
 from knowmate.secure import com_stage
 from knowmate.secure.com_fault import clear_com_error_frames
@@ -92,15 +93,37 @@ def _flush_document_state_on_exit(method):
         self._document_state_flush = None
         try:
             return method(self, *args, **kwargs)
+        except Exception as exc:
+            self._record_cycle_error(exc)
         finally:
-            flush = getattr(self, "_document_state_flush", None)
-            if callable(flush):
-                flush(force=True)
-            self._document_state_flush = None
+            try:
+                flush = getattr(self, "_document_state_flush", None)
+                if callable(flush):
+                    flush(force=True)
+            except Exception as exc:
+                self._record_cycle_error(exc)
+            finally:
+                self._document_state_flush = None
+                if self._run_session_active:
+                    try:
+                        self._restore_single_retry_flag()
+                        self._persist_failure_records()
+                    except Exception as exc:
+                        self._record_cycle_error(exc)
+                    finally:
+                        if self._cancelled and self._cycle_status == "success":
+                            self._cycle_status = "cancelled"
+                        self._failure_updates.finish(self._cycle_status, self._cycle_message)
+                        self._run_session_active = False
+                        self._active_target = None
+                        self._retry_requested = False
     return wrapped
 
 
-def _migrate_legacy_mail_failures(legacy_file: Path, failure_file: Path) -> bool:
+def _migrate_legacy_mail_failures(
+    legacy_file: Path, failure_file: Path, *, records: dict | None = None,
+    persist: Callable[[], bool] | None = None,
+) -> bool:
     """기존 mail 전용 실패 이력을 공용 파일로 보존 병합하고 원본을 보관한다."""
     from knowmate.collector import failure_state
 
@@ -109,14 +132,14 @@ def _migrate_legacy_mail_failures(legacy_file: Path, failure_file: Path) -> bool
     legacy_records = failure_state.load_failures(legacy_file)
     if not legacy_records:
         return False
-    records = failure_state.load_failures(failure_file)
+    records = failure_state.load_failures(failure_file) if records is None else records
     changed = False
     for path, legacy_record in legacy_records.items():
         current = records.get(path)
         if current is None or legacy_record.last_failed_ts > current.last_failed_ts:
             records[path] = legacy_record
             changed = True
-    if changed and not failure_state.save_failures(failure_file, records):
+    if changed and not (persist() if persist is not None else failure_state.save_failures(failure_file, records)):
         logger.error("[mail_scanner] 기존 메일 실패 이력 병합 저장 실패 — 원본을 유지합니다")
         return False
 
@@ -314,16 +337,228 @@ class CollectorWorker(QThread):
         # 건너뛰는 플래그로 바꿨다). 유휴 자동 사이클은 이 플래그를 세우지
         # 않는다 — 매번 세우면 백오프가 사실상 무력화된다.
         self._retry_requested = False
+        self._single_retry_requested: str | None = None
+        self._active_target: str | None = None
+        self._persist_only_requested = False
+        self._failure_updates = FailureUpdates(self._failure_file)
+        self._run_session_active = False
+        self._cycle_status = "success"
+        self._cycle_message = "인덱싱 완료"
+        self._single_original_record = None
+        from knowmate.collector.policy_job import PolicyJob
+        self._policy_job = PolicyJob()
+
+    @property
+    def policy_job_pending(self) -> bool:
+        """Report the policy ownership retained until the GUI acknowledges join."""
+        return self._policy_job.pending
+
+    @property
+    def policy_readback_unknown(self) -> bool:
+        """Keep uncertain durable settings blocked after a policy thread exits."""
+        return self._policy_job.unknown
+
+    @property
+    def policy_unknown(self) -> bool:
+        """Expose the policy confirmation latch to GUI admission."""
+        return self.policy_readback_unknown
+
+    def request_policy_job(self, job_id: str, action: str, paths: tuple[str, ...]) -> str:
+        """Reserve a policy command without GUI-thread I/O."""
+        if self.isRunning() or self._single_retry_requested is not None or self._persist_only_requested or self._retry_requested:
+            return "busy"
+        if self.failure_persistence_pending:
+            return "persistence_pending"
+        result = self._policy_job.reserve(job_id, action, paths)
+        if result == "ok":
+            self._cancelled = False
+        return result
+
+    def request_policy_reconcile(self, job_id: str) -> str:
+        """Reserve a read-only verification after an uncertain settings save."""
+        return self.request_policy_job(job_id, "reconcile", ())
+
+    def clear_policy_command(self, job_id: str) -> bool:
+        """Discard only an unstarted command after native non-start is confirmed."""
+        return False if self.isRunning() or not self.wait(0) else self._policy_job.clear(job_id)
+
+    def acknowledge_policy_job(self, job_id: str) -> bool:
+        """Release policy ownership only once the actual QThread has joined."""
+        return False if self.isRunning() or not self.wait(0) else self._policy_job.acknowledge(job_id)
+
+    def policy_job_snapshot(self) -> dict | None:
+        """Copy bounded progress metadata without reading configuration or DB."""
+        return self._policy_job.snapshot()
+
+    def take_policy_cache(self) -> dict | None:
+        """Transfer a worker-prepared failure baseline without GUI filesystem I/O."""
+        return self._policy_job.take_cache()
+
+    def take_policy_failure_records(self) -> dict | None:
+        """Transfer the detached failure record map prepared for one policy job."""
+        cache = self.take_policy_cache()
+        return cache["failure_records"] if cache is not None else None
+
+    def _emit_finished(self, message: str) -> None:
+        """Retain the summary synchronously before its queued GUI delivery."""
+        self._cycle_message = message
+        self.finished.emit(message)
+
+    def _record_cycle_error(self, error: Exception) -> None:
+        """Contain outer worker failures without leaking exceptions into Qt."""
+        self._cycle_status = "error"
+        self._cycle_message = "인덱싱 처리 중 오류가 발생했습니다."
+        logger.error("[collector] 수집기 종료 처리 오류: error_type=%s", type(error).__name__)
+        self.error.emit(self._cycle_message)
+
+    @property
+    def failure_persistence_pending(self) -> bool:
+        """Report unsaved owner metadata to admission checks."""
+        return self._failure_updates.dirty
+
+    @property
+    def failure_cycle_id(self) -> int:
+        """Expose the latest worker generation without its mutable state."""
+        return self._failure_updates.cycle_id
+
+    def request_single_retry(self, path: str) -> str:
+        """Reserve one source for the next run without GUI-thread I/O."""
+        if self.policy_job_pending:
+            return "busy"
+        if self.policy_readback_unknown:
+            return "policy_unconfirmed"
+        if self.isRunning() or self._single_retry_requested is not None:
+            return "busy"
+        if self.failure_persistence_pending:
+            return "persistence_pending"
+        if not isinstance(path, str) or not path.strip():
+            return "error"
+        self._single_retry_requested = path
+        self._retry_requested = False
+        return "ok"
+
+    def request_failure_persist(self) -> bool:
+        """Reserve a storage-only retry without indexing or Office work."""
+        if self.policy_job_pending or self.policy_readback_unknown or self.isRunning() or not self.failure_persistence_pending:
+            return False
+        self._persist_only_requested = True
+        self._single_retry_requested = None
+        self._retry_requested = False
+        return True
+
+    def drain_failure_updates(self) -> dict | None:
+        """Atomically drain copied scalar failure deltas for the GUI."""
+        return self._failure_updates.drain()
+
+    def _persist_failure_records(self) -> bool:
+        """Persist the shared canonical document/mail failure snapshot."""
+        return self._failure_updates.save()
+
+    def _force_single_failure(self, failures: dict) -> None:
+        """Temporarily bypass the selected source's backoff for this attempt."""
+        from knowmate.collector import failure_state
+        self._single_original_record = failures.get(self._active_target)
+        failure_state.request_retry_one(failures, self._active_target)
+
+    def _restore_single_retry_flag(self) -> None:
+        """Do not persist a one-shot bypass when cancellation deferred its source."""
+        from dataclasses import replace
+        original = self._single_original_record
+        records = self._failure_updates.records
+        if original is not None and records is not None:
+            current = records.get(self._active_target)
+            if current == replace(original, force_retry=True):
+                records[self._active_target] = replace(original)
+        self._single_original_record = None
+
+    def _reject_single_retry(self, reason: str) -> None:
+        """Report a preflight rejection without widening its execution scope."""
+        self._cycle_status = reason
+        self.last_cycle_changed = False
+        label = {
+            "not_found": "파일 또는 실패 이력을 찾을 수 없습니다.",
+            "out_of_scope": "현재 인덱싱 폴더에 포함된 파일이 아닙니다.",
+            "excluded": "인덱싱에서 제외된 파일입니다.",
+            "unsupported": "지원하지 않는 파일입니다.",
+            "too_large": "파일 크기가 인덱싱 한도를 초과했습니다.",
+            "access_error": "파일에 접근할 수 없습니다.",
+            "unavailable": "현재 메일 인덱싱 설정에서는 처리할 수 없습니다.",
+            "recovery_required": "전체 인덱싱으로 이전 작업을 복구한 뒤 다시 시도해 주세요.",
+            "drm_idle": "보안 문서 접근을 확인한 뒤 다시 시도해 주세요.",
+        }.get(reason, "파일 상태를 확인한 뒤 다시 시도해 주세요.")
+        self._emit_finished(f"개별 재시도 보류: {label}")
+
+    def _run_single_mail(self, failures: dict) -> None:
+        """Run one admitted mail source without global document maintenance."""
+        from knowmate.collector.mail_scan_state import load_mail_scan_state
+        from knowmate.collector.mail_scanner import run_mail_scan
+        state = load_mail_scan_state(self._mail_state_file, strict=True)
+        if state.get("files") and (
+            getattr(self._email_indexer, "table_was_recreated", False)
+            or getattr(self._email_indexer, "table_is_empty", False)
+        ):
+            self._reject_single_retry("recovery_required")
+            return
+        self._force_single_failure(failures)
+        self._work_phase = "mail_indexing"
+        rejected = []
+        indexed, _ = run_mail_scan(
+            self._config.get("collector", {}).get("watch_folders", []),
+            self._email_indexer, self._config,
+            on_progress=lambda cur, total, name: self.progress.emit(cur, total, name),
+            state_file=self._mail_state_file, failure_file=self._failure_file,
+            cancel_check=lambda: self._cancelled,
+            target_path=self._active_target, preloaded_failures=failures,
+            persist_failures=self._persist_failure_records,
+            preloaded_state=state,
+            on_target_rejected=rejected.append,
+        )
+        if rejected:
+            self._reject_single_retry(rejected[0])
+            return
+        self.last_cycle_changed = indexed > 0
+        self._persist_failure_records()
+        self._emit_finished(f"개별 메일 재시도 완료 - 처리 {indexed}건")
 
     def request_failure_retry(self) -> None:
         """다음 사이클 시작 시 모든 실패 기록에 재시도(force_retry)를 요청한다
         (수동 트리거 전용). 이력·연속 실패 횟수는 보존된다."""
+        if self.policy_job_pending or self.policy_readback_unknown:
+            return
         self._retry_requested = True
         self._mail_discovery.invalidate()
 
     @_flush_document_state_on_exit
     def run(self):
         """증분 스캔 사이클 1회를 실행한다."""
+        if self._policy_job.run(self):
+            return
+        self._active_target, self._single_retry_requested = self._single_retry_requested, None
+        persist_only, self._persist_only_requested = self._persist_only_requested, False
+        persistence_blocked = self.failure_persistence_pending and not persist_only
+        scope = "persist" if persist_only else "single" if self._active_target is not None else "all"
+        self._run_session_active = True
+        self._cycle_status = "success"
+        self._cycle_message = "실패 이력 저장 완료" if persist_only else "인덱싱 완료"
+        self._failure_updates.begin(scope)
+        self._document_state_flush = None
+        if persistence_blocked:
+            self._cycle_status = "persistence_pending"
+            self._cycle_message = "실패 이력을 저장하지 못했습니다. 저장 후 다시 시도해 주세요."
+            self._failure_updates.finish(self._cycle_status, self._cycle_message)
+            self._run_session_active = False
+            self._active_target = None
+            self._retry_requested = False
+            return
+        if persist_only:
+            self._persist_failure_records()
+            if self.failure_persistence_pending:
+                self._cycle_status = "error"
+                self._cycle_message = "실패 이력을 저장하지 못했습니다. 저장 권한을 확인한 뒤 다시 시도해 주세요."
+            self._failure_updates.finish(self._cycle_status, self._cycle_message)
+            self._run_session_active = False
+            self._active_target = None
+            return
         self._cancelled = False
         from knowmate.rag.embedding_cancel import EmbeddingCancellation, EmbeddingCancelledError, embedding_cancellation_scope
         self._embedding_cancel = EmbeddingCancellation()
@@ -345,8 +580,12 @@ class CollectorWorker(QThread):
             with embedding_cancellation_scope(self._embedding_cancel):
                 self._run_cycle()
         except EmbeddingCancelledError:
+            self._cycle_status = "cancelled"
+            self._cycle_message = "인덱싱 취소됨"
             logger.info("[collector] 임베딩 취소로 사이클 중단: stage=%s", self._work_phase)
         except Exception as exc:
+            self._cycle_status = "error"
+            self._cycle_message = "인덱싱 처리 중 오류가 발생했습니다."
             logger.exception("수집기 예외 발생: %s", exc)
             self.error.emit(str(exc))
         finally:
@@ -407,6 +646,8 @@ class CollectorWorker(QThread):
     @property
     def work_stage(self) -> str:
         """종료 진단용으로 현재 COM·임베딩·DB·수집 단계를 반환한다."""
+        if self.policy_job_pending:
+            return "policy_" + (self.policy_job_snapshot() or {}).get("stage", "reserved")
         if self._office_cleanup_in_progress:
             return "office_cleanup"
         if self.maintenance_in_progress:
@@ -419,7 +660,7 @@ class CollectorWorker(QThread):
     @property
     def blocking_shutdown_work(self) -> bool:
         """진행 중인 임베딩·Office 정리에 제한된 종료 유예가 필요한지 반환한다."""
-        return self._office_cleanup_in_progress or self._embedding_cancel.in_progress
+        return self.policy_job_pending or self._office_cleanup_in_progress or self._embedding_cancel.in_progress
 
     def _cleanup_com_apps(self, phase: str) -> None:
         """생성 워커에서 Office 정리를 시도하고 미확인 결과를 기록한다."""
@@ -599,6 +840,51 @@ class CollectorWorker(QThread):
 
     def _run_cycle(self):
         """스캔 -> 분류 -> 인덱싱 -> orphan 정리 -> 저장 순으로 사이클을 실행한다."""
+        if not self._run_session_active:
+            self._failure_updates.begin("single" if self._active_target is not None else "all")
+        failures = self._failure_updates.records
+        if self._active_target is None:
+            _migrate_legacy_mail_failures(
+                self._failure_file.with_name("mail_index_failure.json"), self._failure_file,
+                records=failures, persist=self._persist_failure_records,
+            )
+        target_meta = None
+        if self._active_target is not None:
+            from knowmate.collector import failure_state
+            from knowmate.collector.mail_scan_state import normalize_stored_path_key
+            requested_key = normalize_stored_path_key(self._active_target)
+            matches = [path for path in failures if normalize_stored_path_key(path) == requested_key]
+            if len(matches) != 1:
+                self._reject_single_retry("not_found")
+                return
+            self._active_target = matches[0]
+            collector = self._config.get("collector", {})
+            mail_cfg = self._config.get("mail", {})
+            mail_extensions = {str(ext).lower() for ext in (mail_cfg.get("extensions") or [".mysingle", ".eml"])}
+            is_mail = Path(self._active_target).suffix.lower() in mail_extensions
+            if is_mail and (self._email_indexer is None or not mail_cfg.get("enabled", False)
+                            or int(mail_cfg.get("max_mails_per_scan", 500)) <= 0):
+                self._reject_single_retry("unavailable")
+                return
+            from knowmate.collector.scanner import SUPPORTED_EXT
+            status, target_meta = validate_retry_target(
+                self._active_target, collector.get("watch_folders", []),
+                extensions=mail_extensions if is_mail else SUPPORTED_EXT,
+                exclude_files=frozenset(normalize_path_key(p) for p in collector.get("exclude_files", [])
+                                        if isinstance(p, str)),
+                max_file_size_mb=float(self._config.get("chunking", {}).get("max_file_size_mb", 30.0)),
+            )
+            if status != "ok":
+                self._reject_single_retry(status)
+                return
+            if is_mail:
+                self._run_single_mail(failures)
+                return
+            idle_threshold = float(collector.get("drm_idle_threshold_sec", 480))
+            if (idle_threshold > 0 and self._get_idle_seconds() >= idle_threshold
+                    and _is_drm_suspected(self._active_target)):
+                self._reject_single_retry("drm_idle")
+                return
         from datetime import datetime, timezone
         collector_cfg = self._config.get("collector", {})
         self._work_phase = "document_indexing"
@@ -778,6 +1064,9 @@ class CollectorWorker(QThread):
             getattr(self._indexer, "table_was_recreated", False)
             or getattr(self._indexer, "table_is_empty", False)
         ):
+            if self._active_target is not None:
+                self._reject_single_retry("recovery_required")
+                return
             for entry in state.values():
                 if not isinstance(entry, dict):
                     continue
@@ -792,16 +1081,19 @@ class CollectorWorker(QThread):
             state_missing_with_rows = not state and self._indexer.table.count_rows() > 0
         except Exception as exc:
             logger.error("[collector] 문서 DB 상태 확인 실패 — 이번 사이클 DB 쓰기 중단: %s", exc)
-            self.finished.emit("문서 인덱스 복구 확인 실패")
+            self._emit_finished("문서 인덱스 복구 확인 실패")
             return
         if recovery_marker_active or state_missing_with_rows:
+            if self._active_target is not None:
+                self._reject_single_retry("recovery_required")
+                return
             try:
                 recovered = self._indexer.recover_document_state()
             except Exception as exc:
                 # A failed metadata read is ambiguous.  Do not add documents
                 # until a later cycle can prove what the prior DB write did.
                 logger.error("[collector] 문서 DB 복구 조회 실패 — 이번 사이클 DB 쓰기 중단: %s", exc)
-                self.finished.emit("문서 인덱스 복구 확인 실패")
+                self._emit_finished("문서 인덱스 복구 확인 실패")
                 return
             for generation in recovered:
                 path = generation.get("file_path")
@@ -829,6 +1121,8 @@ class CollectorWorker(QThread):
         # 기존 청크 삭제가 실패했다면 state에 남긴 ID를 스캔 전에 다시 정리한다.
         pending_changed = False
         for path, entry in state.items():
+            if self._active_target is not None and path != self._active_target:
+                continue
             if not isinstance(entry, dict):
                 continue
             pending_ids = entry.get("pending_delete_chunk_ids", [])
@@ -851,8 +1145,9 @@ class CollectorWorker(QThread):
         # at a current durable state checkpoint below.
 
         from knowmate.collector import failure_state
-        failures = failure_state.load_failures(self._failure_file)
-        retry_requested = self._retry_requested
+        if self._active_target is not None:
+            self._force_single_failure(failures)
+        retry_requested = self._retry_requested and self._active_target is None
         if retry_requested:
             n = failure_state.request_retry_all(failures)
             logger.info("[failure] 사용자 재시도 요청 — 이번 사이클 백오프 무시 (%d건, 이력 보존)", n)
@@ -901,6 +1196,15 @@ class CollectorWorker(QThread):
             found = 0
             migrate_logged = False
             try:
+                if self._active_target is not None:
+                    path = self._active_target
+                    task_queue.put(((PRIORITY_MODIFIED, _PLAIN_RANK), next(_seq), IndexTask(
+                        PRIORITY_MODIFIED, path, "modified", _PLAIN_RANK,
+                        size=target_meta["size"], mtime=target_meta["mtime"],
+                        mtime_ns=target_meta["mtime_ns"],
+                    )))
+                    found = 1
+                    return
                 for folder_str in watch_folders:
                     folder = Path(folder_str)
                     if not folder.exists():
@@ -1019,10 +1323,10 @@ class CollectorWorker(QThread):
                 logger.info("수집기 취소됨")
                 # 취소는 드문 수동 조작이라 판정 비용을 아낄 이유가 없다 — 항상 재계산
                 self.last_cycle_changed = True
-                self.finished.emit(f"인덱싱 취소됨 ({done}건 처리 완료)")
+                self._emit_finished(f"인덱싱 취소됨 ({done}건 처리 완료)")
                 producer.join(timeout=5)
                 flush_document_state(force=True)
-                failure_state.save_failures(self._failure_file, failures)
+                self._persist_failure_records()
                 return
 
             # 4차: 소비자 쪽 재확인 — 권위 있는 최종 판단(생산자는 사이클 시작 시점
@@ -1565,6 +1869,13 @@ class CollectorWorker(QThread):
         if memory_diagnostics is not None:
             self._memory_call("log", "after_document_indexing")
 
+        if self._active_target is not None:
+            flush_document_state(force=True)
+            self._persist_failure_records()
+            self.last_cycle_changed = done > 0
+            self._emit_finished(f"개별 재시도 완료 - 처리 {done}건 / 실패 {len(failed)}건")
+            return
+
         # watch_folders에서 제거된 폴더의 청크를 정리한다 (dry_run·대량삭제차단 준수).
         # 판정 순서는 차단 → 백오프 → 성공 스킵 → 실행 순으로 고정(purge_meta.decide) —
         # 실패 직후 성공 서명을 해제하지 않으면 백오프가 성공 스킵에 가려 무력화된다.
@@ -1650,7 +1961,7 @@ class CollectorWorker(QThread):
         # 이번 범위는 기록뿐이라, 여기 기록된 값으로 이번 사이클의 처리를
         # 바꾸지 않는다(재시도 정책은 4차).
         pruned_count = failure_state.prune(failures)
-        failure_state.save_failures(self._failure_file, failures)
+        self._persist_failure_records()
         failure_summary = failure_state.summarize(failures)
         if failure_summary:
             logger.info(
@@ -1725,8 +2036,6 @@ class CollectorWorker(QThread):
             from knowmate.collector.mail_scanner import run_mail_scan
             mail_state_status = {"persisted": False}
             try:
-                legacy_mail_failure_file = self._failure_file.with_name("mail_index_failure.json")
-                _migrate_legacy_mail_failures(legacy_mail_failure_file, self._failure_file)
                 mail_indexed, _ = run_mail_scan(
                     watch_folders, self._email_indexer, self._config,
                     on_progress=lambda cur, tot, fn: self.progress.emit(cur, tot, fn),
@@ -1744,6 +2053,8 @@ class CollectorWorker(QThread):
                     preloaded_state=mail_state,
                     preloaded_state_load_s=mail_state_load_s,
                     discovery_snapshot=self._mail_discovery,
+                    preloaded_failures=failures,
+                    persist_failures=self._persist_failure_records,
                 )
                 mail_state_persisted = mail_state_status["persisted"]
             except Exception as exc:
@@ -1839,7 +2150,7 @@ class CollectorWorker(QThread):
             done > 0 or report.newly_marked > 0 or report.physically_deleted > 0
             or mail_indexed > 0 or mail_exclusion_changed
         )
-        self.finished.emit(summary)
+        self._emit_finished(summary)
 
 
 # 실제 유휴에 못 미칠 때 다음 재확인까지 최소 대기(너무 촘촘한 재확인 방지)

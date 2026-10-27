@@ -4,8 +4,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from pathlib import Path
-from PyQt6.QtCore import QObject, pyqtSlot, pyqtSignal
+from PyQt6.QtCore import QObject, QTimer, pyqtSlot, pyqtSignal
 
 
 class Bridge(QObject):
@@ -18,6 +19,8 @@ class Bridge(QObject):
     indexFinished  = pyqtSignal(str)  # 인덱싱 완료 메시지
     indexAlert     = pyqtSignal(str)  # 대량삭제 차단 등 UI 알림
     statusUpdated  = pyqtSignal(str)  # 인덱싱 완료 후 건수 현황 JSON
+    failuresChanged = pyqtSignal()  # coalesced failure metadata revision
+    failurePolicyJobChanged = pyqtSignal(str)
 
     def __init__(self, main_window=None, collector_worker=None, parent=None, *,
                  query_config: dict | None = None, query_data_dir: Path | None = None,
@@ -40,6 +43,107 @@ class Bridge(QObject):
         self._local_count: int = 0
         self._shared_count: int = 0
         self._mail_count: int = 0
+        from knowmate.app.failure_policy_controller import FailurePolicyController
+        self._policy = FailurePolicyController()
+        self._config_view: dict = {}
+        self._failure_records_cache: dict | None = None
+        self._policy_notify_pending = False
+        self._policy_last_notify = float("-inf")
+        from knowmate.app.failure_view import FailureView
+        self._failure_view = FailureView()
+        self._failure_notify_pending = False
+        self._failure_last_notify = float("-inf")
+        self._failure_timer = QTimer(self)
+        self._failure_timer.setInterval(500)
+        self._failure_timer.timeout.connect(self._poll_failure_updates)
+        self._failure_timer.start()
+
+    def _poll_failure_updates(self) -> None:
+        """Publish one coalesced update and finalize only after native thread exit."""
+        if self._worker is None:
+            return
+        self._poll_policy_updates()
+        if self._policy.busy:
+            return
+        changed, terminal = self._failure_view.poll(self._worker)
+        if changed:
+            self._failure_notify_pending = True
+        now = time.monotonic()
+        if self._failure_notify_pending and (terminal is not None or now - self._failure_last_notify >= 0.5):
+            self._failure_notify_pending = False
+            self._failure_last_notify = now
+            self.failuresChanged.emit()
+        if terminal is not None:
+            if not terminal.get("persisted", True):
+                self.indexAlert.emit("실패 이력을 저장하지 못했습니다. 저장 후 다시 시도해 주세요.")
+            self._finish_worker_status(terminal.get("message", "인덱싱이 종료되었습니다."),
+                                       update_time=terminal.get("scope") == "all")
+
+    def _worker_write_guard(self) -> str | None:
+        """Reject overlapping writes and schedule a persistence-only retry when needed."""
+        if self._policy.blocked:
+            return "policy_busy"
+        self._poll_failure_updates()
+        if self._policy.blocked:
+            return "policy_busy"
+        if self._worker is not None and self._worker.isRunning():
+            return "busy"
+        if self._failure_view.active:
+            return "busy"
+        if self._worker is not None and getattr(self._worker, "failure_persistence_pending", False):
+            reserve = getattr(self._worker, "request_failure_persist", None)
+            if reserve is not None and reserve():
+                self._worker.start()
+            return "persistence_pending"
+        return None
+
+    @property
+    def policy_shutdown_active(self) -> bool:
+        """Expose the GUI lease classification through actual native join."""
+        return self._policy.busy
+
+    def _publish_policy_state(self, *, force: bool = False) -> None:
+        """Send at most two metadata updates per second plus terminal delivery."""
+        now = time.monotonic()
+        if force or (self._policy_notify_pending and now - self._policy_last_notify >= 0.5):
+            self._policy_notify_pending = False
+            self._policy_last_notify = now
+            self.failurePolicyJobChanged.emit(self.getFailurePolicyJobStatus())
+
+    def _poll_policy_updates(self) -> None:
+        """Apply background policy results without querying the database."""
+        changed, terminal = self._policy.poll()
+        records = self._policy.take_records()
+        if records is not None:
+            self._failure_records_cache = records
+            self._failure_view.records = records
+        if changed:
+            self._policy_notify_pending = True
+        if terminal is not None:
+            counts = terminal.get("counts")
+            if isinstance(counts, dict):
+                self._local_count = counts.get("local_count", self._local_count)
+                self._shared_count = counts.get("shared_count", self._shared_count)
+                self._mail_count = counts.get("mail_count", self._mail_count)
+                self._doc_count = counts.get("doc_count", self._local_count + self._shared_count)
+            self.statusUpdated.emit(json.dumps(self._cached_index_status(), ensure_ascii=False))
+            self.failuresChanged.emit()
+        self._publish_policy_state(force=terminal is not None)
+
+    def _read_config_view(self) -> dict:
+        """Use only warmed shared settings while a policy owns storage access."""
+        from knowmate.config import get_config, get_cached_config
+        if self._policy.cache_only:
+            return get_cached_config() or self._config_view
+        self._config_view = get_config()
+        return self._config_view
+
+    def _cached_index_status(self) -> dict:
+        """Return scalar counts without database projection on the GUI thread."""
+        return dict(status="policy_running" if self._policy.busy else "idle",
+                    last_indexed=self._last_indexed, doc_count=self._doc_count,
+                    local_count=self._local_count, shared_count=self._shared_count,
+                    mail_count=self._mail_count)
 
     # ------------------------------------------------------------------
     # 에이전트 질의
@@ -75,6 +179,9 @@ class Bridge(QObject):
         except (ValueError, TypeError):
             self._query.reject(data, "질문 요청 형식이 올바르지 않습니다.")
             return
+        if self._policy.blocked:
+            self._query.reject(data, "문서 제외 작업이 진행 중입니다. 완료 후 다시 시도해 주세요.")
+            return
         if self._query.busy or self._query.closing:
             self._query.reject(data, "이전 질문 처리가 끝난 뒤 다시 시도해 주세요.")
             return
@@ -99,6 +206,7 @@ class Bridge(QObject):
 
     def begin_query_shutdown(self) -> None:
         """Seal admission and suppress late UI deliveries on actual app exit."""
+        self._policy.begin_shutdown()
         self._query.begin_shutdown()
 
     def wait_query_shutdown(self, timeout_ms: int = 8000) -> bool:
@@ -161,9 +269,8 @@ class Bridge(QObject):
     @pyqtSlot(result=str)
     def getSettings(self) -> str:
         """설정 UI에 필요한 값만 추려 JSON으로 반환한다."""
-        from knowmate.config import get_config
         from knowmate.rag.embedding import EMBEDDING_MODEL
-        cfg = get_config()
+        cfg = self._read_config_view()
         data = {
             "llm": {
                 "base_url": cfg.get("llm", {}).get("base_url", ""),
@@ -202,6 +309,8 @@ class Bridge(QObject):
     @pyqtSlot(str, result=str)
     def saveSettings(self, payload: str) -> str:
         """설정 UI에서 받은 patch를 저장한다. 결과를 {"ok": bool, "error": str} JSON으로 반환."""
+        if self._policy.blocked:
+            return json.dumps({"ok": False, "error": "문서 제외 작업이 진행 중입니다. 완료 후 다시 시도해 주세요.", "code": "policy_busy"})
         if self._query_policy_busy():
             return json.dumps({"ok": False, "error": "질문 처리가 끝난 뒤 다시 시도해 주세요.", "code": "query_busy"})
         try:
@@ -238,6 +347,10 @@ class Bridge(QObject):
     @pyqtSlot(result=str)
     def testConnection(self) -> str:
         """LLM·임베딩 서버 연결을 각각 테스트해 결과를 JSON으로 반환한다."""
+        if self._policy.blocked:
+            detail = "문서 제외 작업이 진행 중입니다. 완료 후 다시 시도해 주세요."
+            return json.dumps({"llm": {"ok": False, "detail": detail},
+                               "embedding": {"ok": False, "detail": detail}})
         from knowmate.config import get_config
         from knowmate.rag.embedding import get_embedding_client
         from knowmate.llm.client import get_llm_client
@@ -264,6 +377,8 @@ class Bridge(QObject):
     @pyqtSlot(result=str)
     def openConfigFile(self) -> str:
         """config.yaml을 OS 기본 편집기로 연다."""
+        if self._policy.blocked:
+            return "policy_busy"
         from knowmate.config import get_data_dir
         path = get_data_dir() / "config.yaml"
         try:
@@ -275,13 +390,15 @@ class Bridge(QObject):
     @pyqtSlot(result=str)
     def getFolders(self) -> str:
         """현재 watch_folders 목록을 JSON 배열로 반환한다."""
-        from knowmate.config import get_config
-        folders = get_config().get("collector", {}).get("watch_folders", [])
+        folders = self._read_config_view().get("collector", {}).get("watch_folders", [])
         return json.dumps(folders, ensure_ascii=False)
 
     @pyqtSlot(str, result=str)
     def addWatchFolder(self, path: str) -> str:
         """폴더를 watch_folders에 추가하고 갱신된 목록을 JSON으로 반환한다."""
+        if self._policy.blocked:
+            self.indexAlert.emit("문서 제외 작업이 진행 중입니다. 완료 후 다시 시도해 주세요.")
+            return self.getFolders()
         if self._query_policy_busy():
             self.indexAlert.emit("질문 처리가 끝난 뒤 다시 시도해 주세요.")
             return self.getFolders()
@@ -296,6 +413,9 @@ class Bridge(QObject):
     @pyqtSlot(str, result=str)
     def removeWatchFolder(self, path: str) -> str:
         """폴더를 watch_folders에서 제거하고 갱신된 목록을 JSON으로 반환한다."""
+        if self._policy.blocked:
+            self.indexAlert.emit("문서 제외 작업이 진행 중입니다. 완료 후 다시 시도해 주세요.")
+            return self.getFolders()
         if self._query_policy_busy():
             self.indexAlert.emit("질문 처리가 끝난 뒤 다시 시도해 주세요.")
             return self.getFolders()
@@ -332,35 +452,47 @@ class Bridge(QObject):
     # 수집기 슬롯
     # ------------------------------------------------------------------
 
-    @pyqtSlot()
-    def startReindex(self) -> None:
+    @pyqtSlot(result=str)
+    def startReindex(self) -> str:
         """증분 재인덱싱을 시작한다."""
         gate = getattr(self._win, "_request_index_start", None)
         if self._worker is None and gate is None:
             self.indexAlert.emit("수집기가 초기화되지 않았습니다.")
-            return
-        if self._worker is not None and self._worker.isRunning():
-            self.indexAlert.emit("인덱싱이 이미 진행 중입니다.")
-            return
+            return "error"
+        blocked = self._worker_write_guard()
+        if blocked:
+            message = {"persistence_pending": "실패 이력을 저장하지 못했습니다. 저장 후 다시 시도해 주세요.",
+                       "policy_busy": "문서 제외 작업이 진행 중입니다. 완료 후 다시 시도해 주세요."}
+            self.indexAlert.emit(message.get(blocked, "인덱싱이 이미 진행 중입니다."))
+            return blocked
         if gate is not None:
-            gate(retry_failures=True)
+            return gate(retry_failures=True) or "ok"
         else:
             if hasattr(self._worker, "request_failure_retry"):
                 self._worker.request_failure_retry()
             self._worker.start()
+        return "ok"
 
     @pyqtSlot()
     def cancelReindex(self) -> None:
         """진행 중인 재인덱싱을 취소한다."""
+        if self._policy.blocked:
+            self.indexAlert.emit("문서 제외 작업이 진행 중입니다. 완료 후 다시 시도해 주세요.")
+            return
         preparation = getattr(self._win, "_ppt_preparation", None)
+        queued = preparation is not None and preparation.start_pending
         if preparation is not None:
             preparation.cancel_start()
         if self._worker and self._worker.isRunning():
             self._worker.cancel()
+        elif queued:
+            self.indexFinished.emit("인덱싱 시작 요청을 취소했습니다.")
 
     @pyqtSlot(result=str)
     def getIndexStatus(self) -> str:
         """현재 인덱싱 상태를 JSON으로 반환한다. LanceDB를 직접 조회해 실제 건수를 반환."""
+        if self._policy.cache_only:
+            return json.dumps(self._cached_index_status(), ensure_ascii=False)
         running = bool(self._worker and self._worker.isRunning())
         local_count, shared_count, mail_count, last_indexed = self._compute_doc_mail_counts(
             want_last_indexed=True
@@ -463,15 +595,21 @@ class Bridge(QObject):
         표시한다 — 표시 형식(오늘/어제/N일 전 등)은 UI 관심사라 여기선 원시값만 준다.
         """
         from knowmate.collector import failure_state
-        from knowmate.config import get_config, get_data_dir
+        from knowmate.config import get_data_dir
         from knowmate.collector.scanner import normalize_path_key
 
-        collector_cfg = get_config().get("collector", {})
+        collector_cfg = self._read_config_view().get("collector", {})
         excluded_raw = collector_cfg.get("exclude_files", [])
         excluded_keys = {normalize_path_key(p) for p in excluded_raw if isinstance(p, str)}
 
-        failure_file = getattr(self._worker, "_failure_file", None) or (get_data_dir() / "index_failure.json")
-        records = failure_state.load_failures(failure_file)
+        records = self._failure_view.records
+        if records is None:
+            if self._policy.cache_only:
+                records = self._failure_records_cache or {}
+            else:
+                failure_file = getattr(self._worker, "_failure_file", None) or (get_data_dir() / "index_failure.json")
+                records = failure_state.load_failures(failure_file)
+        self._failure_records_cache = records
         policy = failure_state.BackoffPolicy.from_config(collector_cfg)
         now = self._get_now()
 
@@ -526,196 +664,75 @@ class Bridge(QObject):
         ):
             self.indexAlert.emit("수집기가 초기화되지 않았습니다.")
             return "error"
-        if self._worker is not None and self._worker.isRunning():
-            self.indexAlert.emit("인덱싱이 이미 진행 중입니다.")
-            return "busy"
-
-        from knowmate.collector import failure_state
-        failure_file = getattr(self._worker, "_failure_file", None)
-        if failure_file is None:
-            if gate is None:
-                return "error"
-            from knowmate.config import get_data_dir
-            failure_file = get_data_dir() / "index_failure.json"
-        records = failure_state.load_failures(failure_file)
-        found = failure_state.request_retry_one(records, path)
-        if found:
-            failure_state.save_failures(failure_file, records)
-        # 요청 자체를 남긴다 — 버튼을 눌렀다는 사실이 로그에 없어서, 재처리가
-        # 사용자 요청 때문인지 백오프 만료 때문인지 실기에서 판정할 수 없었다.
-        # 소비자 쪽 "실패 파일 재시도(사용자 요청)" 로그와 짝을 이룬다.
-        import logging
-        logging.getLogger(__name__).info(
-            "[failure] 사용자 「지금 다시 시도」 요청 (기록 %s): %s",
-            "있음" if found else "없음", path,
-        )
+        if not isinstance(path, str) or not path.strip():
+            return "error"
+        blocked = self._worker_write_guard()
+        if blocked:
+            return blocked
         if gate is not None:
-            gate()
-        else:
+            return gate(target_path=path) or "ok"
+        reserve = getattr(self._worker, "request_single_retry", None)
+        if reserve is None:
+            return "error"
+        result = reserve(path)
+        if result == "ok":
             self._worker.start()
-        return "ok" if found else "not_found"
+        return result
+
+    @pyqtSlot(str, str, result=str)
+    def startFailurePolicyJob(self, action: str, payload: str) -> str:
+        """Accept one exclusion command without GUI-thread storage work."""
+        if action not in {"exclude", "unexclude", "reconcile"}:
+            return json.dumps({"ok": False, "accepted": False, "error": "invalid_action"})
+        paths, error = self._parse_failure_paths(payload)
+        if error:
+            return json.dumps({"ok": False, "accepted": False, "error": error})
+        if action == "reconcile" and paths:
+            return json.dumps({"ok": False, "accepted": False, "error": "invalid_paths"})
+        if self._query.busy or self._query.closing:
+            return json.dumps({"ok": False, "accepted": False, "error": "query_busy"})
+        if self._policy.busy or (self._policy.blocked and action != "reconcile"):
+            return json.dumps({"ok": False, "accepted": False, "error": "policy_busy"})
+        preparation = getattr(self._win, "_ppt_preparation", None)
+        if preparation is not None and preparation.start_pending:
+            return json.dumps({"ok": False, "accepted": False, "error": "busy"})
+        if self._worker is None:
+            return json.dumps({"ok": False, "accepted": False, "error": "not_ready"})
+        unseen_cycle = getattr(self._worker, "failure_cycle_id", 0) != self._failure_view.cycle_id
+        if self._worker.isRunning() or self._failure_view.active or unseen_cycle:
+            return json.dumps({"ok": False, "accepted": False, "error": "busy"})
+        if getattr(self._worker, "failure_persistence_pending", False):
+            return json.dumps({"ok": False, "accepted": False, "error": "persistence_pending"})
+        if not paths and action != "reconcile":
+            return json.dumps({"ok": True, "accepted": False, "job_id": "", "no_op": True})
+        result = self._policy.start(self._worker, action, tuple(paths))
+        self._publish_policy_state(force=True)
+        return json.dumps(result, ensure_ascii=False)
+
+    @pyqtSlot(result=str)
+    def getFailurePolicyJobStatus(self) -> str:
+        """Return cached progress for panel reopening without I/O or toast delivery."""
+        return json.dumps(self._policy.status(), ensure_ascii=False)
 
     @pyqtSlot(str, result=str)
     def excludeFile(self, path: str) -> str:
-        """파일을 collector.exclude_files에 추가하고, 이미 인덱싱된 청크가
-        있으면 즉시 삭제한다(사용자 확정 요청 — 다음 사이클을 기다리지 않는다)."""
-        result = json.loads(self.excludeFiles(json.dumps([path], ensure_ascii=False)))
-        if result.get("ok"):
-            return "ok"
-        return result["error"] if result.get("error") in {"busy", "query_busy"} else "error"
+        """Accept an asynchronous exclusion for one selected file."""
+        return self.startFailurePolicyJob("exclude", json.dumps([path]))
 
     @pyqtSlot(str, result=str)
     def unexcludeFile(self, path: str) -> str:
-        """collector.exclude_files에서 파일을 제거한다(제외 해제).
-
-        다음 스캔 사이클부터 다시 대상이 된다 — 백오프는 별도 판정(실패 이력이
-        남아 있으면 그 정책을 그대로 따른다. 즉시 재시도가 필요하면 retryFile 사용)."""
-        result = json.loads(self.unexcludeFiles(json.dumps([path], ensure_ascii=False)))
-        if result.get("ok"):
-            return "ok"
-        return result["error"] if result.get("error") in {"busy", "query_busy"} else "error"
+        """Accept an asynchronous unexclude without starting indexing."""
+        return self.startFailurePolicyJob("unexclude", json.dumps([path]))
 
     @pyqtSlot(str, result=str)
     def excludeFiles(self, payload: str) -> str:
-        """여러 파일을 한 번에 인덱싱에서 제외하고 결과 요약 JSON을 반환한다."""
-        if self._query_policy_busy():
-            return json.dumps({"ok": False, "error": "query_busy"})
-        paths, error = self._parse_failure_paths(payload)
-        if error:
-            return json.dumps({"ok": False, "error": error})
-        if self._worker is not None and self._worker.isRunning():
-            return json.dumps({"ok": False, "error": "busy"})
-
-        from knowmate.config import get_config, update_exclude_files
-        from knowmate.collector.scanner import normalize_path_key
-        from knowmate.collector.state import load_state, save_state
-
-        folders: list[str] = get_config().get("collector", {}).get("exclude_files", [])
-        existing_keys = {normalize_path_key(path) for path in folders if isinstance(path, str)}
-        changed = [path for path in paths if normalize_path_key(path) not in existing_keys]
-        if changed:
-            try:
-                update_exclude_files(folders + changed)
-            except Exception as exc:
-                import logging
-                logging.getLogger(__name__).warning("[exclude] 일괄 제외 설정 저장 실패: %s", exc)
-                return json.dumps({"ok": False, "error": "config update failed"})
-
-        from knowmate.collector.mail_exclusion import (
-            mail_exclusion_paths, reconcile_mail_exclusions,
-        )
-
-        cfg = get_config()
-        all_excluded = cfg.get("collector", {}).get("exclude_files", [])
-        mail_paths = mail_exclusion_paths(
-            [path for path in all_excluded if isinstance(path, str)], cfg,
-        )
-        mail_keys = {normalize_path_key(path) for path in mail_paths}
-        changed_documents = [
-            path for path in changed if normalize_path_key(path) not in mail_keys
-        ]
-
-        delete_failed = 0
-        document_indexer = getattr(self._worker, "_indexer", None)
-        table = getattr(document_indexer, "table", None)
-        if table is not None:
-            import logging
-            logger = logging.getLogger(__name__)
-            for path in changed_documents:
-                try:
-                    delete_file = getattr(document_indexer, "delete_file_chunks", None)
-                    if callable(delete_file):
-                        delete_file(path)
-                    else:
-                        safe = path.replace("'", "''")
-                        table.delete(f"file_path = '{safe}'")
-                except Exception as exc:
-                    delete_failed += 1
-                    logger.warning("[exclude] 청크 삭제 실패: %s (%s)", path, exc)
-
-        state_cleanup_failed = False
-        state_file = getattr(self._worker, "_state_file", None)
-        if state_file is not None and changed_documents:
-            state = load_state(state_file)
-            changed_keys = {normalize_path_key(path) for path in changed_documents}
-            retained = {
-                path: value for path, value in state.items()
-                if normalize_path_key(path) not in changed_keys
-            }
-            if len(retained) != len(state):
-                try:
-                    save_state(state_file, retained)
-                except Exception as exc:
-                    import logging
-                    logging.getLogger(__name__).warning("[exclude] state 정리 실패: %s (%s)", state_file, exc)
-                    state_cleanup_failed = True
-
-        mail_cleanup_failed = False
-        mail_pending_chunks = 0
-        email_indexer = getattr(self._worker, "_email_indexer", None)
-        mail_state_file = getattr(self._worker, "_mail_state_file", None)
-        reconciled = getattr(self._worker, "_mail_exclusions_reconciled", None)
-        if email_indexer is not None and mail_state_file is not None and isinstance(reconciled, set):
-            report = reconcile_mail_exclusions(
-                email_indexer, mail_state_file, mail_paths, reconciled,
-            )
-            mail_cleanup_failed = not report.ok
-            mail_pending_chunks = report.pending_chunks
-
-        return json.dumps({
-            "ok": True,
-            "requested": len(paths),
-            "changed": len(changed),
-            "already_target": len(paths) - len(changed),
-            "delete_failed": delete_failed,
-            "state_cleanup_failed": state_cleanup_failed,
-            "mail_cleanup_failed": mail_cleanup_failed,
-            "mail_pending_chunks": mail_pending_chunks,
-        })
+        """Accept an asynchronous exclusion for the current selected list."""
+        return self.startFailurePolicyJob("exclude", payload)
 
     @pyqtSlot(str, result=str)
     def unexcludeFiles(self, payload: str) -> str:
-        """여러 파일을 한 번에 인덱싱 제외에서 해제하고 결과 요약 JSON을 반환한다."""
-        if self._query_policy_busy():
-            return json.dumps({"ok": False, "error": "query_busy"})
-        paths, error = self._parse_failure_paths(payload)
-        if error:
-            return json.dumps({"ok": False, "error": error})
-        if self._worker is not None and self._worker.isRunning():
-            return json.dumps({"ok": False, "error": "busy"})
-
-        from knowmate.config import get_config, update_exclude_files
-        from knowmate.collector.scanner import normalize_path_key
-
-        folders: list[str] = get_config().get("collector", {}).get("exclude_files", [])
-        target_keys = {normalize_path_key(path) for path in paths}
-        changed_keys = {
-            normalize_path_key(path) for path in folders
-            if isinstance(path, str) and normalize_path_key(path) in target_keys
-        }
-        if changed_keys:
-            remaining = [
-                path for path in folders
-                if not isinstance(path, str) or normalize_path_key(path) not in changed_keys
-            ]
-            try:
-                update_exclude_files(remaining)
-            except Exception as exc:
-                import logging
-                logging.getLogger(__name__).warning("[exclude] 일괄 제외 해제 설정 저장 실패: %s", exc)
-                return json.dumps({"ok": False, "error": "config update failed"})
-
-        reconciled = getattr(self._worker, "_mail_exclusions_reconciled", None)
-        if isinstance(reconciled, set):
-            from knowmate.collector.mail_scan_state import normalize_path_key as normalize_mail_key
-            reconciled.difference_update(normalize_mail_key(path) for path in paths)
-
-        return json.dumps({
-            "ok": True,
-            "requested": len(paths),
-            "changed": len(changed_keys),
-            "already_target": len(paths) - len(changed_keys),
-        })
+        """Accept an asynchronous unexclude for the current selected list."""
+        return self.startFailurePolicyJob("unexclude", payload)
 
     @staticmethod
     def _parse_failure_paths(payload: str) -> tuple[list[str], str | None]:
@@ -748,6 +765,14 @@ class Bridge(QObject):
 
     def set_worker(self, worker) -> None:
         """단일 수집기 워커를 등록하고 시그널을 바인딩한다 (수동·유휴 인덱싱 공유)."""
+        if self._worker is not None and self._worker is not worker:
+            if self._worker_write_guard() is not None:
+                raise RuntimeError("cannot replace a busy or unpersisted collector")
+            from knowmate.app.failure_view import FailureView
+            self._failure_view = FailureView()
+            self._worker.progress.disconnect(self._on_worker_progress)
+            self._worker.finished.disconnect(self._on_worker_finished)
+            self._worker.indexing_needed.disconnect(self.indexAlert)
         self._worker = worker
         worker.progress.connect(self._on_worker_progress)
         worker.finished.connect(self._on_worker_finished)
@@ -763,13 +788,21 @@ class Bridge(QObject):
 
     def _on_worker_progress(self, current: int, total: int, filename: str) -> None:
         """워커 진행률 시그널을 JSON으로 변환해 JS에 전달한다."""
+        self._policy.invalidate_cache()
         payload = json.dumps({"current": current, "total": total, "filename": filename}, ensure_ascii=False)
         self.indexProgress.emit(payload)
 
     def _on_worker_finished(self, message: str) -> None:
         """워커 완료 시그널 처리."""
+        if hasattr(self._worker, "drain_failure_updates"):
+            return
+        self._finish_worker_status(message)
+
+    def _finish_worker_status(self, message: str, *, update_time: bool = True) -> None:
+        """Refresh aggregate status after the collector has actually stopped."""
         from datetime import datetime
-        self._last_indexed = datetime.now().strftime("%Y-%m-%d %H:%M")
+        if update_time:
+            self._last_indexed = datetime.now().strftime("%Y-%m-%d %H:%M")
         self.indexFinished.emit(message)
 
         # 문서·메일 개수를 바꿀 수 있는 변경이 이번 사이클에 하나도 없었으면(유휴

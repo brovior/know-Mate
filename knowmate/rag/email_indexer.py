@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -296,6 +297,61 @@ class EmailIndexer:
             MailIndexState.CURRENT if is_current else MailIndexState.STALE,
             chunk_ids,
         )
+
+    def get_retry_index_state(
+        self, mail_uid: str, mtime: float, source_file: str,
+        ignored_chunk_ids: set[str] | None = None,
+    ) -> MailIndexCheck:
+        """선택 재시도에서는 완전한 최신 UID 세대를 보존하고 불확실한 교체를 거절한다."""
+        import json
+        from knowmate.collector.mail_scan_state import normalize_stored_path_key
+
+        safe_uid = mail_uid.replace("'", "''")
+        try:
+            rows = (
+                self.table.search()
+                .where(f"mail_uid = '{safe_uid}' AND is_deleted = false")
+                .select(["chunk_id", "mtime", "source_meta", "source_file", "chunk_index", "chunk_total"])
+                .to_arrow().to_pylist()
+            )
+        except Exception as exc:
+            logger.warning("[email_indexer] 개별 재시도 상태 조회 실패: %s", type(exc).__name__)
+            return MailIndexCheck(MailIndexState.ERROR)
+        rows = [row for row in rows if row.get("chunk_id") not in (ignored_chunk_ids or set())]
+        if not rows:
+            return MailIndexCheck(MailIndexState.MISSING)
+        try:
+            chunk_ids = tuple(row["chunk_id"] for row in rows)
+            times = {float(row["mtime"]) for row in rows}
+            totals = {row["chunk_total"] for row in rows}
+            sources = {normalize_stored_path_key(row["source_file"]) for row in rows}
+            total = rows[0]["chunk_total"]
+            complete = (
+                all(isinstance(value, str) and value for value in chunk_ids)
+                and all(isinstance(row["source_file"], str) and row["source_file"] for row in rows)
+                and len(set(chunk_ids)) == len(rows)
+                and len(times) == len(totals) == len(sources) == 1
+                and all(math.isfinite(value) for value in times)
+                and isinstance(total, int) and not isinstance(total, bool) and total > 0
+                and len(rows) == total
+                and all(isinstance(row["chunk_index"], int) and not isinstance(row["chunk_index"], bool)
+                        for row in rows)
+                and {row["chunk_index"] for row in rows} == set(range(total))
+                and all(json.loads(row["source_meta"] or "{}").get("_index_version") == EMAIL_INDEX_VERSION
+                        for row in rows)
+            )
+            if not complete:
+                return MailIndexCheck(MailIndexState.ERROR)
+            stored_mtime = next(iter(times))
+            if stored_mtime > mtime:
+                return MailIndexCheck(MailIndexState.CURRENT, chunk_ids)
+            if stored_mtime == mtime:
+                if normalize_stored_path_key(source_file) not in sources:
+                    return MailIndexCheck(MailIndexState.ERROR)
+                return MailIndexCheck(MailIndexState.CURRENT, chunk_ids)
+            return MailIndexCheck(MailIndexState.STALE, chunk_ids)
+        except (KeyError, TypeError, ValueError, AttributeError, json.JSONDecodeError):
+            return MailIndexCheck(MailIndexState.ERROR)
 
     def get_legacy_path_chunk_ids(self, source_file: str) -> tuple[str, ...]:
         """BOM 오파싱으로 생긴 같은 파일의 경로 기반 Knox 청크만 찾는다."""

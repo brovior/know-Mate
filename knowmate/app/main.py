@@ -175,7 +175,9 @@ class MainWindow(QMainWindow):
 
     def _tray_reindex(self) -> None:
         """트레이 메뉴에서 재인덱싱을 트리거한다(진행 중이면 무시)."""
-        self._request_index_start(retry_failures=True)
+        result = self._request_index_start(retry_failures=True)
+        if result == "policy_busy":
+            self._bridge.indexAlert.emit("문서 제외 작업이 진행 중입니다. 완료 후 다시 시도해 주세요.")
 
     def _quit_app(self) -> None:
         """트레이 '종료' — 실제 앱 종료 플래그를 세우고 닫는다."""
@@ -254,6 +256,7 @@ class MainWindow(QMainWindow):
                 data_dir=get_data_dir(), make_worker=self._make_worker, parent=self,
             )
             self._ppt_preparation.failed.connect(self._bridge.indexAlert.emit)
+            self._ppt_preparation.failed.connect(self._bridge.indexFinished.emit)
             QTimer.singleShot(0, self._ppt_preparation.begin)
             self._pump_startup()
 
@@ -299,13 +302,21 @@ class MainWindow(QMainWindow):
         """
         self._request_index_start()
 
-    def _request_index_start(self, *, retry_failures: bool = False) -> None:
+    def _request_index_start(self, *, retry_failures: bool = False,
+                             target_path: str | None = None) -> str:
         """수동·재시도·트레이·유휴 시작을 하나의 PPT 준비 게이트에 전달한다."""
         preparation = getattr(self, "_ppt_preparation", None)
         if preparation is not None:
-            preparation.request_start(retry_failures=retry_failures)
+            blocked = self._bridge._worker_write_guard()
+            if blocked:
+                return blocked
+            kwargs = {"retry_failures": retry_failures}
+            if target_path is not None:
+                kwargs["target_path"] = target_path
+            return preparation.request_start(**kwargs)
         else:
             self._bridge.indexAlert.emit("수집기가 초기화되지 않았습니다.")
+            return "error"
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -401,9 +412,12 @@ class MainWindow(QMainWindow):
         try:
             from knowmate.app.lifecycle import stop_worker
             from knowmate.secure.office_exit import cleanup_before_worker_termination
+            stop_options = {"office_cleanup": cleanup_before_worker_termination}
+            if getattr(self._bridge, "policy_shutdown_active", False):
+                stop_options["policy_active"] = True
             force_hard_exit = stop_worker(
                 getattr(self._bridge, "_worker", None),
-                office_cleanup=cleanup_before_worker_termination,
+                **stop_options,
             ) or office_shutdown_failed
         except Exception:
             # The cleanup helper may hold a logging lock. Unknown completion

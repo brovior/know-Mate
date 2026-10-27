@@ -217,13 +217,28 @@ def test_finished_signal_does_not_release_until_nonblocking_join(tmp_path):
 
 
 @pytest.mark.parametrize("bad", [None, [], {}, {"query": []}, request(mode="bad"),
-                                request(scopes=[]), request(scopes=[1]),
+                                request(scopes=[]), request(scopes=[1]), request(scopes=None),
+                                request(scopes=["unknown"]), request(scopes="local"),
                                 request(request_id=3), request(view_generation=True)])
 def test_invalid_request_never_constructs_worker(tmp_path, bad):
     bridge, responses, _, _, workers = make_bridge(tmp_path, lambda *_: [])
     bridge.sendQuery(json.dumps(bad))
     assert not workers
     assert responses[0]["status"] == "rejected"
+
+
+@pytest.mark.parametrize("scopes", [["local"], ["shared"], ["mail"],
+                                  ["local", "shared"], ["local", "mail"],
+                                  ["shared", "mail"], ["local", "shared", "mail"]])
+def test_bridge_and_worker_preserve_selected_search_scopes(tmp_path, scopes):
+    """Bridge와 실제 질문 스레드는 세 체크 범위를 그대로 전달한다."""
+    received = []
+    bridge, responses, _, _, _ = make_bridge(
+        tmp_path, lambda query, context: received.append((query, context["scopes"])) or [])
+    bridge.sendQuery(json.dumps(request(scopes=scopes)))
+    until(lambda: not bridge._query.busy)
+    assert responses[0]["status"] == "success"
+    assert received == [("synthetic question", scopes)]
 
 
 def test_all_search_policy_writes_are_rejected_until_join(tmp_path, monkeypatch):
@@ -246,7 +261,8 @@ def test_all_search_policy_writes_are_rejected_until_join(tmp_path, monkeypatch)
             created[0].finished.emit()
             until(lambda: bridge._query._finished_seen)
         assert json.loads(bridge.saveSettings('{}'))["code"] == "query_busy"
-        assert bridge.excludeFile('one.pdf') == bridge.unexcludeFile('one.pdf') == "query_busy"
+        assert json.loads(bridge.excludeFile('one.pdf'))["error"] == "query_busy"
+        assert json.loads(bridge.unexcludeFile('one.pdf'))["error"] == "query_busy"
         assert json.loads(bridge.excludeFiles('["one.pdf"]'))["error"] == "query_busy"
         assert json.loads(bridge.unexcludeFiles('["one.pdf"]'))["error"] == "query_busy"
         assert json.loads(bridge.addWatchFolder('new')) == ['old']
