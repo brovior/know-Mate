@@ -63,10 +63,7 @@ Phase 1~4 완료(RAG 지식검색), 5a 완료(Knox `.mysingle` + 표준 `.eml` �
 
 | 항목 | 상태·다음 행동 | 시작 조건 |
 |---|---|---|
-| 검색 범위 체크박스 | 문서·공유·메일 선택 분리 및 후보 제한 전 범위/로컬 소유자 검사. 전체2,536 PASS·6 SKIP·74 subtests PASS, 경고0 | [범위 검증](DIAGNOSTICS.md#검색-범위-체크박스의-분리-2026-10-27)의 합성 fake 회귀 완료. 사내 API·업무 데이터·frozen UI 확인은 별도 |
-| 대량 문서 제외 진행 표시 | 기존 수집기 워커에서 제외·완료 집계 수행, 팝업/사이드바 진행 및 실제 종료까지 실행 차단. 전체2,484 PASS·6 SKIP·74 subtests PASS, 경고0 | [응답성 검증](DIAGNOSTICS.md#대량-문서-제외의-화면-응답성-2026-10-27)의 합성150건 Qt/Edge 연계 완료. 내장 WebEngine·사내150건·frozen 현장 확인은 별도 |
-| 개별 파일 재시도·실패 목록 갱신 | 선택 파일만 처리하고 진행 중 목록을 갱신. 저장 실패·준비 대기·종료 정리 경합 보호 및 전체2,448 PASS·6 SKIP·74 subtests PASS, 경고0 | [검증 기록](DIAGNOSTICS.md#개별-재시도-범위와-실패-목록-갱신-2026-10-27)의 소스 검증 완료. frozen·사내 Office/DRM 현장 확인은 별도 |
-| PPT 관리자 helper 진단 | 1.0.5.14 후보의 단계·원래 오류·복구 오류 전달 구현. 전체2,407 PASS·6 SKIP·74 subtests PASS, 통신/부모62 PASS·실제 ordinary→UAC2사례·격리 flow19쌍/38관측 통과. 설치/ACL 정책과 의존성 유지 | [helper 진단](DIAGNOSTICS.md#ppt-관리자-helper-진단-전달-2026-10-26)의 별도 candidate payload 기록 확인 및 사내 실패 재수집. 전체 EXE·실제 설치/Office·원격 UNC·다른 관리자 계정은 미검증 |
+| PPT 설치/종료 로더 TrustedInstaller 호환 | 1.0.5.15 사내 설치 성공 보고. 1.0.5.16은 누락된 이벤트 로더에도 공통 정책 적용. 고정 부모·정확한 SID·현재 폴더에만 허용하며 Reader 내부 보호 유지 | [로더 진단](DIAGNOSTICS.md#종료-이벤트-로더의-설치-부모-acl-검사-누락-2026-10-26)의 새 candidate 업데이트·이벤트 로딩·인덱싱/앱 종료 후 원 PID 종료 확인. 실제 Office/DRM은 미검증 |
 | PPT ACL 표현 호환 | 역할별 상한·generic/sync/subset·외곽 TI/CO 호환 및 백업 없는 예약-only 회수의 이전 1.0.5.13 후보 구현. 관련8 PASS·격리133사례·실제 동일 계정 UAC 통과, 전체2,256 PASS·6 SKIP·74 subtests PASS | [호환 진단](DIAGNOSTICS.md#ppt-acl-표현-호환-2026-10-25)의 별도 candidate payload 기록 확인, 실제 사내 업데이트·다른 관리자·Office 승인. 기존 설치 유지 |
 | PPT 구버전 부모 ACL 복구(이전 후보) | 1.0.0.0 설치·정확한 legacy ACL만 부모 DACL 복구한 이전 1.0.5.11 검증. native 비전파·특수 예약·실제 동일 계정 UAC와 격리 lifecycle 14사례 통과. 전체 회귀 2,216 PASS·6 SKIP·74 subtests PASS | [권한 복구 진단](DIAGNOSTICS.md#ppt-구버전-부모-폴더-권한-복구-2026-10-25)의 새 payload 검증 및 실제 구버전 업데이트·다른 관리자·PPT 종료/문서 보호 승인. 기존 설치 유지 |
 | COM poison 복구 뒤 점유 오판·오류 혼합 | 2초 캐시 epoch·정확한 앱 증명·최초/닫기 오류 분리 및 fake 회귀 구현 | [진단 §COM poison](DIAGNOSTICS.md#com-poison-복구-일관성-2026-10-15)의 실제 Windows·Office·DRM 검증 대기 |
@@ -84,4 +81,7 @@ Phase 1~4 완료(RAG 지식검색), 5a 완료(Knox `.mysingle` + 표준 `.eml` �
 | 질문 비동기화 | 대화 탐색 시 요청 유지·원래 대화 응답 저장·복귀 시 로딩 복원 수정. JS 40사례·관련 pytest 41개·실제 Qt 합성 2사례 확인. 전체 2,175 PASS 이후 링크 권한 실패 3건은 권한 설정 후 별도 재실행 PASS | [대화 이동 응답 검증](DIAGNOSTICS.md#대화-이동-뒤-응답-중단-2026-10-24)의 사내 API·장시간 질문 검증 대기 |
 | 실패 원인 판별 6b | 보류 | 오류 코드 실측, 워치독 밖 probe I/O의 행오버 위험 해소 |
 | 공용 인덱스 5b | 예정 | 로컬 캐시 복사 배포 설계·검증 |
+| 검색 범위 체크박스 | 문서·공유·메일 선택 분리 및 후보 제한 전 범위/로컬 소유자 검사. 전체2,536 PASS·6 SKIP·74 subtests PASS, 경고0 | [범위 검증](DIAGNOSTICS.md#검색-범위-체크박스의-분리-2026-10-27)의 합성 fake 회귀 완료. 사내 API·업무 데이터·frozen UI 확인은 별도 |
+| 대량 문서 제외 진행 표시 | 기존 수집기 워커에서 제외·완료 집계 수행, 팝업/사이드바 진행 및 실제 종료까지 실행 차단. 전체2,484 PASS·6 SKIP·74 subtests PASS, 경고0 | [응답성 검증](DIAGNOSTICS.md#대량-문서-제외의-화면-응답성-2026-10-27)의 합성150건 Qt/Edge 연계 완료. 내장 WebEngine·사내150건·frozen 현장 확인은 별도 |
+| 개별 파일 재시도·실패 목록 갱신 | 선택 파일만 처리하고 진행 중 목록을 갱신. 저장 실패·준비 대기·종료 정리 경합 보호 및 전체2,448 PASS·6 SKIP·74 subtests PASS, 경고0 | [검증 기록](DIAGNOSTICS.md#개별-재시도-범위와-실패-목록-갱신-2026-10-27)의 소스 검증 완료. frozen·사내 Office/DRM 현장 확인은 별도 |
 | DRM 저장 정책 | 사내 확인 대기 | 코드 변경이 아닌 정책 확인. [DESIGN.md](design/DESIGN.md) 참고 |
