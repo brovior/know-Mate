@@ -373,3 +373,32 @@ html, body { height: 100%; font-family: 'Malgun Gothic', sans-serif; font-size: 
   padding: 8px 18px; background: var(--primary); color: #fff;
   border: none; border-radius: 8px; font-size: 13px; font-family: inherit; cursor: pointer;
 }
+
+/* Exclusion jobs keep their own progress when the document panel is closed. */
+.failure-policy-progress { margin: 12px 24px; padding: 14px 16px; background: var(--primary-light); border-radius: var(--radius-card); }
+.failure-policy-progress[hidden], .failure-policy-progress [hidden] { display: none; }
+.failure-policy-heading { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; }
+.failure-policy-heading > span:nth-child(2) { flex: 1; min-width: 0; }
+.failure-policy-count { white-space: nowrap; font-variant-numeric: tabular-nums; font-weight: 400; }
+.failure-policy-track { height: 7px; margin-top: 10px; overflow: hidden; background: #1F4E791C; border-radius: 8px; }
+.failure-policy-fill { width: 0; height: 100%; background: var(--primary); border-radius: inherit; transition: width .25s ease; }
+.failure-policy-track.indeterminate .failure-policy-fill { width: 36%; animation: failure-policy-slide 1.5s ease-in-out infinite; }
+.failure-policy-spinner { width: 14px; height: 14px; flex: 0 0 14px; border: 2px solid #1F4E7933; border-top-color: var(--primary); border-radius: 50%; animation: failure-policy-spin 1s linear infinite; }
+.failure-policy-detail, .failure-policy-help { margin-top: 8px; font-size: 12px; color: var(--text-sub); overflow-wrap: anywhere; }
+.failure-policy-help { font-size: 11px; }
+.failure-policy-progress[data-state="terminal"] .failure-policy-spinner { animation: none; border-color: var(--teal-text); background: var(--teal-bg); }
+.failure-policy-progress[data-state="warning"] { background: var(--warn-bg); }
+.failure-policy-progress[data-state="warning"] .failure-policy-spinner { animation: none; border-color: var(--warn-text); }
+.failure-policy-progress[data-state="warning"] .failure-policy-heading { color: var(--warn-text); }
+.failure-policy-progress.compact { margin: 0 0 10px; padding: 10px 12px; }
+.failure-policy-progress.compact .failure-policy-heading { font-size: 12px; }
+.failure-policy-progress.compact .failure-policy-track { height: 5px; }
+.failure-policy-open, .failure-policy-recheck { margin-top: 9px; padding: 5px 8px; border: 1px solid var(--primary); border-radius: 5px; background: transparent; color: var(--primary); font: inherit; font-size: 11px; cursor: pointer; }
+.failure-policy-open { display: block; width: 100%; }
+.failure-policy-recheck:disabled { opacity: .5; cursor: default; }
+@keyframes failure-policy-spin { to { transform: rotate(360deg); } }
+@keyframes failure-policy-slide { 0% { transform: translateX(-110%); } 100% { transform: translateX(390%); } }
+@media (prefers-reduced-motion: reduce) {
+  .failure-policy-spinner, .failure-policy-track.indeterminate .failure-policy-fill { animation: none; }
+  .failure-policy-fill { transition: none; }
+}

@@ -126,6 +126,9 @@ class PptPreparationCoordinator(QObject):
             return "busy"
         if self._worker is not None and self._worker.isRunning():
             return "busy"
+        if self._worker is not None and (getattr(self._worker, "policy_job_pending", False)
+                                        or getattr(self._worker, "policy_readback_unknown", False)):
+            return "policy_busy"
         if self._worker is not None and getattr(self._worker, "failure_persistence_pending", False):
             reserve = getattr(self._worker, "request_failure_persist", None)
             if reserve is not None and reserve():
@@ -294,6 +297,9 @@ class PptPreparationCoordinator(QObject):
         self._pending_start = False
         retry, self._retry_failures = self._retry_failures, False
         target, self._target_path = self._target_path, None
+        if (getattr(self._worker, "policy_job_pending", False)
+                or getattr(self._worker, "policy_readback_unknown", False)):
+            return "policy_busy"
         if not self._worker.isRunning():
             if target is not None:
                 reserve = getattr(self._worker, "request_single_retry", None)

@@ -345,6 +345,59 @@ class CollectorWorker(QThread):
         self._cycle_status = "success"
         self._cycle_message = "인덱싱 완료"
         self._single_original_record = None
+        from knowmate.collector.policy_job import PolicyJob
+        self._policy_job = PolicyJob()
+
+    @property
+    def policy_job_pending(self) -> bool:
+        """Report the policy ownership retained until the GUI acknowledges join."""
+        return self._policy_job.pending
+
+    @property
+    def policy_readback_unknown(self) -> bool:
+        """Keep uncertain durable settings blocked after a policy thread exits."""
+        return self._policy_job.unknown
+
+    @property
+    def policy_unknown(self) -> bool:
+        """Expose the policy confirmation latch to GUI admission."""
+        return self.policy_readback_unknown
+
+    def request_policy_job(self, job_id: str, action: str, paths: tuple[str, ...]) -> str:
+        """Reserve a policy command without GUI-thread I/O."""
+        if self.isRunning() or self._single_retry_requested is not None or self._persist_only_requested or self._retry_requested:
+            return "busy"
+        if self.failure_persistence_pending:
+            return "persistence_pending"
+        result = self._policy_job.reserve(job_id, action, paths)
+        if result == "ok":
+            self._cancelled = False
+        return result
+
+    def request_policy_reconcile(self, job_id: str) -> str:
+        """Reserve a read-only verification after an uncertain settings save."""
+        return self.request_policy_job(job_id, "reconcile", ())
+
+    def clear_policy_command(self, job_id: str) -> bool:
+        """Discard only an unstarted command after native non-start is confirmed."""
+        return False if self.isRunning() or not self.wait(0) else self._policy_job.clear(job_id)
+
+    def acknowledge_policy_job(self, job_id: str) -> bool:
+        """Release policy ownership only once the actual QThread has joined."""
+        return False if self.isRunning() or not self.wait(0) else self._policy_job.acknowledge(job_id)
+
+    def policy_job_snapshot(self) -> dict | None:
+        """Copy bounded progress metadata without reading configuration or DB."""
+        return self._policy_job.snapshot()
+
+    def take_policy_cache(self) -> dict | None:
+        """Transfer a worker-prepared failure baseline without GUI filesystem I/O."""
+        return self._policy_job.take_cache()
+
+    def take_policy_failure_records(self) -> dict | None:
+        """Transfer the detached failure record map prepared for one policy job."""
+        cache = self.take_policy_cache()
+        return cache["failure_records"] if cache is not None else None
 
     def _emit_finished(self, message: str) -> None:
         """Retain the summary synchronously before its queued GUI delivery."""
@@ -370,6 +423,10 @@ class CollectorWorker(QThread):
 
     def request_single_retry(self, path: str) -> str:
         """Reserve one source for the next run without GUI-thread I/O."""
+        if self.policy_job_pending:
+            return "busy"
+        if self.policy_readback_unknown:
+            return "policy_unconfirmed"
         if self.isRunning() or self._single_retry_requested is not None:
             return "busy"
         if self.failure_persistence_pending:
@@ -382,7 +439,7 @@ class CollectorWorker(QThread):
 
     def request_failure_persist(self) -> bool:
         """Reserve a storage-only retry without indexing or Office work."""
-        if self.isRunning() or not self.failure_persistence_pending:
+        if self.policy_job_pending or self.policy_readback_unknown or self.isRunning() or not self.failure_persistence_pending:
             return False
         self._persist_only_requested = True
         self._single_retry_requested = None
@@ -466,12 +523,16 @@ class CollectorWorker(QThread):
     def request_failure_retry(self) -> None:
         """다음 사이클 시작 시 모든 실패 기록에 재시도(force_retry)를 요청한다
         (수동 트리거 전용). 이력·연속 실패 횟수는 보존된다."""
+        if self.policy_job_pending or self.policy_readback_unknown:
+            return
         self._retry_requested = True
         self._mail_discovery.invalidate()
 
     @_flush_document_state_on_exit
     def run(self):
         """증분 스캔 사이클 1회를 실행한다."""
+        if self._policy_job.run(self):
+            return
         self._active_target, self._single_retry_requested = self._single_retry_requested, None
         persist_only, self._persist_only_requested = self._persist_only_requested, False
         persistence_blocked = self.failure_persistence_pending and not persist_only
@@ -585,6 +646,8 @@ class CollectorWorker(QThread):
     @property
     def work_stage(self) -> str:
         """종료 진단용으로 현재 COM·임베딩·DB·수집 단계를 반환한다."""
+        if self.policy_job_pending:
+            return "policy_" + (self.policy_job_snapshot() or {}).get("stage", "reserved")
         if self._office_cleanup_in_progress:
             return "office_cleanup"
         if self.maintenance_in_progress:
@@ -597,7 +660,7 @@ class CollectorWorker(QThread):
     @property
     def blocking_shutdown_work(self) -> bool:
         """진행 중인 임베딩·Office 정리에 제한된 종료 유예가 필요한지 반환한다."""
-        return self._office_cleanup_in_progress or self._embedding_cancel.in_progress
+        return self.policy_job_pending or self._office_cleanup_in_progress or self._embedding_cancel.in_progress
 
     def _cleanup_com_apps(self, phase: str) -> None:
         """생성 워커에서 Office 정리를 시도하고 미확인 결과를 기록한다."""

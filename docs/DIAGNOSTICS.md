@@ -3,6 +3,33 @@
 현재 원인 분석과 다음 검증의 정본이다. 작업 상태는 [ROADMAP.md](ROADMAP.md), 구현 계약은
 [DESIGN.md](design/DESIGN.md), 완료 이력은 [UPDATE_NOTES.md](UPDATE_NOTES.md)를 따른다.
 
+## 대량 문서 제외의 화면 응답성 (2026-10-27)
+
+기존 일괄 제외는 화면 스레드에서 설정 저장·문서별 DB 삭제·state 정리·메일 제외 정리를 실행했다.
+배경 처리로 옮기고 팝업 하단과 사이드바에 단계·건수·작업 중 안내를 표시한다. 닫기·재열기·웹
+화면 재로드에도 작업을 유지하며, 새 인덱싱·정책 변경·질문을 실제 스레드 종료까지 차단한다.
+완료 건수 조회도 워커에서 수행하고, 설정 미확정 상태는 종료 후에도 읽기 재확인 전까지 보호한다.
+계약은 [대량 문서 제외](design/DESIGN.md#대량-문서-제외의-백그라운드-처리)를 따른다.
+
+10·150·1,000건의 합성 metadata와 실제 QThread/Qt 이벤트 루프에서 문서 삭제·완료 집계·native
+종료를 각각 막아도 heartbeat가 유지되고, 실제 종료 전 새 작업·완료 표시가 허용되지 않음을
+확인했다. 실제 임시 LanceDB에서는 선택 문서 삭제/비대상 보존과 메일 제외→해제→개별 재시도→
+재제외의 새 세대 정리를 검증했다. 원본 파일은 보존하며 본문·벡터를 진행 집계에 읽지 않는다.
+
+실제 제품 JS/HTML/CSS와 Qt Bridge/수집기 워커를 시험 전용 loopback transport로 연결하고,
+Edge headless에서 150건×25ms 지연 삭제를 실행했다. 팝업 닫기·재열기·웹 재로드 복원과 새
+인덱싱 거절, 브라우저 프레임 진행/JS 오류 없음, 150건 설정 저장·삭제를 확인했다. 최종 시험의
+Qt heartbeat는 401회, 작업 중 최대 간격은 31ms였다. 실제 사내 DB 처리시간 측정은 아니다.
+내장 QWebEngine host는 별도 단독 probe에서 native exit1로 paint 검증을 마치지 못해,
+동일 제품 UI의 Edge 렌더링과 Qt event loop를 대체 transport로 검증한 범위로 구분한다.
+
+근거는 `test_policy_worker.py`, `test_policy_storage.py`, `test_policy_shutdown.py`,
+`test_failure_policy_app.py`, `test_primary_bulk_policy.py`, `test_bulk_policy_ui.py` 및
+`.aegisdesk_build/bulk-policy-validation/`, `bulk-policy-live-report.json`, 화면 캡처다.
+전체 회귀는 `pytest knowmate/tests -v -W error`로 2,484 통과·6 skip·74 subtests 통과,
+경고 0개(1,008.24초)다. 실제 사내 150건·Office/DRM·frozen EXE는 미검증이며,
+의존성·DB/config 스키마 변경은 없다.
+
 ## 개별 재시도 범위와 실패 목록 갱신 (2026-10-27)
 
 개별 버튼은 선택 파일의 대기만 해제한 뒤 일반 수집 사이클을 시작해, 다른 신규·변경 파일과

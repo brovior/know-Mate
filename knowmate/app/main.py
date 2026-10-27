@@ -175,7 +175,9 @@ class MainWindow(QMainWindow):
 
     def _tray_reindex(self) -> None:
         """트레이 메뉴에서 재인덱싱을 트리거한다(진행 중이면 무시)."""
-        self._request_index_start(retry_failures=True)
+        result = self._request_index_start(retry_failures=True)
+        if result == "policy_busy":
+            self._bridge.indexAlert.emit("문서 제외 작업이 진행 중입니다. 완료 후 다시 시도해 주세요.")
 
     def _quit_app(self) -> None:
         """트레이 '종료' — 실제 앱 종료 플래그를 세우고 닫는다."""
@@ -410,9 +412,12 @@ class MainWindow(QMainWindow):
         try:
             from knowmate.app.lifecycle import stop_worker
             from knowmate.secure.office_exit import cleanup_before_worker_termination
+            stop_options = {"office_cleanup": cleanup_before_worker_termination}
+            if getattr(self._bridge, "policy_shutdown_active", False):
+                stop_options["policy_active"] = True
             force_hard_exit = stop_worker(
                 getattr(self._bridge, "_worker", None),
-                office_cleanup=cleanup_before_worker_termination,
+                **stop_options,
             ) or office_shutdown_failed
         except Exception:
             # The cleanup helper may hold a logging lock. Unknown completion

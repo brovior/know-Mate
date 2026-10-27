@@ -237,14 +237,23 @@ class _FakeIndexerForDelete:
     def __init__(self):
         self.table = _FakeDeleteTable()
 
+    def delete_file_chunks(self, path: str) -> None:
+        """Expose the real indexer's deletion boundary to the policy service."""
+        self.table.delete("file_path = '" + path.replace("'", "''") + "'")
 
-class _FakeWorkerForFailures:
+
+from knowmate.collector.scheduler import CollectorWorker
+
+
+class _FakeWorkerForFailures(CollectorWorker):
     """실패 파일 관리 슬롯(getFailures/retryFile/excludeFile) 테스트용 워커 대역."""
 
     def __init__(self, failure_file, state_file, running=False):
-        self._failure_file = failure_file
-        self._state_file = state_file
-        self._indexer = _FakeIndexerForDelete()
+        """Reuse the real policy command while modeling its native thread boundary."""
+        from knowmate.config import get_config
+        super().__init__(config=get_config(), indexer=_FakeIndexerForDelete(), extractor=None,
+                         state_file=state_file, failure_file=failure_file,
+                         purge_meta_file=state_file.with_name("purge.json"))
         self._running = running
         self._get_now = lambda: 1_700_000_000.0
 
@@ -252,12 +261,28 @@ class _FakeWorkerForFailures:
         return self._running
 
     def start(self):
+        """Run policy commands deterministically; other starts keep the old fake lease."""
+        if self.policy_job_pending:
+            self.run()
+            return
         self._running = True
 
     def request_single_retry(self, path):
         """Reserve a file without modifying the durable failure record."""
         self.target_path = path
         return "ok"
+
+
+def _completed_policy(bridge, response):
+    """Observe completion separately from the new immediate admission response."""
+    import json
+    admission = json.loads(response)
+    if not admission.get("accepted"):
+        return admission
+    bridge._poll_failure_updates()
+    status = json.loads(bridge.getFailurePolicyJobStatus())
+    assert status["terminal"] and not status["active"]
+    return status["result"]
 
 
 class TestFailureManagementSlots:
@@ -405,9 +430,9 @@ class TestFailureManagementSlots:
         bridge = _make_bridge(worker)
         target = str(tmp_path / "excluded.xlsx")
 
-        result = bridge.excludeFile(target)
+        result = _completed_policy(bridge, bridge.excludeFile(target))
 
-        assert result == "ok"
+        assert result["settings_saved"] is True
         assert target in state["collector"]["exclude_files"]
         assert len(worker._indexer.table.deleted_where) == 1
         assert target in worker._indexer.table.deleted_where[0]
@@ -428,9 +453,9 @@ class TestFailureManagementSlots:
         worker = _FakeWorkerForFailures(tmp_path / "f.json", tmp_path / "s.json")
         bridge = _make_bridge(worker)
 
-        result = bridge.unexcludeFile(target)
+        result = _completed_policy(bridge, bridge.unexcludeFile(target))
 
-        assert result == "ok"
+        assert result["settings_saved"] is True
         assert target not in state["collector"]["exclude_files"]
 
     def test_exclude_files_deduplicates_and_updates_config_once(self, tmp_path, monkeypatch):
@@ -443,12 +468,14 @@ class TestFailureManagementSlots:
         save_state(state_file, {target.upper(): {"mtime": 1}, existing: {"mtime": 2}})
         worker = _FakeWorkerForFailures(tmp_path / "f.json", state_file)
 
-        result = __import__("json").loads(
-            _make_bridge(worker).excludeFiles(__import__("json").dumps([target, target.upper(), existing]))
-        )
+        bridge = _make_bridge(worker)
+        result = _completed_policy(bridge, bridge.excludeFiles(__import__("json").dumps([target, target.upper(), existing])))
 
-        assert result == {
-            "ok": True, "requested": 2, "changed": 1, "already_target": 1,
+        assert {key: result[key] for key in (
+            "settings_saved", "requested", "changed", "already_target", "delete_failed",
+            "state_cleanup_failed", "mail_cleanup_failed", "mail_pending_chunks",
+        )} == {
+            "settings_saved": True, "requested": 2, "changed": 1, "already_target": 1,
             "delete_failed": 0, "state_cleanup_failed": False,
             "mail_cleanup_failed": False, "mail_pending_chunks": 0,
         }
@@ -474,18 +501,17 @@ class TestFailureManagementSlots:
             original_delete(where)
 
         worker._indexer.table.delete = _delete
-        result = __import__("json").loads(
-            _make_bridge(worker).excludeFiles(__import__("json").dumps([first, failing]))
-        )
+        bridge = _make_bridge(worker)
+        result = _completed_policy(bridge, bridge.excludeFiles(__import__("json").dumps([first, failing])))
 
-        assert result["ok"] is True
+        assert result["settings_saved"] is True
         assert result["changed"] == 2
         assert result["delete_failed"] == 1
         assert len(worker._indexer.table.deleted_where) == 1
-        assert load_state(state_file) == {}
+        assert load_state(state_file) == {failing: {"mtime": 2}}
 
     def test_exclude_files_reports_state_cleanup_failure_without_undoing_exclusion(self, tmp_path, monkeypatch):
-        from knowmate.collector import state as state_module
+        from knowmate.collector import policy_service as state_module
         from knowmate.collector.state import load_state, save_state
 
         target = str(tmp_path / "state-failure.xlsx")
@@ -499,9 +525,10 @@ class TestFailureManagementSlots:
         monkeypatch.setattr(state_module, "save_state", _save_failure)
         worker = _FakeWorkerForFailures(tmp_path / "f.json", state_file)
 
-        result = __import__("json").loads(_make_bridge(worker).excludeFiles(__import__("json").dumps([target])))
+        bridge = _make_bridge(worker)
+        result = _completed_policy(bridge, bridge.excludeFiles(__import__("json").dumps([target])))
 
-        assert result["ok"] is True
+        assert result["settings_saved"] is True
         assert result["state_cleanup_failed"] is True
         assert config["collector"]["exclude_files"] == [target]
         assert len(worker._indexer.table.deleted_where) == 1
@@ -523,15 +550,15 @@ class TestFailureManagementSlots:
         worker = _FakeWorkerForFailures(tmp_path / "f.json", tmp_path / "s.json")
         bridge = _make_bridge(worker)
 
-        result = __import__("json").loads(
-            bridge.unexcludeFiles(__import__("json").dumps([first.upper(), first, str(tmp_path / "missing.xlsx")]))
-        )
-        repeat = __import__("json").loads(bridge.unexcludeFiles(__import__("json").dumps([first])))
+        result = _completed_policy(bridge, bridge.unexcludeFiles(__import__("json").dumps([first.upper(), first, str(tmp_path / "missing.xlsx")])))
+        repeat = _completed_policy(bridge, bridge.unexcludeFiles(__import__("json").dumps([first])))
 
-        assert result == {"ok": True, "requested": 2, "changed": 1, "already_target": 1}
+        assert {key: result[key] for key in ("settings_saved", "requested", "changed", "already_target")} == {
+            "settings_saved": True, "requested": 2, "changed": 1, "already_target": 1}
         assert state["collector"]["exclude_files"] == [second]
         assert state["_updates"] == 1
-        assert repeat == {"ok": True, "requested": 1, "changed": 0, "already_target": 1}
+        assert {key: repeat[key] for key in ("settings_saved", "requested", "changed", "already_target")} == {
+            "settings_saved": True, "requested": 1, "changed": 0, "already_target": 1}
         assert state["_updates"] == 1
 
     def test_bulk_exclusion_refuses_while_worker_is_running(self, tmp_path, monkeypatch):
@@ -544,8 +571,8 @@ class TestFailureManagementSlots:
         excluded = __import__("json").loads(bridge.excludeFiles('["busy.xlsx"]'))
         unexcluded = __import__("json").loads(bridge.unexcludeFiles('["busy.xlsx"]'))
 
-        assert excluded == {"ok": False, "error": "busy"}
-        assert unexcluded == {"ok": False, "error": "busy"}
+        assert excluded == {"ok": False, "accepted": False, "error": "busy"}
+        assert unexcluded == {"ok": False, "accepted": False, "error": "busy"}
         assert config["collector"]["exclude_files"] == []
         assert config["_updates"] == 0
 
@@ -575,11 +602,10 @@ class TestFailureManagementSlots:
 
         worker._email_indexer = MailIndexer()
 
-        result = __import__("json").loads(
-            _make_bridge(worker).excludeFiles(__import__("json").dumps([target]))
-        )
+        bridge = _make_bridge(worker)
+        result = _completed_policy(bridge, bridge.excludeFiles(__import__("json").dumps([target])))
 
-        assert result["ok"] is True
+        assert result["settings_saved"] is True
         assert result["mail_cleanup_failed"] is False
         assert result["mail_pending_chunks"] == 0
         assert config["collector"]["exclude_files"] == [target]

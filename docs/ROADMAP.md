@@ -63,6 +63,7 @@ Phase 1~4 완료(RAG 지식검색), 5a 완료(Knox `.mysingle` + 표준 `.eml` �
 
 | 항목 | 상태·다음 행동 | 시작 조건 |
 |---|---|---|
+| 대량 문서 제외 진행 표시 | 기존 수집기 워커에서 제외·완료 집계 수행, 팝업/사이드바 진행 및 실제 종료까지 실행 차단. 전체2,484 PASS·6 SKIP·74 subtests PASS, 경고0 | [응답성 검증](DIAGNOSTICS.md#대량-문서-제외의-화면-응답성-2026-10-27)의 합성150건 Qt/Edge 연계 완료. 내장 WebEngine·사내150건·frozen 현장 확인은 별도 |
 | 개별 파일 재시도·실패 목록 갱신 | 선택 파일만 처리하고 진행 중 목록을 갱신. 저장 실패·준비 대기·종료 정리 경합 보호 및 전체2,448 PASS·6 SKIP·74 subtests PASS, 경고0 | [검증 기록](DIAGNOSTICS.md#개별-재시도-범위와-실패-목록-갱신-2026-10-27)의 소스 검증 완료. frozen·사내 Office/DRM 현장 확인은 별도 |
 | PPT 관리자 helper 진단 | 1.0.5.14 후보의 단계·원래 오류·복구 오류 전달 구현. 전체2,407 PASS·6 SKIP·74 subtests PASS, 통신/부모62 PASS·실제 ordinary→UAC2사례·격리 flow19쌍/38관측 통과. 설치/ACL 정책과 의존성 유지 | [helper 진단](DIAGNOSTICS.md#ppt-관리자-helper-진단-전달-2026-10-26)의 별도 candidate payload 기록 확인 및 사내 실패 재수집. 전체 EXE·실제 설치/Office·원격 UNC·다른 관리자 계정은 미검증 |
 | PPT ACL 표현 호환 | 역할별 상한·generic/sync/subset·외곽 TI/CO 호환 및 백업 없는 예약-only 회수의 이전 1.0.5.13 후보 구현. 관련8 PASS·격리133사례·실제 동일 계정 UAC 통과, 전체2,256 PASS·6 SKIP·74 subtests PASS | [호환 진단](DIAGNOSTICS.md#ppt-acl-표현-호환-2026-10-25)의 별도 candidate payload 기록 확인, 실제 사내 업데이트·다른 관리자·Office 승인. 기존 설치 유지 |

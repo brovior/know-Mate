@@ -246,7 +246,8 @@ def test_all_search_policy_writes_are_rejected_until_join(tmp_path, monkeypatch)
             created[0].finished.emit()
             until(lambda: bridge._query._finished_seen)
         assert json.loads(bridge.saveSettings('{}'))["code"] == "query_busy"
-        assert bridge.excludeFile('one.pdf') == bridge.unexcludeFile('one.pdf') == "query_busy"
+        assert json.loads(bridge.excludeFile('one.pdf'))["error"] == "query_busy"
+        assert json.loads(bridge.unexcludeFile('one.pdf'))["error"] == "query_busy"
         assert json.loads(bridge.excludeFiles('["one.pdf"]'))["error"] == "query_busy"
         assert json.loads(bridge.unexcludeFiles('["one.pdf"]'))["error"] == "query_busy"
         assert json.loads(bridge.addWatchFolder('new')) == ['old']

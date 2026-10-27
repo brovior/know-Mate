@@ -14,6 +14,7 @@ function fixture() {
     return {style: {}, dataset: {}, scrollTop: 0, textContent: '',
       classList: {add(x){classes.add(x);},remove(x){classes.delete(x);},contains(x){return classes.has(x);},toggle(){}},
       querySelectorAll(){return [];},querySelector(){return null;},addEventListener(){},
+      setAttribute(name,value){this[name]=value;},removeAttribute(name){delete this[name];},
     };
   }
   const bridge = {getFailures(){const d=deferred();calls.reads.push(d);return d.promise;},

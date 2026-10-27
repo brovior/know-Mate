@@ -19,6 +19,17 @@ let navigationSeq = 0;
 let navigationPending = false;
 let querySafetyTimer = null;
 let queryTimeoutMs = 0;
+let _failurePolicyState = {job_id: "", revision: 0, active: false, terminal: false, policy_unknown: false};
+let _failurePolicySubmitting = false;
+let _failurePolicyPendingAction = "exclude";
+let _failurePolicyRequestSeq = 0;
+let _failurePolicyReadSeq = 0;
+let _failurePolicyEpoch = 0;
+let _failurePolicyTransportUnknown = false;
+let _failurePolicyAwaitingStart = false;
+let _failurePolicyPriorId = "";
+const _failurePolicyRetired = new Set();
+const _failurePolicyToasts = new Set();
 const threadVersions = new WeakMap();
 const savedThreadVersions = new WeakMap();
 const threadSaves = new Map();
@@ -42,6 +53,7 @@ new QWebChannel(qt.webChannelTransport, function(channel) {
   bridge.indexAlert.connect(onIndexAlert);
   bridge.statusUpdated.connect(onStatusUpdated);
   if (bridge.failuresChanged) bridge.failuresChanged.connect(refreshFailAttention);
+  if (bridge.failurePolicyJobChanged) bridge.failurePolicyJobChanged.connect(onFailurePolicyJobChanged);
   onBridgeReady();
 });
 
@@ -61,6 +73,7 @@ function onBridgeReady() {
   }).catch(() => {});
   loadRecentQuestions();
   refreshFailAttention();
+  refreshFailurePolicyStatus();
 }
 
 /* -- 커스텀 타이틀바 -- */
@@ -140,7 +153,7 @@ function handleKey(e) {
 }
 
 function queryLocked() {
-  return frontendSubmitting || backendBusy || navigationPending || Boolean(currentThread &&
+  return failurePolicyBlocked() || frontendSubmitting || backendBusy || navigationPending || Boolean(currentThread &&
     deletingThreads.has(currentThread.mode + ":" + currentThread.id));
 }
 
@@ -154,17 +167,22 @@ function updateQueryControls() {
   }
   document.querySelectorAll(".btn-send").forEach(button => {
     button.disabled = queryLocked();
-    button.title = queryLocked() ? "이전 질문 처리가 끝난 뒤 전송할 수 있습니다." : "전송";
+    button.title = failurePolicyBlocked() ? failurePolicyBusyMessage() : queryLocked() ? "이전 질문 처리가 끝난 뒤 전송할 수 있습니다." : "전송";
   });
   document.querySelectorAll(".btn-settings-save, .btn-add-folder, #folderList button, " +
     "#failBody button[data-act='exclude'], #failBody button[data-act='unexclude']").forEach(button => {
-    button.disabled = frontendSubmitting || backendBusy;
+    button.disabled = frontendSubmitting || backendBusy || failurePolicyBlocked();
+  });
+  document.querySelectorAll("#btnReindex, #btnRetryAll, #obStartBtn, #failBody button[data-act='retry']").forEach(button => {
+    button.disabled = failurePolicyBlocked();
+    if (failurePolicyBlocked()) button.title = failurePolicyBusyMessage();
   });
   const bulk = document.getElementById("btnBulkFailAction");
-  if (bulk && (frontendSubmitting || backendBusy)) bulk.disabled = true;
+  if (bulk && (frontendSubmitting || backendBusy || failurePolicyBlocked())) bulk.disabled = true;
 }
 
 function policyWriteBlocked() {
+  if (failurePolicyBlocked()) { showToast(failurePolicyBusyMessage()); return true; }
   if (!frontendSubmitting && !backendBusy) return false;
   showToast(queryState === "RETIRED_PENDING_EXIT"
     ? "이전 요청을 정리하는 중입니다. 완료 후 다시 시도해 주세요."
@@ -290,6 +308,7 @@ async function prepareNavigation() {
 }
 
 async function sendMsg() {
+  if (failurePolicyBlocked()) { showToast(failurePolicyBusyMessage()); return; }
   if (queryLocked() || !bridge) return;
   const inp = document.getElementById("inputPill");
   const inputValue = inp.value;
@@ -736,6 +755,7 @@ function startFullIndex() {
 
 /* -- 증분 재인덱싱 -- */
 function startReindex() {
+  if (failurePolicyBlocked()) { showToast(failurePolicyBusyMessage()); return; }
   if (!bridge) { showToast("브리지가 준비되지 않았습니다."); return; }
   Promise.resolve(bridge.startReindex()).then(result => {
     if (result === "ok") showIndexRunning();
@@ -757,6 +777,7 @@ function showIndexRunning() {
 }
 
 function cancelReindex() {
+  if (failurePolicyBlocked()) { showToast(failurePolicyBusyMessage()); return; }
   if (bridge) bridge.cancelReindex();
 }
 
@@ -1029,7 +1050,7 @@ function saveSettings() {
       showToast("설정이 저장되었습니다. 일부 항목은 재시작 후 적용됩니다.");
       closeSettings();
     } else {
-      showToast(result.error === "query_busy" || result.code === "query_busy" ? "질문 처리가 끝난 뒤 다시 시도해 주세요." : "설정 저장 실패");
+      showToast(result.error === "policy_busy" || result.code === "policy_busy" ? failurePolicyBusyMessage() : result.error === "query_busy" || result.code === "query_busy" ? "질문 처리가 끝난 뒤 다시 시도해 주세요." : "설정 저장 실패");
     }
   }).catch(() => showToast("설정 저장 실패"));
 }
@@ -1078,6 +1099,195 @@ let _failRefreshTask = null;
 let _failRefreshPending = false;
 let _failRequestGeneration = 0;
 let _failWaitTimer = null;
+
+/** Keep policy writes blocked until the backend confirms native completion. */
+function failurePolicyBlocked() {
+  return _failurePolicySubmitting || _failurePolicyTransportUnknown || _failurePolicyState.active || _failurePolicyState.policy_unknown;
+}
+
+function failurePolicyBusyMessage() {
+  if (_failurePolicyTransportUnknown) return "문서 제외 처리 상태를 확인하지 못했습니다. 상태를 다시 확인해 주세요.";
+  return _failurePolicyState.policy_unknown && !_failurePolicyState.active
+    ? "제외 설정 상태를 확인하지 못했습니다. 상태를 다시 확인해 주세요."
+    : "문서 제외 작업이 진행 중입니다. 완료 후 다시 시도해 주세요.";
+}
+
+function _failurePolicySummary(state) {
+  const result = state.result || {};
+  if (state.policy_unknown || state.settings_saved == null) return "제외 설정 상태를 확인하지 못했습니다. 상태를 다시 확인해 주세요.";
+  if (!state.settings_saved) return result.cancelled ? "요청이 취소됐습니다. 제외 설정은 변경되지 않았습니다." : "제외 설정을 저장하지 못했습니다. 변경되지 않은 상태로 종료했습니다.";
+  if (state.action === "reconcile") return "제외 설정 상태를 확인했습니다. 필요한 작업을 다시 요청해 주세요.";
+  const changed = Number.isFinite(result.changed) ? result.changed : 0;
+  if (state.action === "unexclude") return changed ? `${changed}건을 인덱싱 제외에서 해제했습니다.` : "이미 제외 해제된 문서입니다.";
+  const pending = (result.failed || 0) + (result.not_attempted || 0);
+  let text = changed ? `${changed}건 제외 설정 적용` : "제외 설정 적용 확인";
+  if (pending) text += ` · 검색 데이터 ${pending}건 정리 미완료`;
+  else if (result.cancelled) text += " · 데이터 정리가 중단됐습니다.";
+  else if (result.error_code || result.status === "error") text += " · 처리 결과를 확인해 주세요.";
+  else text += " · 검색 데이터 정리 완료";
+  if (result.state_cleanup_failed) text += " · 처리 상태 저장 실패";
+  if (result.mail_cleanup_failed) text += " · 메일 정리 실패";
+  else if (result.mail_pending_chunks) text += ` · 메일 데이터 ${result.mail_pending_chunks}개 정리 대기`;
+  if ((Object.hasOwn(state, "counts") && state.counts === null) || (Object.hasOwn(result, "counts") && result.counts === null)) text += " · 검색 건수 갱신 미확인";
+  return text;
+}
+
+/** Update the popup and persistent sidebar from one scalar job snapshot. */
+function renderFailurePolicyUI() {
+  const state = _failurePolicyState;
+  const busy = failurePolicyBlocked();
+  const terminal = state.terminal && !state.active && !_failurePolicySubmitting;
+  const result = state.result || {};
+  const warning = _failurePolicyTransportUnknown || state.policy_unknown || (terminal && (!state.settings_saved || result.cancelled || result.failed || result.not_attempted || result.state_cleanup_failed || result.mail_cleanup_failed || result.mail_pending_chunks || result.error_code || result.status === "error"));
+  const titles = {reserved: "제외 요청 중…", settings: state.action === "unexclude" ? "제외 해제 설정 저장 중" : "제외 설정 저장 중", documents: "검색 데이터 정리 중", mail: "메일 검색 데이터 정리 중", counts: "검색 건수 집계 중", finishing: "마무리 중"};
+  const requesting = {exclude: "제외 요청 중…", unexclude: "제외 해제 요청 중…", reconcile: "제외 설정 확인 요청 중…"};
+  let title = _failurePolicySubmitting ? requesting[_failurePolicyPendingAction] : state.action === "reconcile" && state.active ? "제외 설정 상태 확인 중" : titles[state.stage] || "마무리 중";
+  if (terminal) title = state.policy_unknown ? "제외 설정 확인 필요" : warning ? "제외 처리 결과 확인" : state.action === "unexclude" ? "제외 해제 완료" : state.action === "reconcile" ? "제외 설정 확인 완료" : "제외 처리 완료";
+  if (_failurePolicyTransportUnknown) title = "제외 처리 상태 확인 필요";
+  const done = Number.isFinite(state.done) ? Math.max(0, state.done) : 0;
+  const total = Number.isFinite(state.total) ? Math.max(0, state.total) : 0;
+  const determinate = !_failurePolicySubmitting && !warning && state.stage === "documents" && total > 0 && done < total;
+  const showPanel = busy || Boolean(state.job_id && terminal);
+  const showSidebar = busy || Boolean(terminal && warning);
+  const detail = _failurePolicyTransportUnknown ? "요청을 중복 실행하지 않고 현재 처리 상태를 확인합니다." : terminal ? _failurePolicySummary(state) : state.stage === "documents" && !_failurePolicySubmitting ? `${done}/${total}건 처리 시도` : state.stage === "mail" ? "기존 메일 삭제 대기도 함께 정리하고 있습니다." : "처리가 끝날 때까지 기다려 주세요.";
+  for (const where of ["Panel", "Sidebar"]) {
+    const box = document.getElementById("failurePolicy" + where);
+    if (!box) continue;
+    box.hidden = where === "Panel" ? !showPanel : !showSidebar;
+    box.dataset.state = warning ? "warning" : terminal ? "terminal" : "active";
+    const label = document.getElementById("failurePolicy" + where + "Title");
+    if (label) label.textContent = where === "Sidebar" && !terminal && !_failurePolicyTransportUnknown ? state.action === "unexclude" ? "문서 제외 해제 처리 중" : "문서 제외 처리 중" : title;
+    const count = document.getElementById("failurePolicy" + where + "Count");
+    if (count) count.textContent = state.stage === "documents" && !terminal && !_failurePolicySubmitting ? `${done} / ${total}건` : "";
+    const note = document.getElementById("failurePolicy" + where + "Detail");
+    if (note) note.textContent = detail;
+    const help = document.getElementById("failurePolicy" + where + "Help");
+    if (help) help.textContent = where === "Sidebar" ? busy ? "문서 제외 처리 중에는 인덱싱과 제외 설정을 변경할 수 없습니다." : "일부 검색 데이터 정리 결과를 확인해 주세요." : busy ? "이 창을 닫아도 처리는 계속됩니다." : "원본 파일은 그대로 보존됩니다.";
+    const track = document.getElementById("failurePolicy" + where + "Track");
+    if (track) {
+      track.hidden = terminal;
+      track.classList.toggle("indeterminate", !determinate);
+      if (determinate) track.setAttribute("aria-valuenow", String(done / total * 100));
+      else track.removeAttribute("aria-valuenow");
+    }
+    const fill = document.getElementById("failurePolicy" + where + "Fill");
+    if (fill) fill.style.width = determinate ? `${done / total * 100}%` : "";
+    const recheck = document.getElementById("failurePolicy" + where + "Recheck");
+    if (recheck) { recheck.hidden = !state.policy_unknown && !_failurePolicyTransportUnknown; recheck.disabled = _failurePolicySubmitting || (state.active && !_failurePolicyTransportUnknown); }
+  }
+  _failBulkRunning = busy;
+  updateQueryControls();
+  _renderBulkFailureAction(_failCards.filter(card => _failFilter === "all" || _failCategory(card) === _failFilter));
+}
+
+function _applyFailurePolicyState(value, live = false) {
+  let state;
+  try { state = typeof value === "string" ? JSON.parse(value) : value; } catch { return false; }
+  if (!state || typeof state.active !== "boolean" || typeof state.terminal !== "boolean" || typeof state.policy_unknown !== "boolean" || typeof state.job_id !== "string" || !Number.isInteger(state.revision)) return false;
+  const current = _failurePolicyState;
+  if (live && _failurePolicyAwaitingStart && state.job_id === _failurePolicyPriorId) return false;
+  if (_failurePolicyRetired.has(state.job_id)) return false;
+  if (state.job_id === current.job_id && state.revision < current.revision) return false;
+  if (state.job_id === current.job_id && current.terminal && !current.active && (state.active || !state.terminal)) return false;
+  if (!state.job_id && current.job_id) return false;
+  if (state.job_id !== current.job_id && current.active) return false;
+  if (state.job_id !== current.job_id && current.job_id) _failurePolicyRetired.add(current.job_id);
+  _failurePolicyState = state;
+  _failurePolicyTransportUnknown = false;
+  if (!live || state.job_id !== _failurePolicyPriorId) _failurePolicyAwaitingStart = false;
+  if (live) _failurePolicyEpoch++;
+  renderFailurePolicyUI();
+  if (state.terminal && !state.active) {
+    if (live && !_failurePolicyToasts.has(state.job_id)) {
+      _failurePolicyToasts.add(state.job_id);
+      showToast(_failurePolicySummary(state));
+    }
+    if (state.job_id !== current.job_id || !current.terminal) _refreshFailures(true).catch(() => {});
+  }
+  return true;
+}
+
+function onFailurePolicyJobChanged(json) { _applyFailurePolicyState(json, true); }
+
+function _failurePolicyReply(promise) {
+  let timer;
+  const timeout = new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("policy reply timeout")), 3000); });
+  return Promise.race([Promise.resolve(promise), timeout]).finally(() => clearTimeout(timer));
+}
+
+function refreshFailurePolicyStatus() {
+  if (!bridge || typeof bridge.getFailurePolicyJobStatus !== "function") return Promise.resolve();
+  const seq = ++_failurePolicyReadSeq;
+  const epoch = _failurePolicyEpoch;
+  return _failurePolicyReply(bridge.getFailurePolicyJobStatus()).then(value => {
+    if (seq === _failurePolicyReadSeq && epoch === _failurePolicyEpoch) {
+      if (!_applyFailurePolicyState(value)) throw new Error("invalid policy state");
+      return true;
+    }
+    return false;
+  }).catch(() => {
+    if (seq === _failurePolicyReadSeq && epoch === _failurePolicyEpoch) {
+      _failurePolicyTransportUnknown = true;
+      renderFailurePolicyUI();
+      showToast("처리 상태를 확인하지 못했습니다. 진행 상황을 다시 열어 확인해 주세요.");
+    }
+    return false;
+  });
+}
+
+function _failurePolicyRequestError(error) {
+  if (error === "policy_busy" || error === "policy_unconfirmed") return failurePolicyBusyMessage();
+  if (error === "query_busy") return "질문 처리가 끝난 뒤 다시 시도해 주세요.";
+  if (error === "busy") return "인덱싱이 끝난 후 다시 시도해 주세요.";
+  if (error === "persistence_pending") return _failureRequestMessage(error);
+  if (error === "not_ready") return "프로그램 준비가 끝난 뒤 다시 시도해 주세요.";
+  return "제외 작업을 시작하지 못했습니다.";
+}
+
+/** Submit one policy job; an uncertain acknowledgement never resubmits writes. */
+async function _startFailurePolicyJob(action, paths) {
+  if (!bridge || typeof bridge.startFailurePolicyJob !== "function") { showToast("제외 작업을 시작할 준비가 되지 않았습니다."); return; }
+  if (failurePolicyBlocked() && !(action === "reconcile" && !_failurePolicyState.active && !_failurePolicySubmitting)) { showToast(failurePolicyBusyMessage()); return; }
+  if (action !== "reconcile" && policyWriteBlocked()) return;
+  const seq = ++_failurePolicyRequestSeq;
+  _failurePolicyEpoch++;
+  _failurePolicySubmitting = true;
+  _failurePolicyAwaitingStart = true;
+  _failurePolicyPriorId = _failurePolicyState.job_id;
+  _failurePolicyPendingAction = action;
+  renderFailurePolicyUI();
+  try {
+    const response = await _failurePolicyReply(bridge.startFailurePolicyJob(action, JSON.stringify(paths)));
+    if (seq !== _failurePolicyRequestSeq) return;
+    const result = typeof response === "string" ? JSON.parse(response) : response;
+    if (!result || result.ok !== true) {
+      _failurePolicySubmitting = false;
+      _failurePolicyAwaitingStart = false;
+      renderFailurePolicyUI();
+      showToast(_failurePolicyRequestError(result?.error));
+      if (result?.error === "policy_busy" || result?.error === "policy_unconfirmed") await refreshFailurePolicyStatus();
+      return;
+    }
+    _failurePolicySubmitting = false;
+    _failurePolicyAwaitingStart = false;
+    if (result.accepted && result.job_id && _failurePolicyState.job_id !== result.job_id) {
+      _applyFailurePolicyState({job_id: result.job_id, revision: -1, action, stage: "reserved", done: 0, total: paths.length, active: true, terminal: false, policy_unknown: false});
+    }
+    renderFailurePolicyUI();
+    await refreshFailurePolicyStatus();
+  } catch {
+    if (seq !== _failurePolicyRequestSeq) return;
+    showToast("요청이 접수됐는지 확인하고 있습니다. 중복 요청하지 말고 잠시 기다려 주세요.");
+    const known = await refreshFailurePolicyStatus();
+    _failurePolicySubmitting = false;
+    if (!known && _failurePolicyAwaitingStart) _failurePolicyTransportUnknown = true;
+    renderFailurePolicyUI();
+  }
+}
+
+function recheckFailurePolicy() {
+  return _failurePolicyTransportUnknown ? refreshFailurePolicyStatus() : _startFailurePolicyJob("reconcile", []);
+}
 
 function refreshFailAttention() {
   return _refreshFailures().catch(() => {});
@@ -1139,6 +1349,8 @@ function openFailuresPanel() {
   _failFilter = "all";
   document.getElementById("failuresOverlay").classList.add("show");
   if (_failWaitTimer === null) _failWaitTimer = setInterval(_refreshFailureWaitLabels, 30000);
+  renderFailurePolicyUI();
+  refreshFailurePolicyStatus();
   return _refreshFailures(true).catch(() => showToast("실패 목록을 불러오지 못했습니다."));
 }
 
@@ -1202,14 +1414,14 @@ function _renderBulkFailureAction(visible) {
   if (!button || !retryAll) return;
   const isUnexclude = _failFilter === "excluded";
   const targets = _bulkFailureTargets(visible);
-  button.textContent = isUnexclude ? `${targets.length}건 제외 해제` : `${targets.length}건 제외`;
+  button.textContent = failurePolicyBlocked() ? _failurePolicyState.policy_unknown && !_failurePolicyState.active ? "설정 확인 필요" : _failurePolicySubmitting ? "요청 중…" : "제외 처리 중…" : isUnexclude ? `${targets.length}건 제외 해제` : `${targets.length}건 제외`;
   button.classList.toggle("unexclude", isUnexclude);
-  button.disabled = _failBulkRunning || frontendSubmitting || backendBusy || targets.length === 0;
+  button.disabled = failurePolicyBlocked() || _failBulkRunning || frontendSubmitting || backendBusy || targets.length === 0;
   retryAll.style.display = isUnexclude ? "none" : "";
 }
 
 function runBulkFailureAction() {
-  if (!bridge || _failBulkRunning || policyWriteBlocked()) return;
+  if (!bridge || policyWriteBlocked()) return;
   const visible = _failCards.filter(c => _failFilter === "all" || _failCategory(c) === _failFilter);
   const targets = _bulkFailureTargets(visible);
   if (targets.length === 0) return;
@@ -1220,54 +1432,7 @@ function runBulkFailureAction() {
     : `${targets.length}개 문서를 인덱싱에서 제외합니다.\n기존 검색 데이터는 삭제되지만 원본 파일은 삭제되지 않습니다.\n계속하시겠습니까?`;
   if (!window.confirm(message)) return;
 
-  _failBulkRunning = true;
-  renderFailuresPanel();
-  const payload = JSON.stringify(targets.map(card => card.path));
-  const request = isUnexclude ? bridge.unexcludeFiles(payload) : bridge.excludeFiles(payload);
-  request.then(json => {
-    let result;
-    try { result = JSON.parse(json); } catch { throw new Error("invalid response"); }
-    if (!result.ok) throw new Error(result.error || "request failed");
-    return _refreshFailuresAfterBulk().then(
-      () => ({ result, refreshFailed: false }),
-      () => ({ result, refreshFailed: true }),
-    );
-  }).then(({ result, refreshFailed }) => {
-    const message = _bulkFailureSuccessMessage(isUnexclude, result);
-    showToast(refreshFailed ? `${message} 목록을 새로고침하지 못했습니다.` : message);
-  }).catch(error => {
-    if (error && error.message === "query_busy") {
-      showToast("질문 처리가 끝난 뒤 다시 시도해 주세요.");
-    } else if (error && error.message === "busy") {
-      showToast("인덱싱이 끝난 후 다시 시도해 주세요.");
-    } else if (error && error.message === "persistence_pending") {
-      showToast(_failureRequestMessage("persistence_pending"));
-    } else {
-      showToast(isUnexclude ? "일괄 제외 해제에 실패했습니다." : "일괄 인덱싱 제외에 실패했습니다.");
-    }
-  }).finally(() => {
-    _failBulkRunning = false;
-    renderFailuresPanel();
-  });
-}
-
-function _bulkFailureSuccessMessage(isUnexclude, result) {
-  if (isUnexclude) {
-    return result.changed ? `${result.changed}건을 인덱싱 제외에서 해제했습니다.` : "이미 제외 해제된 문서입니다.";
-  }
-  let message;
-  if (result.delete_failed) {
-    message = `${result.changed}건 제외, ${result.delete_failed}개 문서의 검색 데이터 정리 실패`;
-  } else {
-    message = result.changed ? `${result.changed}건을 인덱싱에서 제외했습니다.` : "이미 제외된 문서입니다.";
-  }
-  if (result.mail_cleanup_failed) return `${message} 메일 검색 데이터 정리는 다음 사이클에 재시도합니다.`;
-  if (result.mail_pending_chunks) return `${message} 메일 검색 데이터 ${result.mail_pending_chunks}개 정리 대기 중.`;
-  return result.state_cleanup_failed ? `${message} 인덱싱 상태 정리 실패.` : message;
-}
-
-function _refreshFailuresAfterBulk() {
-  return _refreshFailures(true);
+  return _startFailurePolicyJob(isUnexclude ? "unexclude" : "exclude", targets.map(card => card.path));
 }
 
 // data-act → 실행할 함수. 경로는 HTML을 거치지 않고 카드 객체에서 직접 꺼내
@@ -1373,6 +1538,7 @@ function _renderFailCard(card, index) {
 
 function retryFailureFile(path) {
   if (!bridge) return;
+  if (failurePolicyBlocked()) { showToast(failurePolicyBusyMessage()); return; }
   bridge.retryFile(path).then(result => {
     if (result !== "ok") { showToast(_failureRequestMessage(result)); return; }
     showIndexRunning();
@@ -1380,6 +1546,7 @@ function retryFailureFile(path) {
 }
 
 function _failureRequestMessage(result) {
+  if (result === "policy_busy") return failurePolicyBusyMessage();
   if (result === "busy") return "인덱싱 또는 종료 정리가 이미 진행 중입니다.";
   if (result === "persistence_pending") return "실패 이력을 저장하지 못했습니다. 저장 후 다시 시도해 주세요.";
   if (result === "not_found") return "재시도할 파일의 실패 이력을 찾을 수 없습니다.";
@@ -1388,24 +1555,12 @@ function _failureRequestMessage(result) {
 
 function excludeFailureFile(path) {
   if (!bridge || policyWriteBlocked()) return;
-  bridge.excludeFile(path).then(result => {
-    if (result === "query_busy") { showToast("질문 처리가 끝난 뒤 다시 시도해 주세요."); return; }
-    if (result === "busy") { showToast("인덱싱이 끝난 후 다시 시도해 주세요."); return; }
-    if (result === "persistence_pending") { showToast(_failureRequestMessage(result)); return; }
-    if (result !== "ok") { showToast("인덱싱 제외에 실패했습니다."); return; }
-    _refreshFailures(true).catch(() => showToast("목록을 갱신하지 못했습니다."));
-  }).catch(() => showToast("인덱싱 제외에 실패했습니다."));
+  return _startFailurePolicyJob("exclude", [path]);
 }
 
 function unexcludeFailureFile(path) {
   if (!bridge || policyWriteBlocked()) return;
-  bridge.unexcludeFile(path).then(result => {
-    if (result === "query_busy") { showToast("질문 처리가 끝난 뒤 다시 시도해 주세요."); return; }
-    if (result === "busy") { showToast("인덱싱이 끝난 후 다시 시도해 주세요."); return; }
-    if (result === "persistence_pending") { showToast(_failureRequestMessage(result)); return; }
-    if (result !== "ok") { showToast("제외 해제에 실패했습니다."); return; }
-    _refreshFailures(true).catch(() => showToast("목록을 갱신하지 못했습니다."));
-  }).catch(() => showToast("제외 해제에 실패했습니다."));
+  return _startFailurePolicyJob("unexclude", [path]);
 }
 
 function revealFailureFile(path) {
